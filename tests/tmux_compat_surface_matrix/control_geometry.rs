@@ -103,8 +103,9 @@ fn tmux_compat_status_geometry_follows_the_row_owning_client_when_frozen_tmux_is
         config.clone(),
     )?;
 
-    tmux_control.send("refresh-client -C 100x40\n")?;
-    rmux_control.send("refresh-client -C 100x40\n")?;
+    // Frozen tmux 3.7b also accepts the documented comma form.
+    tmux_control.send("refresh-client -C 100,40\n")?;
+    rmux_control.send("refresh-client -C 100,40\n")?;
     let tmux_small_pty =
         spawn_tmux_attached_input_client_at_size(&harness, &tmux_binary, session, size(70, 20))?;
     let rmux_small_pty = spawn_rmux_attached_input_client_at_size(&harness, session, size(70, 20))?;

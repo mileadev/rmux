@@ -342,8 +342,31 @@ fn validate_refresh_supported_request(request: &RefreshClientRequest) -> Result<
 }
 
 fn parse_control_size(value: &str) -> Option<TerminalSize> {
-    let (cols, rows) = value.split_once('x')?;
+    let (cols, rows) = value.split_once('x').or_else(|| value.split_once(','))?;
     let cols = cols.parse::<u16>().ok()?;
     let rows = rows.parse::<u16>().ok()?;
     (cols > 0 && rows > 0).then_some(TerminalSize { cols, rows })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_control_size;
+    use rmux_proto::TerminalSize;
+
+    #[test]
+    fn control_size_accepts_tmux_separators() {
+        let expected = Some(TerminalSize {
+            cols: 101,
+            rows: 31,
+        });
+        assert_eq!(parse_control_size("101x31"), expected);
+        assert_eq!(parse_control_size("101,31"), expected);
+    }
+
+    #[test]
+    fn control_size_rejects_zero_or_malformed_dimensions() {
+        for value in ["", "101", "0x31", "101,0", "101x31,20", "101,31x20"] {
+            assert_eq!(parse_control_size(value), None, "{value}");
+        }
+    }
 }
