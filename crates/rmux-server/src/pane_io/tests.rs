@@ -10,7 +10,7 @@ use rmux_proto::{
     encode_attach_message, AttachFrameDecoder, AttachMessage, AttachShellCommand,
     AttachedKeystroke, BindKeyRequest, DisplayMessageExtRequest, KeyDispatched, KillSessionRequest,
     NewSessionRequest, OptionName, PaneTarget, Request, Response, ScopeSelector, SessionName,
-    SetOptionMode, Target, TerminalSize, WaitForMode, WaitForRequest,
+    SetOptionMode, Target, TerminalSize, WaitForMode, WaitForRequest, DEFAULT_MAX_FRAME_LENGTH,
 };
 use rmux_pty::PtyPair;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1519,6 +1519,40 @@ async fn live_render_delta_uses_data_message_for_stateful_frames() {
 }
 
 #[tokio::test]
+async fn live_replaceable_repaint_above_payload_ceiling_uses_ordered_data_fragments() {
+    let alpha = SessionName::new("alpha").expect("valid session name");
+    let target = test_attach_target(&alpha, b"", None);
+    let mut target = open_attach_target(target, true).expect("open attach target");
+    let frame = PaneRenderDeltaFrame::new(vec![b'x'; DEFAULT_MAX_FRAME_LENGTH + 1], None);
+    let (stream, mut peer) = tokio::io::duplex(DEFAULT_MAX_FRAME_LENGTH + 64);
+    let stream = AttachTransport::from_io(stream);
+
+    super::emit_live_render_frame(&stream, &mut target, &frame, true)
+        .await
+        .expect("emit oversized live repaint");
+
+    let mut decoder = AttachFrameDecoder::new();
+    let mut messages = Vec::new();
+    let mut bytes = [0_u8; 8192];
+    while messages.len() < 2 {
+        let count = peer.read(&mut bytes).await.expect("read emitted frame");
+        assert!(count > 0, "attach stream closed before both fragments");
+        decoder.push_bytes(&bytes[..count]);
+        while let Some(message) = decoder.next_message().expect("decode emitted frame") {
+            messages.push(message);
+        }
+    }
+
+    assert_eq!(
+        messages,
+        vec![
+            AttachMessage::Data(vec![b'x'; DEFAULT_MAX_FRAME_LENGTH]),
+            AttachMessage::Data(vec![b'x']),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn pane_output_receiver_reports_lag_and_resumes_from_oldest_retained_event() {
     let sender = pane_output_channel_with_limits(1, 32);
     let mut receiver = sender.subscribe();
@@ -2596,6 +2630,68 @@ async fn read_attach_data_until(peer: &mut tokio::net::UnixStream, needle: &[u8]
     })
     .await
     .expect("timed out waiting for attach data")
+}
+
+#[tokio::test]
+async fn initial_attach_repaint_above_two_mib_uses_bounded_ordered_fragments() {
+    let handler = Arc::new(RequestHandler::new());
+    let session_name = SessionName::new("large-initial-repaint").expect("valid session name");
+    let repaint = (0..(2 * DEFAULT_MAX_FRAME_LENGTH + 17))
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    let (_control_tx, control_rx) = mpsc::unbounded_channel();
+    let attach_task = tokio::spawn(forward_attach(
+        stream,
+        test_render_only_attach_target(&session_name, &repaint),
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicU64::new(0)),
+        LiveAttachInputContext::unregistered_for_test(handler, std::process::id()),
+        true,
+    ));
+
+    let mut decoder = AttachFrameDecoder::new();
+    let mut reconstructed = Vec::with_capacity(repaint.len());
+    let mut fragment_lengths = Vec::new();
+    let mut bytes = [0_u8; 64 * 1024];
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while reconstructed.len() < repaint.len() {
+            let count = peer.read(&mut bytes).await.expect("read initial repaint");
+            assert!(count > 0, "attach stream closed during initial repaint");
+            decoder.push_bytes(&bytes[..count]);
+            while let Some(message) = decoder.next_message().expect("decode initial repaint") {
+                let AttachMessage::Data(fragment) = message else {
+                    panic!("oversized initial repaint must use strict ordered data");
+                };
+                if fragment.len() == DEFAULT_MAX_FRAME_LENGTH || !fragment_lengths.is_empty() {
+                    fragment_lengths.push(fragment.len());
+                    reconstructed.extend_from_slice(&fragment);
+                }
+            }
+        }
+    })
+    .await
+    .expect("initial repaint timed out");
+
+    assert_eq!(
+        fragment_lengths,
+        vec![DEFAULT_MAX_FRAME_LENGTH, DEFAULT_MAX_FRAME_LENGTH, 17]
+    );
+    assert_eq!(reconstructed, repaint);
+
+    shutdown_tx.send(()).expect("request attach shutdown");
+    assert!(
+        attach_task
+            .await
+            .expect("attach task joins after shutdown")
+            .is_ok(),
+        "large initial repaint must not terminate the attach forwarder"
+    );
 }
 
 #[tokio::test]

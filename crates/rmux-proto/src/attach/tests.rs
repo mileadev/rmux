@@ -3,7 +3,10 @@ use super::{
     encode_data_like_message, AttachFrameDecoder, AttachMessage, AttachShellCommand,
     AttachedKeystroke, KeyDispatched, KEYSTROKE_TAG, WINDOWS_CONSOLE_KEYSTROKE_TAG,
 };
-use crate::{AttachedWindowsConsoleKey, RmuxError, TerminalGeometry, TerminalPixels, TerminalSize};
+use crate::{
+    AttachedWindowsConsoleKey, RmuxError, TerminalGeometry, TerminalPixels, TerminalSize,
+    DEFAULT_MAX_FRAME_LENGTH,
+};
 
 #[test]
 fn data_messages_round_trip() {
@@ -51,6 +54,28 @@ fn attach_data_slice_encoder_matches_allocating_encoder() {
     let len = encode_attach_data_into_slice(b"hello", &mut frame).expect("encode into slice");
 
     assert_eq!(&frame[..len], encoded.as_slice());
+}
+
+#[test]
+fn attach_data_encoder_accepts_exact_payload_ceiling_and_rejects_next_byte() {
+    let at_limit = vec![b'x'; DEFAULT_MAX_FRAME_LENGTH];
+    let encoded =
+        encode_attach_message(&AttachMessage::Data(at_limit)).expect("payload ceiling encodes");
+    assert_eq!(
+        encoded.len(),
+        DEFAULT_MAX_FRAME_LENGTH + super::ATTACH_DATA_HEADER_LEN
+    );
+
+    assert_eq!(
+        encode_attach_message(&AttachMessage::Data(vec![
+            b'x';
+            DEFAULT_MAX_FRAME_LENGTH + 1
+        ])),
+        Err(RmuxError::FrameTooLarge {
+            length: DEFAULT_MAX_FRAME_LENGTH + 1,
+            maximum: DEFAULT_MAX_FRAME_LENGTH,
+        })
+    );
 }
 
 #[test]

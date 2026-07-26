@@ -6,7 +6,7 @@ use std::time::Duration;
 use rmux_core::events::{OutputCursorItem, OutputGap};
 use rmux_proto::{
     encode_attach_data, encode_attach_data_into_slice, encode_attach_message, AttachFrameDecoder,
-    AttachMessage, ATTACH_DATA_HEADER_LEN,
+    AttachMessage, ATTACH_DATA_HEADER_LEN, DEFAULT_MAX_FRAME_LENGTH,
 };
 #[cfg(unix)]
 use rmux_pty::PtyIo;
@@ -90,7 +90,9 @@ pub(super) async fn emit_render_frame(
     outer_terminal: &OuterTerminal,
     render_frame: &[u8],
 ) -> io::Result<()> {
-    let frame = outer_terminal.wrap_render_frame(render_frame);
+    let Some(frame) = bounded_wrapped_render_frame(outer_terminal, render_frame) else {
+        return emit_attach_bytes(stream, render_frame).await;
+    };
     emit_attach_bytes(stream, &frame).await
 }
 
@@ -100,15 +102,36 @@ pub(super) async fn emit_coalescible_render_frame(
     render_frame: &[u8],
     render_stream: bool,
 ) -> io::Result<()> {
-    let frame = outer_terminal.wrap_render_frame(render_frame);
-    if frame.is_empty() {
+    if render_frame.is_empty() {
         return Ok(());
     }
+    let Some(frame) = bounded_wrapped_render_frame(outer_terminal, render_frame) else {
+        // Render messages are replaceable, so fragmenting one would let the
+        // client discard an intermediate part. Keep a still-bounded repaint
+        // replaceable without synchronized-output wrapping; larger repaints
+        // use strict Data messages whose order the client must preserve.
+        return if render_stream && render_frame.len() <= DEFAULT_MAX_FRAME_LENGTH {
+            emit_attach_frame(stream, &AttachMessage::Render(render_frame.to_vec())).await
+        } else {
+            emit_attach_bytes(stream, render_frame).await
+        };
+    };
     if render_stream {
         emit_attach_frame(stream, &AttachMessage::Render(frame)).await
     } else {
         emit_attach_bytes(stream, &frame).await
     }
+}
+
+fn bounded_wrapped_render_frame(
+    outer_terminal: &OuterTerminal,
+    render_frame: &[u8],
+) -> Option<Vec<u8>> {
+    if render_frame.len() > DEFAULT_MAX_FRAME_LENGTH {
+        return None;
+    }
+    let frame = outer_terminal.wrap_render_frame(render_frame);
+    (frame.len() <= DEFAULT_MAX_FRAME_LENGTH).then_some(frame)
 }
 
 pub(super) async fn read_socket_bytes(
@@ -187,11 +210,13 @@ pub(super) async fn emit_attach_data_frame(
 }
 
 pub(super) async fn emit_attach_bytes(stream: &AttachTransport, bytes: &[u8]) -> io::Result<()> {
-    if bytes.is_empty() {
-        return Ok(());
+    // Data frames are strict stream fragments on both attach clients. The
+    // fixed codec ceiling bounds each encoder allocation independently of the
+    // rendered keyframe or passthrough event that supplied these bytes.
+    for chunk in bytes.chunks(DEFAULT_MAX_FRAME_LENGTH) {
+        emit_attach_data_frame(stream, chunk).await?;
     }
-
-    emit_attach_data_frame(stream, bytes).await
+    Ok(())
 }
 
 pub(super) async fn emit_attach_stop(
@@ -586,30 +611,53 @@ mod unix_tests {
 
 #[cfg(test)]
 mod emit_render_tests {
-    use super::{emit_attach_message, emit_coalescible_render_frame};
+    use super::{emit_attach_bytes, emit_attach_message, emit_coalescible_render_frame};
     use crate::outer_terminal::{OuterTerminal, OuterTerminalContext};
     use crate::pane_io::attach_transport::AttachTransport;
     use rmux_core::OptionStore;
-    use rmux_proto::{AttachFrameDecoder, AttachMessage, AttachShellCommand};
+    use rmux_proto::{
+        AttachFrameDecoder, AttachMessage, AttachShellCommand, OptionName, ScopeSelector,
+        SetOptionMode, DEFAULT_MAX_FRAME_LENGTH,
+    };
     use tokio::io::AsyncReadExt;
 
-    async fn emitted_message(render_stream: bool) -> AttachMessage {
-        let (stream, mut peer) = tokio::io::duplex(1024);
+    async fn emitted_messages(
+        outer_terminal: &OuterTerminal,
+        render_frame: &[u8],
+        render_stream: bool,
+        expected_count: usize,
+    ) -> Vec<AttachMessage> {
+        let capacity = render_frame
+            .len()
+            .saturating_add(expected_count.saturating_mul(5))
+            .saturating_add(64);
+        let (stream, mut peer) = tokio::io::duplex(capacity);
         let stream = AttachTransport::from_io(stream);
-        let outer_terminal =
-            OuterTerminal::resolve(&OptionStore::default(), OuterTerminalContext::default());
 
-        emit_coalescible_render_frame(&stream, &outer_terminal, b"frame", render_stream)
+        emit_coalescible_render_frame(&stream, outer_terminal, render_frame, render_stream)
             .await
             .expect("render frame emits");
 
-        let mut bytes = [0_u8; 128];
-        let count = peer.read(&mut bytes).await.expect("read emitted frame");
         let mut decoder = AttachFrameDecoder::new();
-        decoder.push_bytes(&bytes[..count]);
-        decoder
-            .next_message()
-            .expect("decode succeeds")
+        let mut messages = Vec::with_capacity(expected_count);
+        let mut bytes = [0_u8; 8192];
+        while messages.len() < expected_count {
+            let count = peer.read(&mut bytes).await.expect("read emitted frame");
+            assert!(count > 0, "attach stream closed before all frames arrived");
+            decoder.push_bytes(&bytes[..count]);
+            while let Some(message) = decoder.next_message().expect("decode emitted frame") {
+                messages.push(message);
+            }
+        }
+        messages
+    }
+
+    async fn emitted_message(render_stream: bool) -> AttachMessage {
+        let outer_terminal =
+            OuterTerminal::resolve(&OptionStore::default(), OuterTerminalContext::default());
+        emitted_messages(&outer_terminal, b"frame", render_stream, 1)
+            .await
+            .pop()
             .expect("message emitted")
     }
 
@@ -627,6 +675,106 @@ mod emit_render_tests {
             emitted_message(true).await,
             AttachMessage::Render(bytes) if bytes.ends_with(b"frame")
         ));
+    }
+
+    #[tokio::test]
+    async fn coalescible_render_fragments_strictly_above_attach_payload_ceiling() {
+        let outer_terminal =
+            OuterTerminal::resolve(&OptionStore::default(), OuterTerminalContext::default());
+        let at_limit = vec![b'a'; DEFAULT_MAX_FRAME_LENGTH];
+        let above_limit = vec![b'b'; DEFAULT_MAX_FRAME_LENGTH + 1];
+
+        assert_eq!(
+            emitted_messages(&outer_terminal, &at_limit, true, 1).await,
+            vec![AttachMessage::Render(at_limit)]
+        );
+        assert_eq!(
+            emitted_messages(&outer_terminal, &above_limit, true, 2).await,
+            vec![
+                AttachMessage::Data(vec![b'b'; DEFAULT_MAX_FRAME_LENGTH]),
+                AttachMessage::Data(vec![b'b']),
+            ]
+        );
+        assert_eq!(
+            emitted_messages(&outer_terminal, &above_limit, false, 2).await,
+            vec![
+                AttachMessage::Data(vec![b'b'; DEFAULT_MAX_FRAME_LENGTH]),
+                AttachMessage::Data(vec![b'b']),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn fragmented_attach_data_bounds_every_payload_and_preserves_order() {
+        let mut payload = (0..(2 * DEFAULT_MAX_FRAME_LENGTH + 17))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let split_sequence = b"\x1b[38;2;1;2;3mX";
+        let split_start = DEFAULT_MAX_FRAME_LENGTH - 2;
+        payload[split_start..split_start + split_sequence.len()].copy_from_slice(split_sequence);
+        let capacity = payload.len() + 3 * 5;
+        let (stream, mut peer) = tokio::io::duplex(capacity);
+        let stream = AttachTransport::from_io(stream);
+
+        emit_attach_bytes(&stream, &payload)
+            .await
+            .expect("fragmented data emits");
+
+        let mut decoder = AttachFrameDecoder::new();
+        let mut decoded = Vec::with_capacity(payload.len());
+        let mut lengths = Vec::new();
+        let mut bytes = [0_u8; 8192];
+        while decoded.len() < payload.len() {
+            let count = peer.read(&mut bytes).await.expect("read emitted data");
+            assert!(count > 0, "attach stream closed before all data arrived");
+            decoder.push_bytes(&bytes[..count]);
+            while let Some(message) = decoder.next_message().expect("decode emitted data") {
+                let AttachMessage::Data(bytes) = message else {
+                    panic!("fragmented terminal bytes must use strict data frames");
+                };
+                lengths.push(bytes.len());
+                decoded.extend_from_slice(&bytes);
+            }
+        }
+
+        assert_eq!(
+            lengths,
+            vec![DEFAULT_MAX_FRAME_LENGTH, DEFAULT_MAX_FRAME_LENGTH, 17]
+        );
+        assert_eq!(decoded, payload);
+    }
+
+    #[tokio::test]
+    async fn sync_wrapper_degrades_without_splitting_replaceable_render() {
+        let mut options = OptionStore::new();
+        options
+            .set(
+                ScopeSelector::Global,
+                OptionName::TerminalFeatures,
+                "xterm*:sync".to_owned(),
+                SetOptionMode::Append,
+            )
+            .expect("terminal-features append succeeds");
+        let outer_terminal = OuterTerminal::resolve(
+            &options,
+            OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
+        );
+        let sync_overhead = outer_terminal.wrap_render_frame(b"x").len() - 1;
+        let at_limit = vec![b'a'; DEFAULT_MAX_FRAME_LENGTH - sync_overhead];
+        let above_limit = vec![b'b'; DEFAULT_MAX_FRAME_LENGTH - sync_overhead + 1];
+
+        let exact = emitted_messages(&outer_terminal, &at_limit, true, 1).await;
+        let AttachMessage::Render(exact) = &exact[0] else {
+            panic!("an exactly bounded synchronized repaint stays replaceable");
+        };
+        assert_eq!(exact.len(), DEFAULT_MAX_FRAME_LENGTH);
+        assert!(exact.starts_with(b"\x1b[?2026h"));
+        assert!(exact.ends_with(b"\x1b[?2026l"));
+
+        assert_eq!(
+            emitted_messages(&outer_terminal, &above_limit, true, 1).await,
+            vec![AttachMessage::Render(above_limit)]
+        );
     }
 
     #[tokio::test]
