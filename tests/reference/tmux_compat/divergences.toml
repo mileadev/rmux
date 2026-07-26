@@ -295,3 +295,21 @@ id = "C-D73"
 summary = "scroll-to-mouse without a mouse event is a safe no-op"
 inventory = "bounded"
 tests = ["crates/rmux-server/src/handler_send_keys_tests/copy_mode_mouse_origin.rs::non_mouse_scroll_to_mouse_is_a_safe_noop_product_divergence"]
+
+[[entry]]
+id = "C-D74"
+summary = "Layout mutations emit one canonical control-mode notification"
+inventory = "bounded"
+tests = ["crates/rmux-server/src/handler_layout_notification_tests.rs::layout_command_sites_keep_one_canonical_notification_per_mutation_product_divergence"]
+
+[[entry]]
+id = "C-D75"
+summary = "Delegated read-only attach rejects bindings with chained mutations"
+inventory = "bounded"
+tests = ["crates/rmux-server/src/handler_send_keys_tests/read_only_detach.rs::delegated_read_only_attach_rejects_chained_detach_binding_product_divergence"]
+
+[[entry]]
+id = "C-D76"
+summary = "Delayed command-mode jobs reject replaced stable session targets"
+inventory = "bounded"
+tests = ["tests/run_shell_context.rs::delayed_command_run_shell_rejects_replacement_session_product_divergence"]

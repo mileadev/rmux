@@ -157,6 +157,10 @@ fn delayed_command_run_shell_follows_stable_session_identity_after_rename(
 #[test]
 fn delayed_command_run_shell_rejects_replacement_session_product_divergence(
 ) -> Result<(), Box<dyn Error>> {
+    // tmux 3.7b oracle, measured 2026-07-26: after the original target is
+    // killed, the delayed command resolves a replacement with the same name
+    // and creates the requested window there. RMUX pins the stable session
+    // identity and fails closed instead of mutating the replacement.
     let (harness, _daemon) = current_target_harness("run-shell-command-context-replacement")?;
     let mut run_shell = spawn_delayed_command_run_shell(&harness, "new-window -d -n rebound")?;
     wait_until_delayed(&mut run_shell)?;
