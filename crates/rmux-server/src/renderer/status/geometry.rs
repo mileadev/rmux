@@ -4,6 +4,20 @@ use rmux_proto::{OptionName, TerminalSize};
 use crate::status_lines::status_line_count;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::renderer) enum StatusOverlayRow {
+    Status(u16),
+    Content(u16),
+}
+
+impl StatusOverlayRow {
+    pub(in crate::renderer) const fn y(self) -> u16 {
+        match self {
+            Self::Status(y) | Self::Content(y) => y,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StatusGeometry {
     pub(in crate::renderer) terminal_size: TerminalSize,
     pub(in crate::renderer) content_rows: u16,
@@ -73,5 +87,77 @@ impl StatusGeometry {
             return None;
         }
         Some(status_y.saturating_add(line))
+    }
+
+    pub(in crate::renderer) const fn message_overlay_row(
+        self,
+        status_line: u16,
+    ) -> Option<StatusOverlayRow> {
+        if self.terminal_size.cols == 0 || self.terminal_size.rows == 0 {
+            return None;
+        }
+        match self.status_y {
+            Some(_) => match self.status_line_y(status_line) {
+                Some(y) => Some(StatusOverlayRow::Status(y)),
+                None => None,
+            },
+            None => Some(StatusOverlayRow::Content(
+                self.terminal_size.rows.saturating_sub(1),
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StatusGeometry, StatusOverlayRow};
+    use rmux_core::{OptionStore, Session};
+    use rmux_proto::{OptionName, ScopeSelector, SessionName, SetOptionMode, TerminalSize};
+
+    fn session() -> Session {
+        Session::new(
+            SessionName::new("overlay-row").expect("valid session name"),
+            TerminalSize { cols: 20, rows: 6 },
+        )
+    }
+
+    #[test]
+    fn message_overlay_row_models_status_and_content_backing() {
+        let session = session();
+        let mut options = OptionStore::new();
+        let status_geometry = StatusGeometry::for_session(&session, &options);
+        assert_eq!(
+            status_geometry.message_overlay_row(0),
+            Some(StatusOverlayRow::Status(5))
+        );
+
+        options
+            .set(
+                ScopeSelector::Global,
+                OptionName::Status,
+                "off".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("status off");
+        let content_geometry = StatusGeometry::for_session(&session, &options);
+        assert_eq!(
+            content_geometry.message_overlay_row(0),
+            Some(StatusOverlayRow::Content(5))
+        );
+    }
+
+    #[test]
+    fn message_overlay_row_rejects_degenerate_terminal_sizes() {
+        for size in [
+            TerminalSize { cols: 0, rows: 6 },
+            TerminalSize { cols: 20, rows: 0 },
+        ] {
+            let session = Session::new(
+                SessionName::new("degenerate-overlay").expect("valid session name"),
+                size,
+            );
+            let geometry = StatusGeometry::for_session(&session, &OptionStore::new());
+            assert_eq!(geometry.message_overlay_row(0), None);
+        }
     }
 }

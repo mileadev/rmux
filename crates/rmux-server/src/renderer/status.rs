@@ -36,6 +36,7 @@ mod runs;
 mod status_format;
 
 pub(crate) use geometry::StatusGeometry;
+use geometry::StatusOverlayRow;
 pub(super) use message::format_status_message_line;
 pub(super) use prompt::prompt_status_runs;
 pub(super) use runs::{sanitize_status_text, status_runs_width, StatusRun};
@@ -236,7 +237,7 @@ pub(super) fn status_message_y(
     geometry: StatusGeometry,
 ) -> Option<u16> {
     let line = status_message_line_index(session.name(), options, geometry.status_lines);
-    geometry.status_line_y(line)
+    geometry.message_overlay_row(line).map(StatusOverlayRow::y)
 }
 
 #[derive(Clone, Copy, Default)]

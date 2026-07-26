@@ -14,6 +14,8 @@ use tokio::time::{timeout, Duration};
 
 #[path = "handler_display_message_tests/pane_base_index.rs"]
 mod pane_base_index;
+#[path = "handler_display_message_tests/status_overlay.rs"]
+mod status_overlay;
 #[path = "handler_display_message_tests/synchronize_panes.rs"]
 mod synchronize_panes;
 

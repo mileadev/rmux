@@ -1562,6 +1562,31 @@ fn status_message_uses_message_line_with_multiline_status() {
 }
 
 #[test]
+fn status_message_uses_last_terminal_row_when_status_is_off() {
+    // Oracle tmux 3.7b: disabling status changes the backing row from status
+    // storage to pane content, but does not suppress the message overlay.
+    let size = TerminalSize { cols: 20, rows: 5 };
+    let session = Session::new(session_name("alpha"), size);
+    let mut options = OptionStore::new();
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::Status,
+            "off".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("status off");
+
+    let frame = super::render_status_message(&session, &options, "status-off");
+    let screen = screen_with(&frame, size);
+
+    for row in 0..4 {
+        assert_eq!(visible_line_text(&screen, row, 10), "          ");
+    }
+    assert_eq!(visible_line_text(&screen, 4, 10), "status-off");
+}
+
+#[test]
 fn status_message_truncates_by_display_width_instead_of_scalar_count() {
     let session = Session::new(session_name("alpha"), TerminalSize { cols: 3, rows: 4 });
     let frame = String::from_utf8(super::render_status_message(
