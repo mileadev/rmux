@@ -577,6 +577,7 @@ fn is_lifecycle_noise(hook_name: HookName) -> bool {
             | HookName::ClientFocusOut
             | HookName::PaneSetClipboard
             | HookName::PaneTitleChanged
+            | HookName::WindowRenamed
     )
 }
 
