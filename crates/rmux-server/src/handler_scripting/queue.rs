@@ -8,8 +8,8 @@ use rmux_core::{
     MissingCurrentTargetFallback,
 };
 use rmux_proto::{
-    CommandOutput, ErrorResponse, PaneTarget, Request, Response, RmuxError, SessionName, Target,
-    WindowTarget,
+    CommandOutput, ErrorResponse, PaneTarget, Request, Response, RmuxError, SessionId, SessionName,
+    Target, WindowTarget,
 };
 
 use crate::control::ControlQueueCommandOrigin;
@@ -365,6 +365,22 @@ impl QueueExecutionContext {
             Arc::make_mut(identity).rename_session(old_name, new_name);
         }
     }
+
+    pub(super) fn rebase_after_session_rename(
+        &mut self,
+        session_id: SessionId,
+        old_name: &SessionName,
+        new_name: &SessionName,
+    ) {
+        if self
+            .pinned_current_target_identity
+            .as_ref()
+            .is_some_and(|identity| identity.session_id() != session_id)
+        {
+            return;
+        }
+        self.rename_session_targets(old_name, new_name);
+    }
 }
 
 pub(in crate::handler) fn rename_target_session(
@@ -667,6 +683,30 @@ mod tests {
         assert_eq!(
             explicit.current_target(),
             Some(&Target::Session(session_name("beta")))
+        );
+    }
+
+    #[test]
+    fn session_rename_rebases_only_the_matching_pinned_identity() {
+        let alpha = session_name("alpha");
+        let beta = session_name("beta");
+        let pane = PaneTarget::with_window(alpha.clone(), 0, 0);
+        let identity = StableTargetIdentity::pane_for_test(pane);
+        let mut matching = QueueExecutionContext::without_caller_cwd()
+            .with_pinned_current_target_identity(Some(identity.clone()));
+        let mut replacement = QueueExecutionContext::without_caller_cwd()
+            .with_pinned_current_target_identity(Some(identity));
+
+        matching.rebase_after_session_rename(SessionId::new(1), &alpha, &beta);
+        replacement.rebase_after_session_rename(SessionId::new(2), &alpha, &beta);
+
+        assert_eq!(
+            matching.current_target(),
+            Some(&Target::Pane(PaneTarget::with_window(beta, 0, 0)))
+        );
+        assert_eq!(
+            replacement.current_target(),
+            Some(&Target::Pane(PaneTarget::with_window(alpha, 0, 0)))
         );
     }
 }

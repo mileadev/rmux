@@ -87,6 +87,8 @@ mod queue_exact_target;
 mod queue_lifecycle_target;
 #[path = "handler_scripting/queue_parse.rs"]
 mod queue_parse;
+#[path = "handler_scripting/queue_session_rename.rs"]
+mod queue_session_rename;
 #[path = "handler_scripting/queue_special_target.rs"]
 mod queue_special_target;
 #[path = "handler_scripting/read_only_client_action.rs"]
@@ -144,6 +146,7 @@ pub(crate) use self::queue_exact_target::{
     install_queue_exact_target_capture_pause, QueueExactTargetCapturePause,
 };
 use self::queue_lifecycle_target::{QueueLifecycleTargetCapture, QueueLifecycleTargetPlan};
+use self::queue_session_rename::QueuedSessionRename;
 use self::queue_special_target::QueueSpecialTargetPlan;
 pub(in crate::handler) use self::read_only_client_action::{
     read_only_client_action, ReadOnlyClientAction,
@@ -266,6 +269,7 @@ pub(in crate::handler) fn queued_command_context() -> Option<QueueExecutionConte
 struct QueuedCommandExecution {
     action: QueueCommandAction,
     attached_switch_target: Option<Target>,
+    session_rename: Option<QueuedSessionRename>,
 }
 
 impl RequestHandler {
@@ -695,6 +699,11 @@ impl RequestHandler {
                         context.rebase_current_target_after_attached_switch(target.clone());
                     }
                 }
+                if let Some(rename) = execution.session_rename {
+                    for context in &mut contexts {
+                        rename.apply(context);
+                    }
+                }
                 execution.action
             });
             let starts_child_guard_stream = response_stream_is_active
@@ -1023,6 +1032,7 @@ impl RequestHandler {
                     )?;
                     command.target_witness = Some(Box::new(witness));
                 }
+                let session_rename = QueuedSessionRename::capture(&invocation, &state)?;
                 let exact_target =
                     QueueExactTargetCapture::capture(&command_for_hooks, &invocation, &mut state)
                         .into_identity()?;
@@ -1044,6 +1054,7 @@ impl RequestHandler {
                     retained_lifecycle_target,
                     retained_lifecycle_identity,
                     special_target_binding,
+                    session_rename,
                 ))
             })()
         };
@@ -1053,6 +1064,7 @@ impl RequestHandler {
             retained_lifecycle_target,
             retained_lifecycle_identity,
             special_target_binding,
+            session_rename,
         ) = match invocation {
             Ok(invocation) => invocation,
             Err(error) => {
@@ -1102,6 +1114,7 @@ impl RequestHandler {
             .or_else(|| context.current_target.clone());
 
         let mut attached_switch_target = None;
+        let mut committed_session_rename = None;
         let result = match invocation {
             QueueInvocation::NoOp => Ok(QueueCommandAction::Normal {
                 output: None,
@@ -1155,6 +1168,8 @@ impl RequestHandler {
                 } else {
                     (dispatch.await, Default::default())
                 };
+                committed_session_rename =
+                    session_rename.and_then(|rename| rename.commit(&outcome.response));
                 if captures_client_transition {
                     if let Response::SwitchClient(response) = &outcome.response {
                         let targeted_client =
@@ -1401,6 +1416,7 @@ impl RequestHandler {
             .map(|action| QueuedCommandExecution {
                 action,
                 attached_switch_target,
+                session_rename: committed_session_rename,
             })
             .map_err(|error| source_file_context_error(error, &command_for_hooks, context))
     }
