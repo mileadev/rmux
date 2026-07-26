@@ -503,11 +503,33 @@ async fn running_generation_never_resolves_its_legacy_guard_for_shutdown() -> st
 }
 
 #[tokio::test]
-async fn managed_listener_holds_legacy_namespace_until_shutdown() -> std::io::Result<()> {
+async fn legacy_guard_rejects_clients_and_blocks_preclaim_until_shutdown() -> std::io::Result<()> {
     let label = format!("legacy-rollback-{}", std::process::id());
     let endpoint = endpoint_for_label(&label)?;
     let legacy_path = legacy_path_for(&label, &endpoint);
     let listener = LocalListener::bind(&endpoint)?;
+
+    let async_error = timeout(
+        Duration::from_secs(2),
+        connect_windows_pipe(legacy_path.as_os_str()),
+    )
+    .await
+    .expect("async legacy guard connection must fail promptly")
+    .expect_err("async clients must not connect to the legacy guard");
+    assert_eq!(async_error.kind(), ErrorKind::PermissionDenied);
+
+    let blocking_endpoint = LocalEndpoint::from_path(legacy_path.clone());
+    let blocking_error = timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || {
+            connect_blocking(&blocking_endpoint, Duration::from_secs(1))
+        }),
+    )
+    .await
+    .expect("blocking legacy guard connection must fail promptly")
+    .expect("blocking legacy guard connection task")
+    .expect_err("blocking clients must not connect to the legacy guard");
+    assert_eq!(blocking_error.kind(), ErrorKind::PermissionDenied);
 
     let conflict = ServerOptions::new()
         .first_pipe_instance(true)
