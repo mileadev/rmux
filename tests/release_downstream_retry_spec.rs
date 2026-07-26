@@ -45,6 +45,20 @@ fn workflow_calls(text: &str, name: &str) -> usize {
         .count()
 }
 
+fn job_block<'a>(workflow: &'a str, job: &str, next_job: Option<&str>) -> &'a str {
+    let start_marker = format!("\n  {job}:\n");
+    let start = workflow.find(&start_marker).expect("retry job boundary");
+    let end = next_job
+        .map(|name| {
+            workflow[start + start_marker.len()..]
+                .find(&format!("\n  {name}:\n"))
+                .map(|offset| start + start_marker.len() + offset)
+                .expect("next retry job boundary")
+        })
+        .unwrap_or(workflow.len());
+    &workflow[start..end]
+}
+
 #[test]
 fn retry_entry_point_is_dispatch_only_and_ledger_gated() {
     assert!(DISPATCH.contains("on:\n  workflow_dispatch:"));
@@ -127,6 +141,39 @@ fn retry_wrappers_use_one_common_exact_evidence_preparer() {
     assert!(SNAP.contains("uses: ./.github/actions/release-snap-candidate-write"));
     assert!(SNAP_WRITER.contains("release: latest/candidate"));
     assert!(!SNAP_WRITER.contains("latest/stable"));
+}
+
+#[test]
+fn prepare_loads_its_validator_from_the_immutable_workflow_revision() {
+    for (name, workflow) in [("Chocolatey", CHOCOLATEY), ("Snap", SNAP)] {
+        let prepare = job_block(workflow, "prepare", Some("retry"));
+        let trusted_checkout = prepare
+            .find("ref: ${{ github.workflow_sha }}")
+            .unwrap_or_else(|| panic!("{name} prepare checkout is not workflow-anchored"));
+        let local_validator = prepare
+            .find("uses: ./.github/actions/release-channel-retry-prepare")
+            .unwrap_or_else(|| panic!("{name} prepare validator action is missing"));
+
+        assert!(
+            trusted_checkout < local_validator,
+            "{name} validator must be loaded after the immutable workflow checkout"
+        );
+        assert!(
+            !prepare.contains("ref: ${{ inputs.expected_source_sha }}"),
+            "{name} prepare must not checkout an input-selected revision"
+        );
+
+        let retry = job_block(workflow, "retry", None);
+        let validated_source_checkout = retry
+            .find("ref: ${{ inputs.expected_source_sha }}")
+            .unwrap_or_else(|| panic!("{name} retry source checkout is missing"));
+        assert!(
+            retry
+                .find("needs: prepare")
+                .is_some_and(|boundary| boundary < validated_source_checkout),
+            "{name} source checkout must remain behind the prepare boundary"
+        );
+    }
 }
 
 #[test]
