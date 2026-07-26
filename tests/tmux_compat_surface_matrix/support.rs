@@ -1048,6 +1048,7 @@ impl LiveControlClient {
         self.sink().lock().expect("control notification sink").len()
     }
 
+    /// Returns the captured lines at or after `cursor`.
     pub(super) fn notifications_since(&self, cursor: usize) -> Vec<String> {
         let captured = self
             .sink()

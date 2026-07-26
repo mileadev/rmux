@@ -11,6 +11,204 @@ struct GeometryCase {
 }
 
 #[test]
+fn tmux_compat_refresh_client_size_echo_matrix_when_frozen_tmux_is_available(
+) -> Result<(), Box<dyn Error>> {
+    let harness = TmuxCompatHarness::new("tmux-compat-refresh-size-echo")?;
+    let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
+        return Ok(());
+    };
+    let _guard = pty_tmux_compat_lock();
+    let config = config();
+
+    // Frozen tmux 3.7b oracle, measured 2026-07-26 with two windows and one
+    // command per flush. First declaration, same-size declaration, changed
+    // declaration and its same-size repeat each emit exactly one layout per
+    // window in window order. `manual` emits the same matrix without changing
+    // either window from 80x24.
+    for policy in ["latest", "manual"] {
+        let session = format!("refresh-size-echo-{policy}");
+        let first_window = format!("{session}:0");
+        let second_window = format!("{session}:1");
+        for argv in [
+            [
+                "new-session",
+                "-d",
+                "-s",
+                session.as_str(),
+                "-x",
+                "80",
+                "-y",
+                "24",
+            ]
+            .as_slice(),
+            ["set-option", "-t", session.as_str(), "status", "off"].as_slice(),
+            ["new-window", "-d", "-t", session.as_str()].as_slice(),
+            [
+                "set-option",
+                "-w",
+                "-t",
+                first_window.as_str(),
+                "window-size",
+                policy,
+            ]
+            .as_slice(),
+            [
+                "set-option",
+                "-w",
+                "-t",
+                second_window.as_str(),
+                "window-size",
+                policy,
+            ]
+            .as_slice(),
+        ] {
+            let run = harness.run_pair_with(&tmux_binary, argv, config.clone())?;
+            assert_quiet_success(&run);
+        }
+        let windows = harness.run_pair_with(
+            &tmux_binary,
+            &["list-windows", "-t", session.as_str(), "-F", "#{window_id}"],
+            config.clone(),
+        )?;
+        assert_success_without_stderr(&windows);
+        let tmux_window_ids = windows
+            .tmux
+            .stdout_string()
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let rmux_window_ids = windows
+            .rmux
+            .stdout_string()
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(tmux_window_ids.len(), 2);
+        assert_eq!(rmux_window_ids.len(), 2);
+        let tmux_second_layout = format!("%layout-change {} ", tmux_window_ids[1]);
+        let rmux_second_layout = format!("%layout-change {} ", rmux_window_ids[1]);
+
+        let mut tmux_control = LiveControlClient::spawn_capturing(tmux_control_mode_command(
+            &harness,
+            &tmux_binary,
+            &[],
+            &[],
+        )?)?;
+        let mut rmux_control =
+            LiveControlClient::spawn_capturing(rmux_control_mode_command(&harness, &[], &[])?)?;
+        let attach = format!("attach-session -t {session}\n");
+        tmux_control.send(&attach)?;
+        rmux_control.send(&attach)?;
+        for (client, label) in [
+            (&tmux_control, "tmux refresh attach"),
+            (&rmux_control, "rmux refresh attach"),
+        ] {
+            client.wait_for_notification(0, Duration::from_secs(5), label, |line| {
+                line.starts_with("%session-changed ")
+            })?;
+        }
+
+        for (step, declared) in [
+            ("first", "100x40"),
+            ("idempotent", "100x40"),
+            ("change", "101x41"),
+            ("second-idempotent", "101x41"),
+        ] {
+            let tmux_cursor = tmux_control.notification_cursor();
+            let rmux_cursor = rmux_control.notification_cursor();
+            let refresh = format!("refresh-client -C {declared}\n");
+            tmux_control.send(&refresh)?;
+            rmux_control.send(&refresh)?;
+            tmux_control.wait_for_notification(
+                tmux_cursor,
+                Duration::from_secs(5),
+                "tmux refresh layout",
+                |line| line.starts_with(&tmux_second_layout),
+            )?;
+            rmux_control.wait_for_notification(
+                rmux_cursor,
+                Duration::from_secs(5),
+                "rmux refresh layout",
+                |line| line.starts_with(&rmux_second_layout),
+            )?;
+            let marker = format!("REFRESH-SIZE-ECHO-{policy}-{step}");
+            let marker_command = format!("display-message -p {marker}\n");
+            tmux_control.send(&marker_command)?;
+            rmux_control.send(&marker_command)?;
+            tmux_control.wait_for_notification(
+                tmux_cursor,
+                Duration::from_secs(5),
+                "tmux refresh boundary",
+                |line| line == marker,
+            )?;
+            rmux_control.wait_for_notification(
+                rmux_cursor,
+                Duration::from_secs(5),
+                "rmux refresh boundary",
+                |line| line == marker,
+            )?;
+
+            let tmux_layouts =
+                control_layout_summaries(&tmux_control.notifications_since(tmux_cursor));
+            let rmux_layouts =
+                control_layout_summaries(&rmux_control.notifications_since(rmux_cursor));
+            assert_eq!(
+                tmux_layouts
+                    .iter()
+                    .map(|line| line.0.clone())
+                    .collect::<Vec<_>>(),
+                tmux_window_ids,
+                "frozen tmux oracle changed for {policy}/{step}: {tmux_layouts:?}"
+            );
+            assert_eq!(
+                rmux_layouts
+                    .iter()
+                    .map(|line| line.0.clone())
+                    .collect::<Vec<_>>(),
+                rmux_window_ids,
+                "rmux must emit each window exactly once for {policy}/{step}: {rmux_layouts:?}"
+            );
+            if policy == "manual" {
+                assert_eq!(
+                    rmux_layouts
+                        .iter()
+                        .map(|line| line.1.as_str())
+                        .collect::<Vec<_>>(),
+                    tmux_layouts
+                        .iter()
+                        .map(|line| line.1.as_str())
+                        .collect::<Vec<_>>(),
+                    "manual must echo the unchanged oracle layouts for {step}"
+                );
+            }
+        }
+
+        tmux_control.assert_running("tmux refresh echo control")?;
+        rmux_control.assert_running("rmux refresh echo control")?;
+    }
+
+    Ok(())
+}
+
+fn control_layout_summaries(lines: &[String]) -> Vec<(String, String)> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next()? == "%layout-change").then_some(())?;
+            let window_id = fields.next()?.to_owned();
+            let geometry = fields
+                .next()?
+                .split(',')
+                .nth(1)
+                .expect("layout cell contains geometry")
+                .to_owned();
+            Some((window_id, geometry))
+        })
+        .collect()
+}
+
+#[test]
 fn tmux_compat_status_geometry_follows_the_row_owning_client_when_frozen_tmux_is_available(
 ) -> Result<(), Box<dyn Error>> {
     let harness = TmuxCompatHarness::new("tmux-compat-status-geometry-owner")?;

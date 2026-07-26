@@ -1,15 +1,20 @@
+use std::collections::HashSet;
+
+use rmux_core::LifecycleEvent;
 use rmux_proto::request::RefreshClientRequest;
 use rmux_proto::{
-    ErrorResponse, RefreshClientResponse, Response, RmuxError, SessionId, TerminalSize,
+    ErrorResponse, RefreshClientResponse, Response, RmuxError, SessionId, SessionName,
+    TerminalSize, WindowTarget,
 };
 
 use crate::handler_support::attached_client_required;
 use crate::pane_io::AttachControl;
+use crate::pane_terminals::HandlerState;
 
 use super::super::{
     client_runtime_support::clipboard_query_sequence,
     control_support::{ControlClientIdentity, ManagedClient},
-    RequestHandler,
+    QueuedLifecycleEvent, RequestHandler,
 };
 
 impl RequestHandler {
@@ -254,7 +259,8 @@ impl RequestHandler {
                     Err(error) => return Response::Error(ErrorResponse { error }),
                 }
             }
-            self.publish_applied_window_resizes().await;
+            self.publish_control_size_layout_echoes(session_name, session_id)
+                .await;
         } else if let (None, None, Some(size)) = (session_name.as_ref(), session_id, control_size) {
             let mut active_control = self.active_control.lock().await;
             let Some(active) = active_control
@@ -288,6 +294,132 @@ impl RequestHandler {
             target_client: control_pid.to_string(),
         })
     }
+
+    /// Publishes the layout echo forced by `refresh-client -C`.
+    ///
+    /// Frozen tmux 3.7b, measured 2026-07-26, emits one `%layout-change` for
+    /// every window in index order on the first declaration, an idempotent
+    /// declaration, a changed declaration and its idempotent repeat. It does
+    /// the same under `window-size manual` without applying the client's size.
+    ///
+    /// A real resize is already recorded by the geometry chokepoint. Preparing
+    /// that resize and the forced echoes together preserves its
+    /// `window-resized` event without duplicating its layout notification.
+    async fn publish_control_size_layout_echoes(
+        &self,
+        session_name: &SessionName,
+        session_id: SessionId,
+    ) {
+        let prepared = {
+            let mut state = self.state.lock().await;
+            prepare_control_size_layout_echo_events(&mut state, session_name, session_id)
+        };
+        for event in prepared {
+            self.emit_prepared(event).await;
+        }
+    }
+}
+
+fn prepare_control_size_layout_echo_events(
+    state: &mut HandlerState,
+    session_name: &SessionName,
+    session_id: SessionId,
+) -> Vec<QueuedLifecycleEvent> {
+    let Some(session) = state
+        .sessions
+        .session(session_name)
+        .filter(|session| session.id() == session_id)
+    else {
+        let applied_resizes = state.take_applied_window_resizes();
+        let mut prepared = Vec::with_capacity(applied_resizes.len().saturating_mul(2));
+        for target in &applied_resizes {
+            prepare_applied_window_resize_pair(state, target, &mut prepared);
+        }
+        return prepared;
+    };
+    let layout_targets = session
+        .windows()
+        .keys()
+        .map(|window_index| WindowTarget::with_window(session_name.clone(), *window_index))
+        .collect::<Vec<_>>();
+    let applied_resizes = state.take_applied_window_resizes();
+    let layout_target_set = layout_targets.iter().cloned().collect::<HashSet<_>>();
+    let applied_resize_set = applied_resizes.iter().cloned().collect::<HashSet<_>>();
+    let insert_at = applied_resizes
+        .iter()
+        .position(|target| layout_target_set.contains(target))
+        .unwrap_or(applied_resizes.len());
+    let mut prepared = Vec::with_capacity(
+        layout_targets
+            .len()
+            .saturating_add(applied_resizes.len().saturating_mul(2)),
+    );
+
+    for (index, target) in applied_resizes.iter().enumerate() {
+        if index == insert_at {
+            prepare_control_size_layout_batch(
+                state,
+                &layout_targets,
+                &applied_resize_set,
+                &mut prepared,
+            );
+        }
+        if !layout_target_set.contains(target) {
+            prepare_applied_window_resize_pair(state, target, &mut prepared);
+        }
+    }
+    if insert_at == applied_resizes.len() {
+        prepare_control_size_layout_batch(
+            state,
+            &layout_targets,
+            &applied_resize_set,
+            &mut prepared,
+        );
+    }
+    prepared
+}
+
+fn prepare_control_size_layout_batch(
+    state: &mut HandlerState,
+    layout_targets: &[WindowTarget],
+    applied_resizes: &HashSet<WindowTarget>,
+    prepared: &mut Vec<QueuedLifecycleEvent>,
+) {
+    for target in layout_targets {
+        prepared.push(super::super::prepare_lifecycle_event(
+            state,
+            &LifecycleEvent::WindowLayoutChanged {
+                target: target.clone(),
+            },
+        ));
+        if applied_resizes.contains(target) {
+            prepared.push(super::super::prepare_lifecycle_event(
+                state,
+                &LifecycleEvent::WindowResized {
+                    target: target.clone(),
+                },
+            ));
+        }
+    }
+}
+
+fn prepare_applied_window_resize_pair(
+    state: &mut HandlerState,
+    target: &WindowTarget,
+    prepared: &mut Vec<QueuedLifecycleEvent>,
+) {
+    prepared.push(super::super::prepare_lifecycle_event(
+        state,
+        &LifecycleEvent::WindowLayoutChanged {
+            target: target.clone(),
+        },
+    ));
+    prepared.push(super::super::prepare_lifecycle_event(
+        state,
+        &LifecycleEvent::WindowResized {
+            target: target.clone(),
+        },
+    ));
 }
 
 trait RefreshClientControlScope {

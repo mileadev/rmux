@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use rmux_core::command_parser::CommandParser;
 use rmux_proto::{
-    ControlMode, DetachClientRequest, KillSessionRequest, NewSessionRequest, OptionName, Request,
-    Response, ScopeSelector, SessionName, SetOptionMode, SetOptionRequest, SwitchClientRequest,
-    TerminalSize, WindowTarget,
+    ControlMode, DetachClientRequest, KillSessionRequest, NewSessionRequest, NewWindowRequest,
+    OptionName, Request, Response, ScopeSelector, SessionName, SetOptionMode, SetOptionRequest,
+    SwitchClientRequest, TerminalSize, WindowTarget,
 };
 use tokio::sync::mpsc;
 
@@ -25,6 +25,98 @@ const TARGET_ATTACHED_SIZE: TerminalSize = TerminalSize { cols: 90, rows: 30 };
 const CONTROL_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_NOTIFICATION_SETTLE: Duration = Duration::from_millis(250);
 const CONTROL_NOTIFICATION_POLL: Duration = Duration::from_millis(25);
+
+#[tokio::test]
+async fn refresh_client_control_size_echoes_each_window_once_like_tmux37() {
+    // Frozen tmux 3.7b oracle, measured 2026-07-26 with two windows and one
+    // command per flush:
+    //
+    //   policy  declaration sequence                  layouts per command
+    //   latest  100x40, 100x40, 101x41, 101x41        @0, @1
+    //   manual  100x40, 100x40, 101x41, 101x41        @0, @1
+    //
+    // Under manual, both windows remain 80x24 throughout. Every observer sees
+    // one layout per window in window order, with no duplicate for the window
+    // whose geometry was really applied under latest.
+    for (policy_index, policy) in ["latest", "manual"].into_iter().enumerate() {
+        let handler = RequestHandler::new();
+        let session = session_name(&format!("control-refresh-echo-{policy}"));
+        create_session(&handler, session.clone(), INITIAL_SIZE).await;
+        let created = handler
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
+                target: session.clone(),
+                name: Some("second".to_owned()),
+                detached: true,
+                start_directory: None,
+                environment: None,
+                command: None,
+                process_command: None,
+                target_window_index: Some(1),
+                insert_at_target: false,
+            })))
+            .await;
+        assert!(matches!(created, Response::NewWindow(_)), "{created:?}");
+        for window_index in [0, 1] {
+            set_window_size_policy_for_window(&handler, &session, window_index, policy).await;
+        }
+
+        let control_pid = 92_180 + policy_index as u32 * 2;
+        let observer_pid = control_pid + 1;
+        let (_control_id, mut control_events) =
+            register_control_client_with_id(&handler, control_pid, &session).await;
+        let (_observer_id, mut observer_events) =
+            register_control_client_with_id(&handler, observer_pid, &session).await;
+        let _ = settle_control_notifications(&mut control_events).await;
+        let _ = settle_control_notifications(&mut observer_events).await;
+        let expected_window_ids = window_ids(&handler, &session).await;
+
+        for declared_size in [
+            CONTROL_SIZE,
+            CONTROL_SIZE,
+            TerminalSize {
+                cols: 101,
+                rows: 41,
+            },
+            TerminalSize {
+                cols: 101,
+                rows: 41,
+            },
+        ] {
+            let response = handler
+                .handle(Request::RefreshClient(Box::new(
+                    refresh_client_size_request(control_pid, declared_size),
+                )))
+                .await;
+            assert!(
+                matches!(response, Response::RefreshClient(_)),
+                "{response:?}"
+            );
+
+            for (label, events) in [
+                ("issuing client", &mut control_events),
+                ("observing client", &mut observer_events),
+            ] {
+                let lines = settle_control_notifications(events).await;
+                let actual_window_ids = lines
+                    .iter()
+                    .filter_map(|line| layout_change_window_id(line))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    actual_window_ids, expected_window_ids,
+                    "{policy} {declared_size:?}: {label} must receive exactly one layout per window \
+                     in oracle order; got {lines:?}"
+                );
+            }
+            if policy == "manual" {
+                assert_eq!(
+                    session_window_sizes(&handler, &session).await,
+                    vec![INITIAL_SIZE, INITIAL_SIZE],
+                    "manual must record the client size without applying it"
+                );
+            }
+        }
+    }
+}
 
 #[tokio::test]
 async fn refresh_client_control_size_respects_window_size_policy_like_tmux37() {
@@ -1602,9 +1694,18 @@ async fn create_session(handler: &RequestHandler, session: SessionName, size: Te
 }
 
 async fn set_window_size_policy(handler: &RequestHandler, session: &SessionName, policy: &str) {
+    set_window_size_policy_for_window(handler, session, 0, policy).await;
+}
+
+async fn set_window_size_policy_for_window(
+    handler: &RequestHandler,
+    session: &SessionName,
+    window_index: u32,
+    policy: &str,
+) {
     let response = handler
         .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Window(WindowTarget::with_window(session.clone(), 0)),
+            scope: ScopeSelector::Window(WindowTarget::with_window(session.clone(), window_index)),
             option: OptionName::WindowSize,
             value: policy.to_owned(),
             mode: SetOptionMode::Replace,
@@ -1747,6 +1848,43 @@ async fn active_window_id(handler: &RequestHandler, session: &SessionName) -> u3
         .window()
         .id()
         .as_u32()
+}
+
+async fn window_ids(handler: &RequestHandler, session: &SessionName) -> Vec<u32> {
+    handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(session)
+        .expect("session remains present")
+        .windows()
+        .values()
+        .map(|window| window.id().as_u32())
+        .collect()
+}
+
+async fn session_window_sizes(
+    handler: &RequestHandler,
+    session: &SessionName,
+) -> Vec<TerminalSize> {
+    handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(session)
+        .expect("session remains present")
+        .windows()
+        .values()
+        .map(|window| window.size())
+        .collect()
+}
+
+fn layout_change_window_id(line: &str) -> Option<u32> {
+    line.strip_prefix("%layout-change @")?
+        .split_once(' ')
+        .and_then(|(window_id, _)| window_id.parse().ok())
 }
 
 /// `%layout-change @<id> <layout> <visible layout> <flags>` carries the window
