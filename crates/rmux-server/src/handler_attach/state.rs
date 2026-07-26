@@ -33,6 +33,9 @@ pub(in crate::handler) struct ActiveAttachState {
 #[derive(Debug)]
 pub(in crate::handler) struct ActiveAttach {
     pub(in crate::handler) id: u64,
+    /// Canonical display identity captured while the attaching process still
+    /// exposes its tty. Never reconstruct this from the pid after registration.
+    pub(in crate::handler) client_name: String,
     pub(in crate::handler) session_name: rmux_proto::SessionName,
     pub(in crate::handler) session_id: SessionId,
     pub(in crate::handler) last_session: Option<rmux_proto::SessionName>,
@@ -80,6 +83,12 @@ pub(in crate::handler) struct ActiveAttach {
     pub(in crate::handler) display_panes: Option<DisplayPanesClientState>,
     pub(in crate::handler) transient_message: Option<TransientMessageInputState>,
     pub(in crate::handler) transient_terminal_prefix: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::handler) struct AttachedClientControlOutcome {
+    pub(in crate::handler) session_name: rmux_proto::SessionName,
+    pub(in crate::handler) client_name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -25,7 +25,9 @@ mod list_clients;
 #[path = "handler_client_runtime/requester_access.rs"]
 mod requester_access;
 
-pub(in crate::handler) use crate::client_names::{attached_client_name, control_client_name};
+#[cfg(test)]
+pub(in crate::handler) use crate::client_names::attached_client_name;
+pub(in crate::handler) use crate::client_names::control_client_name;
 pub(in crate::handler) use list_clients::ListClientSnapshot;
 
 pub(in crate::handler) const LIST_CLIENTS_TEMPLATE: &str = "#{client_name}: #{session_name} [#{client_width}x#{client_height} #{client_termname}]#{?#{==:#{client_uid},#{uid}},, [user #{?client_user,#{client_user},#{client_uid}}]}#{?client_flags, (#{client_flags}),}";
@@ -119,7 +121,7 @@ impl RequestHandler {
                         .map(|path| path.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     ListClientSnapshot {
-                        name: attached_client_name(pid),
+                        name: active.client_name.clone(),
                         pid,
                         tty,
                         control: false,
@@ -461,17 +463,15 @@ pub(in crate::handler) fn format_control_client_flags(
 }
 
 pub(in crate::handler) fn attached_client_matches_target(
-    attach_pid: u32,
+    client_name: &str,
     target_client: &str,
 ) -> bool {
-    let Some(tty_path) = attached_client_tty_path(attach_pid) else {
-        return false;
-    };
-    if tty_path == Path::new(target_client) {
+    let client_path = Path::new(client_name);
+    if client_path == Path::new(target_client) {
         return true;
     }
 
-    tty_path
+    client_path
         .strip_prefix("/dev")
         .ok()
         .is_some_and(|stripped| stripped == Path::new(target_client))

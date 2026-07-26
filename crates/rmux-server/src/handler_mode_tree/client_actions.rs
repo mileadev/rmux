@@ -1,7 +1,6 @@
 use rmux_core::LifecycleEvent;
 use rmux_proto::RmuxError;
 
-use crate::client_names::attached_client_name;
 use crate::pane_io::AttachControl;
 
 use super::super::RequestHandler;
@@ -98,7 +97,7 @@ impl RequestHandler {
                 if let Some(event) = outcome.lifecycle_event {
                     self.emit_prepared(event).await;
                 }
-            } else if let Ok(session_name) = self
+            } else if let Ok(outcome) = self
                 .send_attach_control_for_client_identity_from_mode_tree(
                     expected_requester,
                     pid,
@@ -108,11 +107,11 @@ impl RequestHandler {
                 )
                 .await
             {
-                self.emit_client_detached(session_name, pid).await;
+                self.emit_client_detached(outcome).await;
             }
         }
         if let Some(attach_id) = self_detach {
-            if let Ok(session_name) = self
+            if let Ok(outcome) = self
                 .send_attach_control_for_client_identity_from_mode_tree(
                     expected_requester,
                     attach_pid,
@@ -122,7 +121,7 @@ impl RequestHandler {
                 )
                 .await
             {
-                self.emit_client_detached(session_name, attach_pid).await;
+                self.emit_client_detached(outcome).await;
             }
             return Ok(());
         }
@@ -130,10 +129,13 @@ impl RequestHandler {
             .await
     }
 
-    async fn emit_client_detached(&self, session_name: rmux_proto::SessionName, pid: u32) {
+    async fn emit_client_detached(
+        &self,
+        outcome: super::super::attach_support::AttachedClientControlOutcome,
+    ) {
         self.emit(LifecycleEvent::ClientDetached {
-            session_name,
-            client_name: Some(attached_client_name(pid)),
+            session_name: outcome.session_name,
+            client_name: Some(outcome.client_name),
         })
         .await;
     }

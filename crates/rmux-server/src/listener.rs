@@ -318,6 +318,14 @@ async fn serve_connection(
                         continue;
                     }
                 };
+                let attach_client_name = matches!(
+                    &request,
+                    Request::AttachSession(_)
+                        | Request::AttachSessionExt(_)
+                        | Request::AttachSessionExt2(_)
+                        | Request::AttachSessionExt3(_)
+                )
+                .then(|| attached_client_name(requester.pid));
                 let quiesce_behavior = request_quiesce_behavior(&request);
                 let mut request_shutdown = shutdown.clone();
                 let mut normal_request_guard: Option<NormalRequestGuard> =
@@ -538,9 +546,12 @@ async fn serve_connection(
                     };
                     let session_name = response.session_name.clone();
                     let terminal_context = attach.target.outer_terminal.context().clone();
+                    let client_name = attach_client_name
+                        .expect("attach upgrade captures its client name before dispatch");
                     let attach_identity = handler
-                        .register_attach_identity_with_server_access(
+                        .register_attach_identity_with_server_access_and_client_name(
                             requester.pid,
+                            client_name.clone(),
                             session_name.clone(),
                             Some(attach.session_id),
                             AttachRegistration {
@@ -566,7 +577,7 @@ async fn serve_connection(
                     drop(detached_request_guard.take());
                     handler
                         .emit_client_attached_identity(
-                            attached_client_name(requester.pid),
+                            client_name,
                             session_name,
                             attach.session_id,
                         )

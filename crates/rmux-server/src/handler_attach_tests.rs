@@ -854,6 +854,8 @@ mod key_table_identity_regressions;
 
 #[path = "handler_attach_tests/cleanup_identity.rs"]
 mod cleanup_identity;
+#[path = "handler_attach_tests/client_name_lifecycle.rs"]
+mod client_name_lifecycle;
 #[path = "handler_attach_tests/multi_client.rs"]
 mod multi_client;
 #[path = "handler_attach_tests/resize_selection_race.rs"]

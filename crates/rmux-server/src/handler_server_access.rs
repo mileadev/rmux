@@ -5,7 +5,6 @@ use rmux_proto::{CommandOutput, ErrorResponse, Response, RmuxError, ServerAccess
 use std::sync::{Arc, Mutex};
 
 use super::{ClientFlags, RequestHandler};
-use crate::client_names::attached_client_name;
 use crate::pane_io::AttachControl;
 use crate::server_access::{
     resolve_user, validate_server_access_request, AccessMode, ServerAccessStore,
@@ -248,7 +247,7 @@ impl RequestHandler {
             (attached, controls)
         };
         for (attach_pid, attach_id) in attached {
-            if let Ok(session_name) = self
+            if let Ok(outcome) = self
                 .send_attach_control_for_client_identity(
                     attach_pid,
                     attach_id,
@@ -258,8 +257,8 @@ impl RequestHandler {
                 .await
             {
                 self.emit(LifecycleEvent::ClientDetached {
-                    session_name,
-                    client_name: Some(attached_client_name(attach_pid)),
+                    session_name: outcome.session_name,
+                    client_name: Some(outcome.client_name),
                 })
                 .await;
             }

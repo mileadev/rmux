@@ -1071,6 +1071,15 @@ impl RequestHandler {
         &self,
         identity: crate::handler::attach_support::ActiveAttachIdentity,
     ) -> Result<(rmux_proto::SessionName, rmux_proto::SessionId), RmuxError> {
+        self.attached_session_identity_and_client_name_for_identity(identity)
+            .await
+            .map(|(session_name, session_id, _)| (session_name, session_id))
+    }
+
+    pub(crate) async fn attached_session_identity_and_client_name_for_identity(
+        &self,
+        identity: crate::handler::attach_support::ActiveAttachIdentity,
+    ) -> Result<(rmux_proto::SessionName, rmux_proto::SessionId, String), RmuxError> {
         let active_attach = self.active_attach.lock().await;
         active_attach
             .by_pid
@@ -1079,7 +1088,13 @@ impl RequestHandler {
                 identity.matches_active(active)
                     && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
             })
-            .map(|active| (active.session_name.clone(), active.session_id))
+            .map(|active| {
+                (
+                    active.session_name.clone(),
+                    active.session_id,
+                    active.client_name.clone(),
+                )
+            })
             .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))
     }
 

@@ -4,7 +4,6 @@ use std::sync::atomic::Ordering;
 use rmux_proto::{OptionName, SessionId, SessionName, TerminalGeometry};
 
 use super::{AttachedSwitchCommitRequest, ClientFlags, RequestHandler};
-use crate::client_names::attached_client_name;
 use crate::pane_io::AttachControl;
 use crate::pane_terminals::HandlerState;
 
@@ -158,7 +157,7 @@ impl RequestHandler {
                 .attached_count(&plan.target.session_name)
                 .await
                 .saturating_add(1);
-            if self
+            match self
                 .commit_attached_session_switch(
                     plan.attach_pid,
                     plan.attach_id,
@@ -179,14 +178,18 @@ impl RequestHandler {
                     },
                 )
                 .await
-                .is_ok()
             {
-                self.emit_client_session_changed(
-                    attached_client_name(plan.attach_pid),
-                    plan.target.session_name,
-                    plan.target.session_id,
-                )
-                .await;
+                Ok(outcome) => {
+                    self.emit_client_session_changed(
+                        outcome.client_name,
+                        plan.target.session_name,
+                        plan.target.session_id,
+                    )
+                    .await;
+                }
+                Err(failure) => {
+                    let _ = self.finish_attached_switch_failure(failure).await;
+                }
             }
         }
         self.close_attached_session(source_session_id, || AttachControl::Exited)

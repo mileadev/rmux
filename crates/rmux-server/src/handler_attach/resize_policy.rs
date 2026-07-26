@@ -6,7 +6,6 @@ use rmux_proto::{
     OptionName, RmuxError, SessionId, SessionName, TerminalSize, WindowId, WindowTarget,
 };
 
-use crate::client_names::attached_client_name;
 use crate::pane_io::AttachControl;
 use crate::status_lines::content_rows_for_status;
 
@@ -904,7 +903,7 @@ impl RequestHandler {
                         .expect("attached client checked above");
                     let _ = active.control_tx.send(AttachControl::Detach);
                     active.closing.store(true, Ordering::SeqCst);
-                    removed.push(pid);
+                    removed.push((pid, active.client_name));
                     if let Some(table_name) = active.key_table_name.take() {
                         key_tables.push(table_name);
                     }
@@ -926,14 +925,14 @@ impl RequestHandler {
                 state.key_bindings.unref_table(&table_name);
             }
         }
-        for pid in &removed {
+        for (_, client_name) in &removed {
             self.emit_without_attached_refresh(LifecycleEvent::ClientDetached {
                 session_name: session_name.clone(),
-                client_name: Some(attached_client_name(*pid)),
+                client_name: Some(client_name.clone()),
             })
             .await;
         }
-        removed
+        removed.into_iter().map(|(pid, _)| pid).collect()
     }
 }
 

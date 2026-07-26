@@ -208,7 +208,9 @@ impl RequestHandler {
                     .by_pid
                     .iter()
                     .filter(|(_, active)| !active.closing.load(Ordering::SeqCst))
-                    .find(|(pid, _)| attached_client_matches_target(**pid, target_client))
+                    .find(|(_, active)| {
+                        attached_client_matches_target(&active.client_name, target_client)
+                    })
                     .map(|(&pid, active)| ManagedClient::Attach {
                         pid,
                         attach_id: active.id,
@@ -264,11 +266,9 @@ impl RequestHandler {
                 if active_attach.by_pid.contains_key(&pid) {
                     return Ok(Some(pid));
                 }
-            } else if let Some((&pid, _)) = active_attach
-                .by_pid
-                .iter()
-                .find(|(pid, _)| attached_client_matches_target(**pid, target_client))
-            {
+            } else if let Some((&pid, _)) = active_attach.by_pid.iter().find(|(_, active)| {
+                attached_client_matches_target(&active.client_name, target_client)
+            }) {
                 return Ok(Some(pid));
             }
         }
@@ -316,7 +316,9 @@ impl RequestHandler {
                     .by_pid
                     .iter()
                     .filter(|(_, active)| !active.closing.load(Ordering::SeqCst))
-                    .find(|(pid, _)| attached_client_matches_target(**pid, target_client))
+                    .find(|(_, active)| {
+                        attached_client_matches_target(&active.client_name, target_client)
+                    })
                     .map(|(&pid, active)| ManagedClient::Attach {
                         pid,
                         attach_id: active.id,

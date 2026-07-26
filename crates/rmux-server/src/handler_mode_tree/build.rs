@@ -3,7 +3,6 @@ use rmux_core::{formats::FormatContext, Utf8Config};
 use rmux_proto::{PaneTarget, RmuxError};
 use std::collections::BTreeMap;
 
-use crate::client_names::attached_client_name;
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 use crate::pane_terminals::HandlerState;
 
@@ -195,7 +194,7 @@ impl RequestHandler {
                 pid,
                 attach_id: active.id,
                 session_name: Some(active.session_name.clone()),
-                label: attached_client_name(pid),
+                label: active.client_name.clone(),
                 activity: active.activity_at,
                 width: active.client_size.cols,
                 height: active.client_size.rows,

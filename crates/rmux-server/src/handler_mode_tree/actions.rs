@@ -296,7 +296,7 @@ impl RequestHandler {
         // The default choose-tree action is `switch-client -Zt`. Commit it
         // through the same atomic path so target selection, client-size
         // reconciliation, PTY rollback, and attach identity move together.
-        let outcome = self
+        let outcome = match self
             .commit_attached_session_switch(
                 attach_pid,
                 expected_attach_id,
@@ -316,9 +316,13 @@ impl RequestHandler {
                     client_environment: None,
                 },
             )
-            .await?;
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(failure) => return Err(self.finish_attached_switch_failure(failure).await),
+        };
         self.finish_attached_session_switch(
-            attach_pid,
+            outcome.client_name,
             session_name.clone(),
             session_id,
             outcome.previous_session_id,

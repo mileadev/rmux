@@ -38,7 +38,6 @@ use super::{
     retain_partial_attached_escape_input,
 };
 use crate::client_flags::ClientFlags;
-use crate::client_names::attached_client_name;
 use crate::handler::overlay_support::AttachedOverlayInput;
 use crate::handler::{
     attach_support::{ActiveAttachIdentity, TransientMessageInput},
@@ -1754,14 +1753,19 @@ impl RequestHandler {
             return;
         }
 
-        let (should_emit, cache_epoch) = {
+        let (should_emit, cache_epoch, client_name) = {
             let mut active_attach = self.active_attach.lock().await;
-            if !active_attach.by_pid.get(&attach_pid).is_some_and(|active| {
-                identity.matches_active(active)
-                    && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
-            }) {
+            let Some(client_name) = active_attach
+                .by_pid
+                .get(&attach_pid)
+                .filter(|active| {
+                    identity.matches_active(active)
+                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                })
+                .map(|active| active.client_name.clone())
+            else {
                 return;
-            }
+            };
             let changed = active_attach.record_active_client_for_window(attach_pid, target);
             let cache_epoch = if changed {
                 self.active_attach_epoch
@@ -1770,13 +1774,13 @@ impl RequestHandler {
             } else {
                 self.active_attach_epoch.load(Ordering::Acquire)
             };
-            (changed, cache_epoch)
+            (changed, cache_epoch, client_name)
         };
         *active_emit_cache = Some((cache_epoch, window_target));
         if should_emit {
             self.emit(LifecycleEvent::ClientActive {
                 session_name: target.session_name().clone(),
-                client_name: Some(attached_client_name(attach_pid)),
+                client_name: Some(client_name),
             })
             .await;
         }
@@ -1788,17 +1792,17 @@ impl RequestHandler {
         target: &PaneTarget,
         event: TerminalControlEvent,
     ) {
-        let Ok((session_name, session_id)) =
-            self.attached_session_identity_for_identity(identity).await
+        let Ok((session_name, session_id, client_name)) = self
+            .attached_session_identity_and_client_name_for_identity(identity)
+            .await
         else {
             return;
         };
         if target.session_name() != &session_name {
             return;
         }
-        let attach_pid = identity.attach_pid();
         let session_name = target.session_name().clone();
-        let client_name = Some(attached_client_name(attach_pid));
+        let client_name = Some(client_name);
         let events = match event {
             TerminalControlEvent::FocusIn => {
                 vec![

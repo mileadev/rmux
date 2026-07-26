@@ -10,7 +10,6 @@ use super::pane_support::{
 use super::prompt_support::{decode_prompt_key, PromptInputEvent};
 use super::scripting_support::{QueueCommandAction, QueueExecutionContext};
 use super::RequestHandler;
-use crate::client_names::attached_client_name;
 use crate::input_keys::{decode_mouse, MouseDecode};
 use crate::key_table::{decode_attached_key, AttachedKeyDecode};
 use crate::pane_io::{AttachControl, OverlayFrame};
@@ -506,7 +505,7 @@ impl RequestHandler {
 
         let mut close_overlay = false;
         let mut popup_resize = None;
-        let (resized_session, resized_session_id, ignores_size, client_size_changed) = {
+        let (resized_session, resized_session_id, client_name, ignores_size, client_size_changed) = {
             let mut active_attach = self.active_attach.lock().await;
             let Some(active) = active_attach.by_pid.get(&attach_pid).filter(|active| {
                 expected_identity.is_none_or(|identity| {
@@ -583,6 +582,7 @@ impl RequestHandler {
             (
                 session_name,
                 active.session_id,
+                active.client_name.clone(),
                 ignores_size,
                 client_size_changed,
             )
@@ -642,7 +642,7 @@ impl RequestHandler {
         if client_size_changed {
             let event = LifecycleEvent::ClientResized {
                 session_name: resized_session.clone(),
-                client_name: Some(attached_client_name(attach_pid)),
+                client_name: Some(client_name),
             };
             if let Some(identity) = expected_identity {
                 let prepared = {

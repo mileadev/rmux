@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use rmux_core::WindowSizeBasis;
+use rmux_core::{LifecycleEvent, WindowSizeBasis};
 use rmux_proto::{
     AttachShellCommand, AttachedKeystroke, KeyDispatched, OptionName, PaneTarget, SessionId,
     SessionName, TerminalSize,
@@ -176,7 +176,8 @@ pub(in crate::handler) use session_destroy::{
     PreparedAttachedDestroySwitches, SessionDetachOnDestroy,
 };
 pub(super) use state::{
-    ActiveAttach, ActiveAttachState, DisplayPanesClientState, DisplayPanesLabel,
+    ActiveAttach, ActiveAttachState, AttachedClientControlOutcome, DisplayPanesClientState,
+    DisplayPanesLabel,
 };
 pub(crate) use state::{ActiveAttachIdentity, AttachRegistration};
 pub(in crate::handler) use switch_commit::{
@@ -353,6 +354,7 @@ impl RequestHandler {
             AttachControlIdentityExpectation::default(),
         )
         .await
+        .map(|outcome| outcome.session_name)
     }
 
     #[cfg(test)]
@@ -374,6 +376,7 @@ impl RequestHandler {
             },
         )
         .await
+        .map(|outcome| outcome.session_name)
     }
 
     #[cfg(test)]
@@ -398,6 +401,7 @@ impl RequestHandler {
             },
         )
         .await
+        .map(|outcome| outcome.session_name)
     }
 
     pub(super) async fn send_attach_control_for_client_identity(
@@ -406,7 +410,7 @@ impl RequestHandler {
         expected_attach_id: u64,
         command: AttachControl,
         command_name: &str,
-    ) -> Result<rmux_proto::SessionName, rmux_proto::RmuxError> {
+    ) -> Result<AttachedClientControlOutcome, rmux_proto::RmuxError> {
         if matches!(command, AttachControl::Switch(_)) {
             return Err(rmux_proto::RmuxError::Server(
                 "session switch requires a stable session identity".to_owned(),
@@ -431,7 +435,7 @@ impl RequestHandler {
         expected_attach_id: u64,
         command: AttachControl,
         command_name: &str,
-    ) -> Result<rmux_proto::SessionName, rmux_proto::RmuxError> {
+    ) -> Result<AttachedClientControlOutcome, rmux_proto::RmuxError> {
         if matches!(command, AttachControl::Switch(_)) {
             return Err(rmux_proto::RmuxError::Server(
                 "session switch requires a stable session identity".to_owned(),
@@ -457,7 +461,7 @@ impl RequestHandler {
         expected_current_session_id: rmux_proto::SessionId,
         command: AttachControl,
         command_name: &str,
-    ) -> Result<rmux_proto::SessionName, rmux_proto::RmuxError> {
+    ) -> Result<AttachedClientControlOutcome, rmux_proto::RmuxError> {
         if matches!(command, AttachControl::Switch(_)) {
             return Err(rmux_proto::RmuxError::Server(
                 "session switch requires a stable target session identity".to_owned(),
@@ -521,7 +525,7 @@ impl RequestHandler {
         command: AttachControl,
         command_name: &str,
         identity: AttachControlIdentityExpectation,
-    ) -> Result<rmux_proto::SessionName, rmux_proto::RmuxError> {
+    ) -> Result<AttachedClientControlOutcome, rmux_proto::RmuxError> {
         let expected_attach_id = identity.attach_id;
         let expected_current_session_id = identity.current_session_id;
         let target_selection = identity.target_selection;
@@ -631,6 +635,7 @@ impl RequestHandler {
             selection.validate_for_session_identity(&state, session_name, session_id)?;
         }
         let previous_session_name = active.session_name.clone();
+        let client_name = active.client_name.clone();
         let mut overlay_to_terminate = None;
 
         let switches_session_identity = next_session_name.as_ref().is_some_and(|session_name| {
@@ -668,15 +673,23 @@ impl RequestHandler {
                     if error.is_full() {
                         active.closing.store(true, Ordering::SeqCst);
                     }
-                    active_attach.remove_attached_client(attach_pid);
+                    let removed = active_attach
+                        .remove_attached_client(attach_pid)
+                        .expect("failed attached refresh removes the active identity");
                     self.bump_active_attach_epoch();
-                    return if error.is_full() {
-                        Err(rmux_proto::RmuxError::Server(
+                    let error = if error.is_full() {
+                        rmux_proto::RmuxError::Server(
                             "attached client is not draining updates".to_owned(),
-                        ))
+                        )
                     } else {
-                        Err(attached_client_required(command_name))
+                        attached_client_required(command_name)
                     };
+                    drop(active_attach);
+                    drop(state);
+                    terminate_overlay_job(overlay_to_terminate);
+                    self.finish_failed_attached_delivery_removal(removed, previous_session_name)
+                        .await;
+                    return Err(error);
                 }
             }
             if let Some(selection) = target_selection.as_ref() {
@@ -706,7 +719,10 @@ impl RequestHandler {
                 self.refresh_attached_session(&session_name).await;
             }
             terminate_overlay_job(overlay_to_terminate);
-            return Ok(previous_session_name);
+            return Ok(AttachedClientControlOutcome {
+                session_name: previous_session_name,
+                client_name,
+            });
         }
         if is_switch {
             active.render_generation = active.render_generation.saturating_add(1);
@@ -715,15 +731,21 @@ impl RequestHandler {
             if error.is_full() {
                 active.closing.store(true, Ordering::SeqCst);
             }
-            active_attach.remove_attached_client(attach_pid);
+            let removed = active_attach
+                .remove_attached_client(attach_pid)
+                .expect("failed attached control removes the active identity");
             self.bump_active_attach_epoch();
-            return if error.is_full() {
-                Err(rmux_proto::RmuxError::Server(
-                    "attached client is not draining updates".to_owned(),
-                ))
+            let error = if error.is_full() {
+                rmux_proto::RmuxError::Server("attached client is not draining updates".to_owned())
             } else {
-                Err(attached_client_required(command_name))
+                attached_client_required(command_name)
             };
+            drop(active_attach);
+            drop(state);
+            terminate_overlay_job(overlay_to_terminate);
+            self.finish_failed_attached_delivery_removal(removed, previous_session_name)
+                .await;
+            return Err(error);
         }
         if let Some(selection) = target_selection.as_ref() {
             selection
@@ -766,7 +788,36 @@ impl RequestHandler {
         }
         terminate_overlay_job(overlay_to_terminate);
 
-        Ok(previous_session_name)
+        Ok(AttachedClientControlOutcome {
+            session_name: previous_session_name,
+            client_name,
+        })
+    }
+
+    pub(in crate::handler) async fn finish_failed_attached_delivery_removal(
+        &self,
+        removed: ActiveAttach,
+        session_name: SessionName,
+    ) {
+        let outcome = Self::failed_attached_delivery_outcome(removed, session_name);
+        self.emit_without_attached_refresh(LifecycleEvent::ClientDetached {
+            session_name: outcome.session_name,
+            client_name: Some(outcome.client_name),
+        })
+        .await;
+    }
+
+    pub(in crate::handler) fn failed_attached_delivery_outcome(
+        mut removed: ActiveAttach,
+        session_name: SessionName,
+    ) -> AttachedClientControlOutcome {
+        let overlay = removed.overlay.take();
+        let client_name = removed.client_name;
+        terminate_overlay_job(overlay);
+        AttachedClientControlOutcome {
+            session_name,
+            client_name,
+        }
     }
 
     async fn attach_switch_changes_session(
@@ -798,6 +849,7 @@ impl RequestHandler {
     {
         let mut overlay_jobs = Vec::new();
         let mut removed_pids = Vec::new();
+        let mut detached_clients = Vec::new();
         let mut active_attach = self.active_attach.lock().await;
         for active in active_attach.by_pid.values_mut() {
             if active.last_session_id == Some(session_id) {
@@ -812,6 +864,11 @@ impl RequestHandler {
 
             overlay_jobs.push(active.overlay.take());
             removed_pids.push(*pid);
+            let emit_detached =
+                active.emit_detached_on_finish || !active.closing.load(Ordering::SeqCst);
+            if emit_detached {
+                detached_clients.push((active.session_name.clone(), active.client_name.clone()));
+            }
             let _ = active.control_tx.send(control());
             active.closing.store(true, Ordering::SeqCst);
             false
@@ -823,6 +880,13 @@ impl RequestHandler {
         self.bump_active_attach_epoch();
         for overlay in overlay_jobs {
             terminate_overlay_job(overlay);
+        }
+        for (session_name, client_name) in detached_clients {
+            self.emit_without_attached_refresh(LifecycleEvent::ClientDetached {
+                session_name,
+                client_name: Some(client_name),
+            })
+            .await;
         }
     }
 
@@ -2273,6 +2337,7 @@ mod tests {
         let uid = current_owner_uid();
         let mut active = ActiveAttach {
             id: 1,
+            client_name: "77".to_owned(),
             session_name,
             session_id: rmux_proto::SessionId::new(1),
             last_session: None,

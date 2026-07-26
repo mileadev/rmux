@@ -863,7 +863,8 @@ impl RequestHandler {
                 active_attach.by_pid.get(&pid).map(|active| (pid, active))
             } else {
                 active_attach.by_pid.iter().find_map(|(&pid, active)| {
-                    attached_client_matches_target(pid, target_client).then_some((pid, active))
+                    attached_client_matches_target(&active.client_name, target_client)
+                        .then_some((pid, active))
                 })
             };
             if let Some((pid, active)) = matched {
@@ -1071,11 +1072,12 @@ impl RequestHandler {
                 {
                     Ok(AttachedSwitchCommitOutcome {
                         previous_session_id,
+                        client_name,
                         committed_target,
                     }) => {
                         record_switch_client_committed_target(client, committed_target);
                         self.finish_attached_session_switch(
-                            attach_pid,
+                            client_name,
                             session_name.clone(),
                             session_id,
                             previous_session_id,
@@ -1083,7 +1085,10 @@ impl RequestHandler {
                         .await;
                         Response::SwitchClient(SwitchClientResponse { session_name })
                     }
-                    Err(error) => Response::Error(ErrorResponse { error }),
+                    Err(failure) => {
+                        let error = self.finish_attached_switch_failure(failure).await;
+                        Response::Error(ErrorResponse { error })
+                    }
                 }
             }
             SwitchManagedClientIdentity::Control {

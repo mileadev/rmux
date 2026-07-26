@@ -21,6 +21,14 @@ use crate::server_access::{
 
 use super::state::{ActiveAttach, ActiveAttachIdentity, AttachRegistration};
 
+#[cfg(test)]
+struct TestAttachRegistration {
+    client_name: String,
+    closing: Arc<AtomicBool>,
+    terminal_context: OuterTerminalContext,
+    flags: super::ClientFlags,
+}
+
 impl RequestHandler {
     #[cfg(test)]
     pub(crate) async fn register_attach(
@@ -67,10 +75,61 @@ impl RequestHandler {
         terminal_context: OuterTerminalContext,
         flags: super::ClientFlags,
     ) -> u64 {
+        let client_name = attached_client_name(requester_pid);
+        self.register_attach_with_closing_and_client_name(
+            requester_pid,
+            session_name,
+            control_tx,
+            TestAttachRegistration {
+                client_name,
+                closing,
+                terminal_context,
+                flags,
+            },
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn register_attach_with_client_name(
+        &self,
+        requester_pid: u32,
+        client_name: String,
+        session_name: rmux_proto::SessionName,
+        control_tx: mpsc::UnboundedSender<AttachControl>,
+    ) -> u64 {
+        self.register_attach_with_closing_and_client_name(
+            requester_pid,
+            session_name,
+            control_tx,
+            TestAttachRegistration {
+                client_name,
+                closing: Arc::new(AtomicBool::new(false)),
+                terminal_context: OuterTerminalContext::default(),
+                flags: super::ClientFlags::default(),
+            },
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn register_attach_with_closing_and_client_name(
+        &self,
+        requester_pid: u32,
+        session_name: rmux_proto::SessionName,
+        control_tx: mpsc::UnboundedSender<AttachControl>,
+        registration: TestAttachRegistration,
+    ) -> u64 {
+        let TestAttachRegistration {
+            client_name,
+            closing,
+            terminal_context,
+            flags,
+        } = registration;
         let registered_session = session_name.clone();
         let tracks_geometry = !flags.contains(super::ClientFlags::IGNORESIZE);
         let attach_id = self
-            .register_attach_with_access(
+            .register_attach_identity(
                 requester_pid,
                 session_name,
                 None,
@@ -87,8 +146,11 @@ impl RequestHandler {
                     can_write: true,
                     client_size: None,
                 },
+                None,
+                client_name,
             )
             .await
+            .map(ActiveAttachIdentity::attach_id)
             .expect("test attach registration session must remain current");
         if tracks_geometry {
             let mut state = self.state.lock().await;
@@ -128,19 +190,43 @@ impl RequestHandler {
         expected_session_id: Option<rmux_proto::SessionId>,
         registration: AttachRegistration,
     ) -> Option<ActiveAttachIdentity> {
+        let client_name = attached_client_name(requester_pid);
         self.register_attach_identity(
             requester_pid,
             session_name,
             expected_session_id,
             registration,
             None,
+            client_name,
         )
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn register_attach_identity_with_server_access(
         &self,
         requester_pid: u32,
+        session_name: rmux_proto::SessionName,
+        expected_session_id: Option<rmux_proto::SessionId>,
+        registration: AttachRegistration,
+        admission: ServerAccessAdmission,
+    ) -> Option<ActiveAttachIdentity> {
+        let client_name = attached_client_name(requester_pid);
+        self.register_attach_identity_with_server_access_and_client_name(
+            requester_pid,
+            client_name,
+            session_name,
+            expected_session_id,
+            registration,
+            admission,
+        )
+        .await
+    }
+
+    pub(crate) async fn register_attach_identity_with_server_access_and_client_name(
+        &self,
+        requester_pid: u32,
+        client_name: String,
         session_name: rmux_proto::SessionName,
         expected_session_id: Option<rmux_proto::SessionId>,
         registration: AttachRegistration,
@@ -152,6 +238,7 @@ impl RequestHandler {
             expected_session_id,
             registration,
             Some(admission),
+            client_name,
         )
         .await
     }
@@ -163,6 +250,7 @@ impl RequestHandler {
         expected_session_id: Option<rmux_proto::SessionId>,
         registration: AttachRegistration,
         admission: Option<ServerAccessAdmission>,
+        client_name: String,
     ) -> Option<ActiveAttachIdentity> {
         #[cfg(test)]
         if admission.is_some() {
@@ -222,6 +310,7 @@ impl RequestHandler {
                 requester_pid,
                 ActiveAttach {
                     id: attach_id,
+                    client_name,
                     session_name,
                     session_id,
                     last_session: None,
@@ -309,7 +398,7 @@ impl RequestHandler {
     }
 
     pub(crate) async fn finish_attach(&self, requester_pid: u32, attach_id: u64) {
-        let (removed_session, removed_key_table, removed_overlay, emit_detached) = {
+        let (removed_session, removed_key_table, removed_overlay, detached_client_name) = {
             let mut active_attach = self.active_attach.lock().await;
             if active_attach
                 .by_pid
@@ -325,12 +414,12 @@ impl RequestHandler {
                             Some((active.session_name, active.session_id)),
                             active.key_table_name,
                             active.overlay,
-                            emit_detached,
+                            emit_detached.then_some(active.client_name),
                         )
                     })
-                    .unwrap_or((None, None, None, false))
+                    .unwrap_or((None, None, None, None))
             } else {
-                (None, None, None, false)
+                (None, None, None, None)
             }
         };
         if removed_session.is_some() {
@@ -342,10 +431,10 @@ impl RequestHandler {
             state.key_bindings.unref_table(&table_name);
         }
         if let Some((session_name, session_id)) = removed_session {
-            if emit_detached {
+            if let Some(client_name) = detached_client_name {
                 self.emit(LifecycleEvent::ClientDetached {
                     session_name: session_name.clone(),
-                    client_name: Some(attached_client_name(requester_pid)),
+                    client_name: Some(client_name),
                 })
                 .await;
             }

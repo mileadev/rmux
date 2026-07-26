@@ -9,9 +9,8 @@ use crate::hook_runtime::{current_hook_execution, current_hook_formats, with_hoo
 use crate::mouse::AttachedMouseEvent;
 
 use super::super::super::{
-    attach_support::ActiveAttachIdentity, attached_client_name,
-    scripting_support::QueueExecutionContext, with_expected_attach_and_session_identity,
-    with_expected_session_identity, RequestHandler,
+    attach_support::ActiveAttachIdentity, scripting_support::QueueExecutionContext,
+    with_expected_attach_and_session_identity, with_expected_session_identity, RequestHandler,
 };
 
 pub(super) struct AttachedBindingCommandContext {
@@ -20,6 +19,7 @@ pub(super) struct AttachedBindingCommandContext {
     pub(super) requester_pid: u32,
     pub(super) session_name: SessionName,
     pub(super) session_id: SessionId,
+    pub(super) client_name: String,
     pub(super) attached_live_input: bool,
     pub(super) dispatch_target: Target,
     pub(super) mouse_target: Option<Target>,
@@ -58,6 +58,7 @@ pub(super) async fn execute_attached_binding_commands(
         requester_pid,
         session_name,
         session_id,
+        client_name,
         attached_live_input,
         dispatch_target,
         mouse_target,
@@ -74,7 +75,7 @@ pub(super) async fn execute_attached_binding_commands(
     let context = QueueExecutionContext::without_caller_cwd()
         .with_implicit_current_target(Some(dispatch_target.clone()))
         .with_run_shell_canfail_fallback_target()
-        .with_client_name(Some(attached_client_name(attach_pid)))
+        .with_client_name(Some(client_name.clone()))
         .with_mouse_target(mouse_target)
         .with_mouse_event(mouse_event);
 
@@ -85,7 +86,7 @@ pub(super) async fn execute_attached_binding_commands(
             non_blocking: true,
             no_command: false,
             template: None,
-            target_client: Some(attached_client_name(attach_pid)),
+            target_client: Some(client_name),
         };
         let response = match live_identity {
             Some(identity) => {

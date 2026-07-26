@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
+use rmux_core::LifecycleEvent;
 use rmux_proto::{
     PaneId, PaneTarget, RmuxError, SessionId, SessionName, TerminalGeometry, WindowId, WindowTarget,
 };
@@ -8,10 +9,9 @@ use rmux_proto::{
 use super::resize_policy::ATTACHED_SIZE_RECONCILE_ATTEMPTS;
 use super::{
     attach_target_for_session_switch, reset_interactive_attach_state_for_session_switch,
-    terminate_overlay_job, ActiveAttachIdentity, AttachSessionSwitchRenderOptions, ClientFlags,
-    RequestHandler, ATTACH_CONTROL_BACKLOG_LIMIT,
+    terminate_overlay_job, ActiveAttachIdentity, AttachSessionSwitchRenderOptions,
+    AttachedClientControlOutcome, ClientFlags, RequestHandler, ATTACH_CONTROL_BACKLOG_LIMIT,
 };
-use crate::client_names::attached_client_name;
 use crate::handler::client_support::SwitchTargetSelection;
 use crate::handler::update_environment_from_client;
 use crate::outer_terminal::OuterTerminalContext;
@@ -44,7 +44,32 @@ pub(in crate::handler) struct AttachedSwitchCommitOutcome {
     /// stable identity because the source session can be renamed or destroyed
     /// while the post-switch notifications are published.
     pub(in crate::handler) previous_session_id: SessionId,
+    pub(in crate::handler) client_name: String,
     pub(in crate::handler) committed_target: AttachedSwitchCommittedTarget,
+}
+
+#[derive(Debug)]
+pub(in crate::handler) struct AttachedSwitchCommitFailure {
+    error: RmuxError,
+    detached_client: Option<AttachedClientControlOutcome>,
+}
+
+impl AttachedSwitchCommitFailure {
+    fn detached(error: RmuxError, detached_client: AttachedClientControlOutcome) -> Self {
+        Self {
+            error,
+            detached_client: Some(detached_client),
+        }
+    }
+}
+
+impl From<RmuxError> for AttachedSwitchCommitFailure {
+    fn from(error: RmuxError) -> Self {
+        Self {
+            error,
+            detached_client: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -103,7 +128,7 @@ impl RequestHandler {
         attach_pid: u32,
         expected_attach_id: u64,
         request: AttachedSwitchCommitRequest,
-    ) -> Result<AttachedSwitchCommitOutcome, RmuxError> {
+    ) -> Result<AttachedSwitchCommitOutcome, AttachedSwitchCommitFailure> {
         #[cfg(windows)]
         self.wait_for_windows_deferred_all_pane_pids().await;
 
@@ -142,9 +167,9 @@ impl RequestHandler {
                     && !active.closing.load(Ordering::SeqCst)
             });
             let Some(active) = active else {
-                return Err(crate::handler_support::attached_client_required(
-                    "switch-client",
-                ));
+                return Err(
+                    crate::handler_support::attached_client_required("switch-client").into(),
+                );
             };
             // This value must be derived from the attach identity protected by
             // the final state -> active_attach lock pair. Another successful
@@ -152,12 +177,13 @@ impl RequestHandler {
             // during size selection.
             let switch_changes_session = active.session_name != request.session_name
                 || active.session_id != request.session_id;
+            let client_name = active.client_name.clone();
             if state
                 .sessions
                 .session(&request.session_name)
                 .is_none_or(|session| session.id() != request.session_id)
             {
-                return Err(session_not_found(&request.session_name));
+                return Err(session_not_found(&request.session_name).into());
             }
             if !self.attached_size_selection_is_current(
                 &state,
@@ -214,9 +240,11 @@ impl RequestHandler {
                 self.bump_active_attach_epoch();
                 drop(active_attach);
                 drop(state);
-                terminate_overlay_job(removed.overlay);
-                return Err(crate::handler_support::attached_client_required(
-                    "switch-client",
+                let session_name = removed.session_name.clone();
+                let detached_client = Self::failed_attached_delivery_outcome(removed, session_name);
+                return Err(AttachedSwitchCommitFailure::detached(
+                    crate::handler_support::attached_client_required("switch-client"),
+                    detached_client,
                 ));
             }
             self.pause_after_attached_switch_closed_check(attach_pid)
@@ -245,9 +273,11 @@ impl RequestHandler {
                 self.bump_active_attach_epoch();
                 drop(active_attach);
                 drop(state);
-                terminate_overlay_job(removed.overlay);
-                return Err(RmuxError::Server(
-                    "attached client is not draining updates".to_owned(),
+                let session_name = removed.session_name.clone();
+                let detached_client = Self::failed_attached_delivery_outcome(removed, session_name);
+                return Err(AttachedSwitchCommitFailure::detached(
+                    RmuxError::Server("attached client is not draining updates".to_owned()),
+                    detached_client,
                 ));
             }
 
@@ -292,7 +322,7 @@ impl RequestHandler {
             );
             if let Err(error) = mutation {
                 snapshot.restore(&mut state);
-                return Err(rollback_switch_runtime(&mut state, &window_target, error));
+                return Err(rollback_switch_runtime(&mut state, &window_target, error).into());
             }
             let Some(committed_session) = state
                 .sessions
@@ -304,7 +334,8 @@ impl RequestHandler {
                     &mut state,
                     &window_target,
                     RmuxError::Server("switched attached session has no active target".to_owned()),
-                ));
+                )
+                .into());
             };
             let committed_window_index = committed_session.active_window_index();
             let Some(committed_window) = committed_session.window_at(committed_window_index) else {
@@ -313,7 +344,8 @@ impl RequestHandler {
                     &mut state,
                     &window_target,
                     RmuxError::Server("switched attached session has no active window".to_owned()),
-                ));
+                )
+                .into());
             };
             let Some(committed_pane) = committed_window.active_pane() else {
                 snapshot.restore(&mut state);
@@ -321,7 +353,8 @@ impl RequestHandler {
                     &mut state,
                     &window_target,
                     RmuxError::Server("switched attached window has no active pane".to_owned()),
-                ));
+                )
+                .into());
             };
             let committed_target = AttachedSwitchCommittedTarget {
                 target: PaneTarget::with_window(
@@ -383,8 +416,12 @@ impl RequestHandler {
                 let error = rollback_switch_runtime(&mut state, &window_target, delivery_error);
                 drop(active_attach);
                 drop(state);
-                terminate_overlay_job(removed.overlay);
-                return Err(error);
+                let session_name = removed.session_name.clone();
+                let detached_client = Self::failed_attached_delivery_outcome(removed, session_name);
+                return Err(AttachedSwitchCommitFailure::detached(
+                    error,
+                    detached_client,
+                ));
             }
 
             let mode_tree_effects = mode_tree_dismiss_plan.map(|plan| {
@@ -446,6 +483,7 @@ impl RequestHandler {
             }
             return Ok(AttachedSwitchCommitOutcome {
                 previous_session_id,
+                client_name,
                 committed_target,
             });
         }
@@ -453,7 +491,22 @@ impl RequestHandler {
         Err(RmuxError::Server(format!(
             "session {} active window changed during attached-size selection",
             request.session_name
-        )))
+        ))
+        .into())
+    }
+
+    pub(in crate::handler) async fn finish_attached_switch_failure(
+        &self,
+        failure: AttachedSwitchCommitFailure,
+    ) -> RmuxError {
+        if let Some(detached_client) = failure.detached_client {
+            self.emit_without_attached_refresh(LifecycleEvent::ClientDetached {
+                session_name: detached_client.session_name,
+                client_name: Some(detached_client.client_name),
+            })
+            .await;
+        }
+        failure.error
     }
 
     /// Publishes what tmux publishes once an attached `switch-client` has
@@ -470,17 +523,13 @@ impl RequestHandler {
     /// published first, and only then is the source session reconciled.
     pub(in crate::handler) async fn finish_attached_session_switch(
         &self,
-        attach_pid: u32,
+        client_name: String,
         session_name: SessionName,
         session_id: SessionId,
         previous_session_id: SessionId,
     ) {
-        self.emit_client_session_changed(
-            attached_client_name(attach_pid),
-            session_name,
-            session_id,
-        )
-        .await;
+        self.emit_client_session_changed(client_name, session_name, session_id)
+            .await;
         if previous_session_id != session_id {
             let _ = self
                 .reconcile_attached_session_identity_size_and_emit(previous_session_id)
