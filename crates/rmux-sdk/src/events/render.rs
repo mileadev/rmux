@@ -255,6 +255,12 @@ impl PaneRenderStream {
             for chunk in chunks {
                 self.observe_output(Some(chunk));
             }
+            // A gone subscription is an empty drain with terminal state held
+            // by `PaneOutputStream`, not evidence that an open cursor stalled.
+            self.output_closed |= self.output.is_closed();
+            if self.output_closed {
+                break;
+            }
             if self.output.next_sequence() <= before {
                 stale_empty_polls = stale_empty_polls.saturating_add(1);
                 if stale_empty_polls > 1 {

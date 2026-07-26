@@ -362,6 +362,10 @@ impl PaneOutputStream {
         self.next_sequence
     }
 
+    pub(crate) const fn is_closed(&self) -> bool {
+        self.inner.closed
+    }
+
     pub(crate) const fn pane_id(&self) -> PaneId {
         self.pane_id
     }
