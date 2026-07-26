@@ -24,6 +24,8 @@ use crate::pane_terminals::{session_not_found, HandlerState};
 const IMMEDIATE_PANE_INPUT_MAX_BYTES: usize = 256;
 #[cfg(any(unix, windows))]
 const PANE_INPUT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(windows)]
+const PANE_INPUT_WRITE_RECOVERY_GRACE: Duration = Duration::from_millis(500);
 /// Canonical error for a pane input write whose target process is gone.
 /// `PaneTerminalStore::clone_pane_master_if_alive` reports the same text.
 const DEAD_PANE_INPUT_ERROR: &str = "target pane has exited";
@@ -788,6 +790,15 @@ pub(in crate::handler) async fn write_bytes_to_target_io(
     write: PaneInputWrite,
     bytes: Vec<u8>,
 ) -> Result<(), RmuxError> {
+    write_bytes_to_target_io_classified(write, bytes)
+        .await
+        .map_err(PaneInputWriteFailure::into_error)
+}
+
+async fn write_bytes_to_target_io_classified(
+    write: PaneInputWrite,
+    bytes: Vec<u8>,
+) -> Result<(), PaneInputWriteFailure> {
     if bytes.is_empty() {
         return Ok(());
     }
@@ -803,13 +814,12 @@ pub(in crate::handler) async fn write_bytes_to_target_io(
         PaneInputSink::QueuedStarting => Ok(()),
         PaneInputSink::Pty(master) => match write_pane_bytes(master, bytes).await {
             Ok(()) => Ok(()),
-            Err(error) if is_dead_pane_write_error(&error) => {
-                Err(RmuxError::Server(DEAD_PANE_INPUT_ERROR.to_owned()))
-            }
-            Err(error) => Err(RmuxError::Server(format!(
-                "failed to write to pane {}:{}.{}: {}",
-                session_name, window_index, pane_index, error
-            ))),
+            Err(error) => Err(PaneInputWriteFailure::from_pty(
+                error,
+                &session_name,
+                window_index,
+                pane_index,
+            )),
         },
         #[cfg(test)]
         PaneInputSink::CapturedForTest => Ok(()),
@@ -820,24 +830,106 @@ pub(in crate::handler) async fn write_attached_bytes_to_target_io(
     write: PaneInputWrite,
     bytes: Vec<u8>,
 ) -> Result<(), RmuxError> {
-    tolerate_dead_pane_input(write_bytes_to_target_io(write, bytes).await)
-}
-
-/// A pane whose process is gone must not end the client that typed into it.
-///
-/// Attached input is prepared under the state lock and written after it is
-/// released, so the pane can exit in between on every platform and on every
-/// input sink. The keystroke is dropped; the attach connection survives.
-/// Command paths (send-keys, paste-buffer) report the same error instead.
-fn tolerate_dead_pane_input(result: Result<(), RmuxError>) -> Result<(), RmuxError> {
-    match result {
-        Err(error) if is_dead_pane_input_error(&error) => Ok(()),
-        result => result,
+    match write_bytes_to_target_io_classified(write, bytes).await {
+        Ok(()) => Ok(()),
+        Err(failure) => failure.into_attached_result(),
     }
 }
 
-fn is_dead_pane_input_error(error: &RmuxError) -> bool {
-    matches!(error, RmuxError::Server(message) if message == DEAD_PANE_INPUT_ERROR)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PaneInputFailureKind {
+    PaneGone,
+    #[cfg(any(windows, test))]
+    Congested,
+    Other,
+}
+
+#[derive(Debug)]
+struct PaneInputWriteFailure {
+    kind: PaneInputFailureKind,
+    error: RmuxError,
+}
+
+impl PaneInputWriteFailure {
+    fn from_pty(
+        error: io::Error,
+        session_name: &SessionName,
+        window_index: u32,
+        pane_index: u32,
+    ) -> Self {
+        if is_dead_pane_write_error(&error) {
+            return Self::pane_gone();
+        }
+        #[cfg(windows)]
+        if error.kind() == io::ErrorKind::TimedOut {
+            return Self::congested(RmuxError::Server(format!(
+                "failed to write to pane {session_name}:{window_index}.{pane_index}: {error}"
+            )));
+        }
+        Self::other(RmuxError::Server(format!(
+            "failed to write to pane {session_name}:{window_index}.{pane_index}: {error}"
+        )))
+    }
+
+    #[cfg(any(windows, test))]
+    fn from_console(
+        error: &io::Error,
+        session_name: &SessionName,
+        window_index: u32,
+        pane_index: u32,
+    ) -> Self {
+        if is_dead_pane_console_input_error(error) {
+            return Self::pane_gone();
+        }
+        let congested = error.kind() == io::ErrorKind::TimedOut;
+        let error = RmuxError::Server(format!(
+            "failed to write console input to pane \
+             {session_name}:{window_index}.{pane_index}: {error}"
+        ));
+        if congested {
+            return Self::congested(error);
+        }
+        Self::other(error)
+    }
+
+    fn pane_gone() -> Self {
+        Self {
+            kind: PaneInputFailureKind::PaneGone,
+            error: RmuxError::Server(DEAD_PANE_INPUT_ERROR.to_owned()),
+        }
+    }
+
+    #[cfg(any(windows, test))]
+    fn congested(error: RmuxError) -> Self {
+        Self {
+            kind: PaneInputFailureKind::Congested,
+            error,
+        }
+    }
+
+    fn other(error: RmuxError) -> Self {
+        Self {
+            kind: PaneInputFailureKind::Other,
+            error,
+        }
+    }
+
+    fn into_error(self) -> RmuxError {
+        self.error
+    }
+
+    /// Attached input is best-effort once it leaves the state lock: a pane may
+    /// exit or stop draining between target resolution and the write. Drop only
+    /// that input in those two typed cases; command paths still receive
+    /// [`Self::into_error`], and every other failure still closes the attach.
+    fn into_attached_result(self) -> Result<(), RmuxError> {
+        match self.kind {
+            PaneInputFailureKind::PaneGone => Ok(()),
+            #[cfg(any(windows, test))]
+            PaneInputFailureKind::Congested => Ok(()),
+            PaneInputFailureKind::Other => Err(self.error),
+        }
+    }
 }
 
 pub(in crate::handler) fn is_dead_pane_write_error(error: &io::Error) -> bool {
@@ -880,18 +972,13 @@ fn is_dead_pane_console_input_error(error: &io::Error) -> bool {
 }
 
 #[cfg(any(windows, test))]
-fn pane_console_input_error(
+fn pane_console_input_failure(
     error: &io::Error,
     session_name: &SessionName,
     window_index: u32,
     pane_index: u32,
-) -> RmuxError {
-    if is_dead_pane_console_input_error(error) {
-        return RmuxError::Server(DEAD_PANE_INPUT_ERROR.to_owned());
-    }
-    RmuxError::Server(format!(
-        "failed to write console input to pane {session_name}:{window_index}.{pane_index}: {error}"
-    ))
+) -> PaneInputWriteFailure {
+    PaneInputWriteFailure::from_console(error, session_name, window_index, pane_index)
 }
 
 #[cfg(windows)]
@@ -899,6 +986,16 @@ pub(super) async fn write_windows_console_input_action_to_target_io(
     write: PaneConsoleInputWrite,
     action: WindowsConsoleInputAction,
 ) -> Result<(), RmuxError> {
+    write_windows_console_input_action_to_target_io_classified(write, action)
+        .await
+        .map_err(PaneInputWriteFailure::into_error)
+}
+
+#[cfg(windows)]
+async fn write_windows_console_input_action_to_target_io_classified(
+    write: PaneConsoleInputWrite,
+    action: WindowsConsoleInputAction,
+) -> Result<(), PaneInputWriteFailure> {
     let PaneConsoleInputWrite {
         session_name,
         window_index,
@@ -936,9 +1033,13 @@ pub(super) async fn write_windows_console_input_action_to_target_io(
                 }
             })
             .await
-            .map_err(|error| RmuxError::Server(format!("pane console input task failed: {error}")))?
             .map_err(|error| {
-                pane_console_input_error(&error, &session_name, window_index, pane_index)
+                PaneInputWriteFailure::other(RmuxError::Server(format!(
+                    "pane console input task failed: {error}"
+                )))
+            })?
+            .map_err(|error| {
+                PaneInputWriteFailure::from_console(&error, &session_name, window_index, pane_index)
             })
         }
         #[cfg(test)]
@@ -952,7 +1053,10 @@ pub(super) async fn write_attached_windows_console_input_action_to_target_io(
     write: PaneConsoleInputWrite,
     action: WindowsConsoleInputAction,
 ) -> Result<(), RmuxError> {
-    tolerate_dead_pane_input(write_windows_console_input_action_to_target_io(write, action).await)
+    match write_windows_console_input_action_to_target_io_classified(write, action).await {
+        Ok(()) => Ok(()),
+        Err(failure) => failure.into_attached_result(),
+    }
 }
 
 #[cfg(windows)]
@@ -1022,7 +1126,18 @@ async fn write_pane_bytes(master: PtyMaster, bytes: Vec<u8>) -> std::io::Result<
 #[cfg(any(unix, windows))]
 async fn write_pane_bytes_blocking(master: PtyMaster, bytes: Vec<u8>) -> std::io::Result<()> {
     tokio::task::spawn_blocking(move || {
-        master.write_all_with_timeout(&bytes, PANE_INPUT_WRITE_TIMEOUT)
+        #[cfg(unix)]
+        {
+            master.write_all_with_timeout(&bytes, PANE_INPUT_WRITE_TIMEOUT)
+        }
+        #[cfg(windows)]
+        {
+            master.write_all_with_stall_recovery(
+                &bytes,
+                PANE_INPUT_WRITE_TIMEOUT,
+                PANE_INPUT_WRITE_RECOVERY_GRACE,
+            )
+        }
     })
     .await
     .map_err(|error| std::io::Error::other(format!("pane write task failed: {error}")))?
@@ -1169,8 +1284,8 @@ mod dead_pane_input_tests {
     /// `ERROR_GEN_FAILURE`: transient console churn, not a dead pane.
     const EXHAUSTED_TRANSIENT_CONSOLE_ERROR: i32 = 31;
 
-    fn console_error(raw_os_error: i32) -> RmuxError {
-        pane_console_input_error(
+    fn console_failure(raw_os_error: i32) -> PaneInputWriteFailure {
+        pane_console_input_failure(
             &io::Error::from_raw_os_error(raw_os_error),
             &SessionName::new("console-input").expect("valid session"),
             0,
@@ -1181,9 +1296,9 @@ mod dead_pane_input_tests {
     #[test]
     fn attached_input_survives_a_console_write_to_a_pane_that_exited() {
         for raw_os_error in GONE_PANE_CONSOLE_ERRORS {
-            let error = console_error(raw_os_error);
+            let failure = console_failure(raw_os_error);
             assert!(
-                tolerate_dead_pane_input(Err(error)).is_ok(),
+                failure.into_attached_result().is_ok(),
                 "a console key written to a pane that exited must not end the \
                  attach connection (os error {raw_os_error})"
             );
@@ -1193,26 +1308,83 @@ mod dead_pane_input_tests {
     #[test]
     fn console_writes_report_the_same_dead_pane_error_as_pane_bytes() {
         for raw_os_error in GONE_PANE_CONSOLE_ERRORS {
-            let error = console_error(raw_os_error);
-            assert!(
-                is_dead_pane_input_error(&error),
-                "os error {raw_os_error} must reach send-keys as the dead-pane \
-                 error the PTY byte path already reports, got {error}"
+            let failure = console_failure(raw_os_error);
+            assert_eq!(
+                failure.kind,
+                PaneInputFailureKind::PaneGone,
+                "os error {raw_os_error} must retain a typed dead-pane classification"
+            );
+            assert_eq!(
+                failure.into_error(),
+                RmuxError::Server(DEAD_PANE_INPUT_ERROR.to_owned()),
+                "os error {raw_os_error} must reach send-keys as the canonical dead-pane error"
             );
         }
     }
 
     #[test]
     fn other_console_write_failures_stay_reportable() {
-        let error = console_error(EXHAUSTED_TRANSIENT_CONSOLE_ERROR);
+        let failure = console_failure(EXHAUSTED_TRANSIENT_CONSOLE_ERROR);
 
         assert!(
-            error
+            failure
+                .error
                 .to_string()
                 .contains("failed to write console input to pane console-input:0.0"),
-            "unexpected error: {error}"
+            "unexpected error: {}",
+            failure.error
         );
-        assert!(tolerate_dead_pane_input(Err(error)).is_err());
+        assert_eq!(failure.kind, PaneInputFailureKind::Other);
+        assert!(failure.into_attached_result().is_err());
+    }
+
+    #[test]
+    fn attached_input_drops_conpty_congestion_without_hiding_command_failure() {
+        let session = SessionName::new("console-input").expect("valid session");
+        let attached_failure = PaneInputWriteFailure::from_console(
+            &io::Error::new(io::ErrorKind::TimedOut, "transient ConPTY congestion"),
+            &session,
+            0,
+            0,
+        );
+        assert_eq!(
+            attached_failure.kind,
+            PaneInputFailureKind::Congested,
+            "timeout must remain distinct from a dead pane"
+        );
+        assert!(
+            attached_failure.into_attached_result().is_ok(),
+            "a congested pane drops only the current attached input"
+        );
+
+        let command_failure = PaneInputWriteFailure::from_console(
+            &io::Error::new(io::ErrorKind::TimedOut, "transient ConPTY congestion"),
+            &session,
+            0,
+            0,
+        );
+        assert!(
+            command_failure
+                .into_error()
+                .to_string()
+                .contains("transient ConPTY congestion"),
+            "command paths must still report the timeout"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn attached_pty_timeout_uses_the_same_typed_congestion_policy() {
+        let session = SessionName::new("conpty-input").expect("valid session");
+        let failure = PaneInputWriteFailure::from_pty(
+            io::Error::new(io::ErrorKind::TimedOut, "ConPTY input stalled"),
+            &session,
+            0,
+            0,
+        );
+
+        assert_eq!(failure.kind, PaneInputFailureKind::Congested);
+        assert!(failure.into_attached_result().is_ok());
     }
 }
 

@@ -414,6 +414,24 @@ impl PtyMaster {
         self.io.write_all_with_timeout(bytes, timeout)
     }
 
+    /// Writes all bytes to the ConPTY master with one bounded recovery window
+    /// after an inactivity timeout.
+    ///
+    /// The recovery preserves byte order across a cancelled overlapped write.
+    /// A destination that remains blocked for `recovery_grace` returns a
+    /// timeout instead of retrying indefinitely.
+    #[cfg(windows)]
+    pub fn write_all_with_stall_recovery(
+        &self,
+        bytes: &[u8],
+        timeout: Duration,
+        recovery_grace: Duration,
+    ) -> io::Result<()> {
+        self.io
+            .pty
+            .write_all_with_stall_recovery(bytes, timeout, recovery_grace)
+    }
+
     /// Attempts to write bytes to a nonblocking Unix PTY master without waiting.
     ///
     /// Returns the number of bytes accepted immediately. Callers that need to
