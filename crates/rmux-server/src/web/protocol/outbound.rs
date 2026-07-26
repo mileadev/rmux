@@ -453,7 +453,7 @@ mod tests {
     #[test]
     fn session_keyframes_and_pane_frames_apply_the_web_terminal_policy() {
         let size = TerminalSize { cols: 80, rows: 24 };
-        let unsafe_link = b"before\x1b]8;;javascript:alert(1)\x1b\\link\x1b]8;;\x1b\\after";
+        let unsafe_link = b"before\x1b\r]8;;javascript:alert(1)\x1b\\link\x1b]8;;\x1b\\after";
         let snapshot = WebSessionSnapshot::new(
             size,
             unsafe_link.to_vec(),
@@ -471,7 +471,7 @@ mod tests {
                 .any(|window| window == b"javascript:"),
             "session recovery frame must not retain an active-content URI"
         );
-        assert!(frames[0].ends_with(b"beforelink\x1b]8;;\x1b\\after"));
+        assert!(frames[0].ends_with(b"before\rlink\x1b]8;;\x1b\\after"));
 
         let pane_frame = WebSessionPaneFrame::new(
             size,
@@ -492,7 +492,7 @@ mod tests {
         .expect("pane frame fits");
         let payload =
             session_pane_frame_payload(&pane_frame, &mut sanitizer).expect("pane frame fits");
-        assert_eq!(&payload[25..], b"beforelink\x1b]8;;\x1b\\after");
+        assert_eq!(&payload[25..], b"before\rlink\x1b]8;;\x1b\\after");
     }
 
     #[test]
@@ -513,18 +513,50 @@ mod tests {
             history_rows_total: 7,
             history_rows_included: 3,
             metadata_complete: false,
-            recovery_keyframe: Some(b"safe\x1b]52;c;partial".to_vec()),
+            recovery_keyframe: Some(b"safe\x1b".to_vec()),
         };
-        let mut sanitizer = WebTerminalSanitizer::for_role(WebShareConnectRole::Operator);
+        let mut sanitizer = WebTerminalSanitizer::for_role(WebShareConnectRole::Spectator);
         let payload =
             pane_snapshot_payload(&snapshot, &mut sanitizer, false).expect("snapshot fits");
         assert_eq!(&payload[1..], b"safe");
 
+        let mut c0 = Vec::new();
+        sanitizer.push(b"\r", &mut c0);
+        assert_eq!(c0, b"\r");
+
         let mut live = Vec::new();
-        sanitizer.push(b"Zm9v\x07after", &mut live);
+        sanitizer.push(b"]52;c;Zm9vYmFy\x07after", &mut live);
         assert_eq!(
             live, b"after",
-            "an OSC 52 fragmented across snapshot/live boundaries must stay removed"
+            "ESC and C0 frames must not expose a following OSC 52"
+        );
+    }
+
+    #[test]
+    fn session_recovery_keyframe_and_live_tail_share_one_sanitizer_state() {
+        let size = TerminalSize { cols: 80, rows: 24 };
+        let snapshot = WebSessionSnapshot::new(
+            size,
+            b"safe\x1b".to_vec(),
+            TestWebSessionView::new(size),
+            0,
+            0,
+        )
+        .expect("snapshot fits");
+        let mut sanitizer = WebTerminalSanitizer::for_role(WebShareConnectRole::Spectator);
+        let frames =
+            session_keyframe_payloads(None, &snapshot, &mut sanitizer).expect("view serializes");
+        assert!(frames[0].ends_with(b"safe"));
+
+        let mut c0 = Vec::new();
+        sanitizer.push(b"\r", &mut c0);
+        assert_eq!(c0, b"\r");
+
+        let mut live = Vec::new();
+        sanitizer.push(b"]52;c;Zm9vYmFy\x1b\\after", &mut live);
+        assert_eq!(
+            live, b"after",
+            "session ESC and C0 frames must not expose a following OSC 52"
         );
     }
 

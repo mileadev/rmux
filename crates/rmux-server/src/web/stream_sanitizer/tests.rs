@@ -13,6 +13,12 @@ fn sanitize_for_role(role: WebShareConnectRole, chunks: &[&[u8]]) -> Vec<u8> {
     output
 }
 
+fn escape_state_c0_bytes() -> impl Iterator<Item = u8> {
+    (0x00..=0x17)
+        .chain(std::iter::once(0x19))
+        .chain(0x1c..=0x1f)
+}
+
 #[test]
 fn spectator_role_removes_private_metadata_and_keeps_visual_osc() {
     let input = concat!(
@@ -77,6 +83,117 @@ fn osc_52_is_removed_at_every_fragmentation_boundary() {
             b"beforeafter",
             "split {split}"
         );
+    }
+}
+
+#[test]
+fn osc_52_after_escape_carriage_return_is_removed_across_frames() {
+    let frames: [&[u8]; 3] = [b"before\x1b", b"\r", b"]52;c;Zm9vYmFy\x07after"];
+
+    assert_eq!(
+        sanitize_for_role(WebShareConnectRole::Spectator, &frames),
+        b"before\rafter"
+    );
+}
+
+#[test]
+fn escape_c0_families_do_not_bypass_blocked_string_introducers() {
+    let blocked_strings = [
+        ("OSC with BEL", b"]52;c;Zm9vYmFy\x07".as_slice()),
+        ("OSC with ST", b"]52;c;Zm9vYmFy\x1b\\".as_slice()),
+        ("DCS with ST", b"Pq#0;2;0;0;0\x1b\\".as_slice()),
+        ("APC with ST", b"_Gi=1;kitty\x1b\\".as_slice()),
+        ("PM with ST", b"^private-message\x1b\\".as_slice()),
+        ("SOS with ST", b"Xstart-of-string\x1b\\".as_slice()),
+        ("rename with ST", b"ksecret-title\x1b\\".as_slice()),
+    ];
+
+    for control in escape_state_c0_bytes() {
+        for (name, blocked) in blocked_strings {
+            let mut input = b"before\x1b".to_vec();
+            input.push(control);
+            input.extend_from_slice(blocked);
+            input.extend_from_slice(b"after");
+            let mut expected = b"before".to_vec();
+            expected.push(control);
+            expected.extend_from_slice(b"after");
+
+            for split in 0..=input.len() {
+                assert_eq!(
+                    sanitize(&[&input[..split], &input[split..]]),
+                    expected,
+                    "{name}, control {control:#04x}, split {split}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn escape_c0_preserves_private_metadata_policy_by_role() {
+    for (name, private_osc) in [
+        ("title with BEL", b"]2;secret-title\x07".as_slice()),
+        (
+            "cwd with ST",
+            b"]7;file:///home/owner/private\x1b\\".as_slice(),
+        ),
+    ] {
+        let mut input = b"before\x1b\r".to_vec();
+        input.extend_from_slice(private_osc);
+        input.extend_from_slice(b"after");
+        let spectator_expected = b"before\rafter";
+        let mut operator_expected = b"before\r\x1b".to_vec();
+        operator_expected.extend_from_slice(private_osc);
+        operator_expected.extend_from_slice(b"after");
+
+        for split in 0..=input.len() {
+            let chunks = [&input[..split], &input[split..]];
+            assert_eq!(
+                sanitize_for_role(WebShareConnectRole::Spectator, &chunks),
+                spectator_expected,
+                "spectator {name}, split {split}"
+            );
+            assert_eq!(
+                sanitize_for_role(WebShareConnectRole::Operator, &chunks),
+                operator_expected,
+                "operator {name}, split {split}"
+            );
+        }
+    }
+}
+
+#[test]
+fn can_and_sub_still_cancel_escape_before_following_text() {
+    for cancel in [0x18, 0x1a] {
+        let mut input = b"before\x1b".to_vec();
+        input.push(cancel);
+        input.extend_from_slice(b"]52;c;Zm9vYmFy\x07after");
+        let expected = b"before]52;c;Zm9vYmFy\x07after";
+
+        for split in 0..=input.len() {
+            assert_eq!(
+                sanitize(&[&input[..split], &input[split..]]),
+                expected,
+                "cancel {cancel:#04x}, split {split}"
+            );
+        }
+    }
+}
+
+#[test]
+fn escape_c0_remains_pending_when_reentered_from_control_strings() {
+    for input in [
+        b"before\x1b]2;abandoned\x1b\r]52;c;Zm9vYmFy\x07after".as_slice(),
+        b"before\x1b_abandoned\x1b\r]52;c;Zm9vYmFy\x07after".as_slice(),
+        b"before\x1bP1\x1b\r]52;c;Zm9vYmFy\x07after".as_slice(),
+    ] {
+        for split in 0..=input.len() {
+            assert_eq!(
+                sanitize(&[&input[..split], &input[split..]]),
+                b"before\rafter",
+                "input {input:02x?}, split {split}"
+            );
+        }
     }
 }
 

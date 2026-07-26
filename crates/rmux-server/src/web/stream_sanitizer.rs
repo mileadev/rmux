@@ -236,6 +236,11 @@ fn escape_sequence(byte: u8, output: &mut Vec<u8>) -> State {
         },
         b'P' => State::Dcs(DcsState::Entry),
         b'X' | b'^' | b'_' | b'k' => State::DiscardString(DiscardString::new(StringTerminator::St)),
+        // Executing a C0 control does not leave the terminal's Escape state.
+        0x00..=0x17 | 0x19 | 0x1c..=0x1f => {
+            output.push(byte);
+            State::Escape
+        }
         0x1b => State::Escape,
         0x7f..=0xff => State::Escape,
         _ => {
