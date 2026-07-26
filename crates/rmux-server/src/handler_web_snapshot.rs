@@ -284,23 +284,10 @@ impl WebSessionPaneView {
 
 pub(crate) fn session_content_geometry(
     geometry: PaneGeometry,
-    session_size: TerminalSize,
-    status: Option<&str>,
+    content_rows: u16,
 ) -> Option<PaneGeometry> {
-    let content_rows = crate::status_lines::content_rows_for_status(status, session_size.rows);
-    if geometry.y() >= content_rows {
-        return None;
-    }
-    let rows = geometry.rows().min(content_rows - geometry.y());
-    if rows == 0 || geometry.cols() == 0 {
-        return None;
-    }
-    Some(PaneGeometry::new(
-        geometry.x(),
-        geometry.y(),
-        geometry.cols(),
-        rows,
-    ))
+    let geometry = crate::pane_visible_geometry::clip_pane_geometry(geometry, content_rows);
+    (geometry.rows() > 0 && geometry.cols() > 0).then_some(geometry)
 }
 
 pub(crate) fn overlay_pane_lines(
@@ -561,26 +548,21 @@ mod tests {
     }
 
     #[test]
-    fn web_session_content_geometry_reserves_status_row() {
-        let size = TerminalSize {
-            cols: 120,
-            rows: 32,
-        };
-
+    fn web_session_content_geometry_clips_to_canonical_content_rows() {
         assert_eq!(
-            session_content_geometry(PaneGeometry::new(0, 0, 120, 32), size, Some("on")),
+            session_content_geometry(PaneGeometry::new(0, 0, 120, 32), 31),
             Some(PaneGeometry::new(0, 0, 120, 31)),
         );
         assert_eq!(
-            session_content_geometry(PaneGeometry::new(60, 16, 60, 16), size, Some("on")),
+            session_content_geometry(PaneGeometry::new(60, 16, 60, 16), 31),
             Some(PaneGeometry::new(60, 16, 60, 15)),
         );
         assert_eq!(
-            session_content_geometry(PaneGeometry::new(0, 31, 120, 1), size, Some("on")),
+            session_content_geometry(PaneGeometry::new(0, 31, 120, 1), 31),
             None,
         );
         assert_eq!(
-            session_content_geometry(PaneGeometry::new(0, 0, 120, 32), size, Some("2")),
+            session_content_geometry(PaneGeometry::new(0, 0, 120, 32), 30),
             Some(PaneGeometry::new(0, 0, 120, 30)),
         );
     }

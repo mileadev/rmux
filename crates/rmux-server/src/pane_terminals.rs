@@ -584,7 +584,11 @@ fn pane_terminal_geometry_for_session(
     .content_geometry(geometry, alternate_on, copy_mode_active)
 }
 
-fn session_content_rows(session: &Session, options: &OptionStore, window_index: u32) -> u16 {
+pub(crate) fn session_content_rows(
+    session: &Session,
+    options: &OptionStore,
+    window_index: u32,
+) -> u16 {
     let window = session
         .window_at(window_index)
         .unwrap_or_else(|| session.window());
