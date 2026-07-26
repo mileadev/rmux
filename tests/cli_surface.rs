@@ -2404,6 +2404,131 @@ fn control_mode_argv_command_uses_initial_flags_zero_frame() -> Result<(), Box<d
     Ok(())
 }
 
+fn assert_control_attach_records(records: &[&str], offset: usize, session: &str, flags: &str) {
+    let begin = records
+        .get(offset)
+        .unwrap_or_else(|| panic!("missing %begin at offset {offset}: {records:?}"));
+    let end = records
+        .get(offset + 1)
+        .unwrap_or_else(|| panic!("missing %end at offset {}: {records:?}", offset + 1));
+    let session_changed = records.get(offset + 2).unwrap_or_else(|| {
+        panic!(
+            "missing %session-changed at offset {}: {records:?}",
+            offset + 2
+        )
+    });
+    let begin_fields = begin.split_whitespace().collect::<Vec<_>>();
+    let end_fields = end.split_whitespace().collect::<Vec<_>>();
+
+    assert_eq!(begin_fields.first(), Some(&"%begin"), "{records:?}");
+    assert_eq!(end_fields.first(), Some(&"%end"), "{records:?}");
+    assert_eq!(begin_fields.get(1..), end_fields.get(1..), "{records:?}");
+    assert_eq!(begin_fields.last(), Some(&flags), "{records:?}");
+    assert!(
+        session_changed.starts_with("%session-changed $")
+            && session_changed.ends_with(&format!(" {session}")),
+        "{records:?}"
+    );
+}
+
+#[test]
+fn control_attach_eof_cannot_overtake_session_change() -> Result<(), Box<dyn Error>> {
+    const EOF_ITERATIONS: usize = 64;
+
+    let harness = CliHarness::new("control-attach-eof-order")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["new-session", "-d", "-s", "beta"])?);
+
+    for iteration in 0..EOF_ITERATIONS {
+        let output = harness.run(&["-C", "attach-session", "-t", "alpha"])?;
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "iteration {iteration}: stderr={:?}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).is_empty(),
+            "iteration {iteration}: stderr={:?}",
+            stderr(&output)
+        );
+        let rendered = stdout(&output);
+        let records = rendered.lines().collect::<Vec<_>>();
+        assert_eq!(records.len(), 4, "iteration {iteration}: {rendered:?}");
+        assert_control_attach_records(&records, 0, "alpha", "0");
+        assert_eq!(records[3], "%exit", "iteration {iteration}: {rendered:?}");
+    }
+
+    let mut child = harness
+        .base_command()
+        .args(["-C", "attach-session", "-t", "alpha"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("control stdin");
+    let child_stdout = child.stdout.take().expect("control stdout");
+    let stderr_pipe = child.stderr.take().expect("control stderr");
+    let (stdout_buffer, stdout_thread) = spawn_pipe_collector(child_stdout);
+    let (_stderr_buffer, stderr_thread) = spawn_pipe_collector(stderr_pipe);
+
+    wait_for_output_condition(
+        &stdout_buffer,
+        ATTACH_TIMEOUT,
+        "initial control attach session change",
+        |rendered| rendered.matches("%session-changed ").count() == 1,
+    )?;
+    {
+        let buffered = stdout_buffer.lock().expect("control stdout buffer lock");
+        let rendered = String::from_utf8_lossy(&buffered);
+        let records = rendered.lines().collect::<Vec<_>>();
+        assert_eq!(records.len(), 3, "{rendered:?}");
+        assert_control_attach_records(&records, 0, "alpha", "0");
+        assert!(!rendered.contains("%exit"), "{rendered:?}");
+    }
+
+    stdin.write_all(b"attach-session -t beta\n")?;
+    stdin.flush()?;
+    drop(stdin);
+    let status = child.wait()?;
+    let rendered = String::from_utf8(read_pipe_output(stdout_thread, "stdout")?)?;
+    let stderr = String::from_utf8(read_pipe_output(stderr_thread, "stderr")?)?;
+    assert_eq!(status.code(), Some(0));
+    assert!(stderr.is_empty(), "stderr={stderr:?}");
+    let records = rendered.lines().collect::<Vec<_>>();
+    assert_eq!(records.len(), 7, "{rendered:?}");
+    assert_control_attach_records(&records, 0, "alpha", "0");
+    assert_control_attach_records(&records, 3, "beta", "1");
+    assert_eq!(records[6], "%exit", "{rendered:?}");
+    assert_eq!(
+        rendered.matches("%session-changed ").count(),
+        2,
+        "{rendered:?}"
+    );
+    assert!(rendered.ends_with("%exit\n"), "{rendered:?}");
+
+    let failed = harness.run(&["-C", "attach-session", "-t", "missing"])?;
+    let rendered = stdout(&failed);
+    let records = rendered.lines().collect::<Vec<_>>();
+    let begin = records
+        .iter()
+        .position(|record| record.starts_with("%begin "))
+        .expect("failed attach has a begin guard");
+    let error = records
+        .iter()
+        .position(|record| record.starts_with("%error "))
+        .expect("failed attach has an error guard");
+    let exit = records
+        .iter()
+        .position(|record| *record == "%exit")
+        .expect("failed attach has an exit record");
+    assert!(begin < error && error < exit, "{rendered:?}");
+    assert!(!rendered.contains("%session-changed "), "{rendered:?}");
+    assert_eq!(rendered.matches("%exit").count(), 1, "{rendered:?}");
+    Ok(())
+}
+
 #[test]
 fn command_free_control_mode_creates_default_session_before_non_tty_eof(
 ) -> Result<(), Box<dyn Error>> {

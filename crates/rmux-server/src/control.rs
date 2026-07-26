@@ -370,8 +370,8 @@ async fn forward_control_inner(
             }
         }
         if current_command.is_none() {
-            let reconcile_ready_control_attach =
-                input_closed && mode.is_control_control() && session_name.is_none();
+            let reconcile_ready_control_events = input_closed
+                && !control_control_waits_for_attached_session(mode, session_name.as_ref());
             let mut event_context = ServerEventContext {
                 handler: &handler,
                 control_identity,
@@ -389,14 +389,14 @@ async fn forward_control_inner(
             if flush_deferred_server_events(&mut event_context).await? {
                 return Ok(());
             }
-            if reconcile_ready_control_attach {
+            if reconcile_ready_control_events {
                 // A successful attach publishes its session-change event before
                 // the command task returns. When EOF and both futures are ready,
                 // the biased select below deliberately observes command
                 // completion first. Reconcile the bounded snapshot of events
-                // that were already published before treating a still-unbound
-                // -CC client as terminal. New arrivals are left to the select,
-                // so a continuous producer cannot starve EOF.
+                // that were already published before treating the client as
+                // terminal. New arrivals are left to the select, so a continuous
+                // producer cannot starve EOF.
                 let ready_server_event_count = server_events.len();
                 for _ in 0..ready_server_event_count {
                     let Ok(event) = server_events.try_recv() else {
