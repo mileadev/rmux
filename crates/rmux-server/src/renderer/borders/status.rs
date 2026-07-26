@@ -199,7 +199,7 @@ mod tests {
         let frame = String::from_utf8(render_pane_border_status_lines(
             &session,
             &options,
-            StatusGeometry::without_status(session.window().size()),
+            StatusGeometry::without_status(session.window().size(), session.window().size()),
             None,
         ))
         .expect("frame is utf8");
@@ -214,7 +214,8 @@ mod tests {
         let session = two_pane_session();
         let top_pane = session.window().pane(0).expect("top pane exists");
         let bottom_pane = session.window().pane(1).expect("bottom pane exists");
-        let geometry = StatusGeometry::without_status(session.window().size());
+        let geometry =
+            StatusGeometry::without_status(session.window().size(), session.window().size());
 
         assert_eq!(
             pane_border_status_row(PaneBorderStatusPosition::Top, top_pane, geometry),
@@ -262,7 +263,7 @@ mod tests {
         let frame = String::from_utf8(render_pane_border_status_lines(
             &session,
             &options,
-            StatusGeometry::without_status(session.window().size()),
+            StatusGeometry::without_status(session.window().size(), session.window().size()),
             None,
         ))
         .expect("frame is utf8");

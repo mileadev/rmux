@@ -142,6 +142,10 @@ async fn attached_display_message_print_reports_client_size_and_cursor_position(
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    handler
+        .handle_attached_resize(requester_pid, TerminalSize { cols: 80, rows: 24 })
+        .await
+        .expect("attached terminal geometry is applied");
     let target = PaneTarget::new(alpha.clone(), 0);
 
     replace_transcript_contents(

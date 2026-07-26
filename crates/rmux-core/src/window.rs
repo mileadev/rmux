@@ -71,16 +71,6 @@ pub const WINLINK_SILENCE: AlertFlags = AlertFlags(0x4);
 pub const WINLINK_ALERTFLAGS: AlertFlags =
     AlertFlags(WINLINK_BELL.0 | WINLINK_ACTIVITY.0 | WINLINK_SILENCE.0);
 
-/// Meaning of the row count stored in a window's terminal size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum WindowSizeBasis {
-    /// The stored rows already describe the pane-content area.
-    #[default]
-    Content,
-    /// The stored rows describe an interactive terminal and include status rows.
-    Terminal,
-}
-
 /// A session-owned window whose pane order is independent from pane indices.
 ///
 /// Pane order is preserved separately from pane indices so a split can insert a
@@ -100,7 +90,6 @@ pub struct Window {
     custom_layout: bool,
     old_layout: Option<String>,
     size: TerminalSize,
-    size_basis: WindowSizeBasis,
     name: Option<String>,
     automatic_rename: bool,
     zoomed: bool,
@@ -154,7 +143,6 @@ impl Window {
             custom_layout: false,
             old_layout: None,
             size,
-            size_basis: WindowSizeBasis::Content,
             name: None,
             automatic_rename: true,
             zoomed: false,
@@ -174,17 +162,6 @@ impl Window {
     #[must_use]
     pub const fn id(&self) -> WindowId {
         self.id
-    }
-
-    /// Returns whether the stored row count includes terminal status rows.
-    #[must_use]
-    pub const fn size_basis(&self) -> WindowSizeBasis {
-        self.size_basis
-    }
-
-    /// Sets how the stored row count should be interpreted.
-    pub fn set_size_basis(&mut self, basis: WindowSizeBasis) {
-        self.size_basis = basis;
     }
 
     /// Returns the panes in window order.
@@ -237,7 +214,7 @@ impl Window {
         self.layout
     }
 
-    /// Returns the terminal size currently backing the window.
+    /// Returns the content size used by the layout tree and pane PTYs.
     #[must_use]
     pub const fn size(&self) -> TerminalSize {
         self.size

@@ -284,10 +284,17 @@ impl WebSessionPaneView {
 
 pub(crate) fn session_content_geometry(
     geometry: PaneGeometry,
-    content_rows: u16,
+    content_size: TerminalSize,
 ) -> Option<PaneGeometry> {
-    let geometry = crate::pane_visible_geometry::clip_pane_geometry(geometry, content_rows);
-    (geometry.rows() > 0 && geometry.cols() > 0).then_some(geometry)
+    if geometry.x() >= content_size.cols || geometry.y() >= content_size.rows {
+        return None;
+    }
+    let cols = geometry.cols().min(content_size.cols - geometry.x());
+    let rows = geometry.rows().min(content_size.rows - geometry.y());
+    if rows == 0 || cols == 0 {
+        return None;
+    }
+    Some(PaneGeometry::new(geometry.x(), geometry.y(), cols, rows))
 }
 
 pub(crate) fn overlay_pane_lines(
@@ -548,22 +555,27 @@ mod tests {
     }
 
     #[test]
-    fn web_session_content_geometry_clips_to_canonical_content_rows() {
+    fn web_session_geometry_clips_to_content_bounds_without_status_conversion() {
+        let size = TerminalSize {
+            cols: 120,
+            rows: 30,
+        };
+
         assert_eq!(
-            session_content_geometry(PaneGeometry::new(0, 0, 120, 32), 31),
-            Some(PaneGeometry::new(0, 0, 120, 31)),
+            session_content_geometry(PaneGeometry::new(0, 0, 120, 32), size),
+            Some(PaneGeometry::new(0, 0, 120, 30)),
         );
         assert_eq!(
-            session_content_geometry(PaneGeometry::new(60, 16, 60, 16), 31),
-            Some(PaneGeometry::new(60, 16, 60, 15)),
+            session_content_geometry(PaneGeometry::new(60, 16, 70, 16), size),
+            Some(PaneGeometry::new(60, 16, 60, 14)),
         );
         assert_eq!(
-            session_content_geometry(PaneGeometry::new(0, 31, 120, 1), 31),
+            session_content_geometry(PaneGeometry::new(0, 30, 120, 1), size),
             None,
         );
         assert_eq!(
-            session_content_geometry(PaneGeometry::new(0, 0, 120, 32), 30),
-            Some(PaneGeometry::new(0, 0, 120, 30)),
+            session_content_geometry(PaneGeometry::new(120, 0, 1, 1), size),
+            None,
         );
     }
 }

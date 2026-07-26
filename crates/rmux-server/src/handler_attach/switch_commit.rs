@@ -313,10 +313,10 @@ impl RequestHandler {
                 window_target.window_index(),
                 |session| {
                     session.touch_attached();
-                    size_selection.apply_to_window(session, window_target.window_index())?;
                     if let Some(selection) = request.target_selection.as_ref() {
                         selection.apply_to_session(session)?;
                     }
+                    size_selection.apply_to_window(session, window_target.window_index())?;
                     Ok(())
                 },
             );

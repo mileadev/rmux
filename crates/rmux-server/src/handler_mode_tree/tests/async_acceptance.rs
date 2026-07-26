@@ -1829,7 +1829,13 @@ async fn choose_tree_session_switch_resizes_the_target_for_the_attached_client()
 
     let state = handler.state.lock().await;
     let target_session = state.sessions.session(&target).expect("target survives");
-    assert_eq!(target_session.window().size(), client_size);
+    assert_eq!(
+        target_session.window().size(),
+        TerminalSize {
+            cols: client_size.cols,
+            rows: client_size.rows - 1,
+        }
+    );
 }
 
 #[tokio::test]

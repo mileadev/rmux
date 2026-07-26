@@ -1,14 +1,14 @@
 use super::*;
 use crate::daemon::ShutdownHandle;
-use rmux_core::{events::SubscriptionLimits, WindowSizeBasis};
+use rmux_core::events::SubscriptionLimits;
 use rmux_proto::WebShareCreatedResponse;
 use rmux_proto::{encode_attach_message, AttachMessage};
 use rmux_proto::{
     CopyModeRequest, CreateWebShareRequest, HookLifecycle, HookName, KillPaneRequest,
     KillSessionRequest, LinkWindowRequest, ListWebSharesRequest, NewSessionRequest, OptionName,
     PaneTarget, RenameSessionRequest, Request, Response, ScopeSelector, SessionName,
-    SetHookRequest, SetOptionMode, SplitDirection, SplitWindowRequest, SplitWindowTarget,
-    StopWebShareRequest, TerminalSize, WebShareScope, WindowTarget,
+    SetHookRequest, SetOptionMode, SetOptionRequest, SplitDirection, SplitWindowRequest,
+    SplitWindowTarget, StopWebShareRequest, TerminalSize, WebShareScope, WindowTarget,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::time::{sleep, timeout, Duration, Instant};
@@ -807,14 +807,21 @@ async fn web_session_snapshot_tracks_canonical_session_size() {
 }
 
 #[tokio::test]
-async fn web_session_snapshot_and_scroll_geometry_respect_window_size_basis() {
+async fn web_session_snapshot_uses_content_geometry_without_reapplying_status_rows() {
     let handler = RequestHandler::new();
-    let session_name = new_session_with_size(
-        &handler,
-        "websession-geometry-basis",
-        TerminalSize { cols: 80, rows: 3 },
-    )
-    .await;
+    let session_name = new_session(&handler, "websession-content-geometry").await;
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .mutate_session_and_resize_window_terminal(&session_name, 0, |session| {
+                session.resize_active_window_geometry(
+                    TerminalSize { cols: 80, rows: 24 },
+                    TerminalSize { cols: 80, rows: 21 },
+                );
+                Ok(())
+            })
+            .expect("content geometry resize succeeds");
+    }
     assert!(matches!(
         handler
             .handle(Request::SplitWindow(SplitWindowRequest {
@@ -826,7 +833,6 @@ async fn web_session_snapshot_and_scroll_geometry_respect_window_size_basis() {
             .await,
         Response::SplitWindow(_)
     ));
-
     let bottom_target = PaneTarget::with_window(session_name.clone(), 0, 1);
     handler
         .wait_for_pane_startup_to_finish_for_test(&bottom_target)
@@ -841,7 +847,6 @@ async fn web_session_snapshot_and_scroll_geometry_respect_window_size_basis() {
             .window()
             .pane(1)
             .expect("split creates a bottom pane");
-        assert_eq!(pane.geometry(), rmux_core::PaneGeometry::new(0, 2, 80, 1));
         (
             session.id(),
             pane.id(),
@@ -850,67 +855,83 @@ async fn web_session_snapshot_and_scroll_geometry_respect_window_size_basis() {
                 .expect("bottom pane transcript"),
         )
     };
-    transcript
-        .lock()
-        .expect("transcript lock")
-        .append_bytes(b"zero\r\none\r\ntwo\r\nthree\r\n");
-    let session_target = crate::web::WebSessionTarget::new(session_name.clone(), session_id);
+    transcript.lock().expect("transcript lock").append_bytes(
+        b"00\r\n01\r\n02\r\n03\r\n04\r\n05\r\n06\r\n07\r\n08\r\n09\r\n\
+              10\r\n11\r\n12\r\n13\r\n14\r\n15\r\n16\r\n17\r\n18\r\n19\r\n\
+              20\r\n21\r\n22\r\n23\r\n24\r\n25\r\n26\r\n27\r\n28\r\n29\r\n",
+    );
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Session(session_name.clone()),
+                option: OptionName::Status,
+                value: "3".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
 
-    for (basis, status, bottom_visible) in [
-        (WindowSizeBasis::Content, "off", true),
-        (WindowSizeBasis::Content, "on", true),
-        (WindowSizeBasis::Content, "2", true),
-        (WindowSizeBasis::Terminal, "off", true),
-        (WindowSizeBasis::Terminal, "on", false),
-        (WindowSizeBasis::Terminal, "2", false),
-    ] {
-        {
-            let mut state = handler.state.lock().await;
-            state
-                .sessions
-                .session_mut(&session_name)
-                .expect("session exists")
-                .window_at_mut(0)
-                .expect("window exists")
-                .set_size_basis(basis);
-            state
-                .options
-                .set(
-                    ScopeSelector::Session(session_name.clone()),
-                    OptionName::Status,
-                    status.to_owned(),
-                    SetOptionMode::Replace,
-                )
-                .expect("status option is valid");
-        }
+    let created = create_share(
+        &handler,
+        share_request(WebShareScope::Session(session_name.clone())),
+    )
+    .await;
+    let stream = handler
+        .open_web_share(
+            &token_from_url(created.spectator_url.as_deref().expect("spectator URL")),
+            None,
+        )
+        .await
+        .expect("session web share opens");
+    let WebShareStream::Session(session_stream) = stream else {
+        panic!("expected session web share stream");
+    };
 
-        let snapshot = handler
-            .web_session_snapshot(&session_target)
-            .await
-            .expect("full Web session snapshot succeeds");
-        let bottom = snapshot
+    assert_eq!(
+        session_stream.snapshot.size,
+        TerminalSize { cols: 80, rows: 21 }
+    );
+    assert_eq!(
+        session_stream.snapshot.view.size,
+        session_stream.snapshot.size
+    );
+    assert_eq!(
+        session_stream
+            .snapshot
             .view
             .panes
             .iter()
-            .find(|pane| pane.id == bottom_pane_id.as_u32());
-        assert_eq!(
-            bottom.map(|pane| (pane.y, pane.rows)),
-            bottom_visible.then_some((2, 1)),
-            "full snapshot geometry for {basis:?} basis with status {status:?}"
-        );
+            .map(|pane| pane.rows)
+            .collect::<Vec<_>>(),
+        vec![10, 10]
+    );
 
-        let scroll_frame = handler
-            .web_session_pane_scroll_frame(&session_target, bottom_pane_id, 0, None)
-            .await
-            .expect("Web pane scroll frame succeeds");
-        assert_eq!(
-            scroll_frame
-                .as_ref()
-                .map(|frame| (frame.pane.y, frame.pane.rows)),
-            bottom_visible.then_some((2, 1)),
-            "scroll frame geometry for {basis:?} basis with status {status:?}"
-        );
-    }
+    let bottom = session_stream
+        .snapshot
+        .view
+        .panes
+        .iter()
+        .find(|pane| pane.id == bottom_pane_id.as_u32())
+        .expect("bottom pane remains visible");
+    let scroll_frame = handler
+        .web_session_pane_scroll_frame(
+            &crate::web::WebSessionTarget::new(session_name, session_id),
+            bottom_pane_id,
+            0,
+            None,
+        )
+        .await
+        .expect("Web pane scroll frame succeeds")
+        .expect("scrollback produces a pane frame");
+    assert_eq!(
+        (scroll_frame.pane.x, scroll_frame.pane.y),
+        (bottom.x, bottom.y)
+    );
+    assert_eq!(
+        (scroll_frame.pane.cols, scroll_frame.pane.rows),
+        (bottom.cols, bottom.rows)
+    );
 }
 
 #[tokio::test]
@@ -1639,20 +1660,25 @@ async fn web_session_operator_resize_reaches_attached_session() {
 
     timeout(Duration::from_secs(2), async {
         loop {
-            let size = {
+            let geometry = {
                 let state = handler.state.lock().await;
-                state
+                let session = state
                     .sessions
                     .session(&session_name)
-                    .expect("session exists")
-                    .window()
-                    .size()
+                    .expect("session exists");
+                (session.terminal_size(), session.window().size())
             };
-            if size
-                == (TerminalSize {
-                    cols: 100,
-                    rows: 40,
-                })
+            if geometry
+                == (
+                    TerminalSize {
+                        cols: 100,
+                        rows: 40,
+                    },
+                    TerminalSize {
+                        cols: 100,
+                        rows: 39,
+                    },
+                )
             {
                 return;
             }
@@ -1660,7 +1686,7 @@ async fn web_session_operator_resize_reaches_attached_session() {
         }
     })
     .await
-    .expect("browser resize reaches the attached session");
+    .expect("browser resize reaches the attached session as external and content geometry");
 }
 
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {

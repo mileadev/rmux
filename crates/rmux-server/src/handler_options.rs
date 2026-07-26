@@ -51,7 +51,7 @@ impl RequestHandler {
             .then(|| legacy_scope_to_refresh_scope(&request.scope));
         let resize_policy_requested = matches!(
             request.option,
-            OptionName::WindowSize | OptionName::AggressiveResize
+            OptionName::WindowSize | OptionName::AggressiveResize | OptionName::Status
         );
         let mut resize_policy_scope = None;
         let destroy_unattached_scope = (request.option == OptionName::DestroyUnattached)
@@ -311,7 +311,9 @@ impl RequestHandler {
                         }
                         if matches!(
                             option,
-                            OptionName::WindowSize | OptionName::AggressiveResize
+                            OptionName::WindowSize
+                                | OptionName::AggressiveResize
+                                | OptionName::Status
                         ) {
                             resize_policy_scope = candidate_resize_policy_scope;
                         }

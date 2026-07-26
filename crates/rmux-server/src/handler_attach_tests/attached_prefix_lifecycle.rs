@@ -2320,7 +2320,7 @@ async fn attached_resize_resizes_session_and_refreshes_status_frame() {
             size,
             TerminalSize {
                 cols: 132,
-                rows: 43
+                rows: 42
             }
         );
     }

@@ -291,7 +291,7 @@ impl HandlerState {
         {
             self.window_runtime_resize_count = self.window_runtime_resize_count.saturating_add(1);
         }
-        let (runtime_session_name, window_size, pane_geometries) = {
+        let (runtime_session_name, pane_geometries) = {
             let session = self
                 .sessions
                 .session(session_name)
@@ -323,29 +323,20 @@ impl HandlerState {
                             alternate_on,
                             copy_mode_active,
                         ),
+                        window_size: window.size(),
                     }
                 })
                 .collect::<Vec<_>>();
-            (runtime_session_name, window.size(), pane_geometries)
+            (runtime_session_name, pane_geometries)
         };
         let terminal_pixels = self.attached_terminal_pixels.get(session_name).copied();
-        self.terminals.resize_session(
-            &runtime_session_name,
-            &pane_geometries,
-            window_size,
-            terminal_pixels,
-        )?;
+        self.terminals
+            .resize_session(&runtime_session_name, &pane_geometries, terminal_pixels)?;
         self.resize_transcripts(&runtime_session_name, &pane_geometries);
         Ok(())
     }
 
     pub(crate) fn resize_terminals(&mut self, session_name: &SessionName) -> Result<(), RmuxError> {
-        let session_size = self
-            .sessions
-            .session(session_name)
-            .ok_or_else(|| session_not_found(session_name))?
-            .window()
-            .size();
         let terminal_pixels = self.attached_terminal_pixels.get(session_name).copied();
         for (runtime_session_name, pane_geometries) in
             self.session_pane_terminal_geometries_by_runtime(session_name)?
@@ -353,7 +344,6 @@ impl HandlerState {
             self.terminals.resize_session(
                 &runtime_session_name,
                 &pane_geometries,
-                session_size,
                 terminal_pixels,
             )?;
             self.resize_transcripts(&runtime_session_name, &pane_geometries);

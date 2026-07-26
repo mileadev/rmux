@@ -98,14 +98,18 @@ pub(super) async fn register_sized_attach(
     handler: &RequestHandler,
     attach_pid: u32,
     session_name: &SessionName,
-    size: TerminalSize,
+    content_size: TerminalSize,
 ) -> mpsc::UnboundedReceiver<AttachControl> {
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     handler
         .register_attach(attach_pid, session_name.clone(), control_tx)
         .await;
+    let terminal_size = TerminalSize {
+        cols: content_size.cols,
+        rows: content_size.rows.saturating_add(1),
+    };
     handler
-        .handle_attached_resize(attach_pid, size)
+        .handle_attached_resize(attach_pid, terminal_size)
         .await
         .expect("attached resize succeeds");
     control_rx
@@ -134,13 +138,9 @@ pub(super) async fn assert_window_and_pty_size(
         cols: pty_size.cols,
         rows: pty_size.rows,
     };
-    let without_status = TerminalSize {
-        cols: expected.cols,
-        rows: expected.rows.saturating_sub(1),
-    };
-    assert!(
-        actual == expected || actual == without_status,
-        "PTY follows only its active linked window: expected {expected:?}, got {actual:?}"
+    assert_eq!(
+        actual, expected,
+        "PTY follows only its active linked window content size"
     );
 }
 

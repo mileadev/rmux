@@ -139,8 +139,9 @@ pub(crate) fn layout_for_session(
     let session = state.sessions.session(session_name)?;
     let window_index = session.active_window_index();
     let window = session.window_at(window_index)?;
-    let status_enabled = window.size().cols != 0
-        && window.size().rows != 0
+    let terminal_size = session.terminal_size();
+    let status_enabled = terminal_size.cols != 0
+        && terminal_size.rows != 0
         && !matches!(
             state
                 .options
@@ -152,7 +153,7 @@ pub(crate) fn layout_for_session(
             state
                 .options
                 .resolve(Some(session_name), OptionName::Status),
-            window.size().rows,
+            terminal_size.rows,
         );
         match state
             .options
@@ -160,7 +161,7 @@ pub(crate) fn layout_for_session(
         {
             Some("top") => (Some(0), status_lines),
             _ => (
-                Some(window.size().rows.saturating_sub(status_lines)),
+                Some(terminal_size.rows.saturating_sub(status_lines)),
                 status_lines,
             ),
         }
@@ -172,7 +173,10 @@ pub(crate) fn layout_for_session(
         window_index,
         OptionName::PaneBorderStatus,
     ));
-    let content_rows = window.size().rows.saturating_sub(status_lines);
+    let content_rows = window
+        .size()
+        .rows
+        .min(terminal_size.rows.saturating_sub(status_lines));
     let focus_follows_mouse = state
         .options
         .resolve(Some(session_name), OptionName::FocusFollowsMouse)

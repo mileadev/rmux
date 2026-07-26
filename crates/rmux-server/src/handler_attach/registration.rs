@@ -126,8 +126,6 @@ impl RequestHandler {
             terminal_context,
             flags,
         } = registration;
-        let registered_session = session_name.clone();
-        let tracks_geometry = !flags.contains(super::ClientFlags::IGNORESIZE);
         let attach_id = self
             .register_attach_identity(
                 requester_pid,
@@ -152,16 +150,6 @@ impl RequestHandler {
             .await
             .map(ActiveAttachIdentity::attach_id)
             .expect("test attach registration session must remain current");
-        if tracks_geometry {
-            let mut state = self.state.lock().await;
-            if let Some(session) = state.sessions.session_mut(&registered_session) {
-                let active_window_index = session.active_window_index();
-                session
-                    .window_at_mut(active_window_index)
-                    .expect("registered attach session retains its active window")
-                    .set_size_basis(rmux_core::WindowSizeBasis::Terminal);
-            }
-        }
         attach_id
     }
 

@@ -860,6 +860,8 @@ mod client_name_lifecycle;
 mod multi_client;
 #[path = "handler_attach_tests/resize_selection_race.rs"]
 mod resize_selection_race;
+#[path = "handler_attach_tests/window_geometry.rs"]
+mod window_geometry;
 
 #[path = "handler_attach_tests/server_lifecycle.rs"]
 mod server_lifecycle;

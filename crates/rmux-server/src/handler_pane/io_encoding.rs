@@ -1403,6 +1403,14 @@ mod mouse_geometry_tests {
             .sessions
             .create_session(session_name.clone(), TerminalSize { cols: 20, rows: 8 })
             .expect("session creation");
+        state
+            .sessions
+            .session_mut(&session_name)
+            .expect("created session")
+            .resize_active_window_geometry(
+                TerminalSize { cols: 20, rows: 8 },
+                TerminalSize { cols: 20, rows: 7 },
+            );
         let window = WindowTarget::with_window(session_name.clone(), 0);
         for (option, value) in [
             (OptionName::PaneScrollbars, "on"),

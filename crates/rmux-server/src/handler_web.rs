@@ -538,12 +538,7 @@ impl RequestHandler {
         let Some(pane) = panes.into_iter().find(|pane| pane.id() == pane_id) else {
             return Ok(None);
         };
-        let content_rows = crate::pane_terminals::session_content_rows(
-            session,
-            &state.options,
-            session.active_window_index(),
-        );
-        let Some(geometry) = session_content_geometry(pane.geometry(), content_rows) else {
+        let Some(geometry) = session_content_geometry(pane.geometry(), window.size()) else {
             return Ok(None);
         };
         let Some(scrollback) =
@@ -1314,8 +1309,6 @@ fn web_session_snapshot_from_state(
     let mut view = WebSessionView::new(window.size());
     let active_window = session.active_window_index();
     let active_pane = window.active_pane_index();
-    let content_rows =
-        crate::pane_terminals::session_content_rows(session, &state.options, active_window);
     for (index, window) in session.windows() {
         view.add_window(*index, window.name(), *index == active_window);
     }
@@ -1339,7 +1332,7 @@ fn web_session_snapshot_from_state(
             }
             screen.mode
         });
-        let Some(geometry) = session_content_geometry(pane.geometry(), content_rows) else {
+        let Some(geometry) = session_content_geometry(pane.geometry(), window.size()) else {
             continue;
         };
         let scrollback = match scrolls.get(&pane.id()).copied() {

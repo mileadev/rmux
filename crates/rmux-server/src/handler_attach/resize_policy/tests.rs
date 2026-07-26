@@ -9,7 +9,7 @@ fn terminal_candidate_keeps_its_raw_height_when_status_consumes_every_row() {
             size,
             stored_rows: size.rows,
             sequence: 1,
-            basis: WindowSizeBasis::Terminal,
+            basis: ClientSizeBasis::Terminal,
         }],
         &[],
         Some("3"),
@@ -18,8 +18,42 @@ fn terminal_candidate_keeps_its_raw_height_when_status_consumes_every_row() {
     assert_eq!(
         selected,
         Some(SelectedWindowSize {
-            stored_size: size,
-            basis: WindowSizeBasis::Terminal,
+            terminal_size: size,
+            content_size: TerminalSize { cols: 80, rows: 0 },
         })
+    );
+}
+
+#[test]
+fn resizing_an_inactive_window_does_not_replace_the_active_terminal_geometry() {
+    let mut session = Session::new(
+        SessionName::new("inactive-resize").expect("valid session name"),
+        TerminalSize { cols: 80, rows: 24 },
+    );
+    let (inactive_window, _) = session
+        .create_window(TerminalSize { cols: 90, rows: 30 })
+        .expect("inactive window is created");
+    let selected = SelectedWindowSize {
+        terminal_size: TerminalSize {
+            cols: 120,
+            rows: 40,
+        },
+        content_size: TerminalSize {
+            cols: 120,
+            rows: 39,
+        },
+    };
+
+    selected
+        .apply_to_window(&mut session, inactive_window)
+        .expect("inactive content resize succeeds");
+
+    assert_eq!(session.terminal_size(), TerminalSize { cols: 80, rows: 24 });
+    assert_eq!(
+        session
+            .window_at(inactive_window)
+            .expect("inactive window survives")
+            .size(),
+        selected.content_size
     );
 }

@@ -127,7 +127,10 @@ async fn choose_tree_switch_notifies_the_destination_session_layout_change_like_
 
     assert_eq!(
         window_size(&handler, &target).await,
-        switching_size,
+        TerminalSize {
+            cols: switching_size.cols,
+            rows: switching_size.rows - 1,
+        },
         "choose-tree's switch must grow the destination window"
     );
     let lines = notifications_through(&mut control_events, &layout_prefix).await;

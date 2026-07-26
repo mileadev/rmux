@@ -1,13 +1,11 @@
+use crate::pane_indices::visible_pane_index;
+use crate::pane_terminals::HandlerState;
+use crate::pane_visible_geometry::visible_pane_content_geometry;
 use rmux_core::formats::{
     DEFAULT_LIST_PANES_ALL_FORMAT, DEFAULT_LIST_PANES_SESSION_FORMAT,
     DEFAULT_LIST_PANES_WINDOW_FORMAT,
 };
 use rmux_core::{Pane, Session};
-use rmux_proto::OptionName;
-
-use crate::pane_indices::visible_pane_index;
-use crate::pane_terminals::HandlerState;
-use crate::pane_visible_geometry::visible_pane_content_geometry;
 
 #[derive(Clone, Copy)]
 pub(super) enum DefaultListPanesFormat {
@@ -110,23 +108,20 @@ fn list_panes_default_geometry(
         return geometry;
     }
 
-    let size = session.window().size();
+    let size = session
+        .window_at(window_index)
+        .unwrap_or_else(|| session.window())
+        .size();
     if size.cols == 0 || size.rows == 0 {
         return geometry;
     }
 
-    let content_rows = crate::status_lines::content_rows_for_status(
-        state
-            .options
-            .resolve(Some(session.name()), OptionName::Status),
-        size.rows,
-    );
     visible_pane_content_geometry(
         &state.options,
         session.name(),
         window_index,
         geometry,
-        content_rows,
+        size.rows,
     )
 }
 
@@ -138,9 +133,13 @@ mod tests {
     use rmux_proto::{OptionName, ScopeSelector, SessionName, SetOptionMode, TerminalSize};
 
     #[test]
-    fn attached_default_geometry_uses_multi_line_status_rows() {
+    fn attached_default_geometry_uses_stored_content_rows() {
         let alpha = SessionName::new("alpha").expect("valid session name");
         let mut session = Session::new(alpha.clone(), TerminalSize { cols: 80, rows: 24 });
+        session.resize_active_window_geometry(
+            TerminalSize { cols: 80, rows: 24 },
+            TerminalSize { cols: 80, rows: 22 },
+        );
         session.touch_attached();
         let pane = session.active_pane().expect("active pane");
         let mut state = HandlerState::default();

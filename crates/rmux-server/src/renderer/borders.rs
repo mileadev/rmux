@@ -29,7 +29,7 @@ pub(super) fn border_cells(
         active_pane_index,
         inactive_style,
         active_style,
-        StatusGeometry::without_status(window.size()),
+        StatusGeometry::without_status(window.size(), window.size()),
     )
 }
 

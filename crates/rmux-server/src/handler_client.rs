@@ -619,7 +619,7 @@ impl RequestHandler {
                         selection.apply_to_window(session, target.window_index())
                     },
                 ),
-                None => state.mutate_session_and_resize_active_window_terminal(
+                None => state.mutate_session_and_resize_active_window_geometry(
                     session_name,
                     |session| {
                         session.touch_attached();

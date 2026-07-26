@@ -487,7 +487,11 @@ impl Session {
         Ok(selected)
     }
 
-    /// Updates the backing terminal size and recalculates pane geometry for all windows.
+    /// Updates the terminal and content sizes together for all windows.
+    ///
+    /// This is the explicit/manual-size path. Attached clients should use
+    /// [`Session::resize_active_window_geometry`] so status rows never enter a
+    /// window layout.
     pub fn resize_terminal(&mut self, size: TerminalSize) {
         self.terminal_size = size;
         for window in self.windows.values_mut() {
@@ -495,14 +499,23 @@ impl Session {
         }
     }
 
-    /// Updates the backing terminal size and recalculates only the active window geometry.
+    /// Updates only the external terminal size used to render this session.
+    pub fn set_terminal_size(&mut self, size: TerminalSize) {
+        self.terminal_size = size;
+    }
+
+    /// Updates the external terminal and active-window content geometry.
     ///
     /// Attached clients drive the size of the window they are currently viewing. Inactive
     /// windows can have independent policies and may share a runtime with another session, so
     /// resizing every window here would leak the active window's size into unrelated runtimes.
-    pub fn resize_active_window_terminal(&mut self, size: TerminalSize) {
-        self.terminal_size = size;
-        self.window_mut().set_size(size);
+    pub fn resize_active_window_geometry(
+        &mut self,
+        terminal_size: TerminalSize,
+        content_size: TerminalSize,
+    ) {
+        self.terminal_size = terminal_size;
+        self.window_mut().set_size(content_size);
     }
 
     fn resolve_window_target_mut(&mut self, window_index: u32) -> Result<&mut Window, RmuxError> {

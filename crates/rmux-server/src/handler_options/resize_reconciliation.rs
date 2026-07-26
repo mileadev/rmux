@@ -20,7 +20,7 @@ pub(super) enum ResizePolicyReconcileScope {
 pub(super) fn named_option_requires_resize_policy_reconciliation(name: &str) -> bool {
     matches!(
         rmux_core::option_name_by_name(name),
-        Some(OptionName::WindowSize | OptionName::AggressiveResize)
+        Some(OptionName::WindowSize | OptionName::AggressiveResize | OptionName::Status)
     )
 }
 
@@ -193,6 +193,7 @@ mod tests {
             "window-siz",
             "aggressive-resize",
             "aggressive-r",
+            "status",
         ] {
             assert!(
                 named_option_requires_resize_policy_reconciliation(name),

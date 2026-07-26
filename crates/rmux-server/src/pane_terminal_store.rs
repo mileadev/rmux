@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::ExitStatus;
 
 use rmux_core::PaneId;
-use rmux_proto::{PaneTarget, RmuxError, SessionName, TerminalPixels, TerminalSize};
+use rmux_proto::{PaneTarget, RmuxError, SessionName, TerminalPixels};
 use rmux_pty::PtyMaster;
 #[cfg(unix)]
 use tracing::{debug, warn};
@@ -125,7 +125,6 @@ impl PaneTerminalStore {
         &mut self,
         session_name: &SessionName,
         pane_geometries: &[SessionPane],
-        session_size: TerminalSize,
         terminal_pixels: Option<TerminalPixels>,
     ) -> Result<(), RmuxError> {
         #[cfg(test)]
@@ -150,7 +149,7 @@ impl PaneTerminalStore {
             terminal
                 .resize(pty_geometry_from_layout(
                     pane.geometry,
-                    session_size,
+                    pane.window_size,
                     terminal_pixels,
                 ))
                 .map_err(|error| {

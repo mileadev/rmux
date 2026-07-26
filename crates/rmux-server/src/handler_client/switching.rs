@@ -179,10 +179,7 @@ impl SwitchTargetSelection {
                 }
                 Ok(())
             }
-        }?;
-        let selected_size = session.window().size();
-        session.resize_active_window_terminal(selected_size);
-        Ok(())
+        }
     }
 }
 
@@ -1443,6 +1440,13 @@ mod tests {
         SessionName::new(value).expect("valid session name")
     }
 
+    const fn content_size_for_default_status(terminal_size: TerminalSize) -> TerminalSize {
+        TerminalSize {
+            cols: terminal_size.cols,
+            rows: terminal_size.rows.saturating_sub(1),
+        }
+    }
+
     fn drain_control_events(
         events: &mut mpsc::Receiver<ControlServerEvent>,
     ) -> Vec<ControlServerEvent> {
@@ -1573,7 +1577,7 @@ mod tests {
         state
             .mutate_session_and_resize_window_terminal(session_name, window_index, |session| {
                 if session.active_window_index() == window_index {
-                    session.resize_active_window_terminal(size);
+                    session.resize_active_window_geometry(size, size);
                     Ok(())
                 } else {
                     session.resize_window(window_index, size)
@@ -2285,7 +2289,7 @@ mod tests {
                     .window_at(beta_window)
                     .expect("selected target survives")
                     .size(),
-                TARGET_CLIENT_SIZE,
+                content_size_for_default_status(TARGET_CLIENT_SIZE),
                 "the target's smallest policy must choose the existing target client over the larger incoming client"
             );
             assert_eq!(
@@ -2300,11 +2304,10 @@ mod tests {
             "the old active PTY must remain untouched"
         );
         let target_pty_size = test_pane_terminal_size(&handler, &beta, beta_window).await;
-        assert_eq!(target_pty_size.cols, TARGET_CLIENT_SIZE.cols);
-        assert!(
-            target_pty_size.rows == TARGET_CLIENT_SIZE.rows
-                || target_pty_size.rows == TARGET_CLIENT_SIZE.rows.saturating_sub(1),
-            "the selected target PTY follows its reconciled geometry: {target_pty_size:?}"
+        assert_eq!(
+            target_pty_size,
+            content_size_for_default_status(TARGET_CLIENT_SIZE),
+            "the selected target PTY follows its reconciled content geometry"
         );
     }
 

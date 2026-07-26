@@ -199,6 +199,7 @@ impl HandlerState {
                         alternate_on,
                         copy_mode_active,
                     ),
+                    window_size: window.size(),
                 }
             }));
         }

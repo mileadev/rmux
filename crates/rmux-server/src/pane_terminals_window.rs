@@ -1,4 +1,4 @@
-use rmux_core::{OptionStore, Session, WindowSizeBasis};
+use rmux_core::{OptionStore, Session};
 use rmux_proto::{
     KillWindowResponse, LastWindowResponse, NewWindowResponse, NextWindowResponse, OptionName,
     PaneId, PreviousWindowResponse, RenameWindowResponse, RmuxError, ScopeSelector,
@@ -425,63 +425,71 @@ impl HandlerState {
         let session_name = request.target.session_name().clone();
         let window_index = request.target.window_index();
 
-        self.mutate_session_and_resize_window_terminal(&session_name, window_index, |session| {
-            let current_size = session
-                .window_at(window_index)
-                .ok_or_else(|| {
-                    RmuxError::invalid_target(
-                        format!("{session_name}:{window_index}"),
-                        "window index does not exist in session",
-                    )
-                })?
-                .size();
+        let response = self.mutate_session_and_resize_window_terminal(
+            &session_name,
+            window_index,
+            |session| {
+                let current_size = session
+                    .window_at(window_index)
+                    .ok_or_else(|| {
+                        RmuxError::invalid_target(
+                            format!("{session_name}:{window_index}"),
+                            "window index does not exist in session",
+                        )
+                    })?
+                    .size();
 
-            let mut sx = current_size.cols;
-            let mut sy = current_size.rows;
+                let mut sx = current_size.cols;
+                let mut sy = current_size.rows;
 
-            if let Some(width) = request.width {
-                sx = width;
-            }
-            if let Some(height) = request.height {
-                sy = height;
-            }
-
-            if let Some(adjustment) = request.adjustment {
-                use rmux_proto::ResizeWindowAdjustment;
-                match adjustment {
-                    ResizeWindowAdjustment::Left(amount) => {
-                        sx = sx.saturating_sub(amount);
-                    }
-                    ResizeWindowAdjustment::Right(amount) => {
-                        sx = sx.saturating_add(amount);
-                    }
-                    ResizeWindowAdjustment::Up(amount) => {
-                        sy = sy.saturating_sub(amount);
-                    }
-                    ResizeWindowAdjustment::Down(amount) => {
-                        sy = sy.saturating_add(amount);
-                    }
-                    ResizeWindowAdjustment::LargestLinkedSession
-                    | ResizeWindowAdjustment::SmallestLinkedSession => {}
+                if let Some(width) = request.width {
+                    sx = width;
                 }
-            }
+                if let Some(height) = request.height {
+                    sy = height;
+                }
 
-            sx = sx.max(1);
-            sy = sy.max(1);
+                if let Some(adjustment) = request.adjustment {
+                    use rmux_proto::ResizeWindowAdjustment;
+                    match adjustment {
+                        ResizeWindowAdjustment::Left(amount) => {
+                            sx = sx.saturating_sub(amount);
+                        }
+                        ResizeWindowAdjustment::Right(amount) => {
+                            sx = sx.saturating_add(amount);
+                        }
+                        ResizeWindowAdjustment::Up(amount) => {
+                            sy = sy.saturating_sub(amount);
+                        }
+                        ResizeWindowAdjustment::Down(amount) => {
+                            sy = sy.saturating_add(amount);
+                        }
+                        ResizeWindowAdjustment::LargestLinkedSession
+                        | ResizeWindowAdjustment::SmallestLinkedSession => {}
+                    }
+                }
 
-            session.resize_window(
-                window_index,
-                rmux_proto::TerminalSize { cols: sx, rows: sy },
-            )?;
-            session
-                .window_at_mut(window_index)
-                .expect("resized window remains present")
-                .set_size_basis(WindowSizeBasis::Content);
+                sx = sx.max(1);
+                sy = sy.max(1);
 
-            Ok(rmux_proto::ResizeWindowResponse {
-                target: request.target.clone(),
-            })
-        })
+                session.resize_window(
+                    window_index,
+                    rmux_proto::TerminalSize { cols: sx, rows: sy },
+                )?;
+
+                Ok(rmux_proto::ResizeWindowResponse {
+                    target: request.target.clone(),
+                })
+            },
+        )?;
+        self.options.set(
+            ScopeSelector::Window(request.target.clone()),
+            OptionName::WindowSize,
+            "manual".to_owned(),
+            SetOptionMode::Replace,
+        )?;
+        self.synchronize_linked_window_options_from_slot(&session_name, window_index);
+        Ok(response)
     }
 
     pub(crate) fn respawn_window(

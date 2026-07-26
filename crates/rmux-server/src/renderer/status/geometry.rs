@@ -20,6 +20,7 @@ impl StatusOverlayRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StatusGeometry {
     pub(in crate::renderer) terminal_size: TerminalSize,
+    content_cols: u16,
     pub(in crate::renderer) content_rows: u16,
     pub(in crate::renderer) content_y_offset: u16,
     pub(in crate::renderer) status_y: Option<u16>,
@@ -28,35 +29,53 @@ pub(crate) struct StatusGeometry {
 
 impl StatusGeometry {
     pub(crate) fn for_session(session: &Session, options: &OptionStore) -> Self {
-        let size = session.window().size();
+        let terminal_size = session.terminal_size();
+        let layout_size = session.window().size();
         let status = options.resolve(Some(session.name()), OptionName::Status);
-        if size.cols == 0 || size.rows == 0 || matches!(status, Some("off")) {
-            return Self::without_status(size);
+        if terminal_size.cols == 0 || terminal_size.rows == 0 || matches!(status, Some("off")) {
+            return Self::without_status(terminal_size, layout_size);
         }
-        let status_lines = status_line_count(status, size.rows);
+        let status_lines = status_line_count(status, terminal_size.rows);
+        let available_content_rows = terminal_size.rows.saturating_sub(status_lines);
+        let content_cols = layout_size.cols.min(terminal_size.cols);
+        let content_rows = layout_size.rows.min(available_content_rows);
 
         match options.resolve(Some(session.name()), OptionName::StatusPosition) {
             Some("top") => Self {
-                terminal_size: size,
-                content_rows: size.rows.saturating_sub(status_lines),
+                terminal_size,
+                content_cols,
+                content_rows,
                 content_y_offset: status_lines,
                 status_y: Some(0),
                 status_lines,
             },
             _ => Self {
-                terminal_size: size,
-                content_rows: size.rows.saturating_sub(status_lines),
+                terminal_size,
+                content_cols,
+                content_rows,
                 content_y_offset: 0,
-                status_y: Some(size.rows.saturating_sub(status_lines)),
+                status_y: Some(terminal_size.rows.saturating_sub(status_lines)),
                 status_lines,
             },
         }
     }
 
-    pub(in crate::renderer) const fn without_status(size: TerminalSize) -> Self {
+    pub(in crate::renderer) const fn without_status(
+        terminal_size: TerminalSize,
+        layout_size: TerminalSize,
+    ) -> Self {
         Self {
-            terminal_size: size,
-            content_rows: size.rows,
+            terminal_size,
+            content_cols: if layout_size.cols < terminal_size.cols {
+                layout_size.cols
+            } else {
+                terminal_size.cols
+            },
+            content_rows: if layout_size.rows < terminal_size.rows {
+                layout_size.rows
+            } else {
+                terminal_size.rows
+            },
             content_y_offset: 0,
             status_y: None,
             status_lines: 0,
@@ -65,7 +84,7 @@ impl StatusGeometry {
 
     pub(in crate::renderer) const fn content_size(self) -> TerminalSize {
         TerminalSize {
-            cols: self.terminal_size.cols,
+            cols: self.content_cols,
             rows: self.content_rows,
         }
     }

@@ -5,7 +5,7 @@ use rmux_core::{
         is_truthy, render_list_panes_line, FormatContext, DEFAULT_DISPLAY_MESSAGE_FORMAT,
         DEFAULT_LIST_PANES_SESSION_FORMAT, DEFAULT_LIST_PANES_WINDOW_FORMAT,
     },
-    PaneId, WindowSizeBasis,
+    PaneId,
 };
 use rmux_proto::{
     CommandOutput, DisplayMessageResponse, ErrorResponse, ListPanesResponse, Response, RmuxError,
@@ -1035,13 +1035,7 @@ fn collect_list_pane_output_with_selection(
     } else {
         DEFAULT_LIST_PANES_SESSION_FORMAT
     }));
-    let fast_format = if attached_count == 0
-        && !structured
-        && session
-            .windows()
-            .values()
-            .all(|window| window.size_basis() == WindowSizeBasis::Content)
-    {
+    let fast_format = if attached_count == 0 && !structured {
         format.and_then(DefaultListPanesFormat::from_format)
     } else {
         None

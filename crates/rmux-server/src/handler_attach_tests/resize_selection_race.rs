@@ -13,6 +13,13 @@ const LARGE_SIZE: TerminalSize = TerminalSize {
 };
 const SMALL_SIZE: TerminalSize = TerminalSize { cols: 72, rows: 19 };
 
+const fn attached_content_size(terminal_size: TerminalSize) -> TerminalSize {
+    TerminalSize {
+        cols: terminal_size.cols,
+        rows: terminal_size.rows.saturating_sub(1),
+    }
+}
+
 #[tokio::test]
 async fn live_resize_aborts_if_the_attach_switches_after_geometry_capture() {
     let handler = RequestHandler::new();
@@ -236,14 +243,10 @@ async fn attached_size_selection_retries_after_the_captured_window_is_killed() {
             .expect("session survives window kill");
         assert_eq!(session.active_window_index(), 0);
         assert!(session.window_at(1).is_none());
-        assert_eq!(session.window().size(), LARGE_SIZE);
+        assert_eq!(session.window().size(), attached_content_size(LARGE_SIZE));
     }
     let pty_size = pane_terminal_size(&handler, &session_name, 0, 0).await;
-    assert_eq!(pty_size.cols, LARGE_SIZE.cols);
-    assert!(
-        pty_size.rows == LARGE_SIZE.rows || pty_size.rows == LARGE_SIZE.rows.saturating_sub(1),
-        "surviving PTY follows the retried active-window resize: {pty_size:?}"
-    );
+    assert_eq!(pty_size, attached_content_size(LARGE_SIZE));
 }
 
 #[tokio::test]
@@ -276,7 +279,10 @@ async fn attached_size_selection_retries_after_the_candidate_epoch_changes() {
         pause.release.notify_one();
     };
     let (reconciled, ()) = tokio::join!(reconcile, replace_candidate);
-    assert_eq!(reconciled.expect("reconciliation succeeds"), None);
+    assert_eq!(
+        reconciled.expect("reconciliation succeeds"),
+        Some(WindowTarget::with_window(session_name.clone(), 0))
+    );
 
     let state = handler.state.lock().await;
     assert_eq!(
@@ -286,7 +292,7 @@ async fn attached_size_selection_retries_after_the_candidate_epoch_changes() {
             .expect("session survives")
             .window()
             .size(),
-        LARGE_SIZE,
+        attached_content_size(LARGE_SIZE),
         "a stale selection must not overwrite the latest attached candidate"
     );
 }
@@ -416,7 +422,7 @@ async fn attached_candidate_cannot_change_between_final_validation_and_apply() {
             .expect("session survives")
             .window()
             .size(),
-        LARGE_SIZE,
+        attached_content_size(LARGE_SIZE),
         "the serialized follow-on candidate is applied after the first reconciliation"
     );
 }

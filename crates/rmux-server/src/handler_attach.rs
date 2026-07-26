@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use rmux_core::{LifecycleEvent, WindowSizeBasis};
+use rmux_core::LifecycleEvent;
 use rmux_proto::{
     AttachShellCommand, AttachedKeystroke, KeyDispatched, OptionName, PaneTarget, SessionId,
     SessionName, TerminalSize,
@@ -1240,16 +1240,20 @@ pub(super) struct AttachSessionSwitchRenderOptions<'a> {
 #[derive(Clone, Copy)]
 pub(super) struct AttachWindowSizeOverride {
     window_index: u32,
-    size: TerminalSize,
-    basis: WindowSizeBasis,
+    terminal_size: TerminalSize,
+    content_size: TerminalSize,
 }
 
 impl AttachWindowSizeOverride {
-    const fn new(window_index: u32, size: TerminalSize, basis: WindowSizeBasis) -> Self {
+    const fn new(
+        window_index: u32,
+        terminal_size: TerminalSize,
+        content_size: TerminalSize,
+    ) -> Self {
         Self {
             window_index,
-            size,
-            basis,
+            terminal_size,
+            content_size,
         }
     }
 }
@@ -1721,11 +1725,11 @@ pub(super) fn sized_session(
     let Some(size) = size.filter(|size| size.cols > 0 && size.rows > 0) else {
         return Cow::Borrowed(session);
     };
-    if size == session.window().size() {
+    if size == session.terminal_size() {
         return Cow::Borrowed(session);
     }
     let mut resized = session.clone();
-    resized.resize_terminal(size);
+    resized.set_terminal_size(size);
     Cow::Owned(resized)
 }
 
@@ -1740,12 +1744,10 @@ fn attach_render_session<'a>(
     if let Some(size_override) = window_size_override {
         rendered
             .to_mut()
-            .resize_window(size_override.window_index, size_override.size)?;
+            .set_terminal_size(size_override.terminal_size);
         rendered
             .to_mut()
-            .window_at_mut(size_override.window_index)
-            .expect("resized render window remains present")
-            .set_size_basis(size_override.basis);
+            .resize_window(size_override.window_index, size_override.content_size)?;
     }
     if let Some(selection) = selection {
         if selection.session_name() != session.name() {
@@ -1762,13 +1764,6 @@ fn attach_render_session<'a>(
                 .to_mut()
                 .select_window(window_index)
                 .expect("selected web render window was validated above");
-        }
-    }
-
-    if let Some(size_override) = window_size_override {
-        if rendered.active_window_index() == size_override.window_index {
-            let active_size = rendered.window().size();
-            rendered.to_mut().resize_active_window_terminal(active_size);
         }
     }
 

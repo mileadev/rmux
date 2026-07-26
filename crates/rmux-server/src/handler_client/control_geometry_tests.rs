@@ -26,6 +26,13 @@ const CONTROL_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_NOTIFICATION_SETTLE: Duration = Duration::from_millis(250);
 const CONTROL_NOTIFICATION_POLL: Duration = Duration::from_millis(25);
 
+const fn attached_content_size(terminal_size: TerminalSize) -> TerminalSize {
+    TerminalSize {
+        cols: terminal_size.cols,
+        rows: terminal_size.rows.saturating_sub(1),
+    }
+}
+
 #[tokio::test]
 async fn refresh_client_control_size_echoes_each_window_once_like_tmux37() {
     // Frozen tmux 3.7b oracle, measured 2026-07-26 with two windows and one
@@ -128,7 +135,7 @@ async fn refresh_client_control_size_respects_window_size_policy_like_tmux37() {
     for (index, (policy, expected_size)) in [
         ("latest", CONTROL_SIZE),
         ("largest", CONTROL_SIZE),
-        ("smallest", SOURCE_ATTACHED_SIZE),
+        ("smallest", attached_content_size(SOURCE_ATTACHED_SIZE)),
         ("manual", INITIAL_SIZE),
     ]
     .into_iter()
@@ -261,7 +268,7 @@ async fn switch_control_client_reapplies_reported_size_like_tmux37() {
     for (index, (policy, expected_size)) in [
         ("latest", CONTROL_SIZE),
         ("largest", CONTROL_SIZE),
-        ("smallest", TARGET_ATTACHED_SIZE),
+        ("smallest", attached_content_size(TARGET_ATTACHED_SIZE)),
         ("manual", TARGET_SIZE),
     ]
     .into_iter()
@@ -443,7 +450,7 @@ async fn undeclared_control_client_never_shrinks_an_attached_session_like_tmux37
         let expected_size = if policy == "manual" {
             INITIAL_SIZE
         } else {
-            CONTROL_SIZE
+            attached_content_size(CONTROL_SIZE)
         };
         assert_eq!(
             session_size(&handler, &session).await,
@@ -526,7 +533,7 @@ async fn undeclared_control_client_switch_never_resizes_the_target_like_tmux37()
         let expected_size = if policy == "manual" {
             INITIAL_SIZE
         } else {
-            CONTROL_SIZE
+            attached_content_size(CONTROL_SIZE)
         };
 
         let response = handler
@@ -748,7 +755,10 @@ async fn switching_attached_client_notifies_the_source_session_layout_change_lik
         matches!(response, Response::RefreshClient(_)),
         "{response:?}"
     );
-    assert_eq!(session_size(&handler, &source).await, switching_size);
+    assert_eq!(
+        session_size(&handler, &source).await,
+        attached_content_size(switching_size)
+    );
     let source_window_id = active_window_id(&handler, &source).await;
     let source_layout_prefix = format!("%layout-change @{source_window_id} ");
     settle_control_notifications(&mut surviving_events).await;
@@ -845,7 +855,7 @@ async fn assert_switch_notifies_the_destination_layout_change(
     );
     assert_eq!(
         session_size(handler, target).await,
-        switching_size,
+        attached_content_size(switching_size),
         "the destination window must grow to the arriving client's geometry"
     );
 
@@ -986,7 +996,7 @@ async fn attaching_client_notifies_the_destination_session_layout_change_like_tm
     );
     assert_eq!(
         session_size(&handler, &target).await,
-        arriving_size,
+        attached_content_size(arriving_size),
         "the attached window must grow to the arriving client's geometry"
     );
 
@@ -1055,7 +1065,10 @@ async fn attached_client_departure_notifies_the_surviving_control_layout_change_
         matches!(response, Response::RefreshClient(_)),
         "{response:?}"
     );
-    assert_eq!(session_size(&handler, &session).await, departing_size);
+    assert_eq!(
+        session_size(&handler, &session).await,
+        attached_content_size(departing_size)
+    );
     let layout_prefix = format!(
         "%layout-change @{} ",
         active_window_id(&handler, &session).await
@@ -1123,7 +1136,10 @@ async fn detach_client_notifies_the_surviving_control_layout_change_like_tmux37(
         matches!(response, Response::RefreshClient(_)),
         "{response:?}"
     );
-    assert_eq!(session_size(&handler, &session).await, detaching_size);
+    assert_eq!(
+        session_size(&handler, &session).await,
+        attached_content_size(detaching_size)
+    );
     let layout_prefix = format!(
         "%layout-change @{} ",
         active_window_id(&handler, &session).await
@@ -1334,7 +1350,7 @@ async fn destroyed_session_rehome_notifies_the_attached_destination_layout_chang
     assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
     assert_eq!(
         session_size(&handler, &keep).await,
-        rehomed_size,
+        attached_content_size(rehomed_size),
         "the rehome destination must grow to the arriving client's geometry"
     );
 
@@ -1366,7 +1382,12 @@ async fn attached_arrival_and_departure_keep_control_geometry_in_every_automatic
     // window-size candidate while an ordinary attach arrives and after it
     // departs. Latest follows arrival order; largest/smallest aggregate both.
     for (index, (policy, control_size, attach_size, attached_size)) in [
-        ("latest", CONTROL_SIZE, TARGET_SIZE, TARGET_SIZE),
+        (
+            "latest",
+            CONTROL_SIZE,
+            TARGET_SIZE,
+            attached_content_size(TARGET_SIZE),
+        ),
         ("largest", CONTROL_SIZE, TARGET_SIZE, CONTROL_SIZE),
         ("smallest", TARGET_SIZE, CONTROL_SIZE, TARGET_SIZE),
     ]
@@ -1482,8 +1503,8 @@ async fn window_size_option_reconciliation_includes_control_candidates() {
 
     for (policy, expected_size) in [
         ("largest", CONTROL_SIZE),
-        ("smallest", TARGET_SIZE),
-        ("latest", TARGET_SIZE),
+        ("smallest", attached_content_size(TARGET_SIZE)),
+        ("latest", attached_content_size(TARGET_SIZE)),
     ] {
         set_window_size_policy(&handler, &session, policy).await;
         assert_eq!(
