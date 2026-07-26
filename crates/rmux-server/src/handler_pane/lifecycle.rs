@@ -387,7 +387,7 @@ impl RequestHandler {
                                     self.prune_web_panes(&result.removed_pane_ids);
                                     let window_destroyed = result.response.window_destroyed;
                                     let lifecycle_events = if window_destroyed {
-                                        lifecycle_batch.prepare_natural_exit_committed(
+                                        lifecycle_batch.prepare_window_destroyed_committed(
                                             &mut state,
                                             &result.destroyed_sessions,
                                             &selection_before,

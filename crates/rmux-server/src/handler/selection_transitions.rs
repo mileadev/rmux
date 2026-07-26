@@ -251,15 +251,11 @@ impl SelectionTransitionSnapshot {
             .collect()
     }
 
-    pub(in crate::handler) fn prepare_kill_pane_changes(
+    pub(in crate::handler) fn prepare_surviving_kill_pane_changes(
         &self,
         state: &mut HandlerState,
         layout_target: WindowTarget,
-        window_destroyed: bool,
     ) -> Vec<QueuedLifecycleEvent> {
-        if window_destroyed {
-            return Vec::new();
-        }
         let mut events = vec![prepare_lifecycle_event(
             state,
             &LifecycleEvent::WindowLayoutChanged {

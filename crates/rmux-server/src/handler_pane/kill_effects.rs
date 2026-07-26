@@ -288,7 +288,31 @@ impl KillPaneLifecycleBatch {
         self.prepare_committed_inner(state, destroyed_sessions, None)
     }
 
-    pub(super) fn prepare_natural_exit_committed(
+    pub(super) fn prepare_explicit_committed(
+        self,
+        state: &mut HandlerState,
+        destroyed_sessions: &[(SessionName, u32)],
+        selection_before: &SelectionTransitionSnapshot,
+        layout_target: WindowTarget,
+        window_destroyed: bool,
+    ) -> (Vec<QueuedLifecycleEvent>, Vec<QueuedLifecycleEvent>) {
+        if window_destroyed {
+            return (
+                self.prepare_window_destroyed_committed(
+                    state,
+                    destroyed_sessions,
+                    selection_before,
+                ),
+                Vec::new(),
+            );
+        }
+        (
+            self.prepare_committed(state, destroyed_sessions),
+            selection_before.prepare_surviving_kill_pane_changes(state, layout_target),
+        )
+    }
+
+    pub(super) fn prepare_window_destroyed_committed(
         self,
         state: &mut HandlerState,
         destroyed_sessions: &[(SessionName, u32)],
@@ -327,7 +351,7 @@ impl KillPaneLifecycleBatch {
             Vec::new()
         } else {
             let first = self.deferred_windows.remove(0);
-            prepare_natural_exit_selection(
+            prepare_window_removal_selection(
                 state,
                 selection_before,
                 &mut selection_notified,
@@ -357,7 +381,7 @@ impl KillPaneLifecycleBatch {
             let _ = state.hooks.remove_session(&session_name);
         }
         for window in remaining_windows {
-            prepare_natural_exit_selection(
+            prepare_window_removal_selection(
                 state,
                 selection_before,
                 &mut selection_notified,
@@ -374,7 +398,7 @@ impl KillPaneLifecycleBatch {
     }
 }
 
-fn prepare_natural_exit_selection(
+fn prepare_window_removal_selection(
     state: &mut HandlerState,
     selection_before: Option<&SelectionTransitionSnapshot>,
     selection_notified: &mut HashSet<SessionName>,

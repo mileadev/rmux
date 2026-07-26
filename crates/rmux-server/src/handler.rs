@@ -1520,6 +1520,10 @@ mod control_notification_tests;
 mod selection_control_notification_tests;
 
 #[cfg(test)]
+#[path = "handler_explicit_kill_selection_tests.rs"]
+mod explicit_kill_selection_tests;
+
+#[cfg(test)]
 #[path = "handler_switch_selection_notification_tests.rs"]
 mod switch_selection_notification_tests;
 
