@@ -33,6 +33,25 @@ fn make_executable(path: &Path) {
 
 fn install_tools(root: &Path) {
     fs::create_dir_all(root).expect("create tool directory");
+    let find = root.join("find");
+    fs::write(
+        &find,
+        r#"#!/bin/sh
+set -eu
+if test -n "${RMUX_TEST_FAIL_FIND_ROOT:-}"; then
+  for argument in "$@"; do
+    if test "$argument" = "$RMUX_TEST_FAIL_FIND_ROOT"; then
+      printf 'injected find failure for %s\n' "$argument" >&2
+      exit 70
+    fi
+  done
+fi
+exec /usr/bin/find "$@"
+"#,
+    )
+    .expect("write find fixture");
+    make_executable(&find);
+
     let dpkg_deb = root.join("dpkg-deb");
     fs::write(
         &dpkg_deb,
@@ -97,6 +116,18 @@ fn generate(
     previous: Option<&Path>,
     signed: bool,
 ) -> Output {
+    generator_command(input, output, tools, previous, signed)
+        .output()
+        .expect("run APT generator")
+}
+
+fn generator_command(
+    input: &Path,
+    output: &Path,
+    tools: &Path,
+    previous: Option<&Path>,
+    signed: bool,
+) -> Command {
     let path = std::env::join_paths([tools, Path::new("/usr/bin"), Path::new("/bin")])
         .expect("compose pinned PATH");
     let mut command = Command::new(repo_root().join("scripts/generate-apt-repository.sh"));
@@ -118,50 +149,85 @@ fn generate(
     command
         .env("PATH", path)
         .env_remove("RMUX_APT_GPG_KEY")
-        .current_dir(repo_root())
-        .output()
-        .expect("run APT generator")
+        .current_dir(repo_root());
+    command
 }
 
 #[derive(Debug, Eq, PartialEq)]
 enum TreeEntry {
-    Directory(u32),
-    File(u32, Vec<u8>),
-    Symlink(PathBuf),
+    Directory {
+        mode: u32,
+        size: u64,
+    },
+    File {
+        mode: u32,
+        size: u64,
+        sha256: String,
+        bytes: Vec<u8>,
+    },
+    Symlink {
+        mode: u32,
+        size: u64,
+        target: PathBuf,
+    },
 }
 
 fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, TreeEntry> {
-    fn visit(root: &Path, directory: &Path, snapshot: &mut BTreeMap<PathBuf, TreeEntry>) {
-        let mut entries: Vec<_> = fs::read_dir(directory)
-            .expect("read snapshot directory")
-            .map(|entry| entry.expect("read snapshot entry").path())
-            .collect();
-        entries.sort();
-        for path in entries {
-            let metadata = fs::symlink_metadata(&path).expect("read snapshot metadata");
-            let relative = path
-                .strip_prefix(root)
-                .expect("snapshot path is below root")
-                .to_path_buf();
-            if metadata.file_type().is_symlink() {
-                snapshot.insert(
-                    relative,
-                    TreeEntry::Symlink(fs::read_link(&path).expect("read snapshot symlink")),
-                );
-            } else if metadata.is_dir() {
-                snapshot.insert(
-                    relative,
-                    TreeEntry::Directory(metadata.permissions().mode()),
-                );
-                visit(root, &path, snapshot);
-            } else {
-                snapshot.insert(
-                    relative,
-                    TreeEntry::File(
-                        metadata.permissions().mode(),
-                        fs::read(&path).expect("read snapshot file"),
-                    ),
-                );
+    fn sha256(path: &Path) -> String {
+        let output = Command::new("/usr/bin/sha256sum")
+            .arg("--")
+            .arg(path)
+            .output()
+            .expect("run pinned sha256sum");
+        assert!(output.status.success(), "sha256sum failed for {path:?}");
+        String::from_utf8(output.stdout)
+            .expect("sha256sum output is UTF-8")
+            .split_whitespace()
+            .next()
+            .expect("sha256sum emitted a digest")
+            .to_owned()
+    }
+
+    fn visit(root: &Path, path: &Path, snapshot: &mut BTreeMap<PathBuf, TreeEntry>) {
+        let metadata = fs::symlink_metadata(path).expect("read snapshot metadata");
+        let relative = path
+            .strip_prefix(root)
+            .expect("snapshot path is below root");
+        let relative = if relative.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            relative.to_path_buf()
+        };
+        let entry = if metadata.file_type().is_symlink() {
+            TreeEntry::Symlink {
+                mode: metadata.permissions().mode(),
+                size: metadata.len(),
+                target: fs::read_link(path).expect("read snapshot symlink"),
+            }
+        } else if metadata.is_dir() {
+            TreeEntry::Directory {
+                mode: metadata.permissions().mode(),
+                size: metadata.len(),
+            }
+        } else {
+            let bytes = fs::read(path).expect("read snapshot file");
+            TreeEntry::File {
+                mode: metadata.permissions().mode(),
+                size: metadata.len(),
+                sha256: sha256(path),
+                bytes,
+            }
+        };
+        snapshot.insert(relative, entry);
+
+        if metadata.is_dir() {
+            let mut entries: Vec<_> = fs::read_dir(path)
+                .expect("read snapshot directory")
+                .map(|entry| entry.expect("read snapshot entry").path())
+                .collect();
+            entries.sort();
+            for child in entries {
+                visit(root, &child, snapshot);
             }
         }
     }
@@ -173,6 +239,115 @@ fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, TreeEntry> {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn refuses_unreadable_output_inventory_without_mutating_tree_bytes() {
+    let root = fixture_root("unreadable-inventory");
+    let input = root.join("input");
+    let output = root.join("output");
+    let tools = root.join("tools");
+    install_tools(&tools);
+    write_packages(&input, "first");
+    let created = generate(&input, &output, &tools, None, false);
+    assert!(created.status.success(), "{}", stderr(&created));
+    write_packages(&input, "replacement");
+    let before = snapshot_tree(&output);
+
+    let mut permissions = fs::metadata(&output)
+        .expect("read output permissions")
+        .permissions();
+    let original_mode = permissions.mode() & 0o777;
+    permissions.set_mode(0o333);
+    fs::set_permissions(&output, permissions).expect("make output unreadable but writable");
+    let rejected = generate(&input, &output, &tools, None, false);
+    let mode_after = fs::symlink_metadata(&output)
+        .expect("read output mode after refusal")
+        .permissions()
+        .mode()
+        & 0o777;
+    let mut permissions = fs::metadata(&output)
+        .expect("read unreadable output permissions")
+        .permissions();
+    permissions.set_mode(original_mode);
+    fs::set_permissions(&output, permissions).expect("restore output traversal");
+    let after = snapshot_tree(&output);
+    fs::remove_dir_all(&root).expect("remove unreadable-inventory fixture");
+
+    assert!(!rejected.status.success(), "unreadable output was replaced");
+    assert!(
+        stderr(&rejected).contains("cannot enumerate"),
+        "{}",
+        stderr(&rejected)
+    );
+    assert_eq!(mode_after, 0o333, "refusal changed output root mode");
+    assert_eq!(after, before, "refusal changed output tree identity");
+}
+
+#[test]
+fn refuses_injected_find_failure_without_mutating_tree_bytes() {
+    let root = fixture_root("find-failure");
+    let input = root.join("input");
+    let output = root.join("output");
+    let tools = root.join("tools");
+    install_tools(&tools);
+    write_packages(&input, "first");
+    let created = generate(&input, &output, &tools, None, false);
+    assert!(created.status.success(), "{}", stderr(&created));
+    write_packages(&input, "replacement");
+    let before = snapshot_tree(&output);
+
+    let rejected = generator_command(&input, &output, &tools, None, false)
+        .env("RMUX_TEST_FAIL_FIND_ROOT", &output)
+        .output()
+        .expect("run APT generator with failing find");
+    let after = snapshot_tree(&output);
+    fs::remove_dir_all(&root).expect("remove find-failure fixture");
+
+    assert!(!rejected.status.success(), "find failure was ignored");
+    assert!(
+        stderr(&rejected).contains("cannot enumerate"),
+        "{}",
+        stderr(&rejected)
+    );
+    assert_eq!(after, before, "find failure changed output tree identity");
+}
+
+#[test]
+fn refuses_nested_output_symlink_without_mutating_tree_bytes() {
+    let root = fixture_root("nested-symlink");
+    let input = root.join("input");
+    let output = root.join("output");
+    let tools = root.join("tools");
+    install_tools(&tools);
+    write_packages(&input, "first");
+    let created = generate(&input, &output, &tools, None, false);
+    assert!(created.status.success(), "{}", stderr(&created));
+    let outside = root.join("outside-sentinel");
+    fs::write(&outside, b"must remain outside the repository\n").expect("write outside sentinel");
+    symlink(
+        &outside,
+        output.join("dists/stable/main/binary-amd64/nested-link"),
+    )
+    .expect("create nested output symlink");
+    let before = snapshot_tree(&output);
+    let outside_before = fs::read(&outside).expect("read outside sentinel");
+
+    let rejected = generate(&input, &output, &tools, None, false);
+    let after = snapshot_tree(&output);
+    let outside_after = fs::read(&outside).expect("reread outside sentinel");
+    fs::remove_dir_all(&root).expect("remove nested-symlink fixture");
+
+    assert!(!rejected.status.success(), "nested symlink was accepted");
+    assert!(stderr(&rejected).contains("symbolic links"));
+    assert_eq!(
+        after, before,
+        "symlink refusal changed output tree identity"
+    );
+    assert_eq!(
+        outside_after, outside_before,
+        "symlink refusal changed target bytes"
+    );
 }
 
 #[test]

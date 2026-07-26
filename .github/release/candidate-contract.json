@@ -398,6 +398,7 @@
     "flake.lock",
     "flake.nix",
     "rust-toolchain.toml",
+    "scripts/apt-repository-inventory.sh",
     "scripts/assert-cargo-filter-nonempty.ps1",
     "scripts/assert-cargo-filter-nonempty.sh",
     "scripts/assert-windows-static-crt.ps1",

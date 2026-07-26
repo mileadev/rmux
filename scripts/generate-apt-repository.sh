@@ -188,31 +188,16 @@ process_previous_by_hash() {
     done
   done
 }
-resolve_without_symlinks() {
-  local path label logical physical
-  path="$1"
-  label="$2"
-  logical="$(realpath -ms -- "$path")" ||
-    die "cannot resolve $label: $path"
-  physical="$(realpath -m -- "$path")" ||
-    die "cannot resolve $label: $path"
-  [ "$logical" = "$physical" ] ||
-    die "$label must not traverse symbolic links: $path"
-  printf '%s\n' "$logical"
-}
-paths_overlap() {
-  case "$1" in "$2"|"$2"/*) return 0 ;; esac
-  case "$2" in "$1"|"$1"/*) return 0 ;; esac
-  return 1
-}
 validate_allowed_entries() {
   local root label entry name allowed matched
+  local entries=()
   root="$1"
   label="$2"
   shift 2
   [ -d "$root" ] && [ ! -L "$root" ] ||
     die "$label is missing or unsafe"
-  while IFS= read -r -d '' entry; do
+  collect_find_entries entries "$label" -P "$root" -mindepth 1 -maxdepth 1
+  for entry in "${entries[@]}"; do
     name="${entry##*/}"
     matched=0
     for allowed in "$@"; do
@@ -223,26 +208,28 @@ validate_allowed_entries() {
     done
     [ "$matched" -eq 1 ] ||
       die "$label contains an unexpected entry: $name"
-  done < <(find "$root" -mindepth 1 -maxdepth 1 -print0)
+  done
 }
 render_packages_index() {
   local repository pool architecture deb relative size md5 sha256
+  local packages=()
   repository="$1"
   pool="$2"
   architecture="$3"
-  find "$pool" -maxdepth 1 -type f -name "rmux_*_${architecture}.deb" |
-    LC_ALL=C sort |
-    while IFS= read -r deb; do
-      relative="${deb#"$repository"/}"
-      size="$(wc -c < "$deb" | tr -d ' ')"
-      md5="$(hash_file md5 "$deb")"
-      sha256="$(hash_file sha256 "$deb")"
-      dpkg-deb -f "$deb"
-      printf 'Filename: %s\n' "$relative"
-      printf 'Size: %s\n' "$size"
-      printf 'MD5sum: %s\n' "$md5"
-      printf 'SHA256: %s\n\n' "$sha256"
-    done
+  collect_sorted_find_entries packages "APT package pool" \
+    -P "$pool" -maxdepth 1 -type f -name "rmux_*_${architecture}.deb"
+  for deb in "${packages[@]}"; do
+    relative="${deb#"$repository"/}"
+    size="$(wc -c < "$deb" | tr -d ' ')" ||
+      die "cannot read APT package size: $deb"
+    md5="$(hash_file md5 "$deb")" || die "cannot hash APT package: $deb"
+    sha256="$(hash_file sha256 "$deb")" || die "cannot hash APT package: $deb"
+    dpkg-deb -f "$deb" || die "cannot read APT package metadata: $deb"
+    printf 'Filename: %s\n' "$relative"
+    printf 'Size: %s\n' "$size"
+    printf 'MD5sum: %s\n' "$md5"
+    printf 'SHA256: %s\n\n' "$sha256"
+  done
 }
 validate_release_shape() {
   local release architecture paths
@@ -331,12 +318,12 @@ verify_managed_index() {
 }
 validate_managed_output() {
   local suite_root pool_root release architecture binary name entry digest count matched package
+  local output_entries=() pool_entries=() architecture_packages=() by_hash_entries=()
   [ -e "$output_dir" ] || return 0
   [ -d "$output_dir" ] && [ ! -L "$output_dir" ] ||
     die "output directory is not one real directory: $output_dir"
-  [ -z "$(find "$output_dir" -mindepth 1 -print -quit)" ] && return
-  [ -z "$(find "$output_dir" -type l -print -quit)" ] ||
-    die "output directory must not contain symbolic links"
+  inventory_tree_entries output_entries "$output_dir" "APT output"
+  [ "${#output_entries[@]}" -gt 0 ] || return 0
   validate_allowed_entries "$output_dir" "APT output" dists pool rmux.asc
   suite_root="$output_dir/dists/$suite"
   pool_root="$output_dir/pool/$component/r/rmux"
@@ -358,7 +345,9 @@ validate_managed_output() {
   fi
   release="$suite_root/Release"
   validate_release_shape "$release"
-  while IFS= read -r -d '' package; do
+  collect_find_entries pool_entries "managed APT package pool" \
+    -P "$pool_root" -mindepth 1 -maxdepth 1
+  for package in "${pool_entries[@]}"; do
     [ -f "$package" ] || die "managed APT pool contains a non-file"
     name="${package##*/}"
     case "$name" in *$'\n'*) die "managed APT package name contains a newline" ;; esac
@@ -367,15 +356,17 @@ validate_managed_output() {
       case "$name" in rmux_*_"$architecture".deb) matched=1 ;; esac
     done
     [ "$matched" -eq 1 ] || die "managed APT pool contains an unexpected entry: $name"
-  done < <(find "$pool_root" -mindepth 1 -maxdepth 1 -print0)
+  done
 
+  validate_allowed_entries "$suite_root/$component" "APT component indexes" \
+    "${architectures[@]/#/binary-}"
   for architecture in "${architectures[@]}"; do
     binary="$suite_root/$component/binary-$architecture"
-    validate_allowed_entries "$suite_root/$component" "APT component indexes" \
-      "${architectures[@]/#/binary-}"
     validate_allowed_entries "$binary" "APT binary index" Packages Packages.gz by-hash
     validate_allowed_entries "$binary/by-hash" "APT by-hash root" SHA256
-    [ -n "$(find "$pool_root" -maxdepth 1 -type f -name "rmux_*_${architecture}.deb" -print -quit)" ] ||
+    collect_find_entries architecture_packages "managed APT $architecture packages" \
+      -P "$pool_root" -maxdepth 1 -type f -name "rmux_*_${architecture}.deb"
+    [ "${#architecture_packages[@]}" -gt 0 ] ||
       die "managed APT pool lacks architecture: $architecture"
     cmp -s "$binary/Packages" \
       <(render_packages_index "$output_dir" "$pool_root" "$architecture") ||
@@ -390,7 +381,9 @@ validate_managed_output() {
         die "managed APT by-hash lacks the current $architecture/$name"
     done
     count=0
-    while IFS= read -r -d '' entry; do
+    collect_find_entries by_hash_entries "managed APT $architecture by-hash" \
+      -P "$binary/by-hash/SHA256" -mindepth 1 -maxdepth 1
+    for entry in "${by_hash_entries[@]}"; do
       [ -f "$entry" ] || die "managed APT by-hash contains a non-file"
       digest="${entry##*/}"
       [ "${#digest}" -eq 64 ] || die "managed APT by-hash has an invalid name"
@@ -398,7 +391,7 @@ validate_managed_output() {
       [ "$(hash_file sha256 "$entry")" = "$digest" ] ||
         die "managed APT by-hash content does not match its name"
       count=$((count + 1))
-    done < <(find "$binary/by-hash/SHA256" -mindepth 1 -maxdepth 1 -print0)
+    done
     [ "$count" -le 4 ] || die "managed APT by-hash retains too many generations"
   done
 }
@@ -501,12 +494,13 @@ for architecture in "${architectures[@]}"; do
   case "$architecture" in *[!A-Za-z0-9_-]*|"") die "invalid architecture: $architecture" ;; esac
 done
 
-for command in awk basename cat cmp cp date dirname dpkg-deb find gzip md5sum mkdir realpath rm sha256sum sort tr wc; do
+for command in awk basename cat cmp cp date dirname dpkg-deb find gzip md5sum mkdir readlink realpath rm sha256sum sort stat tr wc; do
   need "$command"
 done
 if [ -n "$signing_key" ]; then
   need gpg
 fi
+source "$(dirname -- "${BASH_SOURCE[0]}")/apt-repository-inventory.sh"
 
 input_dir="$(resolve_without_symlinks "$input_dir" "input directory")"
 [ -d "$input_dir" ] || die "input directory not found: $input_dir"
@@ -515,13 +509,14 @@ case "$output_dir" in /) die "--output-dir is too broad: $output_dir" ;; esac
 paths_overlap "$input_dir" "$output_dir" &&
   die "--input-dir and --output-dir cannot overlap"
 if [ -n "$previous_repository_dir" ]; then
+  previous_entries=()
   previous_repository_dir="$(
     resolve_without_symlinks "$previous_repository_dir" "previous repository directory"
   )"
   [ -d "$previous_repository_dir" ] ||
     die "previous repository directory not found: $previous_repository_dir"
-  [ -z "$(find "$previous_repository_dir" -type l -print -quit)" ] ||
-    die "previous repository directory must not contain symbolic links"
+  inventory_tree_entries \
+    previous_entries "$previous_repository_dir" "previous repository directory"
   paths_overlap "$previous_repository_dir" "$output_dir" &&
     die "--previous-repository-dir and --output-dir cannot overlap"
 fi
