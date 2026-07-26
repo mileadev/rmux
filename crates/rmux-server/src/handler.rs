@@ -1518,6 +1518,10 @@ mod selection_control_notification_tests;
 mod switch_selection_notification_tests;
 
 #[cfg(test)]
+#[path = "handler_natural_exit_selection_tests.rs"]
+mod natural_exit_selection_tests;
+
+#[cfg(test)]
 #[path = "handler_control_lifecycle_tests.rs"]
 mod control_lifecycle_tests;
 

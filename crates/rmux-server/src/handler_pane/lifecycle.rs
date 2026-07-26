@@ -11,7 +11,7 @@ use super::super::{
     pane_stream_support::{stream_source_for_target, PaneStreamSource},
     prepare_lifecycle_event,
     scripting_support::format_context_for_target,
-    RequestHandler,
+    RequestHandler, SelectionTransitionSnapshot,
 };
 use super::pane_kill_effects::KillPaneLifecycleBatch;
 use crate::format_runtime::render_runtime_template;
@@ -64,6 +64,7 @@ enum PaneExitPlan {
         pane_event: super::super::QueuedLifecycleEvent,
         lifecycle_events: Vec<super::super::QueuedLifecycleEvent>,
         layout_event: Option<Box<super::super::QueuedLifecycleEvent>>,
+        selection_events: Vec<super::super::QueuedLifecycleEvent>,
         output: ExitedPaneOutput,
         metadata: PaneExitMetadata,
     },
@@ -350,6 +351,7 @@ impl RequestHandler {
                         } else {
                             let timer_mutation =
                                 self.plan_all_window_mutation_silence_timers_locked(&state);
+                            let selection_before = SelectionTransitionSnapshot::capture(&state);
                             match state.kill_pane(target.clone()) {
                                 Ok(result) => {
                                     let pane_event = lifecycle_batch
@@ -383,20 +385,39 @@ impl RequestHandler {
                                         },
                                     );
                                     self.prune_web_panes(&result.removed_pane_ids);
-                                    let lifecycle_events = lifecycle_batch
-                                        .prepare_committed(&mut state, &result.destroyed_sessions);
-                                    let layout_event =
-                                        (!result.response.window_destroyed).then(|| {
-                                            prepare_lifecycle_event(
-                                                &mut state,
-                                                &LifecycleEvent::WindowLayoutChanged {
-                                                    target: WindowTarget::with_window(
-                                                        target.session_name().clone(),
-                                                        target.window_index(),
-                                                    ),
-                                                },
-                                            )
-                                        });
+                                    let window_destroyed = result.response.window_destroyed;
+                                    let lifecycle_events = if window_destroyed {
+                                        lifecycle_batch.prepare_natural_exit_committed(
+                                            &mut state,
+                                            &result.destroyed_sessions,
+                                            &selection_before,
+                                        )
+                                    } else {
+                                        lifecycle_batch.prepare_committed(
+                                            &mut state,
+                                            &result.destroyed_sessions,
+                                        )
+                                    };
+                                    let layout_target = WindowTarget::with_window(
+                                        target.session_name().clone(),
+                                        target.window_index(),
+                                    );
+                                    let layout_event = (!window_destroyed).then(|| {
+                                        prepare_lifecycle_event(
+                                            &mut state,
+                                            &LifecycleEvent::WindowLayoutChanged {
+                                                target: layout_target.clone(),
+                                            },
+                                        )
+                                    });
+                                    let selection_events = if window_destroyed {
+                                        Vec::new()
+                                    } else {
+                                        selection_before.prepare_window_pane_changes(
+                                            &mut state,
+                                            std::slice::from_ref(&layout_target),
+                                        )
+                                    };
                                     for (destroyed_session, session_id) in
                                         &result.destroyed_sessions
                                     {
@@ -432,6 +453,7 @@ impl RequestHandler {
                                         pane_event,
                                         lifecycle_events,
                                         layout_event: layout_event.map(Box::new),
+                                        selection_events,
                                         output: output.take().expect(
                                             "pane exit output is consumed by one committed plan",
                                         ),
@@ -563,6 +585,7 @@ impl RequestHandler {
                 pane_event,
                 lifecycle_events,
                 layout_event,
+                selection_events,
                 output,
                 metadata,
             } => {
@@ -601,6 +624,9 @@ impl RequestHandler {
                 }
                 if let Some(layout_event) = layout_event {
                     self.emit_prepared(*layout_event).await;
+                }
+                for selection_event in selection_events {
+                    self.emit_prepared(selection_event).await;
                 }
                 for session_id in prepared_rehome_order {
                     if let Some(prepared) = prepared_attached_switches.get_mut(&session_id) {
