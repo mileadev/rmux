@@ -7,7 +7,9 @@ use std::sync::mpsc;
 use std::thread;
 
 use rmux_ipc::{LocalListener, LocalStream, MAX_NAMED_MUTEX_LEN};
-use rmux_proto::{encode_frame, FrameDecoder, HasSessionResponse, Request, Response};
+use rmux_proto::{
+    encode_frame, FrameDecoder, HasSessionResponse, Request, Response, RMUX_WIRE_VERSION,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -234,6 +236,46 @@ async fn answer_startup_probe(listener: LocalListener) -> TestResult {
     let request = read_startup_request(&mut stream).await?;
     assert!(matches!(request, Request::HasSession(_)));
     let frame = encode_frame(&Response::HasSession(HasSessionResponse { exists: false }))?;
+    stream.write_all(&frame).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn incompatible_wire_probe_is_reported_immediately() -> TestResult {
+    let endpoint =
+        rmux_ipc::endpoint_for_label(format!("sdk-incompatible-{}", std::process::id()))?;
+    let listener = LocalListener::bind(&endpoint)?;
+    let server = tokio::spawn(answer_incompatible_startup_probe(listener));
+
+    let result = probe_responsive(&endpoint, endpoint.as_path()).await;
+    match result {
+        Err(StartupError::PipeIo {
+            operation, source, ..
+        }) => {
+            assert_eq!(operation, "decode probe response");
+            assert!(source.to_string().contains("unsupported wire version"));
+        }
+        other => panic!("expected incompatible probe error, got {other:?}"),
+    }
+
+    server.await??;
+    Ok(())
+}
+
+async fn answer_incompatible_startup_probe(listener: LocalListener) -> TestResult {
+    let (mut stream, _) = listener.accept().await?;
+    let request = read_startup_request(&mut stream).await?;
+    assert!(matches!(request, Request::HasSession(_)));
+
+    let mut frame = encode_frame(&Response::HasSession(HasSessionResponse { exists: false }))?;
+    let unsupported_version = if RMUX_WIRE_VERSION == 1 {
+        2
+    } else {
+        RMUX_WIRE_VERSION - 1
+    };
+    assert!(RMUX_WIRE_VERSION < 128 && unsupported_version < 128);
+    frame[1] = unsupported_version as u8;
     stream.write_all(&frame).await?;
     stream.flush().await?;
     Ok(())
