@@ -2,9 +2,17 @@ use std::ffi::OsString;
 
 use rmux_core::command_parser::CommandArgument;
 
-pub(super) fn render_control_command_lines(
+pub(super) fn initial_control_command_lines(
     arguments: &[OsString],
 ) -> Result<Vec<String>, clap::Error> {
+    if arguments.is_empty() {
+        return Ok(vec!["new-session".to_owned()]);
+    }
+
+    render_control_command_lines(arguments)
+}
+
+fn render_control_command_lines(arguments: &[OsString]) -> Result<Vec<String>, clap::Error> {
     let mut lines = Vec::new();
     let mut current = Vec::new();
 
@@ -61,7 +69,14 @@ mod tests {
 
     use rmux_core::command_parser::CommandParser;
 
-    use super::render_control_command_lines;
+    use super::{initial_control_command_lines, render_control_command_lines};
+
+    #[test]
+    fn command_free_control_mode_uses_tmux_default_command() {
+        let lines = initial_control_command_lines(&[]).expect("control lines");
+
+        assert_eq!(lines, ["new-session"]);
+    }
 
     #[test]
     fn control_lines_preserve_alias_names_groups_and_literal_arguments() {

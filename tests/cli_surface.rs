@@ -2405,6 +2405,98 @@ fn control_mode_argv_command_uses_initial_flags_zero_frame() -> Result<(), Box<d
 }
 
 #[test]
+fn command_free_control_mode_creates_default_session_before_non_tty_eof(
+) -> Result<(), Box<dyn Error>> {
+    // Frozen tmux 3.7b oracle, measured 2026-07-26: `tmux -C` with non-TTY
+    // stdin at EOF runs `new-session` as its flags=0 command, then emits
+    // `%exit`; the resulting session remains detached.
+    let harness = CliHarness::new("control-default-session-eof")?;
+
+    let output = harness.run(&["-C"])?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr(&output).is_empty(), "stderr={:?}", stderr(&output));
+    let rendered = stdout(&output);
+    assert!(
+        rendered.contains("%session-changed $0 0"),
+        "default new-session did not attach the control client: {rendered:?}"
+    );
+    assert!(rendered.ends_with("%exit\n"), "rendered={rendered:?}");
+
+    let sessions = harness.run(&["list-sessions", "-F", "#{session_name}:#{session_attached}"])?;
+    assert_eq!(sessions.status.code(), Some(0));
+    assert_eq!(stdout(&sessions), "0:0\n");
+    assert!(stderr(&sessions).is_empty());
+    Ok(())
+}
+
+#[test]
+fn command_free_control_mode_runs_stdin_commands_after_default_session(
+) -> Result<(), Box<dyn Error>> {
+    // Frozen tmux 3.7b oracle, measured 2026-07-26: the implicit
+    // `new-session` uses flags=0 and precedes commands read from stdin, which
+    // use flags=1 and inherit the newly attached session.
+    let harness = CliHarness::new("control-default-session-stdin")?;
+    let mut child = harness
+        .base_command()
+        .arg("-C")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("control stdin");
+    stdin.write_all(b"display-message -p 'stdin-session=#{session_name}'\n")?;
+    drop(stdin);
+
+    let output = child.wait_with_output()?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr(&output).is_empty(), "stderr={:?}", stderr(&output));
+    let rendered = stdout(&output);
+    assert!(
+        rendered.contains(" 0\n") && rendered.contains("%session-changed $0 0"),
+        "default command did not run in its flags=0 frame: {rendered:?}"
+    );
+    assert!(
+        rendered.contains(" 1\nstdin-session=0\n"),
+        "stdin command did not run after the default session: {rendered:?}"
+    );
+    assert!(rendered.ends_with("%exit\n"), "rendered={rendered:?}");
+    Ok(())
+}
+
+#[test]
+fn command_free_control_mode_creates_attached_default_session_on_tty() -> Result<(), Box<dyn Error>>
+{
+    // Frozen tmux 3.7b oracle, measured 2026-07-26: with an open TTY,
+    // `tmux -C` creates session 0 and keeps its control client attached.
+    let harness = CliHarness::new("control-default-session-tty")?;
+    let mut control = AttachedSession::spawn_command(&harness, &["-C"], TerminalSize::new(80, 24))?;
+
+    let transcript = read_until_contains(
+        control.master_mut(),
+        "%session-changed $0 0",
+        ATTACH_TIMEOUT,
+    )?;
+    assert!(
+        transcript.contains("%begin ") && transcript.contains(" 0\r\n"),
+        "default new-session did not use a flags=0 frame: {transcript:?}"
+    );
+    let sessions = harness.run(&["list-sessions", "-F", "#{session_name}:#{session_attached}"])?;
+    assert_eq!(sessions.status.code(), Some(0));
+    assert_eq!(stdout(&sessions), "0:1\n");
+    assert!(stderr(&sessions).is_empty());
+    assert!(
+        control.child_mut().try_wait()?.is_none(),
+        "TTY control client exited while stdin remained open"
+    );
+
+    control.send_bytes(b"detach-client\n")?;
+    assert!(control.wait_for_exit(ATTACH_TIMEOUT)?.success());
+    Ok(())
+}
+
+#[test]
 fn control_control_eof_waits_for_new_session_output() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("control-control-new-session-eof")?;
     let _cleanup = harness.auto_start_cleanup()?;

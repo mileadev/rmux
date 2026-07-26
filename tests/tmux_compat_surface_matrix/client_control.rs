@@ -226,10 +226,9 @@ fn tmux_compat_control_mode_guard_tuple_and_exit_framing_when_frozen_tmux_is_ava
     };
 
     // Both scenarios below run against a pre-created session so that the
-    // rmux daemon and tmux server are live and plain `-C` has a control
-    // client to attach to. This keeps the EOF-only scenario from degrading
-    // into a no-daemon cold-start case that produces an empty transcript
-    // on rmux (which is not the Cluster H compatibility target).
+    // default `new-session` command exercised by plain `-C` starts from the
+    // same live-server state in tmux and rmux. Cold-start default-session
+    // behavior has separate CLI regression coverage.
     let (config, _) = config_with_clean_homes(&harness)?;
     let create =
         harness.run_pair_with(&tmux_binary, &["new-session", "-d", "-s", "alpha"], config)?;
