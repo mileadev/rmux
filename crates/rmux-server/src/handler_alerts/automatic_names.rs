@@ -1,10 +1,19 @@
 //! Automatic window-name refresh and synchronization.
 
+use rmux_core::LifecycleEvent;
 use rmux_proto::{PaneTarget, SessionId, SessionName, Target, WindowId, WindowTarget};
 
-use super::super::{scripting_support::format_context_for_target, RequestHandler};
+use super::super::{
+    prepare_unsequenced_lifecycle_event, scripting_support::format_context_for_target,
+    sequence_prepared_lifecycle_event, RequestHandler, UnsequencedLifecycleEvent,
+};
 use crate::format_runtime::render_automatic_window_name;
 use crate::pane_terminals::HandlerState;
+
+pub(in crate::handler) struct AutomaticWindowNameChange {
+    pub(in crate::handler) refresh_sessions: Vec<SessionName>,
+    pub(in crate::handler) lifecycle_event: UnsequencedLifecycleEvent,
+}
 
 impl RequestHandler {
     pub(in crate::handler) async fn refresh_automatic_window_name_for_pane_target(
@@ -22,13 +31,12 @@ impl RequestHandler {
         &self,
         target: &PaneTarget,
     ) -> bool {
-        !self
-            .sync_automatic_window_name_for_window_target(&WindowTarget::with_window(
-                target.session_name().clone(),
-                target.window_index(),
-            ))
-            .await
-            .is_empty()
+        self.sync_automatic_window_name_for_window_target(&WindowTarget::with_window(
+            target.session_name().clone(),
+            target.window_index(),
+        ))
+        .await
+        .is_some()
     }
 
     pub(in crate::handler) async fn sync_automatic_window_name_for_pane_session_identity(
@@ -38,66 +46,77 @@ impl RequestHandler {
     ) -> bool {
         let window_target =
             WindowTarget::with_window(target.session_name().clone(), target.window_index());
-        let mut state = self.state.lock().await;
-        let Some(window_id) = state
-            .sessions
-            .session(target.session_name())
-            .filter(|session| session.id() == expected_session_id)
-            .and_then(|session| session.window_at(target.window_index()))
-            .map(rmux_core::Window::id)
-        else {
-            return false;
-        };
-        !Self::sync_automatic_window_name_for_window_target_locked(
-            &mut state,
+        self.sync_automatic_window_name_for_window_identity(
             &window_target,
-            window_id,
+            Some(expected_session_id),
         )
-        .is_empty()
+        .await
+        .is_some()
     }
 
     pub(in crate::handler) async fn refresh_automatic_window_name_for_window_target(
         &self,
         target: &WindowTarget,
     ) -> bool {
-        let sessions_to_refresh = self
+        let Some(sessions_to_refresh) = self
             .sync_automatic_window_name_for_window_target(target)
-            .await;
+            .await
+        else {
+            return false;
+        };
         for session_name in &sessions_to_refresh {
             self.refresh_attached_session(session_name).await;
         }
 
-        !sessions_to_refresh.is_empty()
+        true
     }
 
     async fn sync_automatic_window_name_for_window_target(
         &self,
         target: &WindowTarget,
-    ) -> Vec<SessionName> {
-        let mut state = self.state.lock().await;
-        let Some(window_id) = state
-            .sessions
-            .session(target.session_name())
-            .and_then(|session| session.window_at(target.window_index()))
-            .map(rmux_core::Window::id)
-        else {
-            return Vec::new();
+    ) -> Option<Vec<SessionName>> {
+        self.sync_automatic_window_name_for_window_identity(target, None)
+            .await
+    }
+
+    async fn sync_automatic_window_name_for_window_identity(
+        &self,
+        target: &WindowTarget,
+        expected_session_id: Option<SessionId>,
+    ) -> Option<Vec<SessionName>> {
+        let (refresh_sessions, lifecycle_event) = {
+            let mut state = self.state.lock().await;
+            let window_id = state
+                .sessions
+                .session(target.session_name())
+                .filter(|session| {
+                    expected_session_id.is_none_or(|expected| session.id() == expected)
+                })
+                .and_then(|session| session.window_at(target.window_index()))
+                .map(rmux_core::Window::id)?;
+            let change = Self::sync_automatic_window_name_for_window_target_locked(
+                &mut state, target, window_id,
+            )?;
+            let lifecycle_event =
+                sequence_prepared_lifecycle_event(&mut state, change.lifecycle_event);
+            (change.refresh_sessions, lifecycle_event)
         };
-        Self::sync_automatic_window_name_for_window_target_locked(&mut state, target, window_id)
+        self.emit_prepared(lifecycle_event).await;
+        Some(refresh_sessions)
     }
 
     pub(in crate::handler) fn sync_automatic_window_name_for_window_target_locked(
         state: &mut HandlerState,
         target: &WindowTarget,
         expected_window_id: WindowId,
-    ) -> Vec<SessionName> {
+    ) -> Option<AutomaticWindowNameChange> {
         let target_matches_identity = state
             .sessions
             .session(target.session_name())
             .and_then(|session| session.window_at(target.window_index()))
             .is_some_and(|window| window.id() == expected_window_id);
         if !target_matches_identity {
-            return Vec::new();
+            return None;
         }
 
         let rendered_window_name =
@@ -108,18 +127,13 @@ impl RequestHandler {
             .is_none()
             .then(|| mode_marker_fallback_window_name(state, target))
             .flatten();
-        let Some(window_name) = rendered_window_name
+        let window_name = rendered_window_name
             .as_deref()
-            .or(fallback_window_name.as_deref())
-        else {
-            return Vec::new();
-        };
+            .or(fallback_window_name.as_deref())?;
 
         let tracked = state.tracks_auto_named_window(target.session_name(), target.window_index());
         let should_update = {
-            let Some(session) = state.sessions.session(target.session_name()) else {
-                return Vec::new();
-            };
+            let session = state.sessions.session(target.session_name())?;
             match session.window_at(target.window_index()) {
                 Some(window) if window.id() == expected_window_id => {
                     !window_name.is_empty()
@@ -132,11 +146,11 @@ impl RequestHandler {
                             tracked,
                         )
                 }
-                _ => return Vec::new(),
+                _ => return None,
             }
         };
         if !should_update {
-            return Vec::new();
+            return None;
         }
 
         state
@@ -147,12 +161,22 @@ impl RequestHandler {
             .expect("existing window must accept automatic rename update")
             .set_automatic_name(window_name.to_owned());
         state.mark_auto_named_window(target.session_name(), target.window_index());
-        state
+        let refresh_sessions = state
             .synchronize_linked_window_family_from_slot(
                 target.session_name(),
                 target.window_index(),
             )
-            .unwrap_or_else(|_| vec![target.session_name().clone()])
+            .unwrap_or_else(|_| vec![target.session_name().clone()]);
+        let lifecycle_event = prepare_unsequenced_lifecycle_event(
+            state,
+            &LifecycleEvent::WindowRenamed {
+                target: target.clone(),
+            },
+        );
+        Some(AutomaticWindowNameChange {
+            refresh_sessions,
+            lifecycle_event,
+        })
     }
 }
 

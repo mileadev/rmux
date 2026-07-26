@@ -30,6 +30,7 @@ struct ClockModeExitEffects {
     pane_identity: ClockModePaneIdentity,
     mode_revision: u64,
     restore_frame: Option<Vec<u8>>,
+    automatic_rename_event: Option<super::QueuedLifecycleEvent>,
     lifecycle_event: super::QueuedLifecycleEvent,
     refresh_sessions: Vec<(SessionName, SessionId)>,
 }
@@ -163,6 +164,9 @@ impl RequestHandler {
                 frame,
             )
             .await;
+        }
+        if let Some(event) = effects.automatic_rename_event {
+            self.emit_prepared(event).await;
         }
         self.emit_prepared(effects.lifecycle_event).await;
         for (session_name, session_id) in effects.refresh_sessions {
@@ -430,11 +434,18 @@ fn prepare_clock_mode_exit_effects(
     mode_revision: u64,
 ) -> Result<ClockModeExitEffects, RmuxError> {
     let restore_frame = clock_mode_restore_frame_locked(state, target)?;
-    let renamed_sessions = RequestHandler::sync_automatic_window_name_for_window_target_locked(
+    let automatic_name_change = RequestHandler::sync_automatic_window_name_for_window_target_locked(
         state,
         &WindowTarget::with_window(target.session_name().clone(), target.window_index()),
         pane_identity.window_id,
     );
+    let (renamed_sessions, automatic_rename_event) = match automatic_name_change {
+        Some(change) => {
+            let event = super::sequence_prepared_lifecycle_event(state, change.lifecycle_event);
+            (change.refresh_sessions, Some(event))
+        }
+        None => (Vec::new(), None),
+    };
     let lifecycle_event = super::prepare_lifecycle_event(
         state,
         &LifecycleEvent::PaneModeChanged {
@@ -447,6 +458,7 @@ fn prepare_clock_mode_exit_effects(
         pane_identity,
         mode_revision,
         restore_frame,
+        automatic_rename_event,
         lifecycle_event,
         refresh_sessions,
     })

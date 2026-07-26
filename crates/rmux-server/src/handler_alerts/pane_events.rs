@@ -322,10 +322,11 @@ impl RequestHandler {
         self.pause_before_pane_alert_final_apply().await;
 
         let attached_counts = self.attached_counts_snapshot().await;
-        let (plans, automatic_name_refreshes, inactive_output_refreshes) = {
+        let (plans, automatic_name_refreshes, automatic_rename_events, inactive_output_refreshes) = {
             let mut state = self.state.lock().await;
             let mut plans = Vec::new();
             let mut automatic_name_refreshes = HashSet::new();
+            let mut automatic_rename_events = Vec::new();
             for (window_id, pending) in window_alerts {
                 let silence_was_reset = silence_resets.contains(&window_id);
                 let mut flags = AlertFlags::empty();
@@ -348,11 +349,12 @@ impl RequestHandler {
                     pane_target.window_index(),
                 );
 
-                automatic_name_refreshes.extend(
-                    Self::sync_automatic_window_name_for_window_target_locked(
-                        &mut state, &target, window_id,
-                    ),
-                );
+                if let Some(change) = Self::sync_automatic_window_name_for_window_target_locked(
+                    &mut state, &target, window_id,
+                ) {
+                    automatic_name_refreshes.extend(change.refresh_sessions);
+                    automatic_rename_events.push(change.lifecycle_event);
+                }
 
                 // Name synchronization may update linked/grouped models. Resolve again before
                 // assigning flags or preparing alert hooks.
@@ -408,9 +410,25 @@ impl RequestHandler {
                         .map(|session| session.name().clone())
                 })
                 .collect::<HashSet<_>>();
-            (plans, automatic_name_refreshes, inactive_output_refreshes)
+            (
+                plans,
+                automatic_name_refreshes,
+                automatic_rename_events,
+                inactive_output_refreshes,
+            )
         };
 
+        for lifecycle_event in automatic_rename_events {
+            let lifecycle_event = {
+                let mut state = self.state.lock().await;
+                sequence_prepared_lifecycle_event(&mut state, lifecycle_event)
+            };
+            if wait_for_lifecycle_hooks {
+                self.emit_prepared_and_wait(lifecycle_event).await;
+            } else {
+                self.emit_prepared(lifecycle_event).await;
+            }
+        }
         for session_name in automatic_name_refreshes {
             self.refresh_attached_session(&session_name).await;
         }

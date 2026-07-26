@@ -1478,6 +1478,10 @@ mod display_message_tests;
 mod alert_tests;
 
 #[cfg(test)]
+#[path = "handler_auto_rename_notification_tests.rs"]
+mod auto_rename_notification_tests;
+
+#[cfg(test)]
 #[path = "handler_winlink_insertion_tests.rs"]
 mod winlink_insertion_tests;
 

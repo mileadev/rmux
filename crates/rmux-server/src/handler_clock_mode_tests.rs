@@ -639,6 +639,18 @@ async fn clock_mode_fires_hooks_and_control_notifications_on_entry_and_exit() {
     let mut notifications =
         register_control_client(&handler, 700, target.session_name().clone()).await;
     let _ = drain_control_notifications(&mut notifications);
+    let (window_id, initial_window_name) = {
+        let state = handler.state.lock().await;
+        let window = state
+            .sessions
+            .session(target.session_name())
+            .and_then(|session| session.window_at(target.window_index()))
+            .expect("clock-mode window exists");
+        (
+            window.id().as_u32(),
+            window.name().unwrap_or_default().to_owned(),
+        )
+    };
 
     assert!(matches!(
         handler
@@ -666,6 +678,7 @@ async fn clock_mode_fires_hooks_and_control_notifications_on_entry_and_exit() {
     assert_eq!(
         drain_control_notifications(&mut notifications),
         vec![
+            format!("%window-renamed @{window_id} [tmux]"),
             format!("%pane-mode-changed %{pane_id}"),
             "%paste-buffer-changed pane-mode-hook".to_owned(),
         ]
@@ -691,6 +704,7 @@ async fn clock_mode_fires_hooks_and_control_notifications_on_entry_and_exit() {
     assert_eq!(
         drain_control_notifications(&mut notifications),
         vec![
+            format!("%window-renamed @{window_id} {initial_window_name}"),
             format!("%pane-mode-changed %{pane_id}"),
             "%paste-buffer-changed pane-mode-hook".to_owned(),
         ]
