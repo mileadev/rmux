@@ -19,7 +19,9 @@ use crate::pane_terminals::{session_not_found, HandlerState};
 
 use super::super::{
     active_session_target,
-    attach_support::{AttachedSwitchCommitRequest, AttachedSwitchCommittedTarget},
+    attach_support::{
+        ActiveAttachIdentity, AttachedSwitchCommitRequest, AttachedSwitchCommittedTarget,
+    },
     attached_client_matches_target, client_environment_snapshot, control_client_target_pid,
     control_support::{current_control_queue_identity, ManagedClient},
     normalize_target_client, parse_session_sort_order, switch_client_target_find_type,
@@ -465,6 +467,39 @@ impl RequestHandler {
             }
             Err(error) => return Response::Error(ErrorResponse { error }),
         };
+        self.handle_switch_client_ext3_for_managed_client(requester_pid, client, request)
+            .await
+    }
+
+    pub(in crate::handler) async fn handle_switch_client_ext3_for_attach_identity(
+        &self,
+        identity: ActiveAttachIdentity,
+        request: SwitchClientExt3Request,
+    ) -> Response {
+        if request.target_client.is_some() {
+            return Response::Error(ErrorResponse {
+                error: RmuxError::Server(
+                    "identity-bound switch-client does not accept -c".to_owned(),
+                ),
+            });
+        }
+        let client = SwitchManagedClientIdentity::Attach {
+            pid: identity.attach_pid(),
+            attach_id: identity.attach_id(),
+        };
+        if let Err(error) = self.validate_switch_managed_client_identity(client).await {
+            return Response::Error(ErrorResponse { error });
+        }
+        self.handle_switch_client_ext3_for_managed_client(identity.attach_pid(), client, request)
+            .await
+    }
+
+    async fn handle_switch_client_ext3_for_managed_client(
+        &self,
+        requester_pid: u32,
+        client: SwitchManagedClientIdentity,
+        request: SwitchClientExt3Request,
+    ) -> Response {
         record_switch_client_target_identity(client);
         if switch_target_selector_count(&request) > 1 {
             return Response::Error(ErrorResponse {

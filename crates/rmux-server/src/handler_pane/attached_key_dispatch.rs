@@ -467,7 +467,7 @@ impl RequestHandler {
         .await
     }
 
-    async fn report_attached_command_error(
+    pub(in crate::handler) async fn report_attached_command_error(
         &self,
         session_name: &rmux_proto::SessionName,
         attach_pid: u32,

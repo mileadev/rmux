@@ -49,8 +49,8 @@ use crate::key_table::{
     matches_prefix_key, session_option_key, AttachedKeyDecode,
 };
 
-#[path = "live/read_only_detach.rs"]
-mod read_only_detach;
+#[path = "live/read_only_client_action.rs"]
+mod read_only_client_action;
 
 pub(crate) type ActiveClientEmitCache = Option<(u64, WindowTarget)>;
 
@@ -571,7 +571,7 @@ impl RequestHandler {
             });
             #[cfg(not(windows))]
             let windows_key_override = None;
-            self.handle_read_only_detach_input(
+            self.handle_read_only_client_action_input(
                 identity,
                 pending_input,
                 bytes,

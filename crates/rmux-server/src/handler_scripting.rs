@@ -74,6 +74,8 @@ mod queue_lifecycle_target;
 mod queue_parse;
 #[path = "handler_scripting/queue_special_target.rs"]
 mod queue_special_target;
+#[path = "handler_scripting/read_only_client_action.rs"]
+mod read_only_client_action;
 #[path = "handler_scripting/request_parse.rs"]
 mod request_parse;
 #[path = "handler_scripting/run_shell_dispatch.rs"]
@@ -128,6 +130,9 @@ pub(crate) use self::queue_exact_target::{
 };
 use self::queue_lifecycle_target::{QueueLifecycleTargetCapture, QueueLifecycleTargetPlan};
 use self::queue_special_target::QueueSpecialTargetPlan;
+pub(in crate::handler) use self::read_only_client_action::{
+    read_only_client_action, ReadOnlyClientAction,
+};
 use self::request_parse::parse_queue_invocation;
 #[cfg(test)]
 pub(crate) use self::request_parse::parse_request_from_parts;
