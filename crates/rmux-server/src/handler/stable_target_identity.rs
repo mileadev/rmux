@@ -185,6 +185,44 @@ impl StableTargetIdentity {
         &self.target
     }
 
+    pub(in crate::handler) fn resolve_current_pane_target(
+        &self,
+        state: &HandlerState,
+    ) -> Option<PaneTarget> {
+        let Target::Pane(_) = &self.target else {
+            return None;
+        };
+        let window_target = state.window_link_occurrence_target(
+            self.occurrence_id?,
+            self.session_id,
+            self.window_id?,
+        )?;
+        let pane_id = self.pane_id?;
+        let pane_index = state
+            .sessions
+            .session(window_target.session_name())?
+            .window_at(window_target.window_index())?
+            .panes()
+            .iter()
+            .find(|pane| pane.id() == pane_id)?
+            .index();
+        Some(PaneTarget::with_window(
+            window_target.session_name().clone(),
+            window_target.window_index(),
+            pane_index,
+        ))
+    }
+
+    pub(in crate::handler) fn resolve_current_pane_identity(
+        &self,
+        state: &HandlerState,
+    ) -> Option<Self> {
+        let target = self.resolve_current_pane_target(state)?;
+        let mut identity = self.clone();
+        identity.target = Target::Pane(target);
+        Some(identity)
+    }
+
     pub(in crate::handler) fn rename_session(
         &mut self,
         old_name: &SessionName,

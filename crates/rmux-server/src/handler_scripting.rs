@@ -76,6 +76,8 @@ mod queue_parse;
 mod queue_special_target;
 #[path = "handler_scripting/request_parse.rs"]
 mod request_parse;
+#[path = "handler_scripting/run_shell_dispatch.rs"]
+mod run_shell_dispatch;
 #[path = "handler_scripting/runtime.rs"]
 mod runtime;
 #[path = "handler_scripting/session_parse.rs"]

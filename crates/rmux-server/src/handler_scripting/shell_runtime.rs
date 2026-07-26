@@ -23,6 +23,7 @@ use super::format_context::{format_context_for_target_with_server_values, global
 use super::queue::{QueueCommandAction, QueueExecutionContext};
 use super::queue_parse::ParsedIfShellCommand;
 use super::queue_special_target::QueueSpecialTargetBinding;
+use super::run_shell_dispatch::{render_run_shell_command_from_state, SynchronousRunShellDispatch};
 use super::runtime::{run_shell_delay_duration, run_shell_foreground, shell_condition_is_true};
 use super::targets::active_session_target;
 use crate::format_runtime::render_runtime_template;
@@ -73,11 +74,12 @@ fn if_shell_runs_in_background(background: bool, format_mode: bool) -> bool {
     background && !format_mode
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct QueuedRunShellState {
     parent_depth: usize,
     parent_context: Option<QueueExecutionContext>,
     target_binding: Option<QueueSpecialTargetBinding>,
+    dispatch: Option<SynchronousRunShellDispatch>,
 }
 
 impl RequestHandler {
@@ -172,6 +174,7 @@ impl RequestHandler {
             parent_depth,
             parent_context,
             target_binding,
+            dispatch: None,
         };
         let target_was_captured = request.target.is_some() || target_missing_canfail;
         if request.target.is_none() && !target_missing_canfail {
@@ -228,6 +231,27 @@ impl RequestHandler {
             return Response::RunShell(RunShellResponse::background());
         }
 
+        if let Some(delay_seconds) = request.delay_seconds {
+            if let Err(error) = run_shell_delay_duration(delay_seconds.as_secs_f64()) {
+                return Response::Error(ErrorResponse { error });
+            }
+        }
+        let dispatch = match self
+            .capture_synchronous_run_shell_dispatch(
+                requester_pid,
+                &mut request,
+                client_name.as_deref(),
+                target_missing_canfail,
+            )
+            .await
+        {
+            Ok(dispatch) => dispatch,
+            Err(error) => return Response::Error(ErrorResponse { error }),
+        };
+        let queue_state = QueuedRunShellState {
+            dispatch: Some(dispatch),
+            ..queue_state
+        };
         match self
             .run_shell_task(
                 requester_pid,
@@ -393,13 +417,28 @@ impl RequestHandler {
             });
         }
 
-        let profile = self.run_shell_profile(&request).await?;
+        let profile = match queue_state
+            .dispatch
+            .as_ref()
+            .and_then(|dispatch| dispatch.shell_profile.clone())
+        {
+            Some(profile) => profile,
+            None => self.run_shell_profile(&request).await?,
+        };
         if let Some(target_binding) = queue_state.target_binding.as_ref() {
             target_binding.require_live_for(self).await?;
         }
-        let command = self
-            .expand_run_shell_command(&request, client_name.as_deref(), target_missing_canfail)
-            .await?;
+        let command = match queue_state.dispatch.as_ref() {
+            Some(dispatch) => dispatch.expanded_command.clone(),
+            None => {
+                self.expand_run_shell_command(
+                    &request,
+                    client_name.as_deref(),
+                    target_missing_canfail,
+                )
+                .await?
+            }
+        };
         if let Some(target_binding) = queue_state.target_binding.as_ref() {
             target_binding.require_live_for(self).await?;
         }
@@ -441,6 +480,17 @@ impl RequestHandler {
         if request.target.is_none() && !target_missing_canfail {
             request.target = self.inherited_run_shell_target(requester_pid).await;
         }
+        if let Some(delay_seconds) = request.delay_seconds {
+            run_shell_delay_duration(delay_seconds.as_secs_f64())?;
+        }
+        let dispatch = self
+            .capture_synchronous_run_shell_dispatch(
+                requester_pid,
+                &mut request,
+                client_name.as_deref(),
+                target_missing_canfail,
+            )
+            .await?;
         let Some(request) = self
             .prepare_run_shell_request(requester_pid, request, ShellTargetPolicy::Fixed)
             .await?
@@ -459,6 +509,7 @@ impl RequestHandler {
             parent_depth: parent_context.run_shell_command_depth(),
             parent_context: Some(parent_context.clone()),
             target_binding: target_binding.cloned(),
+            dispatch: Some(dispatch),
         };
         let (commands, context) = self
             .prepare_run_shell_commands(
@@ -517,22 +568,52 @@ impl RequestHandler {
         target_missing_canfail: bool,
         queue_state: &QueuedRunShellState,
     ) -> Result<(ParsedCommands, QueueExecutionContext), RmuxError> {
+        let dispatch = queue_state.dispatch.as_ref();
         let has_fixed_target = request.target.is_some();
-        let command = self
-            .expand_run_shell_command(&request, client_name.as_deref(), target_missing_canfail)
-            .await?;
+        let command = match dispatch {
+            Some(dispatch) => dispatch.expanded_command.clone(),
+            None => {
+                self.expand_run_shell_command(
+                    &request,
+                    client_name.as_deref(),
+                    target_missing_canfail,
+                )
+                .await?
+            }
+        };
         let parsed = self.parse_command_string_one_group(&command).await?;
         if parsed_contains_attach_session(&parsed) {
             return Err(RmuxError::Server(
                 "open terminal failed: not a terminal".to_owned(),
             ));
         }
-        let current_target = if target_missing_canfail {
-            None
-        } else {
-            self.run_shell_commands_current_target(requester_pid, request.target.clone())
-                .await
-        };
+        let (current_target, pinned_target_identity, captured_target_disappeared) =
+            if target_missing_canfail {
+                (None, None, false)
+            } else if let Some(identity) =
+                dispatch.and_then(|dispatch| dispatch.target_identity.as_ref())
+            {
+                let state = self.state.lock().await;
+                match identity.resolve_current_pane_identity(&state) {
+                    Some(current_identity) => (
+                        Some(current_identity.target().clone()),
+                        Some(current_identity),
+                        false,
+                    ),
+                    None => (
+                        Some(identity.target().clone()),
+                        Some(identity.clone()),
+                        true,
+                    ),
+                }
+            } else {
+                (
+                    self.run_shell_commands_current_target(requester_pid, request.target.clone())
+                        .await,
+                    None,
+                    false,
+                )
+            };
         let context = match queue_state.parent_context.as_ref() {
             Some(context) => match request.start_directory.clone() {
                 Some(caller_cwd) => context.clone().with_caller_cwd(Some(caller_cwd)),
@@ -552,8 +633,14 @@ impl RequestHandler {
                 }
                 ShellTargetPolicy::Fixed => context.with_implicit_current_target(current_target),
             }
+        };
+        let context = if captured_target_disappeared {
+            context.forbid_missing_current_target_fallback()
+        } else {
+            context
         }
         .with_client_name(client_name)
+        .with_pinned_current_target_identity(pinned_target_identity)
         .with_mouse_event(super::queued_command_mouse_event().or_else(|| {
             queue_state
                 .parent_context
@@ -687,49 +774,15 @@ impl RequestHandler {
         let hook_formats = current_hook_formats();
         let socket_path = self.socket_path();
         let state = self.state.lock().await;
-        let context = match target {
-            Some(target) => format_context_for_target_with_server_values(
-                &state,
-                &Target::Pane(target.clone()),
-                attached_count,
-                &socket_path,
-            )
-            .unwrap_or_else(|_| global_format_context(&state, &socket_path)),
-            None if !target_missing_canfail => match hook_formats
-                .iter()
-                .rev()
-                .find(|(name, _)| name == "hook_session_name")
-                .and_then(|(_, value)| SessionName::new(value.clone()).ok())
-                .and_then(|session_name| hook_session_default_target(&state, &session_name))
-            {
-                Some(target) => {
-                    format_context_for_target_with_server_values(&state, &target, 0, &socket_path)?
-                }
-                None => global_format_context(&state, &socket_path),
-            },
-            None => global_format_context(&state, &socket_path),
-        };
-        let context = match client_name {
-            Some(client_name) => context.with_named_value("client_name", client_name.to_owned()),
-            None => context,
-        };
-        let context = hook_formats
-            .into_iter()
-            .fold(context, |context, (name, value)| {
-                context.with_named_value(name, value)
-            });
-        let context = if request.as_commands {
-            context
-        } else {
-            request
-                .arguments
-                .iter()
-                .enumerate()
-                .fold(context, |context, (index, value)| {
-                    context.with_named_value((index + 1).to_string(), value.clone())
-                })
-        };
-        Ok(render_runtime_template(&request.command, &context, false))
+        render_run_shell_command_from_state(
+            &state,
+            request,
+            client_name,
+            target_missing_canfail,
+            attached_count,
+            hook_formats,
+            &socket_path,
+        )
     }
 
     async fn run_shell_profile(
@@ -737,42 +790,7 @@ impl RequestHandler {
         request: &RunShellRequest,
     ) -> Result<TerminalProfile, RmuxError> {
         let state = self.state.lock().await;
-        let (session_name, session_id) = request
-            .target
-            .as_ref()
-            .and_then(|target| {
-                state
-                    .sessions
-                    .session(target.session_name())
-                    .map(|session| (Some(target.session_name()), Some(session.id().as_u32())))
-            })
-            .unwrap_or((None, None));
-
-        let base_environment = request
-            .target
-            .as_ref()
-            .and_then(|target| state.session_base_environment_for_pane_target(target));
-        let pane_id = request
-            .target
-            .as_ref()
-            .and_then(|target| pane_id_for_target(&state, target));
-
-        TerminalProfile::for_run_shell_with_base_environment(
-            &state.environment,
-            &state.options,
-            session_name,
-            session_id,
-            &self.socket_path(),
-            base_environment.as_ref(),
-            !self.config_loading_active(),
-            pane_id,
-            request.start_directory.as_deref(),
-        )
-        .map(|profile| match request.source_depth {
-            Some(depth) => profile.with_source_depth(depth),
-            None if self.config_loading_active() => profile.with_source_depth(1),
-            None => profile,
-        })
+        self.run_shell_profile_from_state(&state, request)
     }
 
     async fn if_shell_profile(
@@ -1189,7 +1207,7 @@ fn new_session_is_detached(command: &rmux_core::command_parser::ParsedCommand) -
         })
 }
 
-fn pane_id_for_target(
+pub(super) fn pane_id_for_target(
     state: &crate::pane_terminals::HandlerState,
     target: &PaneTarget,
 ) -> Option<PaneId> {
@@ -1214,7 +1232,7 @@ fn base_environment_for_target(
     }
 }
 
-fn hook_session_default_target(
+pub(super) fn hook_session_default_target(
     state: &crate::pane_terminals::HandlerState,
     session_name: &SessionName,
 ) -> Option<Target> {
