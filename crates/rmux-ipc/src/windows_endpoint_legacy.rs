@@ -10,13 +10,14 @@ use std::path::PathBuf;
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT,
 };
-use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
+use windows_sys::Win32::System::Pipes::{WaitNamedPipeW, NMPWAIT_NOWAIT};
 
 use crate::endpoint::{LocalEndpoint, PIPE_PREFIX};
 use crate::windows_endpoint_record::LEGACY_COMPONENT_MAX_LEN;
 use crate::windows_endpoint_security::wide_path;
 
 const MAX_LEGACY_PIPE_PATH_UNITS: usize = 256;
+const NONBLOCKING_PIPE_PROBE_TIMEOUT: u32 = NMPWAIT_NOWAIT;
 
 pub(crate) fn supported_component(sid: &str, integrity: &str, component: &OsStr) -> Option<String> {
     let component = component.to_string_lossy();
@@ -39,7 +40,7 @@ pub(crate) fn namespace_exists(endpoint: &LocalEndpoint) -> io::Result<bool> {
     let wide = wide_path(endpoint.as_path())?;
     let available = unsafe {
         // SAFETY: `wide` is a NUL-terminated path to a local named pipe.
-        WaitNamedPipeW(wide.as_ptr(), 0)
+        WaitNamedPipeW(wide.as_ptr(), NONBLOCKING_PIPE_PROBE_TIMEOUT)
     };
     if available != 0 {
         return Ok(true);
@@ -64,5 +65,10 @@ mod tests {
             endpoint.as_path(),
             std::path::Path::new(r"\\.\pipe\rmux-S-1-5-21-il-medium-named")
         );
+    }
+
+    #[test]
+    fn legacy_namespace_probe_uses_win32_nowait() {
+        assert_eq!(NONBLOCKING_PIPE_PROBE_TIMEOUT, 1);
     }
 }
