@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use rmux_client::{default_socket_path, AutoStartError, ClientError, NestedContextError};
-use rmux_proto::RmuxError;
+use rmux_proto::{DisplayMessageDurationParseError, RmuxError};
 
 use crate::tmux_error_surface::tmux_client_connect_error_message;
 
@@ -206,18 +206,7 @@ fn tmux_compat_clap_message(error: &clap::Error) -> String {
         }
     }
     if let Some(stripped) = message.strip_prefix("error: ") {
-        if matches!(
-            stripped,
-            "width too small"
-                | "width invalid"
-                | "width too large"
-                | "height too small"
-                | "height invalid"
-                | "height too large"
-                | "adjustment invalid"
-                | "adjustment too small"
-                | "adjustment too large"
-        ) {
+        if normalized_invalid_value_detail(stripped).is_some() {
             return stripped.to_owned();
         }
     }
@@ -232,18 +221,23 @@ fn tmux_compat_clap_message(error: &clap::Error) -> String {
 }
 
 fn normalized_invalid_value_detail(detail: &str) -> Option<String> {
-    if matches!(
-        detail,
-        "width too small"
-            | "width invalid"
-            | "width too large"
-            | "height too small"
-            | "height invalid"
-            | "height too large"
-            | "adjustment invalid"
-            | "adjustment too small"
-            | "adjustment too large"
-    ) {
+    let is_display_message_delay_error = DisplayMessageDurationParseError::ALL
+        .into_iter()
+        .any(|error| error.as_str() == detail);
+    if is_display_message_delay_error
+        || matches!(
+            detail,
+            "width too small"
+                | "width invalid"
+                | "width too large"
+                | "height too small"
+                | "height invalid"
+                | "height too large"
+                | "adjustment invalid"
+                | "adjustment too small"
+                | "adjustment too large"
+        )
+    {
         return Some(detail.to_owned());
     }
 
@@ -259,6 +253,33 @@ impl From<NestedContextError> for ExitFailure {
 #[cfg(test)]
 mod tests {
     use super::tmux_compat_clap_message;
+
+    #[test]
+    fn display_message_delay_errors_keep_single_tmux_line() {
+        for parse_error in [
+            rmux_proto::DisplayMessageDurationParseError::Invalid,
+            rmux_proto::DisplayMessageDurationParseError::TooSmall,
+            rmux_proto::DisplayMessageDurationParseError::TooLarge,
+        ] {
+            let message = parse_error.to_string();
+            let error = clap::Error::raw(clap::error::ErrorKind::InvalidValue, message.as_str());
+
+            assert_eq!(tmux_compat_clap_message(&error), message);
+        }
+    }
+
+    #[test]
+    fn unrelated_clap_errors_keep_their_normal_prefix() {
+        let error = clap::Error::raw(
+            clap::error::ErrorKind::InvalidValue,
+            "unrelated invalid value",
+        );
+
+        assert_eq!(
+            tmux_compat_clap_message(&error),
+            "error: unrelated invalid value"
+        );
+    }
 
     #[test]
     fn clap_invalid_option_value_errors_keep_single_tmx_line() {

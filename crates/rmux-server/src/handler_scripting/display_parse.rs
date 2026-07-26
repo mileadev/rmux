@@ -532,7 +532,7 @@ fn parse_display_message_duration(value: &str) -> Result<DisplayMessageDurationM
     value
         .parse()
         .map_err(|error: rmux_proto::DisplayMessageDurationParseError| {
-            RmuxError::Server(error.to_string())
+            RmuxError::Message(error.to_string())
         })
 }
 

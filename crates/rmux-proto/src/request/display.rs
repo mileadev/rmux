@@ -38,13 +38,23 @@ pub enum DisplayMessageDurationParseError {
     TooLarge,
 }
 
-impl fmt::Display for DisplayMessageDurationParseError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
+impl DisplayMessageDurationParseError {
+    /// Canonical tmux numeric error classes for `display-message -d`.
+    pub const ALL: [Self; 3] = [Self::Invalid, Self::TooSmall, Self::TooLarge];
+
+    /// Returns the exact tmux 3.7b diagnostic for this error class.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
             Self::Invalid => "delay invalid",
             Self::TooSmall => "delay too small",
             Self::TooLarge => "delay too large",
-        })
+        }
+    }
+}
+
+impl fmt::Display for DisplayMessageDurationParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 

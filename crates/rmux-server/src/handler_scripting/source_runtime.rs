@@ -3,8 +3,8 @@ use std::path::Path;
 use rmux_core::{
     command_inventory::RMUX_EXTENSION_COMMANDS,
     command_parser::{
-        CommandArgument, CommandParseErrorKind, CommandParser, EnvironmentAssignment,
-        ParsedCommand, ParsedCommands, SOURCE_FILE_MAX_COMMAND_BYTES,
+        lookup_command, CommandArgument, CommandParseErrorKind, CommandParser,
+        EnvironmentAssignment, ParsedCommand, ParsedCommands, SOURCE_FILE_MAX_COMMAND_BYTES,
     },
     parse_binding_command_tokens_with_parser,
 };
@@ -993,7 +993,7 @@ impl RequestHandler {
                     .await;
                 }
                 Ok(_) => {}
-                Err(error) if should_defer_source_validation_error(&error, recursive) => {}
+                Err(error) if should_defer_source_validation_error(&error, command, recursive) => {}
                 Err(error) => {
                     errors.push(super::source_file_context_error(error, command, context));
                 }
@@ -1239,10 +1239,20 @@ impl NestedValidationError {
     }
 }
 
-fn should_defer_source_validation_error(error: &RmuxError, recursive: bool) -> bool {
+fn should_defer_source_validation_error(
+    error: &RmuxError,
+    command: &ParsedCommand,
+    recursive: bool,
+) -> bool {
+    let is_direct_display_message_error = !recursive
+        && matches!(error, RmuxError::Message(_))
+        && lookup_command(command.name()).is_ok_and(|entry| entry.name == "display-message");
     match error {
         RmuxError::InvalidTarget { .. } | RmuxError::SessionNotFound(_) => true,
-        RmuxError::Server(message) | RmuxError::Message(message) => {
+        RmuxError::Message(message) => {
+            is_direct_display_message_error || is_runtime_target_or_client_lookup_error(message)
+        }
+        RmuxError::Server(message) => {
             is_runtime_target_or_client_lookup_error(message)
                 || (!recursive && is_source_runtime_option_lookup_error(message))
         }

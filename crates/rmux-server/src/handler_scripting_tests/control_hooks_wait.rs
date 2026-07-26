@@ -101,7 +101,7 @@ async fn parsed_queue_display_message_reports_tmux_delay_errors() {
             .execute_parsed_commands_for_test(std::process::id(), parsed)
             .await
             .expect_err("invalid display-message delay must fail");
-        assert_eq!(error, rmux_proto::RmuxError::Server(expected.to_owned()));
+        assert_eq!(error, rmux_proto::RmuxError::Message(expected.to_owned()));
     }
 }
 

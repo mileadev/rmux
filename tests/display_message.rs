@@ -3,8 +3,102 @@
 mod common;
 
 use std::error::Error;
+use std::io::Write;
+use std::process::Stdio;
 
 use common::{assert_success, stderr, stdout, terminate_child, CliHarness};
+
+#[test]
+fn display_message_delay_errors_match_tmux_37b_across_cli_source_file_and_control(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("display-message-delay-errors")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    let mut diagnostics = Vec::new();
+
+    for (index, (delay, expected)) in [
+        ("1.0", "delay invalid"),
+        ("-1", "delay too small"),
+        ("4294967296", "delay too large"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let expected_line = format!("{expected}\n");
+
+        let config = harness.tmpdir().join(format!("delay-{index}.conf"));
+        std::fs::write(&config, format!("display-message -d '{delay}' -p hello\n"))?;
+        let sourced = harness.run(&[
+            "source-file",
+            config.to_str().expect("UTF-8 source-file path"),
+        ])?;
+        assert_eq!(
+            sourced.status.code(),
+            Some(1),
+            "source-file delay {delay:?}"
+        );
+
+        let mut control = harness
+            .base_command()
+            .arg("-C")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        control
+            .stdin
+            .as_mut()
+            .expect("control stdin")
+            .write_all(format!("display-message -d '{delay}' -p hello\n").as_bytes())?;
+        drop(control.stdin.take());
+        let controlled = control.wait_with_output()?;
+        let control_stdout = stdout(&controlled);
+        assert!(
+            stderr(&controlled).is_empty(),
+            "control delay {delay:?}: {:?}",
+            stderr(&controlled)
+        );
+        let control_lines = control_stdout.lines().collect::<Vec<_>>();
+        let error_index = control_lines
+            .iter()
+            .position(|line| line.starts_with("%error "))
+            .unwrap_or_else(|| panic!("control delay {delay:?}: {control_stdout:?}"));
+        let control_diagnostic = control_lines
+            .get(error_index.saturating_sub(1))
+            .expect("control diagnostic before %error")
+            .to_string();
+
+        let cli = harness.run(&["display-message", "-d", delay, "-p", "hello"])?;
+        assert_eq!(cli.status.code(), Some(1), "CLI delay {delay:?}");
+        assert!(stdout(&cli).is_empty(), "CLI delay {delay:?}");
+        diagnostics.push((
+            delay,
+            stdout(&sourced),
+            stderr(&sourced),
+            stderr(&cli),
+            control_diagnostic,
+            expected_line,
+        ));
+    }
+
+    let expected = diagnostics
+        .iter()
+        .map(|(delay, _, _, _, _, expected)| {
+            (
+                *delay,
+                String::new(),
+                expected.clone(),
+                expected.clone(),
+                expected.trim_end().to_owned(),
+                expected.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(diagnostics, expected);
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
 
 #[test]
 fn display_message_prints_expanded_format_without_attached_client() -> Result<(), Box<dyn Error>> {
