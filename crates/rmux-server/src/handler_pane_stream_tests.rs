@@ -16,6 +16,9 @@ use crate::pane_transcript::SharedPaneTranscript;
 
 use super::{validate_raw_rebase_size, RequestHandler};
 
+#[path = "handler_pane_stream_tests/subscription_kind.rs"]
+mod subscription_kind;
+
 const CONNECTION_ID: u64 = 41;
 
 #[cfg(unix)]

@@ -189,6 +189,11 @@ impl RequestHandler {
                 error: RmuxError::Server("subscription is not owned by this connection".to_owned()),
             });
         }
+        if let Err(error) =
+            validate_pane_output_subscription_kind(&subscriptions, request.subscription_id)
+        {
+            return Response::Error(ErrorResponse { error });
+        }
 
         let removed = subscriptions
             .registry
@@ -232,15 +237,18 @@ impl RequestHandler {
                     ),
                 });
             }
+            if let Err(error) =
+                validate_pane_output_subscription_kind(&subscriptions, request.subscription_id)
+            {
+                return Response::Error(ErrorResponse { error });
+            }
             let _ = subscriptions.registry.touch(request.subscription_id, now);
             let pane = record.pane().clone();
 
-            let Some(receiver) = subscriptions.receivers.get_mut(&request.subscription_id) else {
-                subscriptions.remove_subscription(request.subscription_id);
-                return Response::Error(ErrorResponse {
-                    error: RmuxError::Server("subscription receiver not found".to_owned()),
-                });
-            };
+            let receiver = subscriptions
+                .receivers
+                .get_mut(&request.subscription_id)
+                .expect("validated pane-output subscription must have a receiver");
 
             let items = receiver.try_recv_batch(limit);
             let cursor = cursor_dto(receiver.cursor());
@@ -553,6 +561,19 @@ pub(in crate::handler) fn cursor_event_limit(
         )),
         Some(value) => Ok(usize::from(value).min(default)),
         None => Ok(default),
+    }
+}
+
+fn validate_pane_output_subscription_kind(
+    subscriptions: &OutputSubscriptionState,
+    subscription_id: rmux_proto::PaneOutputSubscriptionId,
+) -> Result<(), RmuxError> {
+    if subscriptions.receivers.contains_key(&subscription_id) {
+        Ok(())
+    } else {
+        Err(RmuxError::Server(
+            "subscription is not a pane-output subscription".to_owned(),
+        ))
     }
 }
 
