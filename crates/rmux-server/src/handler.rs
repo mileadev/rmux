@@ -1552,6 +1552,9 @@ mod pane_group_transfer_tests;
 #[path = "handler_pane_transfer_hook_tests.rs"]
 mod pane_transfer_hook_tests;
 #[cfg(test)]
+#[path = "handler_pane_transfer_renumber_tests.rs"]
+mod pane_transfer_renumber_tests;
+#[cfg(test)]
 #[path = "handler_pane_window_metadata_tests.rs"]
 mod pane_window_metadata_tests;
 

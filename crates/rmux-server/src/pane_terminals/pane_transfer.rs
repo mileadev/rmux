@@ -238,6 +238,28 @@ fn pane_index_for_id(session: &Session, window_index: u32, pane_id: PaneId) -> O
     })
 }
 
+fn pane_target_for_id(
+    state: &HandlerState,
+    session_name: &rmux_proto::SessionName,
+    pane_id: PaneId,
+) -> Result<PaneTarget, RmuxError> {
+    let session = state
+        .sessions
+        .session(session_name)
+        .ok_or_else(|| session_not_found(session_name))?;
+    let window_index = session.window_index_for_pane_id(pane_id).ok_or_else(|| {
+        RmuxError::Server("moved pane disappeared after pane transfer".to_owned())
+    })?;
+    let pane_index = pane_index_for_id(session, window_index, pane_id).ok_or_else(|| {
+        RmuxError::Server("moved pane index disappeared after pane transfer".to_owned())
+    })?;
+    Ok(PaneTarget::with_window(
+        session_name.clone(),
+        window_index,
+        pane_index,
+    ))
+}
+
 fn resolve_swap_targets(
     sessions: &rmux_core::SessionStore,
     request: &SwapPaneRequest,
