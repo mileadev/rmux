@@ -33,6 +33,9 @@ use super::super::input_capture::RawPaneInputProbe;
 #[path = "handler_send_keys_tests/live_attach.rs"]
 mod live_attach;
 
+#[path = "handler_send_keys_tests/read_only_detach.rs"]
+mod read_only_detach;
+
 #[path = "handler_send_keys_tests/kitty_keyboard.rs"]
 mod kitty_keyboard;
 

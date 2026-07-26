@@ -6,7 +6,7 @@ use std::sync::{atomic::Ordering, Arc};
 use rmux_core::{input::mode, key_code_lookup_bits, KeyCode, LifecycleEvent, KEYC_ANY};
 #[cfg(windows)]
 use rmux_core::{key_string_lookup_string, KEYC_CTRL, KEYC_IMPLIED_META, KEYC_META, KEYC_SHIFT};
-use rmux_proto::{AttachedKeystroke, PaneTarget, Response, WindowTarget};
+use rmux_proto::{AttachedKeystroke, PaneTarget, WindowTarget};
 #[cfg(windows)]
 use rmux_pty::WindowsConsoleKeyEvent;
 
@@ -46,8 +46,11 @@ use crate::handler::{
 use crate::input_keys::{decode_extended_key, decode_mouse, ExtendedKeyDecode, MouseDecode};
 use crate::key_table::{
     decode_attached_key, default_key_table_name, lookup_attached_key_table_binding,
-    matches_prefix_key, session_option_key, AttachedKeyDecode, PREFIX_TABLE,
+    matches_prefix_key, session_option_key, AttachedKeyDecode,
 };
+
+#[path = "live/read_only_detach.rs"]
+mod read_only_detach;
 
 pub(crate) type ActiveClientEmitCache = Option<(u64, WindowTarget)>;
 
@@ -553,7 +556,29 @@ impl RequestHandler {
             .attached_client_input_is_read_only_for_identity(identity)
             .await?
         {
-            pending_input.clear();
+            if has_transient_terminal_prefix {
+                pending_input.clear();
+            }
+            let backspace = self.attached_backspace_byte().await;
+            #[cfg(windows)]
+            let windows_key_override = windows_console_key.and_then(|key_event| {
+                let AttachedKeyDecode::Matched { size, key } =
+                    decode_live_attached_key(bytes, backspace)
+                else {
+                    return None;
+                };
+                (size == bytes.len()).then(|| windows_console_binding_key(key, key_event))
+            });
+            #[cfg(not(windows))]
+            let windows_key_override = None;
+            self.handle_read_only_detach_input(
+                identity,
+                pending_input,
+                bytes,
+                backspace,
+                windows_key_override,
+            )
+            .await?;
             return Ok(AttachedLiveInputStep::Complete(false));
         }
         self.clear_attached_focus_alerts(identity).await;
@@ -1897,75 +1922,6 @@ impl RequestHandler {
         let mut pending_input = Vec::new();
         self.handle_attached_live_input(attach_pid, &mut pending_input, bytes)
             .await
-    }
-
-    async fn dispatch_immediate_prefix_detach(
-        &self,
-        identity: ActiveAttachIdentity,
-        target: &rmux_proto::PaneTarget,
-        bytes: &[u8],
-        backspace: Option<u8>,
-    ) -> io::Result<bool> {
-        let AttachedKeyDecode::Matched {
-            size: prefix_size,
-            key: prefix_key,
-        } = decode_live_attached_key(bytes, backspace)
-        else {
-            return Ok(false);
-        };
-        if prefix_size == 0 || prefix_size >= bytes.len() {
-            return Ok(false);
-        }
-
-        let AttachedKeyDecode::Matched {
-            size: command_size,
-            key: command_key,
-        } = decode_live_attached_key(&bytes[prefix_size..], backspace)
-        else {
-            return Ok(false);
-        };
-        if prefix_size.saturating_add(command_size) != bytes.len() {
-            return Ok(false);
-        }
-
-        let is_bare_detach_binding = {
-            let state = self.state.lock().await;
-            let prefix = session_option_key(
-                &state,
-                target.session_name(),
-                rmux_proto::OptionName::Prefix,
-            );
-            let prefix2 = session_option_key(
-                &state,
-                target.session_name(),
-                rmux_proto::OptionName::Prefix2,
-            );
-            if !matches_prefix_key(prefix_key, prefix, prefix2) {
-                return Ok(false);
-            }
-            lookup_attached_key_table_binding(
-                &state,
-                PREFIX_TABLE,
-                key_code_lookup_bits(command_key),
-            )
-            .is_some_and(|binding| {
-                let commands = binding.commands().commands();
-                commands.len() == 1
-                    && commands[0].name() == "detach-client"
-                    && commands[0].arguments().is_empty()
-            })
-        };
-        if !is_bare_detach_binding {
-            return Ok(false);
-        }
-
-        if !self.current_live_attach_input(identity).await {
-            return Ok(false);
-        }
-        match self.handle_detach_client_for_identity(identity).await {
-            Response::Error(error) => Err(io_other(error.error)),
-            _ => Ok(true),
-        }
     }
 }
 

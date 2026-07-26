@@ -12,6 +12,8 @@ mod command_surface;
 mod config_surface;
 #[path = "tmux_compat_surface_matrix/control_geometry.rs"]
 mod control_geometry;
+#[path = "tmux_compat_surface_matrix/read_only_detach.rs"]
+mod read_only_detach;
 #[path = "tmux_compat_surface_matrix/support.rs"]
 mod support;
 #[path = "tmux_compat_surface_matrix/window_commands.rs"]

@@ -166,6 +166,28 @@ impl RequestHandler {
         .await
     }
 
+    pub(in crate::handler) async fn set_attached_key_table_for_read_only_input(
+        &self,
+        identity: super::ActiveAttachIdentity,
+        session_name: &rmux_proto::SessionName,
+        expected_key_table_generation: u64,
+        key_table_name: Option<String>,
+        key_table_set_at: Option<Instant>,
+    ) -> Result<Option<AttachedKeyTableCommit>, rmux_proto::RmuxError> {
+        self.set_attached_key_table_with_expected_identity(
+            AttachedKeyTableExpectation {
+                attach_pid: identity.attach_pid(),
+                attach_id: Some(identity.attach_id()),
+                session: Some((session_name, identity.session_id())),
+                key_table_generation: Some(expected_key_table_generation),
+                reset_repeat: true,
+            },
+            key_table_name,
+            key_table_set_at,
+        )
+        .await
+    }
+
     pub(in crate::handler) async fn set_attached_key_table_for_client_session_identity_and_reset_repeat(
         &self,
         identity: super::ActiveAttachIdentity,
