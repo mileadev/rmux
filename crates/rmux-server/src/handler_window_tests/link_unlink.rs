@@ -1263,6 +1263,150 @@ async fn unlink_window_kill_if_last_deletes_an_unshared_window_slot() {
 }
 
 #[tokio::test]
+async fn unlink_only_linked_window_destroys_the_empty_session() {
+    // Frozen tmux 3.7b, measured on 2026-07-26: unlinking a session's only
+    // window removes that session when the window survives through another
+    // link.
+    let handler = RequestHandler::new();
+    let owner = session_name("unlink-only-window-owner");
+    let alias = session_name("unlink-only-window-alias");
+    create_session(&handler, owner.as_str()).await;
+    create_session(&handler, alias.as_str()).await;
+
+    assert!(matches!(
+        handler
+            .handle(Request::LinkWindow(LinkWindowRequest {
+                source: WindowTarget::with_window(owner.clone(), 0),
+                target: WindowTarget::with_window(alias.clone(), 9),
+                after: false,
+                before: false,
+                kill_destination: false,
+                detached: true,
+            }))
+            .await,
+        Response::LinkWindow(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::KillWindow(KillWindowRequest {
+                target: WindowTarget::with_window(alias.clone(), 0),
+                kill_all_others: false,
+            }))
+            .await,
+        Response::KillWindow(_)
+    ));
+
+    let response = handler
+        .handle(Request::UnlinkWindow(UnlinkWindowRequest {
+            target: WindowTarget::with_window(alias.clone(), 9),
+            kill_if_last: false,
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::UnlinkWindow(_)),
+        "{response:?}"
+    );
+
+    let state = handler.state.lock().await;
+    assert!(
+        state.sessions.session(&alias).is_none(),
+        "the empty alias session must be destroyed"
+    );
+    assert!(
+        state
+            .sessions
+            .session(&owner)
+            .and_then(|session| session.window_at(0))
+            .is_some(),
+        "the linked owner window must survive"
+    );
+}
+
+#[tokio::test]
+async fn unlink_only_linked_window_preserves_a_concurrently_added_window() {
+    let handler = std::sync::Arc::new(RequestHandler::new());
+    let owner = session_name("unlink-race-owner");
+    let alias = session_name("unlink-race-alias");
+    create_session(&handler, owner.as_str()).await;
+    create_session(&handler, alias.as_str()).await;
+
+    let linked = handler
+        .handle(Request::LinkWindow(LinkWindowRequest {
+            source: WindowTarget::with_window(owner.clone(), 0),
+            target: WindowTarget::with_window(alias.clone(), 9),
+            after: false,
+            before: false,
+            kill_destination: false,
+            detached: true,
+        }))
+        .await;
+    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
+    let killed = handler
+        .handle(Request::KillWindow(KillWindowRequest {
+            target: WindowTarget::with_window(alias.clone(), 0),
+            kill_all_others: false,
+        }))
+        .await;
+    assert!(matches!(killed, Response::KillWindow(_)), "{killed:?}");
+
+    let pause = handler.install_kill_session_selection_identity_pause(alias.clone());
+    let unlink_handler = std::sync::Arc::clone(&handler);
+    let unlink_alias = alias.clone();
+    let unlinking = tokio::spawn(async move {
+        unlink_handler
+            .handle(Request::UnlinkWindow(UnlinkWindowRequest {
+                target: WindowTarget::with_window(unlink_alias, 9),
+                kill_if_last: false,
+            }))
+            .await
+    });
+    timeout(Duration::from_secs(1), pause.reached.notified())
+        .await
+        .expect("conditional session removal reaches the identity pause");
+
+    let created = handler
+        .handle(Request::NewWindow(Box::new(NewWindowRequest {
+            target: alias.clone(),
+            name: None,
+            detached: true,
+            start_directory: None,
+            environment: None,
+            command: Some(quiet_window_test_command()),
+            process_command: None,
+            target_window_index: Some(10),
+            insert_at_target: false,
+        })))
+        .await;
+    assert!(matches!(created, Response::NewWindow(_)), "{created:?}");
+    pause.release.notify_one();
+
+    let unlinked = timeout(Duration::from_secs(2), unlinking)
+        .await
+        .expect("unlink-window must finish")
+        .expect("unlink-window task joins");
+    assert!(
+        matches!(unlinked, Response::UnlinkWindow(_)),
+        "{unlinked:?}"
+    );
+
+    let state = handler.state.lock().await;
+    let alias_session = state
+        .sessions
+        .session(&alias)
+        .expect("the concurrently extended session survives");
+    assert!(alias_session.window_at(9).is_none());
+    assert!(alias_session.window_at(10).is_some());
+    assert!(
+        state
+            .sessions
+            .session(&owner)
+            .and_then(|session| session.window_at(0))
+            .is_some(),
+        "the linked owner window survives"
+    );
+}
+
+#[tokio::test]
 async fn unlink_window_kill_if_last_rekeys_renumbered_silence_timers_without_delay() {
     let handler = RequestHandler::new();
     let alpha = session_name("unlink-renumber-timers");

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use rmux_core::{
     formats::{is_truthy, render_list_sessions_line, FormatContext},
-    LifecycleEvent, PaneId, WINDOW_ALERTFLAGS,
+    LifecycleEvent, PaneId, WindowId, WINDOW_ALERTFLAGS,
 };
 use rmux_proto::request::NewSessionExtRequest;
 use rmux_proto::types::OptionScopeSelector;
@@ -45,6 +45,28 @@ const DEFERRED_INITIAL_PANE_READY_SETTLE: Duration = Duration::from_millis(100);
 // Keep immediate post-new-session console control input queued until the
 // autostarted ConPTY console is safely isolated from the launching client.
 const DEFERRED_INITIAL_PANE_INPUT_GRACE: Duration = Duration::from_secs(2);
+
+enum KillSessionExecution {
+    Completed(Response),
+    OnlyLinkedWindowChanged,
+}
+
+impl KillSessionExecution {
+    fn into_unconditional_response(self) -> Response {
+        match self {
+            Self::Completed(response) => response,
+            Self::OnlyLinkedWindowChanged => {
+                unreachable!("unconditional kill-session cannot lose a window precondition")
+            }
+        }
+    }
+}
+
+impl From<Response> for KillSessionExecution {
+    fn from(response: Response) -> Self {
+        Self::Completed(response)
+    }
+}
 
 #[cfg(test)]
 #[derive(Debug, Default)]
@@ -1103,8 +1125,9 @@ impl RequestHandler {
         request: rmux_proto::KillSessionRequest,
     ) -> Response {
         let expected_session_id = explicit_session_id_target(&request.target);
-        self.handle_kill_session_with_identity(request, expected_session_id, None)
+        self.handle_kill_session_with_identity(request, expected_session_id, None, None)
             .await
+            .into_unconditional_response()
     }
 
     pub(in crate::handler) async fn handle_kill_session_identity(
@@ -1112,8 +1135,24 @@ impl RequestHandler {
         request: rmux_proto::KillSessionRequest,
         session_id: SessionId,
     ) -> Response {
-        self.handle_kill_session_with_identity(request, Some(session_id), None)
+        self.handle_kill_session_with_identity(request, Some(session_id), None, None)
             .await
+            .into_unconditional_response()
+    }
+
+    pub(in crate::handler) async fn handle_kill_session_if_only_linked_window_identity(
+        &self,
+        request: rmux_proto::KillSessionRequest,
+        session_id: SessionId,
+        window_id: WindowId,
+    ) -> Option<Response> {
+        match self
+            .handle_kill_session_with_identity(request, Some(session_id), None, Some(window_id))
+            .await
+        {
+            KillSessionExecution::Completed(response) => Some(response),
+            KillSessionExecution::OnlyLinkedWindowChanged => None,
+        }
     }
 
     pub(in crate::handler) async fn handle_kill_expired_session_lease_identity(
@@ -1122,8 +1161,9 @@ impl RequestHandler {
         session_id: SessionId,
         lease_token: u64,
     ) -> Response {
-        self.handle_kill_session_with_identity(request, Some(session_id), Some(lease_token))
+        self.handle_kill_session_with_identity(request, Some(session_id), Some(lease_token), None)
             .await
+            .into_unconditional_response()
     }
 
     async fn handle_kill_session_with_identity(
@@ -1131,19 +1171,21 @@ impl RequestHandler {
         request: rmux_proto::KillSessionRequest,
         expected_session_id: Option<SessionId>,
         expected_expired_lease_token: Option<u64>,
-    ) -> Response {
+        expected_only_linked_window_id: Option<WindowId>,
+    ) -> KillSessionExecution {
         let (session_name, selected_session_id) = {
             let state = self.state.lock().await;
             if let Some(session_id) = expected_session_id {
                 let Some(session) = state.sessions.session_by_id(session_id) else {
                     return Response::Error(ErrorResponse {
                         error: RmuxError::SessionNotFound(request.target.to_string()),
-                    });
+                    })
+                    .into();
                 };
                 let session_name = session.name().clone();
                 if let Err(error) = super::require_expected_session_identity(&state, &session_name)
                 {
-                    return Response::Error(ErrorResponse { error });
+                    return Response::Error(ErrorResponse { error }).into();
                 }
                 (session_name, session_id)
             } else {
@@ -1156,7 +1198,7 @@ impl RequestHandler {
                         if let Err(error) =
                             super::require_expected_session_identity(&state, &session_name)
                         {
-                            return Response::Error(ErrorResponse { error });
+                            return Response::Error(ErrorResponse { error }).into();
                         }
                         let session_id = state
                             .sessions
@@ -1165,7 +1207,7 @@ impl RequestHandler {
                             .id();
                         (session_name, session_id)
                     }
-                    Err(error) => return Response::Error(ErrorResponse { error }),
+                    Err(error) => return Response::Error(ErrorResponse { error }).into(),
                 }
             }
         };
@@ -1177,7 +1219,8 @@ impl RequestHandler {
                     let Some(session) = state.sessions.session_by_id(selected_session_id) else {
                         return Response::Error(ErrorResponse {
                             error: RmuxError::SessionNotFound(session_name.to_string()),
-                        });
+                        })
+                        .into();
                     };
                     session.name().clone()
                 } else {
@@ -1186,12 +1229,14 @@ impl RequestHandler {
                 let Some(session) = state.sessions.session_mut(&current_session_name) else {
                     return Response::Error(ErrorResponse {
                         error: RmuxError::SessionNotFound(current_session_name.to_string()),
-                    });
+                    })
+                    .into();
                 };
                 if session.id() != selected_session_id {
                     return Response::Error(ErrorResponse {
                         error: RmuxError::SessionNotFound(current_session_name.to_string()),
-                    });
+                    })
+                    .into();
                 }
                 let window_indexes = session.windows().keys().copied().collect::<Vec<_>>();
                 for window_index in window_indexes {
@@ -1207,7 +1252,7 @@ impl RequestHandler {
             };
             self.refresh_attached_session(&refresh_session_name).await;
             self.refresh_control_session(&refresh_session_name).await;
-            return response;
+            return response.into();
         }
 
         #[cfg(test)]
@@ -1228,7 +1273,8 @@ impl RequestHandler {
                 let Some(session) = state.sessions.session_by_id(selected_session_id) else {
                     return Response::Error(ErrorResponse {
                         error: RmuxError::SessionNotFound(session_name.to_string()),
-                    });
+                    })
+                    .into();
                 };
                 session.name().clone()
             } else {
@@ -1241,13 +1287,32 @@ impl RequestHandler {
             {
                 return Response::Error(ErrorResponse {
                     error: RmuxError::SessionNotFound(session_name.to_string()),
-                });
+                })
+                .into();
+            }
+            if let Some(expected_window_id) = expected_only_linked_window_id {
+                let session = state
+                    .sessions
+                    .session(&session_name)
+                    .expect("validated session must exist");
+                let mut windows = session.windows().iter();
+                let only_window = windows.next();
+                let only_window_is_still_linked =
+                    only_window.is_some_and(|(window_index, window)| {
+                        windows.next().is_none()
+                            && window.id() == expected_window_id
+                            && state.window_link_count(&session_name, *window_index) > 1
+                    });
+                if !only_window_is_still_linked {
+                    return KillSessionExecution::OnlyLinkedWindowChanged;
+                }
             }
             if let Some(token) = expected_expired_lease_token {
                 if !self.claim_expired_session_lease(selected_session_id, token) {
                     return Response::Error(ErrorResponse {
                         error: RmuxError::owned_session_lease_lost(session_name),
-                    });
+                    })
+                    .into();
                 }
             }
             let sessions_to_remove = if request.kill_all_except_target {
@@ -1302,7 +1367,8 @@ impl RequestHandler {
                             "missing pane terminals for session {}",
                             session_name
                         )),
-                    });
+                    })
+                    .into();
                 }
             }
 
@@ -1484,7 +1550,7 @@ impl RequestHandler {
 
         let _ = self.queue_shutdown_if_server_empty().await;
 
-        response
+        response.into()
     }
 
     pub(in crate::handler) async fn handle_rename_session(

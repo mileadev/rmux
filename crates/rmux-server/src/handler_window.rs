@@ -2,8 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use rmux_core::{LifecycleEvent, PaneId};
 use rmux_proto::{
-    ErrorResponse, HookName, MoveWindowRequest, MoveWindowResponse, PaneTarget, Response,
-    RmuxError, ScopeSelector, SessionName, Target, WindowTarget,
+    ErrorResponse, HookName, KillSessionRequest, MoveWindowRequest, MoveWindowResponse, PaneTarget,
+    Response, RmuxError, ScopeSelector, SessionName, Target, UnlinkWindowRequest,
+    UnlinkWindowResponse, WindowTarget,
 };
 
 #[cfg(windows)]
@@ -1121,12 +1122,12 @@ impl RequestHandler {
         Response::MoveWindow(committed.response)
     }
 
-    pub(super) async fn handle_unlink_window(
-        &self,
-        request: rmux_proto::UnlinkWindowRequest,
-    ) -> Response {
+    pub(super) async fn handle_unlink_window(&self, request: UnlinkWindowRequest) -> Response {
         let session_name = request.target.session_name().clone();
         self.pause_before_window_lifecycle_mutation().await;
+        if let Some(response) = self.destroy_session_for_only_linked_window(&request).await {
+            return response;
+        }
         let (
             response,
             removed_pane_ids,
@@ -1251,6 +1252,45 @@ impl RequestHandler {
         }
 
         response
+    }
+
+    async fn destroy_session_for_only_linked_window(
+        &self,
+        request: &UnlinkWindowRequest,
+    ) -> Option<Response> {
+        let (session_id, window_id) = {
+            let state = self.state.lock().await;
+            if let Err(error) = super::require_expected_window_identity(&state, &request.target) {
+                return Some(Response::Error(ErrorResponse { error }));
+            }
+            let session = state.sessions.session(request.target.session_name())?;
+            if session.windows().len() != 1
+                || state
+                    .window_link_count(request.target.session_name(), request.target.window_index())
+                    <= 1
+            {
+                return None;
+            }
+            let window = session.window_at(request.target.window_index())?;
+            (session.id(), window.id())
+        };
+        let target = request.target.clone();
+        let response = self
+            .handle_kill_session_if_only_linked_window_identity(
+                KillSessionRequest {
+                    target: target.session_name().clone(),
+                    kill_all_except_target: false,
+                    clear_alerts: false,
+                    kill_group: false,
+                },
+                session_id,
+                window_id,
+            )
+            .await?;
+        Some(match response {
+            Response::KillSession(_) => Response::UnlinkWindow(UnlinkWindowResponse { target }),
+            other => other,
+        })
     }
 
     pub(super) async fn handle_swap_window(
