@@ -219,6 +219,57 @@ async fn direct_and_target_action_capture_join_stop_at_active_alternate_boundary
     assert_eq!(queued.stdout(), b"abcdefgh\nVIM\n\n");
 }
 
+#[tokio::test]
+async fn named_capture_buffer_keeps_dch_field_boundary_like_tmux_3_7b() {
+    let handler = RequestHandler::new();
+    let size = TerminalSize { cols: 12, rows: 8 };
+    create_session_with_size(&handler, "mutations", size).await;
+    let target = PaneTarget::with_window(session_name("mutations"), 0, 0);
+    replace_transcript_contents(
+        &handler,
+        &target,
+        size,
+        b"ABCDEFGHIJKLmnopqrstuvwx012345678\r\nNXT\r\nEND\
+          \x1b[r\x1b[2;1H\x1b[99P",
+    )
+    .await;
+
+    let mut capture = capture_pane_request(target, None, None, false, Some("mutation-consumer"));
+    capture.join_wrapped = true;
+    let response = handler
+        .handle(Request::CapturePane(Box::new(capture)))
+        .await;
+    let Response::CapturePane(response) = response else {
+        panic!("expected capture-pane buffer response, got {response:?}");
+    };
+    assert_eq!(response.buffer_name.as_deref(), Some("mutation-consumer"));
+
+    let shown = handler
+        .handle(Request::ShowBuffer(ShowBufferRequest {
+            name: Some("mutation-consumer".to_owned()),
+        }))
+        .await;
+    let bytes = shown
+        .command_output()
+        .expect("show-buffer returns captured bytes")
+        .stdout()
+        .to_vec();
+    let nonempty = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        nonempty,
+        [
+            b"ABCDEFGHIJKL".as_slice(),
+            b"012345678".as_slice(),
+            b"NXT".as_slice(),
+            b"END".as_slice(),
+        ]
+    );
+}
+
 async fn replace_transcript_contents(
     handler: &RequestHandler,
     target: &PaneTarget,

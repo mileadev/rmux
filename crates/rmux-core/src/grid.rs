@@ -611,6 +611,14 @@ impl Grid {
             return;
         }
 
+        let moved_lines = lower.saturating_sub(upper);
+        if !(to_history && self.history_enabled) {
+            self.prepare_wrapped_line_move(upper, upper.saturating_add(1), moved_lines);
+        }
+        self.scroll_region_up_one(upper, lower, bg, to_history);
+    }
+
+    fn scroll_region_up_one(&mut self, upper: u32, lower: u32, bg: Colour, to_history: bool) {
         let upper = upper as usize;
         let lower = lower as usize;
         if upper == 0 && lower + 1 == self.visible.len() {
@@ -649,6 +657,12 @@ impl Grid {
             return;
         }
 
+        let moved_lines = lower.saturating_sub(upper);
+        self.prepare_wrapped_line_move(upper.saturating_add(1), upper, moved_lines);
+        self.scroll_region_down_one(upper, lower, bg);
+    }
+
+    fn scroll_region_down_one(&mut self, upper: u32, lower: u32, bg: Colour) {
         let upper = upper as usize;
         let lower = lower as usize;
         if upper == 0 && lower + 1 == self.visible.len() {
@@ -663,6 +677,42 @@ impl Grid {
         let visible = self.visible.make_contiguous();
         visible[upper..=lower].rotate_right(1);
         visible[upper].clear(bg);
+    }
+
+    pub(crate) fn insert_lines(&mut self, upper: u32, lower: u32, count: u32, bg: Colour) {
+        if !self.valid_region(upper, lower) {
+            return;
+        }
+        let region_lines = lower.saturating_sub(upper).saturating_add(1);
+        let count = count.max(1).min(region_lines);
+        let moved_lines = region_lines.saturating_sub(count);
+        if moved_lines == 0 {
+            self.break_wrap_before_visible_line(upper);
+        } else {
+            self.prepare_wrapped_line_move(upper.saturating_add(count), upper, moved_lines);
+        }
+        for _ in 0..count {
+            self.scroll_region_down_one(upper, lower, bg);
+        }
+        // tmux follows the move with a full-line clear starting after the
+        // moved range. That clear also breaks WRAPPED immediately before its
+        // start, even when its unsigned row count describes an empty range.
+        if count != moved_lines {
+            self.break_wrap_before_visible_line(upper.saturating_add(moved_lines));
+        }
+    }
+
+    /// Mirrors tmux's `grid_move_lines` wrap-boundary maintenance without
+    /// coupling raw row storage to tmux's allocation strategy.
+    fn prepare_wrapped_line_move(&mut self, destination: u32, source: u32, count: u32) {
+        if count == 0 || source == destination {
+            return;
+        }
+        self.break_wrap_before_visible_line(destination);
+        let destination_end = destination.saturating_add(count);
+        if source < destination || source >= destination_end {
+            self.break_wrap_before_visible_line(source);
+        }
     }
 
     pub(crate) fn logical_cursor(

@@ -90,9 +90,7 @@ impl ScreenWriter for Screen {
         let upper = self.cursor_y;
         let lower = self.rlower;
         let lines = n.max(1).min(lower.saturating_sub(upper).saturating_add(1));
-        for _ in 0..lines {
-            self.grid.scroll_region_down(upper, lower, bg);
-        }
+        self.grid.insert_lines(upper, lower, lines, bg);
     }
 
     fn delete_line(&mut self, n: u32, bg: i32) {
@@ -211,9 +209,16 @@ impl ScreenWriter for Screen {
         let sx = self.grid.sx();
         let count = n.max(1).min(sx.saturating_sub(x));
         let blank = self.blank_cell(bg);
+        let clears_whole_line = x == 0 && count == sx;
+        if clears_whole_line {
+            self.grid.break_wrap_before_visible_line(self.cursor_y);
+        }
         if let Some(line) = self.current_line_mut() {
             line.delete_cells(x, count, &blank);
             Self::repair_wide_cells_on_line(line, sx, bg);
+            if clears_whole_line {
+                line.set_wrapped(false);
+            }
             line.touch();
         }
     }
