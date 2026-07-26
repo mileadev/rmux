@@ -106,7 +106,10 @@ pub(super) fn parse_send_keys(mut args: CommandTokens) -> Result<Request, RmuxEr
                 let _ = args.optional();
                 target = Some(parse_pane_target("send-keys", args.required("-t target")?)?);
             }
-            _ => break,
+            token => {
+                reject_unknown_option_before_positional("send-keys", token)?;
+                break;
+            }
         }
     }
 

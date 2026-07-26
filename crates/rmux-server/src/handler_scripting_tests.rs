@@ -444,3 +444,6 @@ mod command_alias;
 
 #[path = "handler_scripting_tests/command_blocks.rs"]
 mod command_blocks;
+
+#[path = "handler_scripting_tests/parser_flags.rs"]
+mod parser_flags;

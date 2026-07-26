@@ -8,7 +8,7 @@ use rmux_proto::{
 
 use super::super::DEFAULT_SESSION_SIZE;
 use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
-use super::values::{parse_u16, unsupported_flag};
+use super::values::{parse_u16, reject_unknown_option_before_positional, unsupported_flag};
 use super::{implicit_session_name, parse_session_name};
 
 pub(super) fn parse_new_session(mut args: CommandTokens) -> Result<Request, RmuxError> {
@@ -255,7 +255,10 @@ pub(super) fn parse_rename_session(
                 let _ = args.optional();
                 target = Some(parse_session_name(args.required("-t target")?)?);
             }
-            _ => break,
+            token => {
+                reject_unknown_option_before_positional("rename-session", token)?;
+                break;
+            }
         }
     }
 

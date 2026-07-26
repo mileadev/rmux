@@ -87,6 +87,26 @@ fn direct_cli_rejects_unknown_options_before_command_tails() {
             "unexpected direct CLI error for {command}: {error}"
         );
     }
+
+    for (command, arguments) in [
+        ("send-keys", &["-x", "C-c"][..]),
+        ("rename-session", &["-x"][..]),
+        ("rename-window", &["-x"][..]),
+        ("set-buffer", &["-x", "payload"][..]),
+        ("display-message", &["-p", "-x"][..]),
+    ] {
+        let mut invocation = Vec::with_capacity(arguments.len() + 1);
+        invocation.push(command);
+        invocation.extend_from_slice(arguments);
+
+        let error =
+            parse_args(&invocation).expect_err("unknown option must fail direct CLI parsing");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        assert!(
+            error.to_string().contains("-x"),
+            "unexpected direct CLI error for {command}: {error}"
+        );
+    }
 }
 
 #[test]
