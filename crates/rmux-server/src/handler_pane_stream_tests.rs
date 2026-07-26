@@ -238,6 +238,34 @@ fn surface_frame(event: &PaneStreamEvent) -> Option<&PaneSurfaceFrame> {
 }
 
 #[tokio::test]
+async fn raw_recovery_coverage_reports_sanitized_osc_metadata_incomplete() {
+    let handler = RequestHandler::new();
+    let (target, _, transcript) = test_pane(&handler).await;
+    let payload = concat!(
+        "\x1b]2;pile-\x7f-é\x1b\\",
+        "\x1b[22;2t",
+        "\x1b]2;courant-界\x1b\\",
+        "\x1b]7;file:///rép\u{009d}ertoire/界\x1b\\"
+    );
+    transcript
+        .lock()
+        .expect("transcript lock")
+        .append_bytes(payload.as_bytes());
+
+    let subscribed = subscribe(&handler, &target, PaneStreamMode::Raw).await;
+    let PaneStreamEvent::RawRebase(rebase) = subscribed.event else {
+        panic!("raw subscription must start with a rebase");
+    };
+
+    assert!(!rebase.coverage.metadata_complete);
+    assert!(!rebase.keyframe.contains(&0x7f));
+    assert!(!rebase
+        .keyframe
+        .windows("\u{009d}".len())
+        .any(|window| window == "\u{009d}".as_bytes()));
+}
+
+#[tokio::test]
 async fn raw_stream_emits_bytes_and_rebases_in_band_after_resize() {
     let handler = RequestHandler::new();
     let (target, output, transcript) = test_pane(&handler).await;

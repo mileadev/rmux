@@ -510,10 +510,13 @@ pub struct PaneRecoveryCoverage {
     pub history_rows_total: u64,
     /// Newest whole scrollback rows represented by the keyframe.
     pub history_rows_included: u64,
-    /// Whether every bounded terminal metadata value was represented.
+    /// Whether terminal metadata carried by the keyframe is lossless.
     ///
-    /// `false` means oversized title, path, title-stack, or hyperlink metadata
-    /// was omitted or shortened. The visible cell grid remains authoritative.
+    /// `true` guarantees exact reconstruction of stored title, OSC 7 path,
+    /// title-stack, and hyperlink values. `false` means at least one recovery
+    /// metadata value was omitted, shortened to fit a byte budget, or stripped
+    /// of control characters for safe OSC replay. This is independent of the
+    /// history-row coverage above; the visible cell grid remains authoritative.
     pub metadata_complete: bool,
 }
 

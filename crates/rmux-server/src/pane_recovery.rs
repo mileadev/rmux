@@ -414,6 +414,7 @@ fn materialize_keyframe(
     metadata_complete: bool,
     history_policy: RecoveryHistoryPolicy,
 ) -> Result<PaneRecoveryKeyframe, RmuxError> {
+    let mut metadata_complete = metadata_complete;
     let size = source.size();
     let cols = u32::from(size.cols);
     let alternate = source.is_alternate();
@@ -436,8 +437,8 @@ fn materialize_keyframe(
 
     let mut prefix = Vec::new();
     prefix.extend_from_slice(RESET_PREFIX);
-    append_title_state(&mut prefix, source);
-    append_osc_text(&mut prefix, 7, source.path());
+    metadata_complete &= append_title_state(&mut prefix, source);
+    metadata_complete &= append_osc_text(&mut prefix, 7, source.path());
     prefix.extend_from_slice(parser_state);
 
     // The saved viewport is repainted on the main screen before the alternate
@@ -758,26 +759,38 @@ fn adjust_history_total(total: usize, captured: usize, recovered: usize) -> usiz
     }
 }
 
-fn append_title_state(out: &mut Vec<u8>, screen: &Screen) {
+fn append_title_state(out: &mut Vec<u8>, screen: &Screen) -> bool {
+    let mut complete = true;
     for _ in 0..Screen::title_stack_limit() {
         out.extend_from_slice(b"\x1b[23;2t");
     }
     for title in screen.title_stack() {
-        append_osc_text(out, 2, title);
+        complete &= append_osc_text(out, 2, title);
         out.extend_from_slice(b"\x1b[22;2t");
     }
-    append_osc_text(out, 2, screen.title());
+    complete &= append_osc_text(out, 2, screen.title());
+    complete
 }
 
-fn append_osc_text(out: &mut Vec<u8>, command: u8, value: &str) {
+/// Appends a safely replayable OSC value and reports whether it was lossless.
+///
+/// Unicode control characters are omitted instead of being embedded in the
+/// recovery envelope, so callers must include the result in metadata coverage.
+fn append_osc_text(out: &mut Vec<u8>, command: u8, value: &str) -> bool {
+    let mut complete = true;
     out.extend_from_slice(b"\x1b]");
     out.extend_from_slice(command.to_string().as_bytes());
     out.push(b';');
-    for character in value.chars().filter(|character| !character.is_control()) {
+    for character in value.chars() {
+        if character.is_control() {
+            complete = false;
+            continue;
+        }
         let mut encoded = [0_u8; 4];
         out.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
     }
     out.extend_from_slice(b"\x1b\\");
+    complete
 }
 
 fn append_scroll_region(out: &mut Vec<u8>, screen: &Screen) {
@@ -1569,6 +1582,142 @@ mod tests {
         let keyframe = seed.keyframe();
         assert!(!keyframe.metadata_complete);
         assert!(keyframe.bytes.len() <= MAX_RECOVERY_KEYFRAME_BYTES);
+    }
+
+    #[test]
+    fn keyframe_reports_filtered_title_del_metadata() {
+        let mut transcript = PaneTranscript::new(100, SIZE);
+        transcript.append_bytes(b"\x1b]2;before\x7fafter\x1b\\");
+        assert_eq!(transcript.screen().title(), "before\u{7f}after");
+
+        let recent = PaneRecoveryDraft::capture(&transcript)
+            .expect("capture recovery title")
+            .materialize()
+            .expect("materialize recovery title")
+            .keyframe();
+        let visible = PaneRecoveryDraft::capture(&transcript)
+            .expect("capture visible-only recovery title")
+            .materialize_visible_only()
+            .expect("materialize visible-only recovery title")
+            .keyframe();
+
+        for keyframe in [recent, visible] {
+            assert!(!keyframe.metadata_complete);
+            assert!(!keyframe.bytes.contains(&0x7f));
+            assert!(keyframe.bytes.len() <= MAX_RECOVERY_KEYFRAME_BYTES);
+
+            let mut replayed = TerminalScreen::new(SIZE, 100);
+            replayed.feed(&keyframe.bytes);
+            assert_eq!(replayed.screen().title(), "beforeafter");
+        }
+    }
+
+    #[test]
+    fn keyframe_reports_filtered_osc_7_c1_metadata_and_preserves_utf8() {
+        let path = "file:///tmp/ré\u{009d}pertoire/界";
+        let mut transcript = PaneTranscript::new(100, SIZE);
+        transcript.append_bytes(format!("\x1b]7;{path}\x1b\\").as_bytes());
+        assert_eq!(transcript.screen().path(), path);
+
+        let keyframe = PaneRecoverySeed::capture(&transcript)
+            .expect("capture recovery path")
+            .keyframe();
+        assert!(!keyframe.metadata_complete);
+        assert!(!contains_subslice(&keyframe.bytes, "\u{009d}".as_bytes()));
+        assert!(keyframe.bytes.len() <= MAX_RECOVERY_KEYFRAME_BYTES);
+
+        let mut replayed = TerminalScreen::new(SIZE, 100);
+        replayed.feed(&keyframe.bytes);
+        assert_eq!(replayed.screen().path(), "file:///tmp/répertoire/界");
+    }
+
+    #[test]
+    fn keyframe_reports_filtered_title_stack_c1_metadata() {
+        let stacked = "pile-\u{0085}-é";
+        let current = "courant-界";
+        let mut transcript = PaneTranscript::new(100, SIZE);
+        transcript.append_bytes(
+            format!("\x1b]2;{stacked}\x1b\\\x1b[22;2t\x1b]2;{current}\x1b\\").as_bytes(),
+        );
+        assert_eq!(transcript.screen().title_stack(), &[stacked.to_owned()]);
+        assert_eq!(transcript.screen().title(), current);
+
+        let keyframe = PaneRecoverySeed::capture(&transcript)
+            .expect("capture recovery title stack")
+            .keyframe();
+        assert!(!keyframe.metadata_complete);
+        assert!(!contains_subslice(&keyframe.bytes, "\u{0085}".as_bytes()));
+        assert!(keyframe.bytes.len() <= MAX_RECOVERY_KEYFRAME_BYTES);
+
+        let mut replayed = TerminalScreen::new(SIZE, 100);
+        replayed.feed(&keyframe.bytes);
+        assert_eq!(replayed.screen().title(), current);
+        assert_eq!(replayed.screen().title_stack(), &["pile--é".to_owned()]);
+        replayed.feed(b"\x1b[23;2t");
+        assert_eq!(replayed.screen().title(), "pile--é");
+    }
+
+    #[test]
+    fn keyframe_metadata_coverage_respects_utf8_title_stack_budgets() {
+        let first = "é".repeat(MAX_RECOVERY_STRING_BYTES / "é".len());
+        let second = format!(
+            "{}x",
+            "界".repeat((MAX_RECOVERY_STRING_BYTES - 1) / "界".len())
+        );
+        assert_eq!(first.len(), MAX_RECOVERY_STRING_BYTES);
+        assert_eq!(second.len(), MAX_RECOVERY_STRING_BYTES);
+
+        let mut initial = Vec::new();
+        write!(
+            initial,
+            "\x1b]2;{first}\x1b\\\x1b[22;2t\x1b]2;{second}\x1b\\\x1b[22;2t\x1b]2;courant-界\x1b\\"
+        )
+        .expect("build exact-budget title stack");
+        let mut transcript = PaneTranscript::new(100, SIZE);
+        transcript.append_bytes(&initial);
+        assert_eq!(
+            transcript
+                .screen()
+                .title_stack()
+                .iter()
+                .map(String::len)
+                .sum::<usize>(),
+            MAX_RECOVERY_TITLE_STACK_BYTES
+        );
+
+        let exact = PaneRecoverySeed::capture(&transcript)
+            .expect("capture exact-budget recovery metadata")
+            .keyframe();
+        assert!(exact.metadata_complete);
+        assert!(exact.bytes.len() <= MAX_RECOVERY_KEYFRAME_BYTES);
+        let mut replayed = TerminalScreen::new(SIZE, 100);
+        replayed.feed(&exact.bytes);
+        assert_eq!(
+            replayed.screen().title_stack(),
+            transcript.screen().title_stack()
+        );
+        assert_eq!(replayed.screen().title(), transcript.screen().title());
+
+        transcript.append_bytes(b"\x1b[22;2t");
+        assert!(transcript
+            .screen()
+            .title_stack()
+            .iter()
+            .all(|title| title.len() <= MAX_RECOVERY_STRING_BYTES));
+        assert!(
+            transcript
+                .screen()
+                .title_stack()
+                .iter()
+                .map(String::len)
+                .sum::<usize>()
+                > MAX_RECOVERY_TITLE_STACK_BYTES
+        );
+        let over = PaneRecoverySeed::capture(&transcript)
+            .expect("capture over-budget recovery metadata")
+            .keyframe();
+        assert!(!over.metadata_complete);
+        assert!(over.bytes.len() <= MAX_RECOVERY_KEYFRAME_BYTES);
     }
 
     #[test]
