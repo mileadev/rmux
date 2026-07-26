@@ -317,7 +317,7 @@ verify_managed_index() {
     die "managed APT index $relative does not match its MD5 entry"
 }
 validate_managed_output() {
-  local suite_root pool_root release architecture binary name entry digest count matched package
+  local suite_root pool_root release architecture binary name entry digest count matched package package_architecture
   local output_entries=() pool_entries=() architecture_packages=() by_hash_entries=()
   [ -e "$output_dir" ] || return 0
   [ -d "$output_dir" ] && [ ! -L "$output_dir" ] ||
@@ -352,10 +352,17 @@ validate_managed_output() {
     name="${package##*/}"
     case "$name" in *$'\n'*) die "managed APT package name contains a newline" ;; esac
     matched=0
+    package_architecture=""
     for architecture in "${architectures[@]}"; do
-      case "$name" in rmux_*_"$architecture".deb) matched=1 ;; esac
+      case "$name" in
+        rmux_*_"$architecture".deb)
+          matched=1
+          package_architecture="$architecture"
+          ;;
+      esac
     done
     [ "$matched" -eq 1 ] || die "managed APT pool contains an unexpected entry: $name"
+    validate_apt_package_identity "$package" "$package_architecture"
   done
 
   validate_allowed_entries "$suite_root/$component" "APT component indexes" \
@@ -395,26 +402,6 @@ validate_managed_output() {
     [ "$count" -le 4 ] || die "managed APT by-hash retains too many generations"
   done
 }
-validate_input_packages() {
-  local architecture deb matches
-  input_packages=()
-  shopt -s nullglob
-  for architecture in "${architectures[@]}"; do
-    matches=("$input_dir"/rmux_*_"$architecture".deb)
-    [ "${#matches[@]}" -gt 0 ] ||
-      die "no rmux_*_${architecture}.deb files found in $input_dir"
-    for deb in "${matches[@]}"; do
-      [ -f "$deb" ] && [ ! -L "$deb" ] ||
-        die "unsafe APT input package: $deb"
-      case "${deb##*/}" in *$'\n'*) die "APT input package name contains a newline" ;; esac
-      dpkg-deb -f "$deb" >/dev/null ||
-        die "invalid APT input package: $deb"
-      input_packages+=("$deb")
-    done
-  done
-  shopt -u nullglob
-}
-
 input_dir=""
 output_dir=""
 previous_repository_dir=""

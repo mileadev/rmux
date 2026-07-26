@@ -79,3 +79,38 @@ inventory_tree_entries() {
     fi
   done
 }
+
+validate_apt_package_identity() {
+  local package expected_architecture package_name package_architecture
+  package="$1"
+  expected_architecture="$2"
+  dpkg-deb -f "$package" >/dev/null ||
+    die "cannot read APT package metadata: $package"
+  package_name="$(dpkg-deb -f "$package" Package)" ||
+    die "cannot read APT Package metadata: $package"
+  [ "$package_name" = rmux ] ||
+    die "APT Package identity must be rmux: $package"
+  package_architecture="$(dpkg-deb -f "$package" Architecture)" ||
+    die "cannot read APT Architecture metadata: $package"
+  [ "$package_architecture" = "$expected_architecture" ] ||
+    die "APT Architecture metadata does not match $expected_architecture: $package"
+}
+
+validate_input_packages() {
+  local architecture deb matches
+  input_packages=()
+  shopt -s nullglob
+  for architecture in "${architectures[@]}"; do
+    matches=("$input_dir"/rmux_*_"$architecture".deb)
+    [ "${#matches[@]}" -gt 0 ] ||
+      die "no rmux_*_${architecture}.deb files found in $input_dir"
+    for deb in "${matches[@]}"; do
+      [ -f "$deb" ] && [ ! -L "$deb" ] ||
+        die "unsafe APT input package: $deb"
+      case "${deb##*/}" in *$'\n'*) die "APT input package name contains a newline" ;; esac
+      validate_apt_package_identity "$deb" "$architecture"
+      input_packages+=("$deb")
+    done
+  done
+  shopt -u nullglob
+}

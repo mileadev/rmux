@@ -95,7 +95,12 @@ case "$2" in
   *_arm64.deb) architecture=arm64 ;;
   *) exit 64 ;;
 esac
-printf 'Package: rmux\nVersion: 0.9.1\nArchitecture: %s\n' "$architecture"
+case "${3:-}" in
+  "") printf 'Package: rmux\nVersion: 0.9.1\nArchitecture: %s\n' "$architecture" ;;
+  Package) printf 'rmux\n' ;;
+  Architecture) printf '%s\n' "$architecture" ;;
+  *) exit 64 ;;
+esac
 "#,
     )
     .expect("write dpkg-deb fixture");

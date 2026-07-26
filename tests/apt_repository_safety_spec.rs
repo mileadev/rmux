@@ -63,7 +63,23 @@ case "$2" in
   *_arm64.deb) architecture=arm64 ;;
   *) exit 64 ;;
 esac
-printf 'Package: rmux\nVersion: 0.10.0\nArchitecture: %s\n' "$architecture"
+package=rmux
+case "$(/usr/bin/cat -- "$2")" in
+  *:foreign-package) package=alien-package ;;
+  *:metadata-unreadable) exit 74 ;;
+  *:architecture-mismatch)
+    case "$architecture" in
+      amd64) architecture=arm64 ;;
+      arm64) architecture=amd64 ;;
+    esac
+    ;;
+esac
+case "${3:-}" in
+  "") printf 'Package: %s\nVersion: 0.10.0\nArchitecture: %s\n' "$package" "$architecture" ;;
+  Package) printf '%s\n' "$package" ;;
+  Architecture) printf '%s\n' "$architecture" ;;
+  *) exit 64 ;;
+esac
 "#,
     )
     .expect("write dpkg-deb fixture");
@@ -348,6 +364,120 @@ fn refuses_nested_output_symlink_without_mutating_tree_bytes() {
         outside_after, outside_before,
         "symlink refusal changed target bytes"
     );
+}
+
+#[test]
+fn refuses_foreign_package_identity_without_mutating_tree_bytes() {
+    let root = fixture_root("foreign-package");
+    let input = root.join("input");
+    let output = root.join("output");
+    let tools = root.join("tools");
+    install_tools(&tools);
+    write_packages(&input, "first");
+    let created = generate(&input, &output, &tools, None, false);
+    assert!(created.status.success(), "{}", stderr(&created));
+    write_packages(&input, "replacement");
+    write_package(&input, "amd64", "foreign-package");
+    let before = snapshot_tree(&output);
+
+    let rejected = generate(&input, &output, &tools, None, false);
+    let after = snapshot_tree(&output);
+    fs::remove_dir_all(&root).expect("remove foreign-package fixture");
+
+    assert!(!rejected.status.success(), "foreign Package was published");
+    assert!(
+        stderr(&rejected).contains("Package identity"),
+        "{}",
+        stderr(&rejected)
+    );
+    assert_eq!(
+        after, before,
+        "foreign Package refusal changed output tree identity"
+    );
+}
+
+#[test]
+fn refuses_unreadable_package_metadata_without_mutating_tree_bytes() {
+    let root = fixture_root("unreadable-metadata");
+    let input = root.join("input");
+    let output = root.join("output");
+    let tools = root.join("tools");
+    install_tools(&tools);
+    write_packages(&input, "first");
+    let created = generate(&input, &output, &tools, None, false);
+    assert!(created.status.success(), "{}", stderr(&created));
+    write_packages(&input, "replacement");
+    write_package(&input, "amd64", "metadata-unreadable");
+    let before = snapshot_tree(&output);
+
+    let rejected = generate(&input, &output, &tools, None, false);
+    let after = snapshot_tree(&output);
+    fs::remove_dir_all(&root).expect("remove unreadable-metadata fixture");
+
+    assert!(
+        !rejected.status.success(),
+        "unreadable metadata was published"
+    );
+    assert_eq!(
+        after, before,
+        "metadata read refusal changed output tree identity"
+    );
+}
+
+#[test]
+fn refuses_mismatched_package_architecture_without_mutating_tree_bytes() {
+    let root = fixture_root("architecture-mismatch");
+    let input = root.join("input");
+    let output = root.join("output");
+    let tools = root.join("tools");
+    install_tools(&tools);
+    write_packages(&input, "first");
+    let created = generate(&input, &output, &tools, None, false);
+    assert!(created.status.success(), "{}", stderr(&created));
+    write_packages(&input, "replacement");
+    write_package(&input, "amd64", "architecture-mismatch");
+    let before = snapshot_tree(&output);
+
+    let rejected = generate(&input, &output, &tools, None, false);
+    let after = snapshot_tree(&output);
+    fs::remove_dir_all(&root).expect("remove architecture-mismatch fixture");
+
+    assert!(
+        !rejected.status.success(),
+        "mismatched package architecture was published"
+    );
+    assert!(
+        stderr(&rejected).contains("Architecture metadata"),
+        "{}",
+        stderr(&rejected)
+    );
+    assert_eq!(
+        after, before,
+        "architecture refusal changed output tree identity"
+    );
+}
+
+#[test]
+fn publishes_valid_rmux_package_identity_metadata() {
+    let root = fixture_root("valid-identity");
+    let input = root.join("input");
+    let output = root.join("output");
+    let tools = root.join("tools");
+    install_tools(&tools);
+    write_packages(&input, "valid");
+
+    let generated = generate(&input, &output, &tools, None, false);
+    let amd64_packages = fs::read_to_string(output.join("dists/stable/main/binary-amd64/Packages"))
+        .expect("read valid amd64 Packages index");
+    let arm64_packages = fs::read_to_string(output.join("dists/stable/main/binary-arm64/Packages"))
+        .expect("read valid arm64 Packages index");
+    fs::remove_dir_all(&root).expect("remove valid-identity fixture");
+
+    assert!(generated.status.success(), "{}", stderr(&generated));
+    assert!(amd64_packages.contains("Package: rmux\n"));
+    assert!(amd64_packages.contains("Architecture: amd64\n"));
+    assert!(arm64_packages.contains("Package: rmux\n"));
+    assert!(arm64_packages.contains("Architecture: arm64\n"));
 }
 
 #[test]
