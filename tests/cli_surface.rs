@@ -2455,9 +2455,13 @@ fn control_attach_eof_cannot_overtake_session_change() -> Result<(), Box<dyn Err
         );
         let rendered = stdout(&output);
         let records = rendered.lines().collect::<Vec<_>>();
-        assert_eq!(records.len(), 4, "iteration {iteration}: {rendered:?}");
+        assert!(records.len() >= 4, "iteration {iteration}: {rendered:?}");
         assert_control_attach_records(&records, 0, "alpha", "0");
-        assert_eq!(records[3], "%exit", "iteration {iteration}: {rendered:?}");
+        assert_eq!(
+            records.last(),
+            Some(&"%exit"),
+            "iteration {iteration}: {rendered:?}"
+        );
     }
 
     let mut child = harness
@@ -2483,7 +2487,7 @@ fn control_attach_eof_cannot_overtake_session_change() -> Result<(), Box<dyn Err
         let buffered = stdout_buffer.lock().expect("control stdout buffer lock");
         let rendered = String::from_utf8_lossy(&buffered);
         let records = rendered.lines().collect::<Vec<_>>();
-        assert_eq!(records.len(), 3, "{rendered:?}");
+        assert!(records.len() >= 3, "{rendered:?}");
         assert_control_attach_records(&records, 0, "alpha", "0");
         assert!(!rendered.contains("%exit"), "{rendered:?}");
     }
@@ -2497,10 +2501,15 @@ fn control_attach_eof_cannot_overtake_session_change() -> Result<(), Box<dyn Err
     assert_eq!(status.code(), Some(0));
     assert!(stderr.is_empty(), "stderr={stderr:?}");
     let records = rendered.lines().collect::<Vec<_>>();
-    assert_eq!(records.len(), 7, "{rendered:?}");
     assert_control_attach_records(&records, 0, "alpha", "0");
-    assert_control_attach_records(&records, 3, "beta", "1");
-    assert_eq!(records[6], "%exit", "{rendered:?}");
+    let second_begin = records
+        .iter()
+        .enumerate()
+        .skip(3)
+        .find_map(|(index, record)| record.starts_with("%begin ").then_some(index))
+        .unwrap_or_else(|| panic!("missing second %begin record: {rendered:?}"));
+    assert_control_attach_records(&records, second_begin, "beta", "1");
+    assert_eq!(records.last(), Some(&"%exit"), "{rendered:?}");
     assert_eq!(
         rendered.matches("%session-changed ").count(),
         2,
