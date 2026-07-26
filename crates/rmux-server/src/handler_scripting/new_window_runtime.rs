@@ -14,7 +14,7 @@ use super::targets::NewWindowTargetIndex;
 use crate::format_runtime::render_runtime_template;
 use crate::handler::{
     client_environment_snapshot, client_spawn_environment, prepare_lifecycle_event_if_enabled,
-    RequestHandler, StableTargetIdentity,
+    RequestHandler, SelectionTransitionSnapshot, StableTargetIdentity,
 };
 use crate::hook_runtime::{capture_inline_hooks, PendingInlineHookFormat};
 use crate::pane_terminals::{
@@ -235,7 +235,7 @@ impl RequestHandler {
         let client_environment = client_environment_snapshot(requester_pid);
         let spawn_environment = client_spawn_environment(client_environment.as_ref());
         let (response, inline_hooks) = capture_inline_hooks(async {
-            let (response, linked_event, committed_move) = {
+            let (response, lifecycle_events, committed_move) = {
                 let mut state = self.state.lock().await;
                 if let Err(error) = target_witness.validate(&state) {
                     return Response::Error(ErrorResponse { error });
@@ -262,6 +262,7 @@ impl RequestHandler {
                     Ok(start_directory) => start_directory,
                     Err(error) => return Response::Error(ErrorResponse { error }),
                 };
+                let selection_before = SelectionTransitionSnapshot::capture(&state);
                 match state.create_window_at_requested_index(
                     &target,
                     target_window_index,
@@ -321,7 +322,7 @@ impl RequestHandler {
                             };
                             (
                                 Response::NewWindow(created),
-                                None,
+                                Vec::new(),
                                 Some((committed, destination)),
                             )
                         } else {
@@ -348,17 +349,22 @@ impl RequestHandler {
                                 &[],
                                 timer_targets,
                             );
-                            let linked_event = prepare_lifecycle_event_if_enabled(
+                            let mut lifecycle_events = selection_before
+                                .prepare_session_window_changes(
+                                    &mut state,
+                                    std::slice::from_ref(&target),
+                                );
+                            lifecycle_events.extend(prepare_lifecycle_event_if_enabled(
                                 &mut state,
                                 &LifecycleEvent::WindowLinked {
                                     session_name: target.clone(),
                                     target: Some(created.target.clone()),
                                 },
-                            );
-                            (Response::NewWindow(created), linked_event, None)
+                            ));
+                            (Response::NewWindow(created), lifecycle_events, None)
                         }
                     }
-                    Err(error) => (Response::Error(ErrorResponse { error }), None, None),
+                    Err(error) => (Response::Error(ErrorResponse { error }), Vec::new(), None),
                 }
             };
 
@@ -386,9 +392,11 @@ impl RequestHandler {
                         ))),
                         PendingInlineHookFormat::AfterCommand,
                     );
-                    if let Some(linked_event) = linked_event {
+                    if !lifecycle_events.is_empty() {
                         self.pause_before_window_lifecycle_emit().await;
-                        self.emit_prepared(linked_event).await;
+                        for event in lifecycle_events {
+                            self.emit_prepared(event).await;
+                        }
                     }
                 }
                 let refresh_target = match &response {

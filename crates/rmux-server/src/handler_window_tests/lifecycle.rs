@@ -776,7 +776,7 @@ async fn kill_last_linked_window_orders_target_session_before_surviving_alias() 
     ));
 
     let mut observed = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..4 {
         let queued = timeout(Duration::from_secs(1), events.recv())
             .await
             .expect("linked kill lifecycle event should arrive")
@@ -788,6 +788,9 @@ async fn kill_last_linked_window_orders_target_session_before_surviving_alias() 
             rmux_core::LifecycleEvent::SessionClosed { session_name, .. } => {
                 format!("session:{session_name}")
             }
+            rmux_core::LifecycleEvent::SessionWindowChanged { session_name } => {
+                format!("selection:{session_name}")
+            }
             other => panic!("unexpected lifecycle event: {other:?}"),
         });
     }
@@ -796,6 +799,7 @@ async fn kill_last_linked_window_orders_target_session_before_surviving_alias() 
         [
             "window:alpha-linked-last",
             "session:alpha-linked-last",
+            "selection:beta-linked-last",
             "window:beta-linked-last",
         ]
     );

@@ -9,7 +9,7 @@ use super::super::{
     defer_lifecycle_event, prepare_deferred_lifecycle_event, prepare_lifecycle_event,
     scripting_support::format_context_for_target,
     DeferredLifecycleEvent, PaneOutputSubscriptionKeySnapshot, QueuedLifecycleEvent,
-    RequestHandler,
+    RequestHandler, SelectionTransitionSnapshot,
 };
 use super::pane_timer_mutations::BreakPaneTimerTargetPlan;
 use crate::format_runtime::render_runtime_template;
@@ -19,6 +19,7 @@ const DEFAULT_BREAK_PANE_FORMAT: &str = "#{session_name}:#{window_index}.#{pane_
 
 struct PaneTransferEffects {
     source_family_sessions: Vec<SessionName>,
+    selection_before: SelectionTransitionSnapshot,
     refresh_sessions: Vec<SessionName>,
     hook_snapshot: HookStore,
     unlinked_windows: Vec<DeferredLifecycleEvent>,
@@ -33,8 +34,10 @@ struct PaneTransferEffects {
 struct PreparedPaneTransferEffects {
     refresh_sessions: Vec<SessionName>,
     unlinked_windows: Vec<QueuedLifecycleEvent>,
+    pane_selection_events: Vec<QueuedLifecycleEvent>,
     layout_events: Vec<QueuedLifecycleEvent>,
     linked_event: Option<QueuedLifecycleEvent>,
+    session_selection_events: Vec<QueuedLifecycleEvent>,
     closed_sessions: Vec<(
         SessionName,
         SessionId,
@@ -133,6 +136,7 @@ impl PaneTransferEffects {
             .collect();
         Self {
             source_family_sessions,
+            selection_before: SelectionTransitionSnapshot::capture(state),
             refresh_sessions,
             hook_snapshot: state.hooks.clone(),
             unlinked_windows,
@@ -160,9 +164,12 @@ impl PaneTransferEffects {
         removed_sessions: &[SessionName],
         layout_targets: &[WindowTarget],
         linked_event: Option<LifecycleEvent>,
+        include_selection_changes: bool,
     ) -> PreparedPaneTransferEffects {
         let Self {
             refresh_sessions,
+            source_family_sessions,
+            selection_before,
             mut hook_snapshot,
             unlinked_windows,
             closed_sessions,
@@ -172,6 +179,11 @@ impl PaneTransferEffects {
             .into_iter()
             .map(|event| prepare_deferred_lifecycle_event(state, &mut hook_snapshot, event))
             .collect();
+        let pane_selection_events = if include_selection_changes {
+            selection_before.prepare_window_pane_changes(state, layout_targets)
+        } else {
+            Vec::new()
+        };
         let layout_events = layout_targets
             .iter()
             .cloned()
@@ -182,6 +194,17 @@ impl PaneTransferEffects {
         let linked_event = linked_event
             .as_ref()
             .map(|event| prepare_lifecycle_event(state, event));
+        let session_selection_events = if include_selection_changes {
+            let mut preferred_sessions = linked_event
+                .as_ref()
+                .and_then(|event| event.event.session_name().cloned())
+                .into_iter()
+                .collect::<Vec<_>>();
+            preferred_sessions.extend(source_family_sessions);
+            selection_before.prepare_session_window_changes(state, &preferred_sessions)
+        } else {
+            Vec::new()
+        };
         let closed_sessions = closed_sessions
             .into_iter()
             .filter(|(session_name, _, _, _)| removed_sessions.contains(session_name))
@@ -197,8 +220,10 @@ impl PaneTransferEffects {
         PreparedPaneTransferEffects {
             refresh_sessions,
             unlinked_windows,
+            pane_selection_events,
             layout_events,
             linked_event,
+            session_selection_events,
             closed_sessions,
         }
     }
@@ -326,7 +351,7 @@ impl RequestHandler {
                 })
                 .unwrap_or_default();
             let effects = matches!(response, Response::JoinPane(_)).then(|| {
-                effects.prepare_emitted(&mut state, &removed_sessions, &layout_targets, None)
+                effects.prepare_emitted(&mut state, &removed_sessions, &layout_targets, None, false)
             });
             (response, effects, removed_sessions)
         };
@@ -402,7 +427,7 @@ impl RequestHandler {
                 })
                 .unwrap_or_default();
             let effects = matches!(response, Response::MovePane(_)).then(|| {
-                effects.prepare_emitted(&mut state, &removed_sessions, &layout_targets, None)
+                effects.prepare_emitted(&mut state, &removed_sessions, &layout_targets, None, false)
             });
             (response, effects, removed_sessions)
         };
@@ -511,6 +536,7 @@ impl RequestHandler {
                     &removed_sessions,
                     &layout_targets,
                     linked_event,
+                    true,
                 )
             });
             (response, effects, removed_sessions)
@@ -577,11 +603,17 @@ impl RequestHandler {
         for event in &effects.unlinked_windows {
             self.emit_prepared(event.clone()).await;
         }
+        for event in &effects.pane_selection_events {
+            self.emit_prepared(event.clone()).await;
+        }
         for event in &effects.layout_events {
             self.emit_prepared(event.clone()).await;
         }
         if let Some(event) = &effects.linked_event {
             self.pause_before_window_lifecycle_emit().await;
+            self.emit_prepared(event.clone()).await;
+        }
+        for event in &effects.session_selection_events {
             self.emit_prepared(event.clone()).await;
         }
         for (_, _, _, event) in &effects.closed_sessions {

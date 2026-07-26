@@ -7,7 +7,7 @@ use rmux_proto::{
 
 use super::super::{
     attach_support::SessionDetachOnDestroy, subscription_support::capture_pane_stream_sources,
-    RequestHandler,
+    RequestHandler, SelectionTransitionSnapshot,
 };
 #[cfg(windows)]
 use super::pane_io_encoding::{
@@ -255,8 +255,8 @@ impl RequestHandler {
             removed_subscription_keys,
             removed_pane_ids,
             resize_targets,
-            layout_window,
             after_hook_target,
+            post_lifecycle_events,
         ) = {
             let mut state = self.state.lock().await;
             let detach_on_destroy = SessionDetachOnDestroy::capture_all(&state);
@@ -289,6 +289,7 @@ impl RequestHandler {
             let previous_stream_sources =
                 capture_pane_stream_sources(&state, &previous_subscription_keys);
             let timer_mutation = self.plan_all_window_mutation_silence_timers_locked(&state);
+            let selection_before = SelectionTransitionSnapshot::capture(&state);
             match state.remove_pane_alias_with_options(target.clone(), request.kill_all_except) {
                 Ok(result) => {
                     state.retire_removed_lifecycle_targets();
@@ -315,6 +316,11 @@ impl RequestHandler {
                         hook_batch.prepare_committed(&mut state, &destroyed_sessions);
                     let after_hook_target =
                         after_kill_pane_target(&state, &result.hook_context, &affected_sessions);
+                    let post_lifecycle_events = selection_before.prepare_kill_pane_changes(
+                        &mut state,
+                        WindowTarget::with_window(session_name.clone(), layout_window),
+                        result.response.window_destroyed,
+                    );
                     if !result.session_destroyed && result.response.window_destroyed {
                         let _ = state.hooks.remove_window(&WindowTarget::with_window(
                             session_name.clone(),
@@ -380,8 +386,8 @@ impl RequestHandler {
                         removed_subscription_keys,
                         result.removed_pane_ids,
                         resize_targets,
-                        layout_window,
                         after_hook_target,
+                        post_lifecycle_events,
                     )
                 }
                 Err(error) => (
@@ -393,8 +399,8 @@ impl RequestHandler {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
-                    layout_window,
                     None,
+                    Vec::new(),
                 ),
             }
         };
@@ -483,13 +489,8 @@ impl RequestHandler {
             if !destroyed_names.is_empty() {
                 let _ = self.queue_shutdown_if_server_empty().await;
             }
-            if let Response::KillPane(success) = &response {
-                if !success.window_destroyed {
-                    self.emit(LifecycleEvent::WindowLayoutChanged {
-                        target: WindowTarget::with_window(session_name.clone(), layout_window),
-                    })
-                    .await;
-                }
+            for event in post_lifecycle_events {
+                self.emit_prepared(event).await;
             }
         }
 

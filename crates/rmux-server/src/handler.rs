@@ -93,6 +93,8 @@ mod web_request_identity;
 pub(crate) use shutdown_support::{DetachedRequestGuard, NormalRequestGuard};
 #[path = "handler/sdk_wait_quota.rs"]
 mod sdk_wait_quota;
+#[path = "handler/selection_transitions.rs"]
+mod selection_transitions;
 #[path = "handler_subscriptions.rs"]
 mod subscription_support;
 #[path = "handler_switch_target.rs"]
@@ -187,6 +189,7 @@ pub(in crate::handler) use pane_output_subscription_rekeys::{
     PaneOutputSubscriptionKeySnapshot, PaneOutputSubscriptionReconciliation,
 };
 use pane_support::PaneSnapshotRevisionRegistry;
+pub(in crate::handler) use selection_transitions::SelectionTransitionSnapshot;
 use session_lease_support::SessionLeaseStore;
 pub(crate) use session_lease_support::{
     with_session_lease_create_addressing, SessionLeaseCreateAddressing,
@@ -1503,6 +1506,10 @@ mod clock_mode_tests;
 #[cfg(test)]
 #[path = "handler_control_notification_tests.rs"]
 mod control_notification_tests;
+
+#[cfg(test)]
+#[path = "handler_selection_control_notification_tests.rs"]
+mod selection_control_notification_tests;
 
 #[cfg(test)]
 #[path = "handler_control_lifecycle_tests.rs"]

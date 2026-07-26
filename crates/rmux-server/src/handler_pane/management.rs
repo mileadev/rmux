@@ -6,8 +6,8 @@ use rmux_proto::{
 
 use super::super::{
     attach_support::SessionDetachOnDestroy, client_environment_snapshot, client_spawn_environment,
-    scripting_support::render_start_directory_template,
-    subscription_support::capture_pane_stream_sources, RequestHandler,
+    prepare_lifecycle_event, scripting_support::render_start_directory_template,
+    subscription_support::capture_pane_stream_sources, RequestHandler, SelectionTransitionSnapshot,
 };
 use crate::hook_runtime::PendingInlineHookFormat;
 use crate::pane_io::AttachControl;
@@ -139,7 +139,7 @@ impl RequestHandler {
         let attached_count = self.attached_count(&session_name).await;
         let client_environment = client_environment_snapshot(requester_pid);
         let spawn_environment = client_spawn_environment(client_environment.as_ref());
-        let (response, successful_pane, refresh_sessions) = {
+        let (response, successful_pane, refresh_sessions, lifecycle_events) = {
             let mut state = self.state.lock().await;
             if let Err(error) =
                 super::super::require_expected_session_identity(&state, &session_name)
@@ -171,6 +171,7 @@ impl RequestHandler {
                 Ok(effects) => effects,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
+            let selection_before = SelectionTransitionSnapshot::capture(&state);
             match state.split_window(
                 target,
                 direction,
@@ -223,15 +224,50 @@ impl RequestHandler {
                             successful_pane.window_index(),
                         );
                         match split_window_response(&state, response, response_mode) {
-                            Ok(response) => (response, Some(successful_pane), refresh_sessions),
-                            Err(error) => {
-                                (Response::Error(ErrorResponse { error }), None, Vec::new())
+                            Ok(response) => {
+                                let layout_target = WindowTarget::with_window(
+                                    successful_pane.session_name().clone(),
+                                    successful_pane.window_index(),
+                                );
+                                let mut lifecycle_events = selection_before
+                                    .prepare_window_pane_changes(
+                                        &mut state,
+                                        std::slice::from_ref(&layout_target),
+                                    );
+                                lifecycle_events.push(prepare_lifecycle_event(
+                                    &mut state,
+                                    &LifecycleEvent::WindowLayoutChanged {
+                                        target: layout_target,
+                                    },
+                                ));
+                                (
+                                    response,
+                                    Some(successful_pane),
+                                    refresh_sessions,
+                                    lifecycle_events,
+                                )
                             }
+                            Err(error) => (
+                                Response::Error(ErrorResponse { error }),
+                                None,
+                                Vec::new(),
+                                Vec::new(),
+                            ),
                         }
                     }
-                    Err(error) => (Response::Error(ErrorResponse { error }), None, Vec::new()),
+                    Err(error) => (
+                        Response::Error(ErrorResponse { error }),
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                    ),
                 },
-                Err(error) => (Response::Error(ErrorResponse { error }), None, Vec::new()),
+                Err(error) => (
+                    Response::Error(ErrorResponse { error }),
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                ),
             }
         };
 
@@ -242,13 +278,9 @@ impl RequestHandler {
                 Some(Target::Pane(successful_pane.clone())),
                 PendingInlineHookFormat::AfterCommand,
             );
-            self.emit(LifecycleEvent::WindowLayoutChanged {
-                target: WindowTarget::with_window(
-                    session_name.clone(),
-                    successful_pane.window_index(),
-                ),
-            })
-            .await;
+            for event in lifecycle_events {
+                self.emit_prepared(event).await;
+            }
             self.refresh_linked_window_sessions(refresh_sessions).await;
         }
 
@@ -270,6 +302,7 @@ impl RequestHandler {
             removed_subscription_keys,
             removed_pane_ids,
             after_hook_target,
+            post_lifecycle_events,
         ) = {
             let mut state = self.state.lock().await;
             if let Err(error) =
@@ -286,6 +319,7 @@ impl RequestHandler {
             let removed_stream_sources =
                 capture_pane_stream_sources(&state, &removed_subscription_keys);
             let timer_mutation = self.plan_all_window_mutation_silence_timers_locked(&state);
+            let selection_before = SelectionTransitionSnapshot::capture(&state);
             match state.kill_pane_with_options(request.target, request.kill_all_except) {
                 Ok(result) => {
                     self.stage_removed_pane_stream_sources(
@@ -316,6 +350,11 @@ impl RequestHandler {
                         hook_batch.prepare_committed(&mut state, &destroyed_sessions);
                     let after_hook_target =
                         after_kill_pane_target(&state, &result.hook_context, &affected_sessions);
+                    let post_lifecycle_events = selection_before.prepare_kill_pane_changes(
+                        &mut state,
+                        WindowTarget::with_window(session_name.clone(), target.window_index()),
+                        result.response.window_destroyed,
+                    );
                     if !result.session_destroyed && result.response.window_destroyed {
                         let _ = state.hooks.remove_window(&WindowTarget::with_window(
                             session_name.clone(),
@@ -334,6 +373,7 @@ impl RequestHandler {
                         removed_subscription_keys,
                         result.removed_pane_ids,
                         after_hook_target,
+                        post_lifecycle_events,
                     )
                 }
                 Err(error) => (
@@ -345,6 +385,7 @@ impl RequestHandler {
                     Vec::new(),
                     Vec::new(),
                     None,
+                    Vec::new(),
                 ),
             }
         };
@@ -428,16 +469,8 @@ impl RequestHandler {
             if !destroyed_names.is_empty() {
                 let _ = self.queue_shutdown_if_server_empty().await;
             }
-            if let Response::KillPane(success) = &response {
-                if !success.window_destroyed {
-                    self.emit(LifecycleEvent::WindowLayoutChanged {
-                        target: WindowTarget::with_window(
-                            session_name.clone(),
-                            target.window_index(),
-                        ),
-                    })
-                    .await;
-                }
+            for event in post_lifecycle_events {
+                self.emit_prepared(event).await;
             }
         }
 

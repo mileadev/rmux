@@ -646,16 +646,19 @@ async fn sessions_changed_notifications_reach_control_clients_with_and_without_s
     let _ = drain_control_notifications(&mut detached_rx);
 
     new_session(&handler, &beta).await;
+    let beta_window_id = window_id(&handler, &WindowTarget::new(beta.clone())).await;
     assert_eq!(
         drain_control_notifications(&mut attached_rx),
-        vec!["%sessions-changed".to_owned()]
+        vec![
+            format!("%unlinked-window-add @{beta_window_id}"),
+            "%sessions-changed".to_owned(),
+        ]
     );
     assert_eq!(
         drain_control_notifications(&mut detached_rx),
         vec!["%sessions-changed".to_owned()]
     );
 
-    let beta_window_id = window_id(&handler, &WindowTarget::new(beta.clone())).await;
     let response = handler
         .handle(Request::KillSession(KillSessionRequest {
             target: beta,
@@ -1176,9 +1179,13 @@ async fn hook_commands_emit_distinct_lifecycle_control_notifications() {
         }))
         .await;
     assert!(matches!(response, Response::ShowOptions(_)));
+    let beta_window_id = window_id(&handler, &WindowTarget::new(session_name("beta"))).await;
     assert_eq!(
         drain_control_notifications(&mut control_rx),
-        vec!["%sessions-changed".to_owned()]
+        vec![
+            format!("%unlinked-window-add @{beta_window_id}"),
+            "%sessions-changed".to_owned(),
+        ]
     );
 
     let has_beta = handler

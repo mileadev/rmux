@@ -44,16 +44,6 @@ impl RequestHandler {
             if !attached {
                 return false;
             }
-            if let Some(window_id) = self
-                .created_session_window_id(session_name, session_id)
-                .await
-            {
-                self.send_control_notification_to_queue(
-                    identity,
-                    format!("%window-add @{window_id}"),
-                )
-                .await;
-            }
             return true;
         }
 
@@ -79,16 +69,6 @@ impl RequestHandler {
             .is_err()
         {
             return false;
-        }
-        if let Some(window_id) = self
-            .created_session_window_id(session_name, session_id)
-            .await
-        {
-            self.send_control_notification_to_queue(
-                control_identity,
-                format!("%window-add @{window_id}"),
-            )
-            .await;
         }
         true
     }
@@ -121,22 +101,5 @@ impl RequestHandler {
                 session_id,
             )
             .await;
-    }
-
-    async fn created_session_window_id(
-        &self,
-        session_name: &SessionName,
-        session_id: SessionId,
-    ) -> Option<u32> {
-        let state = self.state.lock().await;
-        state
-            .sessions
-            .session(session_name)
-            .filter(|session| session.id() == session_id)
-            .and_then(|session| {
-                session
-                    .window_at(session.active_window_index())
-                    .map(|window| window.id().as_u32())
-            })
     }
 }
