@@ -344,6 +344,9 @@ mod relative_metadata;
 #[path = "handler_window_tests/swap_rotate.rs"]
 mod swap_rotate;
 
+#[path = "handler_window_tests/swap_selection_notifications.rs"]
+mod swap_selection_notifications;
+
 #[path = "handler_window_tests/silence_fanout.rs"]
 mod silence_fanout;
 
