@@ -438,6 +438,25 @@ fn full_range() -> ScreenCaptureRange {
     }
 }
 
+fn joined_capture_options() -> GridRenderOptions {
+    GridRenderOptions {
+        join_wrapped: true,
+        include_empty_cells: false,
+        trim_spaces: false,
+        ..GridRenderOptions::default()
+    }
+}
+
+struct AlternateCaptureCase {
+    name: &'static str,
+    cols: u16,
+    rows: u16,
+    history_limit: usize,
+    input: &'static [u8],
+    expected_viewport: &'static [u8],
+    expected_full: &'static [u8],
+}
+
 #[test]
 fn trim_below_cursor_truncates_transcript_and_pulls_history_into_view() {
     let mut screen = new_screen(10, 5, 20);
@@ -1599,6 +1618,192 @@ fn alternate_screen_restore_preserves_wrapped_rows() {
         .flags()
         .contains(crate::grid::GridLineFlags::WRAPPED));
     assert_eq!(screen.capture_grid(true).lines, vec!["abcdef"]);
+}
+
+#[test]
+fn joined_capture_breaks_active_alternate_history_boundary_like_tmux_3_7b() {
+    let cases = [
+        AlternateCaptureCase {
+            name: "A01 ASCII partial wrap",
+            cols: 8,
+            rows: 2,
+            history_limit: 20,
+            input: b"abcdefghijkl\r\n\x1b[?1049h\x1b[HVIM",
+            expected_viewport: b"VIM\n\n",
+            expected_full: b"abcdefgh\nVIM\n\n",
+        },
+        AlternateCaptureCase {
+            name: "A04 width 12 UTF-8 alternate text",
+            cols: 12,
+            rows: 2,
+            history_limit: 20,
+            input: "ABCDEFGHIJKLMNO\r\n\x1b[?1049h\x1b[H界UI".as_bytes(),
+            expected_viewport: "界UI\n\n".as_bytes(),
+            expected_full: "ABCDEFGHIJKL\n界UI\n\n".as_bytes(),
+        },
+        AlternateCaptureCase {
+            name: "A05 empty alternate screen",
+            cols: 8,
+            rows: 2,
+            history_limit: 20,
+            input: b"abcdefghijkl\r\n\x1b[?1049h",
+            expected_viewport: b"\n\n",
+            expected_full: b"abcdefgh\n\n\n",
+        },
+        AlternateCaptureCase {
+            name: "A06 ASCII exact wrap",
+            cols: 8,
+            rows: 2,
+            history_limit: 20,
+            input: b"ABCDEFGHIJKLMNOP\r\n\x1b[?1049h\x1b[HTUI",
+            expected_viewport: b"TUI\n\n",
+            expected_full: b"ABCDEFGH\nTUI\n\n",
+        },
+        AlternateCaptureCase {
+            name: "A09 UTF-8 wrapped history",
+            cols: 8,
+            rows: 2,
+            history_limit: 20,
+            input: "étéabcdefg\r\n\x1b[?1049h\x1b[HVIM".as_bytes(),
+            expected_viewport: b"VIM\n\n",
+            expected_full: "étéabcde\nVIM\n\n".as_bytes(),
+        },
+    ];
+
+    let actual = cases
+        .iter()
+        .map(|case| {
+            let mut screen = new_screen(case.cols, case.rows, case.history_limit);
+            parse(&mut screen, case.input);
+            assert!(screen.is_alternate(), "{}", case.name);
+
+            let viewport_raw = screen
+                .capture_transcript(ScreenCaptureRange::default(), GridRenderOptions::default());
+            let viewport_join =
+                screen.capture_transcript(ScreenCaptureRange::default(), joined_capture_options());
+            let full_raw = screen.capture_transcript(full_range(), GridRenderOptions::default());
+            let full_join_first = screen.capture_transcript(full_range(), joined_capture_options());
+            let full_join_repeated =
+                screen.capture_transcript(full_range(), joined_capture_options());
+
+            (
+                case.name,
+                viewport_raw,
+                viewport_join,
+                full_raw,
+                full_join_first,
+                full_join_repeated,
+                case.expected_viewport.to_vec(),
+                case.expected_full.to_vec(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    for (
+        name,
+        viewport_raw,
+        viewport_join,
+        full_raw,
+        full_join_first,
+        full_join_repeated,
+        expected_viewport,
+        expected_full,
+    ) in actual
+    {
+        assert_eq!(viewport_raw, expected_viewport, "{name}: raw viewport");
+        assert_eq!(viewport_join, expected_viewport, "{name}: joined viewport");
+        assert_eq!(full_raw, expected_full, "{name}: raw full capture");
+        assert_eq!(
+            full_join_first, expected_full,
+            "{name}: first joined full capture"
+        );
+        assert_eq!(
+            full_join_repeated, expected_full,
+            "{name}: repeated joined full capture"
+        );
+    }
+}
+
+#[test]
+fn joined_capture_keeps_hard_and_empty_alternate_boundaries_unchanged() {
+    let cases = [
+        AlternateCaptureCase {
+            name: "A03 history-limit zero",
+            cols: 8,
+            rows: 2,
+            history_limit: 0,
+            input: b"abcdefghijkl\r\n\x1b[?1049h\x1b[HVIM",
+            expected_viewport: b"VIM\n\n",
+            expected_full: b"VIM\n\n",
+        },
+        AlternateCaptureCase {
+            name: "A08 hard history line",
+            cols: 8,
+            rows: 2,
+            history_limit: 20,
+            input: b"HARD\r\nNEXT\r\n\x1b[?1049h\x1b[HVIM",
+            expected_viewport: b"VIM\n\n",
+            expected_full: b"HARD\nVIM\n\n",
+        },
+        AlternateCaptureCase {
+            name: "A10 empty history",
+            cols: 8,
+            rows: 3,
+            history_limit: 20,
+            input: b"\x1b[?1049h\x1b[HVIM",
+            expected_viewport: b"VIM\n\n\n",
+            expected_full: b"VIM\n\n\n",
+        },
+    ];
+
+    for case in cases {
+        let mut screen = new_screen(case.cols, case.rows, case.history_limit);
+        parse(&mut screen, case.input);
+
+        assert_eq!(
+            screen.capture_transcript(ScreenCaptureRange::default(), joined_capture_options()),
+            case.expected_viewport,
+            "{}: viewport",
+            case.name
+        );
+        assert_eq!(
+            screen.capture_transcript(full_range(), joined_capture_options()),
+            case.expected_full,
+            "{}: full capture",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn joined_capture_alt_cycles_preserve_main_wrap_product_divergence() {
+    let mut screen = new_screen(8, 2, 20);
+    parse(&mut screen, b"abcdefghijkl\r\n\x1b[?1049h\x1b[HFIRST");
+    let first_active = screen.capture_transcript(full_range(), joined_capture_options());
+
+    parse(&mut screen, b"\x1b[?1049l");
+    let first_restored = screen.capture_transcript(full_range(), joined_capture_options());
+
+    parse(&mut screen, b"\x1b[?1049h\x1b[HSECOND");
+    let repeated_active = screen.capture_transcript(full_range(), joined_capture_options());
+
+    parse(&mut screen, b"\x1b[?1049l");
+    let repeated_restored = screen.capture_transcript(full_range(), joined_capture_options());
+
+    assert_eq!(
+        [
+            first_active,
+            first_restored,
+            repeated_active,
+            repeated_restored,
+        ],
+        [
+            b"abcdefgh\nFIRST\n\n".to_vec(),
+            b"abcdefghijkl\n\n".to_vec(),
+            b"abcdefgh\nSECOND\n\n".to_vec(),
+            b"abcdefghijkl\n\n".to_vec(),
+        ]
+    );
 }
 
 #[test]

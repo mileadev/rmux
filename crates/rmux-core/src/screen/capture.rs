@@ -6,6 +6,21 @@ use crate::transcript::{resolve_screen_capture_range, ScreenCaptureRange};
 
 use super::Screen;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureSurfaceBoundary {
+    Continuous,
+    HistoryToAlternateViewport,
+}
+
+impl CaptureSurfaceBoundary {
+    fn separates_after(self, absolute_y: usize, history_size: usize, capture_end: usize) -> bool {
+        matches!(self, Self::HistoryToAlternateViewport)
+            && history_size > 0
+            && absolute_y.saturating_add(1) == history_size
+            && capture_end >= history_size
+    }
+}
+
 /// One rendered recovery row: the bytes to replay, the soft-wrap flag, and the
 /// columns those bytes paint.
 ///
@@ -134,7 +149,12 @@ impl Screen {
         range: ScreenCaptureRange,
         options: GridRenderOptions,
     ) -> Vec<u8> {
-        capture_grid_bytes(&self.grid, &self.hyperlinks, range, options)
+        let boundary = if self.is_alternate() {
+            CaptureSurfaceBoundary::HistoryToAlternateViewport
+        } else {
+            CaptureSurfaceBoundary::Continuous
+        };
+        capture_grid_bytes(&self.grid, &self.hyperlinks, range, options, boundary)
     }
 
     /// Captures tmux-style per-line format flags for the selected physical rows.
@@ -225,9 +245,15 @@ impl Screen {
         range: ScreenCaptureRange,
         options: GridRenderOptions,
     ) -> Option<Vec<u8>> {
-        self.saved_grid
-            .as_ref()
-            .map(|saved| capture_grid_bytes(&saved.grid, &self.hyperlinks, range, options))
+        self.saved_grid.as_ref().map(|saved| {
+            capture_grid_bytes(
+                &saved.grid,
+                &self.hyperlinks,
+                range,
+                options,
+                CaptureSurfaceBoundary::Continuous,
+            )
+        })
     }
 
     /// Captures saved pre-alternate-screen rows from independent ANSI states.
@@ -353,11 +379,13 @@ fn capture_grid_bytes(
     hyperlinks: &Hyperlinks,
     range: ScreenCaptureRange,
     options: GridRenderOptions,
+    boundary: CaptureSurfaceBoundary,
 ) -> Vec<u8> {
     let total_lines = grid.hsize() + usize::try_from(grid.sy()).unwrap_or(usize::MAX);
     let Some(range) = resolve_screen_capture_range(range, grid.hsize(), total_lines) else {
         return Vec::new();
     };
+    let capture_end = *range.end();
 
     let line_count = range.end().saturating_sub(*range.start()).saturating_add(1);
     let mut output = Vec::with_capacity(capture_capacity_hint(
@@ -379,7 +407,10 @@ fn capture_grid_bytes(
             continue;
         };
         let wrapped = grid.absolute_line_wrapped(absolute_y).unwrap_or(false);
-        if !options.join_wrapped || !wrapped {
+        if !options.join_wrapped
+            || !wrapped
+            || boundary.separates_after(absolute_y, grid.hsize(), capture_end)
+        {
             state.reset_to_default_line_style(options, Some(hyperlinks), &mut output);
             output.push(b'\n');
         }
