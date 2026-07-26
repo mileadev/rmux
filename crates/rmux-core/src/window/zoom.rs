@@ -1,11 +1,26 @@
 use super::Window;
-use crate::PaneGeometry;
+use crate::{layout::LayoutTree, PaneGeometry};
 
 impl Window {
     /// Returns whether this window is currently zoomed.
     #[must_use]
     pub const fn is_zoomed(&self) -> bool {
         self.zoomed
+    }
+
+    /// Returns the canonical layout currently visible to a client.
+    ///
+    /// Zoom keeps the saved layout tree intact while presenting the active
+    /// pane as a full-window leaf. Unzoomed windows expose the saved tree.
+    #[must_use]
+    pub fn visible_layout_dump(&self) -> String {
+        if !self.zoomed {
+            return self.layout_dump();
+        }
+
+        self.active_pane().map_or_else(String::new, |pane| {
+            LayoutTree::single(self.size).dump(std::slice::from_ref(pane))
+        })
     }
 
     pub(crate) fn toggle_zoom(&mut self, pane_index: u32) -> bool {
@@ -110,11 +125,38 @@ mod tests {
     fn single_pane_zoom_toggle_is_a_noop() {
         let mut window = Window::new(TerminalSize { cols: 80, rows: 24 });
         let geometry = window.pane(0).expect("pane 0 exists").geometry();
+        let layout = window.layout_dump();
 
         assert!(!window.toggle_zoom(0));
 
         assert!(!window.is_zoomed());
         assert_eq!(window.pane(0).expect("pane 0 exists").geometry(), geometry);
+        assert_eq!(window.visible_layout_dump(), layout);
+    }
+
+    #[test]
+    fn visible_layout_projects_zoom_without_mutating_the_saved_layout() {
+        let mut window = window_with_two_panes();
+        window.save_old_layout();
+        let layout = window.layout_dump();
+        let old_layout = window
+            .old_layout()
+            .expect("old layout was saved")
+            .to_owned();
+
+        assert!(window.toggle_zoom(0));
+
+        assert_eq!(window.layout_dump(), layout);
+        assert_eq!(window.old_layout(), Some(old_layout.as_str()));
+        assert_eq!(
+            window.visible_layout_dump(),
+            "b25d,80x24,0,0,0",
+            "tmux 3.7b renders the zoomed pane as a canonical full-window leaf"
+        );
+
+        assert!(window.auto_unzoom());
+        assert_eq!(window.visible_layout_dump(), layout);
+        assert_eq!(window.old_layout(), Some(old_layout.as_str()));
     }
 
     #[test]
