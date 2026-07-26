@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use rmux_core::events::PaneOutputSubscriptionKey;
 use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{
     KillSessionRequest, KillWindowRequest, LinkWindowRequest, MoveWindowRequest, MoveWindowTarget,
@@ -20,11 +21,12 @@ const PRE_DESTROY_TAIL: &[u8] = b"pre-destroy-tail";
 const DRAIN_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::test]
-async fn kill_session_drains_then_removes_destroyed_pane_output_subscription() {
+async fn kill_session_drains_surface_frame_then_removes_destroyed_subscriptions() {
     let handler = RequestHandler::new();
     let session = create_session(&handler, "subscription-destroy-kill-session").await;
     let target = PaneTarget::with_window(session.clone(), 0, 0);
     let (subscription_id, _) = subscribe(&handler, &target).await;
+    let (surface_subscription_id, surface_key) = subscribe_surface_stream(&handler, &target).await;
     publish_pre_destroy_tail(&handler, &target).await;
 
     let response = handler
@@ -37,16 +39,20 @@ async fn kill_session_drains_then_removes_destroyed_pane_output_subscription() {
         .await;
     assert!(matches!(response, Response::KillSession(_)), "{response:?}");
 
+    assert_surface_stream_drains_then_closes(&handler, surface_subscription_id, "kill-session")
+        .await;
     assert_subscription_drains_then_closes(&handler, subscription_id, "kill-session").await;
+    assert_drain_source_released(&handler, &surface_key, "kill-session");
 }
 
 #[tokio::test]
-async fn kill_window_drains_then_removes_destroyed_pane_output_subscription() {
+async fn kill_window_drains_surface_frame_then_removes_destroyed_subscriptions() {
     let handler = RequestHandler::new();
     let session = create_session(&handler, "subscription-destroy-kill-window").await;
     create_window(&handler, &session, 1).await;
     let target = PaneTarget::with_window(session.clone(), 1, 0);
     let (subscription_id, _) = subscribe(&handler, &target).await;
+    let (surface_subscription_id, surface_key) = subscribe_surface_stream(&handler, &target).await;
     publish_pre_destroy_tail(&handler, &target).await;
 
     let response = handler
@@ -57,7 +63,10 @@ async fn kill_window_drains_then_removes_destroyed_pane_output_subscription() {
         .await;
     assert!(matches!(response, Response::KillWindow(_)), "{response:?}");
 
+    assert_surface_stream_drains_then_closes(&handler, surface_subscription_id, "kill-window")
+        .await;
     assert_subscription_drains_then_closes(&handler, subscription_id, "kill-window").await;
+    assert_drain_source_released(&handler, &surface_key, "kill-window");
 }
 
 #[tokio::test]
@@ -99,12 +108,14 @@ async fn kill_window_drains_buffered_raw_stream_bytes_before_the_typed_end() {
 }
 
 #[tokio::test]
-async fn link_window_k_drains_then_removes_replaced_destination_subscription() {
+async fn link_window_k_drains_surface_frame_then_removes_replaced_subscriptions() {
     let handler = RequestHandler::new();
     let source = create_session(&handler, "subscription-destroy-link-source").await;
     let destination = create_session(&handler, "subscription-destroy-link-destination").await;
     let destination_target = PaneTarget::with_window(destination.clone(), 0, 0);
     let (subscription_id, destination_pane_id) = subscribe(&handler, &destination_target).await;
+    let (surface_subscription_id, surface_key) =
+        subscribe_surface_stream(&handler, &destination_target).await;
     publish_pre_destroy_tail(&handler, &destination_target).await;
 
     let response = handler
@@ -125,16 +136,21 @@ async fn link_window_k_drains_then_removes_replaced_destination_subscription() {
         "link-window -k must remove the replaced stable pane identity"
     );
 
+    assert_surface_stream_drains_then_closes(&handler, surface_subscription_id, "link-window -k")
+        .await;
     assert_subscription_drains_then_closes(&handler, subscription_id, "link-window -k").await;
+    assert_drain_source_released(&handler, &surface_key, "link-window -k");
 }
 
 #[tokio::test]
-async fn move_window_k_drains_then_removes_replaced_destination_subscription() {
+async fn move_window_k_drains_surface_frame_then_removes_replaced_subscriptions() {
     let handler = RequestHandler::new();
     let source = create_session(&handler, "subscription-destroy-move-source").await;
     let destination = create_session(&handler, "subscription-destroy-move-destination").await;
     let destination_target = PaneTarget::with_window(destination.clone(), 0, 0);
     let (subscription_id, destination_pane_id) = subscribe(&handler, &destination_target).await;
+    let (surface_subscription_id, surface_key) =
+        subscribe_surface_stream(&handler, &destination_target).await;
     publish_pre_destroy_tail(&handler, &destination_target).await;
 
     let response = handler
@@ -156,16 +172,20 @@ async fn move_window_k_drains_then_removes_replaced_destination_subscription() {
         "move-window -k must remove the replaced stable pane identity"
     );
 
+    assert_surface_stream_drains_then_closes(&handler, surface_subscription_id, "move-window -k")
+        .await;
     assert_subscription_drains_then_closes(&handler, subscription_id, "move-window -k").await;
+    assert_drain_source_released(&handler, &surface_key, "move-window -k");
 }
 
 #[tokio::test]
-async fn unlink_window_k_drains_then_removes_destroyed_pane_output_subscription() {
+async fn unlink_window_k_drains_surface_frame_then_removes_destroyed_subscriptions() {
     let handler = RequestHandler::new();
     let session = create_session(&handler, "subscription-destroy-unlink").await;
     create_window(&handler, &session, 1).await;
     let target = PaneTarget::with_window(session.clone(), 1, 0);
     let (subscription_id, pane_id) = subscribe(&handler, &target).await;
+    let (surface_subscription_id, surface_key) = subscribe_surface_stream(&handler, &target).await;
     publish_pre_destroy_tail(&handler, &target).await;
 
     let response = handler
@@ -185,11 +205,14 @@ async fn unlink_window_k_drains_then_removes_destroyed_pane_output_subscription(
         "unlink-window -k must remove the unshared stable pane identity"
     );
 
+    assert_surface_stream_drains_then_closes(&handler, surface_subscription_id, "unlink-window -k")
+        .await;
     assert_subscription_drains_then_closes(&handler, subscription_id, "unlink-window -k").await;
+    assert_drain_source_released(&handler, &surface_key, "unlink-window -k");
 }
 
 #[tokio::test]
-async fn linked_respawn_window_drains_sibling_subscription_and_preserves_retained_receiver() {
+async fn linked_respawn_window_k_drains_surface_sibling_and_preserves_retained_receiver() {
     let handler = RequestHandler::new();
     let owner = create_session(&handler, "subscription-respawn-owner").await;
     let alias = create_session(&handler, "subscription-respawn-alias").await;
@@ -216,6 +239,8 @@ async fn linked_respawn_window_drains_sibling_subscription_and_preserves_retaine
         .expect("sibling pane is present in the linked alias before respawn");
     let (retained_subscription, _) = subscribe(&handler, &retained_target).await;
     let (removed_subscription, _) = subscribe(&handler, &removed_target).await;
+    let (removed_surface_subscription, removed_surface_key) =
+        subscribe_surface_stream(&handler, &removed_target).await;
     publish_pre_destroy_tail(&handler, &removed_target).await;
     let option_response = handler
         .handle(Request::PaneOptionSet(PaneOptionSetRequest {
@@ -267,12 +292,19 @@ async fn linked_respawn_window_drains_sibling_subscription_and_preserves_retaine
             .is_none(),
         "destroyed sibling must not remain reachable through the linked alias"
     );
+    assert_surface_stream_drains_then_closes(
+        &handler,
+        removed_surface_subscription,
+        "respawn-window -k sibling",
+    )
+    .await;
     assert_subscription_drains_then_closes(
         &handler,
         removed_subscription,
         "respawn-window sibling",
     )
     .await;
+    assert_drain_source_released(&handler, &removed_surface_key, "respawn-window -k sibling");
     let stale_alias_options = {
         let state = handler.state.lock().await;
         state
@@ -458,10 +490,53 @@ async fn subscribe_raw_stream(
     response.subscription_id
 }
 
-async fn publish_pre_destroy_tail(handler: &RequestHandler, target: &PaneTarget) {
-    handler
-        .send_pane_output_for_test(target, PRE_DESTROY_TAIL.to_vec())
+async fn subscribe_surface_stream(
+    handler: &RequestHandler,
+    target: &PaneTarget,
+) -> (PaneOutputSubscriptionId, PaneOutputSubscriptionKey) {
+    let response = handler
+        .handle_subscribe_pane_stream(
+            CONNECTION_ID,
+            SubscribePaneStreamRequest {
+                target: PaneTargetRef::slot(target.clone()),
+                mode: PaneStreamMode::Surface,
+                include_snapshot: false,
+            },
+        )
         .await;
+    let Response::SubscribePaneStream(response) = response else {
+        panic!("surface pane stream subscription should succeed: {response:?}");
+    };
+    assert!(
+        matches!(response.event, PaneStreamEvent::SurfaceReset(_)),
+        "surface pane stream must begin with a reset: {response:?}"
+    );
+    let key = handler
+        .pane_output_subscription_key_for_test(response.subscription_id)
+        .expect("surface pane stream has a registry key");
+    (response.subscription_id, key)
+}
+
+async fn publish_pre_destroy_tail(handler: &RequestHandler, target: &PaneTarget) {
+    let (output, transcript) = {
+        let state = handler.state.lock().await;
+        let output = state
+            .pane_output_for_target(
+                target.session_name(),
+                target.window_index(),
+                target.pane_index(),
+            )
+            .expect("test pane has an output channel");
+        let transcript = state
+            .transcript_handle(target)
+            .expect("test pane has a transcript");
+        (output, transcript)
+    };
+    transcript
+        .lock()
+        .expect("test pane transcript mutex")
+        .append_bytes(PRE_DESTROY_TAIL);
+    output.send(PRE_DESTROY_TAIL.to_vec());
 }
 
 async fn raw_stream_events_until_end(
@@ -495,6 +570,73 @@ async fn raw_stream_events_until_end(
         }
     }
     panic!("raw stream must reach a terminal event while draining: {events:?}");
+}
+
+async fn assert_surface_stream_drains_then_closes(
+    handler: &RequestHandler,
+    subscription_id: PaneOutputSubscriptionId,
+    label: &str,
+) {
+    let mut events = Vec::new();
+    for _ in 0..64 {
+        let response = handler
+            .handle_pane_stream_cursor(
+                CONNECTION_ID,
+                PaneStreamCursorRequest {
+                    subscription_id,
+                    max_events: Some(1),
+                },
+            )
+            .await;
+        let Response::PaneStreamCursor(response) = response else {
+            panic!("{label} surface stream must stay readable while draining: {response:?}");
+        };
+        let ended = response
+            .events
+            .iter()
+            .any(|event| matches!(event, PaneStreamEvent::End(_)));
+        events.extend(response.events);
+        if ended {
+            break;
+        }
+        if !response.limited {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                PaneStreamEvent::SurfacePatch(frame) | PaneStreamEvent::SurfaceReset(frame),
+                PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved),
+            ] if frame
+                .snapshot
+                .cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>()
+                .contains(std::str::from_utf8(PRE_DESTROY_TAIL).expect("ASCII test tail"))
+        ),
+        "{label} must deliver exactly one final Surface frame and one PaneRemoved end: {events:?}"
+    );
+
+    let response = handler
+        .handle_pane_stream_cursor(
+            CONNECTION_ID,
+            PaneStreamCursorRequest {
+                subscription_id,
+                max_events: Some(1),
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            response,
+            Response::Error(ref error) if error.error.to_string().contains("subscription not found")
+        ),
+        "{label} must not retain or redeliver an ended Surface stream: {response:?}"
+    );
 }
 
 /// A destroyed pane's already-published output must still reach its
@@ -551,6 +693,22 @@ async fn assert_subscription_drains_then_closes(
             Response::Error(ref error) if error.error.to_string().contains("subscription not found")
         ),
         "{label} must make the drained subscription unreadable: {cursor:?}"
+    );
+}
+
+fn assert_drain_source_released(
+    handler: &RequestHandler,
+    key: &PaneOutputSubscriptionKey,
+    label: &str,
+) {
+    assert!(
+        handler
+            .subscriptions
+            .lock()
+            .expect("subscription registry mutex")
+            .draining_stream_source(key)
+            .is_none(),
+        "{label} must release the staged pane stream source after the final subscription"
     );
 }
 

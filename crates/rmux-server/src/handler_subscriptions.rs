@@ -347,14 +347,15 @@ impl RequestHandler {
                 subscriptions.rekey_pane(&previous, current);
             }
             let mut draining = Vec::new();
-            for pane in removals {
-                subscriptions.mark_pane_streams_ending(&pane, PaneStreamEndReason::PaneRemoved);
-                if subscriptions.begin_pane_drain(pane.clone(), None, now) {
-                    draining.push(pane);
+            for removal in removals {
+                subscriptions
+                    .mark_pane_streams_ending(&removal.key, PaneStreamEndReason::PaneRemoved);
+                if subscriptions.begin_pane_drain(removal.key.clone(), removal.stream_source, now) {
+                    draining.push(removal.key);
                 } else {
                     // Nothing left to drain for this pane: release its cached
                     // stream state and any stranded drain bookkeeping now.
-                    subscriptions.remove_pane(&pane);
+                    subscriptions.remove_pane(&removal.key);
                 }
             }
             draining
@@ -523,17 +524,17 @@ fn resolve_pane_target_ref(
     }
 }
 
-/// Captures the immutable stream handles of panes an explicit kill is about to
-/// remove, while the caller still owns the state lock that will commit the
-/// kill. Once the panes leave `state.sessions` the handles are unrecoverable,
-/// so a surface stream could no longer project the output that was already
-/// buffered when the kill ran.
-pub(in crate::handler) fn capture_pane_stream_sources(
+/// Captures the immutable stream handles of panes a state mutation may remove,
+/// while the caller still owns the state lock that will commit the mutation.
+/// Once the panes leave `state.sessions` the handles are unrecoverable, so a
+/// surface stream could no longer project the output that was already buffered
+/// when the mutation ran.
+pub(in crate::handler) fn capture_pane_stream_sources<'a>(
     state: &HandlerState,
-    panes: &[PaneOutputSubscriptionKey],
+    panes: impl IntoIterator<Item = &'a PaneOutputSubscriptionKey>,
 ) -> Vec<super::pane_stream_support::PaneStreamSource> {
     panes
-        .iter()
+        .into_iter()
         .filter_map(|pane| {
             let target =
                 state.pane_target_for_runtime_pane(pane.runtime_session_name(), pane.pane_id())?;
