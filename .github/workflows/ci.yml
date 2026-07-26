@@ -327,15 +327,16 @@ jobs:
         run: cargo fetch --locked
 
       # The browser bundle must NOT carry x25519-dalek/curve25519-dalek; the
-      # WebCrypto path replaces them. cargo tree -i exits non-zero when the
-      # package is absent, so success here means it leaked — fail closed.
+      # WebCrypto path replaces them. Capture a successful dependency-tree
+      # query first so an invalid invocation cannot masquerade as absence.
       - name: Assert x25519-dalek is excluded from the WASM build
         run: |
-          if cargo tree -p rmux-web-crypto --no-default-features --features wasm --target wasm32-unknown-unknown -i x25519-dalek >/dev/null 2>&1; then
-            echo "::error::x25519-dalek must not enter the WASM crypto build"
+          tree="$(cargo tree -p rmux-web-crypto --no-default-features --features wasm --target wasm32-unknown-unknown --prefix none --locked)"
+          if printf '%s\n' "$tree" | grep -Eq '^(x25519-dalek|curve25519-dalek) v'; then
+            echo "::error::x25519-dalek/curve25519-dalek must not enter the WASM crypto build"
             exit 1
           fi
-          echo "x25519-dalek correctly excluded from the WASM crypto build"
+          echo "x25519-dalek/curve25519-dalek correctly excluded from the WASM crypto build"
 
       # Regression guard for the browser test gate: the wasm-test feature set must
       # compile its test targets (tests/handshake.rs is x25519-gated out).
