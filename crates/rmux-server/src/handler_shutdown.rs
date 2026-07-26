@@ -426,7 +426,17 @@ impl RequestHandler {
             .iter()
             .any(|connection_id| Some(*connection_id) != excluded_connection_id)
         {
-            return IdleShutdownState::Stale;
+            return match reason {
+                // A detached connection can have finished the mutation and
+                // received its response while an attached client's terminal
+                // exit is still draining. Keep exit-empty pending until that
+                // connection closes, then re-evaluate the server state.
+                PendingShutdownReason::ExitEmpty => IdleShutdownState::Unknown,
+                PendingShutdownReason::SeamlessUpgradeIdle => IdleShutdownState::Stale,
+                PendingShutdownReason::KillServer => {
+                    unreachable!("kill-server does not use the idle shutdown state machine")
+                }
+            };
         }
         drop(active_detached_connections);
 

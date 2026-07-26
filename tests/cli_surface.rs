@@ -20,13 +20,13 @@ use common::{
     stderr, stdout, terminate_child, wait_for_socket, AttachedSession, CliHarness,
     BINARY_OVERRIDE_ENV, BINARY_OVERRIDE_TEST_OPT_IN_ENV,
 };
-use rmux_client::INTERNAL_DAEMON_FLAG;
+use rmux_client::{connect, INTERNAL_DAEMON_FLAG};
 use rmux_core::command_parser::COMMAND_TABLE;
 use rmux_proto::{
     encode_frame, CommandOutput, ErrorResponse, FrameDecoder, HandshakeResponse,
-    ListSessionsResponse, OptionScopeSelector, Request, Response, RmuxError, ShowOptionsResponse,
-    SourceFileResponse, CONTROL_CONTROL_END, CONTROL_CONTROL_START, RMUX_FRAME_MAGIC,
-    RMUX_WIRE_VERSION,
+    KillSessionRequest, ListSessionsRequest, ListSessionsResponse, OptionScopeSelector, Request,
+    Response, RmuxError, SessionName, ShowOptionsResponse, SourceFileResponse, CONTROL_CONTROL_END,
+    CONTROL_CONTROL_START, RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION,
 };
 #[cfg(all(feature = "tiny-cli", not(debug_assertions)))]
 use rmux_proto::{
@@ -4389,6 +4389,60 @@ fn detach_client_can_control_the_sole_active_attach_from_another_process(
     let status = attach.wait_for_exit(ATTACH_TIMEOUT)?;
     assert_eq!(status.code(), Some(0));
     attach.assert_restored()?;
+    Ok(())
+}
+
+#[test]
+fn exit_empty_retries_after_a_replied_detached_client_drains_an_attached_exit(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("exit-empty-replied-client")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+
+    let created = harness.run_with(
+        &["new-session", "-d", "-s", "alpha", "sleep 60"],
+        |command| {
+            command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+        },
+    )?;
+    assert_success(&created);
+    std::thread::sleep(Duration::from_millis(250));
+
+    let mut attach = AttachedSession::spawn(&harness, "alpha", TerminalSize::new(80, 24))?;
+    attach.wait_for_raw_mode(NONBLOCKING_ATTACH_TIMEOUT)?;
+    let mut killer = connect(harness.socket_path())?;
+    let response = killer.kill_session(KillSessionRequest {
+        target: SessionName::new("alpha")?,
+        kill_all_except_target: false,
+        clear_alerts: false,
+        kill_group: false,
+    })?;
+    assert!(matches!(response, Response::KillSession(_)));
+
+    let (status, attached_output) = attach.wait_for_exit_with_output(ATTACH_TIMEOUT)?;
+    assert_eq!(status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&attached_output).contains("[exited]"),
+        "attached output={attached_output:?}"
+    );
+    attach.assert_restored()?;
+
+    let response = killer.list_sessions(ListSessionsRequest {
+        format: None,
+        filter: None,
+        sort_order: None,
+        reversed: false,
+    })?;
+    let Response::ListSessions(response) = response else {
+        panic!("expected empty list-sessions response, got {response:?}");
+    };
+    assert!(response.command_output().stdout().is_empty());
+    assert!(
+        harness.socket_path().exists(),
+        "the daemon must not close a client that is still receiving replies"
+    );
+
+    drop(killer);
+    wait_for_socket_cleanup(harness.socket_path())?;
     Ok(())
 }
 
