@@ -372,13 +372,7 @@ impl RequestHandler {
                                         Vec::new(),
                                         &result.reindexed_windows,
                                     );
-                                    if result.response.window_destroyed {
-                                        let _ =
-                                            state.hooks.remove_window(&WindowTarget::with_window(
-                                                target.session_name().clone(),
-                                                target.window_index(),
-                                            ));
-                                    } else {
+                                    if !result.response.window_destroyed {
                                         let _ = state.hooks.remove_pane(&target);
                                     }
                                     self.record_pane_state_change(

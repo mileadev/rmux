@@ -4,6 +4,7 @@ use std::path::Path;
 use rmux_core::{PaneId, Session};
 use rmux_proto::{
     KillPaneResponse, PaneTarget, RespawnPaneRequest, RespawnPaneResponse, RmuxError, SessionName,
+    WindowTarget,
 };
 use rmux_pty::PtyMaster;
 
@@ -644,6 +645,14 @@ impl HandlerState {
         };
         debug_assert_eq!(committed_outcome, preview_outcome);
         let removed_pane_ids = committed_outcome.removed_pane_ids().to_vec();
+        if committed_outcome.window_destroyed() {
+            let destroyed_window =
+                WindowTarget::with_window(session_name.clone(), target.window_index());
+            let _ = self.options.remove_window(&destroyed_window);
+            let _ = self.hooks.remove_window(&destroyed_window);
+            self.clear_auto_named_window(&session_name, target.window_index());
+            let _ = self.detach_window_link_slot(&session_name, target.window_index());
+        }
         let mut affected_sessions = if committed_outcome.window_destroyed() {
             vec![session_name.clone()]
         } else {
@@ -751,16 +760,6 @@ impl HandlerState {
         self.sync_pane_lifecycle_dimensions_for_session(&session_name);
         for (affected_session, before) in before_pane_options {
             self.rekey_pane_options_after_session_change(&before, &affected_session)?;
-        }
-
-        if committed_outcome.window_destroyed() {
-            let _ = self.detach_window_link_slot(&session_name, target.window_index());
-            let _ = self
-                .options
-                .remove_window(&rmux_proto::WindowTarget::with_window(
-                    session_name.clone(),
-                    target.window_index(),
-                ));
         }
 
         let removed_pane_ids = self.pane_ids_no_longer_referenced(removed_pane_ids);

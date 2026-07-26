@@ -321,12 +321,7 @@ impl RequestHandler {
                         WindowTarget::with_window(session_name.clone(), layout_window),
                         result.response.window_destroyed,
                     );
-                    if !result.session_destroyed && result.response.window_destroyed {
-                        let _ = state.hooks.remove_window(&WindowTarget::with_window(
-                            session_name.clone(),
-                            layout_window,
-                        ));
-                    } else if !result.session_destroyed {
+                    if !result.session_destroyed && !result.response.window_destroyed {
                         let _ = state.hooks.remove_pane(&target);
                     }
                     self.record_panes_closed_as_killed(&result.removed_pane_ids);
