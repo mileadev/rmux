@@ -158,7 +158,7 @@ where
 
     copy_result?;
     if let Some(stdin_result) = stdin_result {
-        stdin_result.map_err(ClientError::Io)?;
+        finish_control_input_after_output_closed(stdin_result).map_err(ClientError::Io)?;
     }
     Ok(())
 }
@@ -215,13 +215,29 @@ where
 
     copy_result?;
     if let Some(stdin_result) = stdin_result {
-        stdin_result.map_err(ClientError::Io)?;
+        finish_control_input_after_output_closed(stdin_result).map_err(ClientError::Io)?;
     }
     Ok(())
 }
 
 fn output_needs_suffix(mode: ControlMode) -> bool {
     mode.is_control_control()
+}
+
+fn finish_control_input_after_output_closed(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::NotConnected
+            ) =>
+        {
+            Ok(())
+        }
+        result => result,
+    }
 }
 
 fn poll_input_thread(
@@ -392,7 +408,7 @@ where
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::io::{Cursor, Read, Write};
+    use std::io::{self, Cursor, Read, Write};
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -400,7 +416,7 @@ mod tests {
         ClientTerminalContext, ControlMode, ControlModeResponse, MAX_INITIAL_CONTROL_COMMANDS,
     };
 
-    use super::drive_control_mode_with_stdio;
+    use super::{drive_control_mode_with_stdio, finish_control_input_after_output_closed};
     use crate::connection::{Connection, ControlModeUpgrade};
 
     #[test]
@@ -429,6 +445,24 @@ mod tests {
             0,
             "client must not write a partial upgrade before rejecting the batch"
         );
+    }
+
+    #[test]
+    fn closed_control_transport_supersedes_input_side_connection_errors() {
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::NotConnected,
+        ] {
+            finish_control_input_after_output_closed(Err(io::Error::from(kind)))
+                .expect("closed server transport makes further control input irrelevant");
+        }
+
+        let error = finish_control_input_after_output_closed(Err(io::Error::from(
+            io::ErrorKind::InvalidData,
+        )))
+        .expect_err("unrelated input failures remain visible");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

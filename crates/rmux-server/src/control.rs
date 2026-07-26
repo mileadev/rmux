@@ -47,7 +47,7 @@ use output_queue::{ensure_control_newline, flush_output_queue, ControlOutputQueu
 #[path = "control/command_numbering.rs"]
 mod command_numbering;
 #[cfg(any(unix, windows))]
-use command_numbering::ControlCommandNumbering;
+use command_numbering::{ControlCommandNumbering, ControlCommandOrigin};
 
 #[path = "control/command_validation.rs"]
 mod command_validation;
@@ -61,6 +61,11 @@ use subscriptions::{
     drain_ready_pane_events, handle_pane_event, refresh_subscriptions, PaneEvent, PaneSubscription,
     PaneSubscriptionStart,
 };
+
+#[path = "control/session_attachment.rs"]
+mod session_attachment;
+#[cfg(any(unix, windows))]
+use session_attachment::ControlSessionAttachment;
 
 #[cfg(any(unix, windows))]
 const MAX_DEFERRED_CONTROL_NOTIFICATIONS: usize = 1024;
@@ -307,12 +312,14 @@ async fn forward_control_inner(
         acquire_control_eof_queue_lease(&mut eof_queue_lease, &handler, control_identity).await;
         arm_control_eof_transition(&mut eof_transition);
     }
-    let mut session_name: Option<SessionName> = handler.control_session_name(requester_pid).await;
+    let mut attachment =
+        ControlSessionAttachment::new(handler.control_session_name(requester_pid).await);
     let mut flags: ControlClientFlags = handler
         .control_client_flags(requester_pid)
         .await
         .unwrap_or_default();
     let mut current_command: Option<ActiveControlCommand> = None;
+    let mut initial_command_completion_pending = false;
     let mut command_numbering = if initial_command_count == 0 {
         let initial_timestamp = unix_epoch_seconds();
         output_queue.enqueue_line(
@@ -331,7 +338,7 @@ async fn forward_control_inner(
     refresh_subscriptions(
         &handler,
         control_identity,
-        session_name.as_ref(),
+        attachment.session_name(),
         &mut subscriptions,
         pane_event_tx.clone(),
         PaneSubscriptionStart::Now,
@@ -342,7 +349,7 @@ async fn forward_control_inner(
             handler: &handler,
             control_identity,
             requester_pid,
-            session_name: &mut session_name,
+            session_name: attachment.session_name_mut(),
             subscriptions: &mut subscriptions,
             pane_event_tx: pane_event_tx.clone(),
             pane_event_rx: &mut pane_event_rx,
@@ -370,13 +377,13 @@ async fn forward_control_inner(
             }
         }
         if current_command.is_none() {
-            let reconcile_ready_control_events = input_closed
-                && !control_control_waits_for_attached_session(mode, session_name.as_ref());
+            let reconcile_ready_control_events = initial_command_completion_pending
+                || (input_closed && !control_control_waits_for_attached_session(mode, &attachment));
             let mut event_context = ServerEventContext {
                 handler: &handler,
                 control_identity,
                 requester_pid,
-                session_name: &mut session_name,
+                session_name: attachment.session_name_mut(),
                 subscriptions: &mut subscriptions,
                 pane_event_tx: pane_event_tx.clone(),
                 pane_event_rx: &mut pane_event_rx,
@@ -391,12 +398,13 @@ async fn forward_control_inner(
             }
             if reconcile_ready_control_events {
                 // A successful attach publishes its session-change event before
-                // the command task returns. When EOF and both futures are ready,
-                // the biased select below deliberately observes command
+                // the command task returns. When completion and both futures are
+                // ready, the biased select below deliberately observes command
                 // completion first. Reconcile the bounded snapshot of events
-                // that were already published before treating the client as
+                // already published before deciding whether the completed CLI
+                // batch is unattached or treating an EOF-bound client as
                 // terminal. New arrivals are left to the select, so a continuous
-                // producer cannot starve EOF.
+                // producer cannot starve either terminal decision.
                 let ready_server_event_count = server_events.len();
                 for _ in 0..ready_server_event_count {
                     let Ok(event) = server_events.try_recv() else {
@@ -423,11 +431,21 @@ async fn forward_control_inner(
                 .await?;
             return Ok(());
         }
+        if initial_command_completion_pending && current_command.is_none() {
+            initial_command_completion_pending = false;
+            if !attachment.is_attached() {
+                output_queue.enqueue_line(format_exit_line(None).into_bytes(), false);
+                flush_output_queue(&mut output_queue, &mut write_half, flags, &mut paused_panes)
+                    .await?;
+                write_half.shutdown().await?;
+                return Ok(());
+            }
+        }
         if !shutdown_draining
             && input_closed
             && current_command.is_none()
             && queued_lines.is_empty()
-            && !control_control_waits_for_attached_session(mode, session_name.as_ref())
+            && !control_control_waits_for_attached_session(mode, &attachment)
         {
             // Any incomplete line remaining in input_buffer after EOF is
             // discarded, matching tmux's `evbuffer_readln` semantics. EOF
@@ -516,6 +534,7 @@ async fn forward_control_inner(
                         timestamp,
                         command_number: command_frame.number,
                         guard_flag: command_frame.guard_flag,
+                        origin: command_frame.origin,
                         eof_cancellation,
                         task: Some(tokio::spawn(async move {
                             let _normal_request_guard = normal_request_guard;
@@ -569,8 +588,15 @@ async fn forward_control_inner(
                         &mut paused_panes,
                     )
                     .await?;
+                    if command_frame.origin.completes_initial_batch() {
+                        initial_command_completion_pending = true;
+                        break;
+                    }
                 }
             }
+        }
+        if initial_command_completion_pending && current_command.is_none() {
+            continue;
         }
         if shutdown_draining && current_command.is_none() {
             continue;
@@ -579,7 +605,7 @@ async fn forward_control_inner(
             && input_closed
             && current_command.is_none()
             && queued_lines.is_empty()
-            && !control_control_waits_for_attached_session(mode, session_name.as_ref())
+            && !control_control_waits_for_attached_session(mode, &attachment)
         {
             output_queue.enqueue_line(format_exit_line(None).into_bytes(), false);
             flush_output_queue(&mut output_queue, &mut write_half, flags, &mut paused_panes)
@@ -707,6 +733,9 @@ async fn forward_control_inner(
                     }
                 }
                 flush_output_queue(&mut output_queue, &mut write_half, flags, &mut paused_panes).await?;
+                if command.origin.completes_initial_batch() {
+                    initial_command_completion_pending = true;
+                }
                 let shutdown_requested =
                     server_shutdown_started || handler.request_shutdown_if_pending();
                 if shutdown_requested {
@@ -795,7 +824,7 @@ async fn forward_control_inner(
                     handler: &handler,
                     control_identity,
                     requester_pid,
-                    session_name: &mut session_name,
+                    session_name: attachment.session_name_mut(),
                     subscriptions: &mut subscriptions,
                     pane_event_tx: pane_event_tx.clone(),
                     pane_event_rx: &mut pane_event_rx,
@@ -826,9 +855,9 @@ async fn forward_control_inner(
 #[cfg(any(unix, windows))]
 fn control_control_waits_for_attached_session(
     mode: ControlMode,
-    session_name: Option<&SessionName>,
+    attachment: &ControlSessionAttachment,
 ) -> bool {
-    mode.is_control_control() && session_name.is_some()
+    mode.is_control_control() && attachment.is_attached()
 }
 
 #[cfg(any(unix, windows))]
@@ -1351,6 +1380,7 @@ struct ActiveControlCommand {
     timestamp: i64,
     command_number: u64,
     guard_flag: u8,
+    origin: ControlCommandOrigin,
     eof_cancellation: ControlQueueEofCancellation,
     task: Option<JoinHandle<ControlCommandResult>>,
 }
