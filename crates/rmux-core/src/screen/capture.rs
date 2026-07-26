@@ -47,10 +47,13 @@ impl RecoveryRowRenderer<'_> {
         render_grid_row_independent(&self.screen.grid, &self.hyperlinks, absolute_y, options)
     }
 
-    /// Returns the active grid's soft-wrap flag without rendering the row.
+    /// Returns one reconstructed main-history row's soft-wrap flag.
     #[must_use]
-    pub fn active_row_wrapped(&self, absolute_y: usize) -> Option<bool> {
-        self.screen.grid.absolute_line_wrapped(absolute_y)
+    pub fn recovery_history_row_wrapped(&self, absolute_y: usize) -> Option<bool> {
+        let grid = self.saved_grid.as_ref().unwrap_or(&self.screen.grid);
+        (absolute_y < grid.hsize())
+            .then(|| grid.absolute_line_wrapped(absolute_y))
+            .flatten()
     }
 
     /// Renders one row of the saved pre-alternate viewport.

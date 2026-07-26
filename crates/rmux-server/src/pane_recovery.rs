@@ -684,7 +684,7 @@ fn recent_history_suffix(
         let mut start = end - 1;
         let mut group_rows = 1_usize;
         while start > 0 {
-            let Some(previous_wrapped) = renderer.active_row_wrapped(start - 1) else {
+            let Some(previous_wrapped) = renderer.recovery_history_row_wrapped(start - 1) else {
                 return Err(RmuxError::Server(
                     "terminal history changed during recovery capture".to_owned(),
                 ));
@@ -1197,6 +1197,21 @@ mod tests {
                 u64::try_from(expected.screen().history_size()).unwrap_or(u64::MAX)
             );
         }
+    }
+
+    #[test]
+    fn keyframe_materializes_saved_main_history_after_alternate_height_shrink() {
+        let mut transcript = PaneTranscript::new(100, SIZE);
+        let mut output = Vec::new();
+        for row in 0..12 {
+            writeln!(output, "main-{row:02}\r").expect("write main-screen row");
+        }
+        output.extend_from_slice(b"\x1b[?1049h\x1b[2J\x1b[Halt");
+        transcript.append_bytes(&output);
+        transcript.resize(TerminalSize { cols: 16, rows: 2 });
+
+        PaneRecoverySeed::capture(&transcript)
+            .expect("materialize main-screen history beneath a shrunken alternate screen");
     }
 
     #[test]
