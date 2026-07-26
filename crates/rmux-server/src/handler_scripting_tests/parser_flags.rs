@@ -1,15 +1,19 @@
 use super::*;
 
 use crate::handler::scripting_support::parse_request_from_parts;
-use rmux_core::{key_string_lookup_string, OptionStore, SessionStore};
+use rmux_core::{OptionStore, SessionStore};
 use rmux_proto::RmuxError;
 
-const UNKNOWN_FLAG_COMMANDS: [(&str, &str); 5] = [
+const UNKNOWN_FLAG_COMMANDS: [(&str, &str); 6] = [
     ("set-buffer", "set-buffer -x payload"),
     ("rename-session", "rename-session -x"),
     ("rename-window", "rename-window -x"),
     ("display-message", "display-message -p -x"),
     ("send-keys", "send-keys -x C-c"),
+    (
+        "set-environment",
+        "set-environment -g -x parser-flag-poison",
+    ),
 ];
 
 const DAEMON_TEST_STACK_SIZE: usize = 8 * 1024 * 1024;
@@ -84,6 +88,58 @@ fn server_tail_parsers_reject_unknown_flags_before_positionals() {
             "{command} absorbed -x as a positional operand"
         );
     }
+}
+
+#[test]
+fn server_set_environment_rejects_unknown_option_shapes() {
+    let (sessions, find_context) = parser_fixture();
+
+    for (arguments, unknown) in [
+        (&["-g", "-x", "short-poison"][..], "-x"),
+        (&["-g", "--bogus", "long-poison"][..], "--bogus"),
+        (&["-g", "-Fz", "cluster-poison"][..], "-Fz"),
+    ] {
+        let error = parse_server_request("set-environment", arguments, &sessions, &find_context)
+            .expect_err("unknown set-environment option must fail");
+        assert_eq!(
+            error,
+            RmuxError::Server(format!("command set-environment: unknown flag {unknown}")),
+            "set-environment absorbed {unknown} as its variable name"
+        );
+    }
+}
+
+#[test]
+fn server_set_environment_preserves_options_and_terminator() {
+    let (sessions, find_context) = parser_fixture();
+
+    for arguments in [
+        &["-g", "GLOBAL_NAME", "value"][..],
+        &["-F", "FORMAT_NAME", "#{session_name}"][..],
+        &["-h", "HIDDEN_NAME", "value"][..],
+        &["-r", "CLEAR_NAME"][..],
+        &["-u", "UNSET_NAME"][..],
+        &["-t", "alpha", "TARGET_NAME", "value"][..],
+        &["-Fgh", "COMPACT_NAME", "value"][..],
+        &["-talpha", "COMPACT_TARGET_NAME", "value"][..],
+        &["-g", "--", "-DASH_NAME", "value"][..],
+    ] {
+        parse_server_request("set-environment", arguments, &sessions, &find_context)
+            .unwrap_or_else(|error| {
+                panic!("set-environment rejected legitimate arguments {arguments:?}: {error}")
+            });
+    }
+
+    assert_eq!(
+        parse_server_request("set-environment", &["-g", "-t"], &sessions, &find_context,)
+            .expect_err("-t without a target must fail"),
+        RmuxError::Server("missing -t target".to_owned())
+    );
+    assert_eq!(
+        parse_server_request("set-environment", &["--"], &sessions, &find_context)
+            .expect_err("-- without a variable name must fail"),
+        RmuxError::Server("missing set-environment name".to_owned())
+    );
 }
 
 #[test]
@@ -169,6 +225,18 @@ async fn assert_named_buffer_absent(handler: &RequestHandler, name: &str) {
     );
 }
 
+async fn assert_global_environment_absent(handler: &RequestHandler, name: &str) {
+    let state = handler.state.lock().await;
+    let entries = state
+        .environment
+        .show_environment_entries(&ScopeSelector::Global, true, None)
+        .unwrap_or_else(|error| panic!("show global environment {name:?}: {error}"));
+    assert!(
+        entries.iter().all(|entry| entry.name != name),
+        "unknown flag mutated global environment {name:?}: {entries:?}"
+    );
+}
+
 async fn assert_control_mode_case(index: usize, command: &str, invalid: &str) {
     let handler = RequestHandler::new();
     let alpha = session_name("control-parser-flags");
@@ -194,6 +262,7 @@ async fn assert_control_mode_case(index: usize, command: &str, invalid: &str) {
         "{invalid} did not fail closed in control-mode"
     );
     assert_named_buffer_absent(&handler, &canary).await;
+    assert_global_environment_absent(&handler, "-x").await;
     assert_stable_session(&handler, &alpha, pane_id).await;
 }
 
@@ -236,6 +305,7 @@ async fn assert_explicit_source_file_case(index: usize, command: &str, invalid: 
         "{invalid} did not fail closed in source-file"
     );
     assert_named_buffer_absent(&handler, &canary).await;
+    assert_global_environment_absent(&handler, "-x").await;
     assert_stable_session(&handler, &alpha, pane_id).await;
     fs::remove_dir_all(root).expect("remove parser-flag source root");
 }
@@ -285,6 +355,7 @@ async fn assert_startup_config_case(index: usize, command: &str, invalid: &str) 
     );
     drop(errors);
     assert_named_buffer_absent(&handler, &canary).await;
+    assert_global_environment_absent(&handler, "-x").await;
     assert_stable_session(&handler, &alpha, pane_id).await;
     fs::remove_dir_all(root).expect("remove parser-flag startup root");
 }
@@ -317,26 +388,35 @@ async fn assert_bind_key_case(index: usize, command: &str, invalid: &str) {
         .await
         .expect("binding installs before it is triggered");
 
-    let commands = {
-        let key_code = key_string_lookup_string(&key).expect("binding key parses");
-        let state = handler.state.lock().await;
-        state
-            .key_bindings
-            .get_binding("root", key_code)
-            .unwrap_or_else(|| panic!("binding {key} exists"))
-            .commands()
-            .clone()
+    let requester_pid = std::process::id();
+    let (attach_tx, _attach_rx) = tokio::sync::mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), attach_tx)
+        .await;
+    let response = handler
+        .handle(Request::SendKeysExt(rmux_proto::SendKeysExtRequest {
+            target: Some(PaneTarget::with_window(alpha.clone(), 0, 0)),
+            keys: vec![key],
+            expand_formats: false,
+            hex: false,
+            literal: false,
+            dispatch_key_table: true,
+            copy_mode_command: false,
+            forward_mouse_event: false,
+            reset_terminal: false,
+            repeat_count: None,
+        }))
+        .await;
+    let Response::Error(error) = response else {
+        panic!("triggered binding must reject the unknown nested flag: {response:?}");
     };
-    let error = handler
-        .execute_parsed_commands_for_test(std::process::id(), commands)
-        .await
-        .expect_err("triggered binding must reject the unknown nested flag");
     assert_eq!(
-        error,
+        error.error,
         RmuxError::Server(format!("command {command}: unknown flag -x")),
         "{invalid} did not fail closed when its binding was triggered"
     );
     assert_named_buffer_absent(&handler, &canary).await;
+    assert_global_environment_absent(&handler, "-x").await;
     assert_stable_session(&handler, &alpha, pane_id).await;
 }
 
@@ -349,4 +429,37 @@ async fn bind_key_nested_commands_reject_unknown_flags_body() {
     for (index, (command, invalid)) in UNKNOWN_FLAG_COMMANDS.into_iter().enumerate() {
         Box::pin(assert_bind_key_case(index, command, invalid)).await;
     }
+}
+
+#[test]
+fn parsed_queue_rejects_set_environment_unknown_flag_without_follow_on_effects() {
+    run_on_daemon_test_stack(
+        parsed_queue_rejects_set_environment_unknown_flag_without_follow_on_effects_body,
+    );
+}
+
+async fn parsed_queue_rejects_set_environment_unknown_flag_without_follow_on_effects_body() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("queue-parser-flags");
+    let pane_id = create_stable_session(&handler, &alpha).await;
+    let canary = "queue-set-environment-canary";
+    let commands = CommandParser::new()
+        .parse(&format!(
+            "set-environment -g -x parser-flag-poison ; \
+             set-buffer -b {canary} must-not-run"
+        ))
+        .expect("multi-command queue parses");
+
+    let error = handler
+        .execute_parsed_commands_for_test(std::process::id(), commands)
+        .await
+        .expect_err("set-environment unknown flag must abort its queue");
+
+    assert_eq!(
+        error,
+        RmuxError::Server("command set-environment: unknown flag -x".to_owned())
+    );
+    assert_named_buffer_absent(&handler, canary).await;
+    assert_global_environment_absent(&handler, "-x").await;
+    assert_stable_session(&handler, &alpha, pane_id).await;
 }

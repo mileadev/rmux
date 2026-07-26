@@ -9,7 +9,7 @@ use rmux_proto::{
 
 use super::targets::{implicit_pane_target, implicit_session_name, implicit_window_target};
 use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
-use super::values::unsupported_flag;
+use super::values::{reject_unknown_option_before_positional, unsupported_flag};
 use super::{parse_session_name, parse_target_arg};
 
 #[path = "config_parse/hooks.rs"]
@@ -360,6 +360,7 @@ pub(super) fn parse_set_environment(
             }
             _ => {
                 let Some(cluster) = parse_compact_flag_cluster(&token, "Fghru", "t") else {
+                    reject_unknown_option_before_positional("set-environment", &token)?;
                     break;
                 };
                 let _ = args.optional();

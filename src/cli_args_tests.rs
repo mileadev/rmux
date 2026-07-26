@@ -94,6 +94,7 @@ fn direct_cli_rejects_unknown_options_before_command_tails() {
         ("rename-window", &["-x"][..]),
         ("set-buffer", &["-x", "payload"][..]),
         ("display-message", &["-p", "-x"][..]),
+        ("set-environment", &["-x", "poisoned"][..]),
     ] {
         let mut invocation = Vec::with_capacity(arguments.len() + 1);
         invocation.push(command);
