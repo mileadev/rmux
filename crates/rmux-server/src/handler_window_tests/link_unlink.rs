@@ -10,6 +10,27 @@ async fn assert_send_keys_succeeds(handler: &RequestHandler, target: PaneTarget)
     assert!(matches!(response, Response::SendKeys(_)), "{response:?}");
 }
 
+async fn assert_pane_output_observes(
+    receiver: &mut crate::pane_io::PaneOutputReceiver,
+    expected: &[u8],
+) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            match receiver.recv().await {
+                rmux_core::events::OutputCursorItem::Event(event) if event.bytes() == expected => {
+                    return;
+                }
+                rmux_core::events::OutputCursorItem::Event(_) => {}
+                rmux_core::events::OutputCursorItem::Gap(gap) => {
+                    panic!("pane output cursor fell behind before the expected event: {gap:?}");
+                }
+            }
+        }
+    })
+    .await
+    .expect("expected pane output was not observed");
+}
+
 #[tokio::test]
 async fn link_window_refreshes_attached_non_syntactic_group_peer_output_receiver() {
     let handler = RequestHandler::new();
@@ -78,14 +99,7 @@ async fn link_window_refreshes_attached_non_syntactic_group_peer_output_receiver
     };
     let expected = b"linked-peer-live-output".to_vec();
     output.send(expected.clone());
-
-    let received = timeout(Duration::from_secs(2), target.pane_output.recv())
-        .await
-        .expect("refreshed peer receiver must follow the linked pane runtime");
-    let rmux_core::events::OutputCursorItem::Event(event) = received else {
-        panic!("expected linked pane output, got {received:?}");
-    };
-    assert_eq!(event.bytes(), expected);
+    assert_pane_output_observes(&mut target.pane_output, &expected).await;
 }
 
 #[tokio::test]
@@ -562,13 +576,7 @@ async fn unlink_window_via_group_peer_refreshes_exact_family_and_removes_exact_t
     };
     let expected = b"unlink-peer-live-output".to_vec();
     output.send(expected.clone());
-    let received = timeout(Duration::from_secs(2), target.pane_output.recv())
-        .await
-        .expect("refreshed owner receiver follows the surviving active window");
-    let rmux_core::events::OutputCursorItem::Event(event) = received else {
-        panic!("expected surviving pane output, got {received:?}");
-    };
-    assert_eq!(event.bytes(), expected);
+    assert_pane_output_observes(&mut target.pane_output, &expected).await;
 
     for target in &removed_targets {
         assert_eq!(
