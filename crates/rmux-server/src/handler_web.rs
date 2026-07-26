@@ -120,6 +120,27 @@ impl RequestHandler {
     }
 
     #[cfg(test)]
+    pub(crate) async fn publish_web_pane_bytes_for_test(
+        &self,
+        target: &PaneTargetRef,
+        bytes: Vec<u8>,
+    ) -> Result<(), RmuxError> {
+        let (output, transcript) = {
+            let state = self.state.lock().await;
+            let target = resolve_pane_target_ref(&state, target)?;
+            let output = state.pane_output_for_target(
+                target.session_name(),
+                target.window_index(),
+                target.pane_index(),
+            )?;
+            let transcript = state.transcript_handle(&target)?;
+            (output, transcript)
+        };
+        pane_io::publish_pane_bytes_for_test(&transcript, &output, bytes);
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) async fn open_web_share(
         &self,
         token: &str,

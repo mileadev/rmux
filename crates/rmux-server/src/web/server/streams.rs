@@ -45,7 +45,7 @@ pub(super) async fn serve_pane_loop(
     supports_pane_recovery_coverage: bool,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
-    let mut sanitizer = WebTerminalSanitizer::default();
+    let mut sanitizer = WebTerminalSanitizer::for_role(pane.connect_role());
     let initial_snapshot = queue_snapshot(
         &outbound,
         &pane.snapshot,
@@ -318,7 +318,7 @@ pub(super) async fn serve_session_loop(
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let mut scrolls = HashMap::new();
-    let mut sanitizer = WebTerminalSanitizer::default();
+    let mut sanitizer = WebTerminalSanitizer::for_role(session.connect_role());
     queue_session_keyframe_or_close(
         &outbound,
         None,

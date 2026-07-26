@@ -12,10 +12,13 @@
 //! — would delete pane output the owner can plainly see, so bare C1 bytes are
 //! forwarded as the data bytes they are.
 
+use super::WebShareConnectRole;
+
 const MAX_BUFFERED_OSC_BYTES: usize = 1024 * 1024;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct WebTerminalSanitizer {
+    role: WebShareConnectRole,
     state: State,
     pending_c2: bool,
 }
@@ -36,6 +39,14 @@ enum State {
 }
 
 impl WebTerminalSanitizer {
+    pub(crate) fn for_role(role: WebShareConnectRole) -> Self {
+        Self {
+            role,
+            state: State::Ground,
+            pending_c2: false,
+        }
+    }
+
     pub(crate) fn push(&mut self, input: &[u8], output: &mut Vec<u8>) {
         for byte in input.iter().copied() {
             self.push_byte(byte, output);
@@ -87,7 +98,7 @@ impl WebTerminalSanitizer {
                     escape_sequence(input, output)
                 } else if string_ended(input, escaped, true) {
                     input.append_to(&mut bytes);
-                    if allowed_osc(&bytes) {
+                    if allowed_osc(&bytes, self.role) {
                         output.extend_from_slice(&bytes);
                     }
                     State::Ground
@@ -239,7 +250,7 @@ fn string_ended(input: InputByte, escaped: bool, bell_terminates: bool) -> bool 
         || (bell_terminates && input.byte == 0x07)
 }
 
-fn allowed_osc(sequence: &[u8]) -> bool {
+fn allowed_osc(sequence: &[u8], role: WebShareConnectRole) -> bool {
     let Some(payload) = sequence
         .strip_prefix(b"\x1b]".as_slice())
         .or_else(|| sequence.strip_prefix([0xc2, 0x9d].as_slice()))
@@ -262,10 +273,12 @@ fn allowed_osc(sequence: &[u8]) -> bool {
     if code == "8" {
         return allowed_hyperlink(&payload[code_end..]);
     }
-    matches!(
+    let visual = matches!(
         code,
-        "0" | "1" | "2" | "4" | "7" | "10" | "11" | "12" | "104" | "110" | "111" | "112" | "133"
-    )
+        "4" | "10" | "11" | "12" | "104" | "110" | "111" | "112"
+    );
+    let private_metadata = matches!(code, "0" | "1" | "2" | "7" | "133");
+    visual || (matches!(role, WebShareConnectRole::Operator) && private_metadata)
 }
 
 fn allowed_hyperlink(payload: &[u8]) -> bool {
@@ -303,13 +316,72 @@ fn strip_osc_terminator(mut payload: &[u8]) -> &[u8] {
 mod tests {
     use super::*;
 
-    fn sanitize(chunks: &[&[u8]]) -> Vec<u8> {
-        let mut sanitizer = WebTerminalSanitizer::default();
+    fn sanitize_for_role(role: WebShareConnectRole, chunks: &[&[u8]]) -> Vec<u8> {
+        let mut sanitizer = WebTerminalSanitizer::for_role(role);
         let mut output = Vec::new();
         for chunk in chunks {
             sanitizer.push(chunk, &mut output);
         }
         output
+    }
+
+    fn sanitize(chunks: &[&[u8]]) -> Vec<u8> {
+        sanitize_for_role(WebShareConnectRole::Operator, chunks)
+    }
+
+    #[test]
+    fn spectator_role_removes_private_metadata_and_keeps_visual_osc() {
+        let input = concat!(
+            "A\u{1b}]0;private icon and title\u{1b}\\",
+            "B\u{1b}]1;private icon\u{1b}\\",
+            "C\u{1b}]2;private title\u{1b}\\",
+            "D\u{1b}]7;file:///home/owner/private\u{1b}\\",
+            "E\u{1b}]133;P;Cwd=/home/owner/private\u{1b}\\",
+            "F\u{1b}]4;1;rgb:ff/00/00\u{1b}\\",
+            "G\u{1b}]8;;https://example.test\u{1b}\\link\u{1b}]8;;\u{1b}\\H",
+        )
+        .as_bytes();
+        let expected = concat!(
+            "ABCDEF",
+            "\u{1b}]4;1;rgb:ff/00/00\u{1b}\\",
+            "G",
+            "\u{1b}]8;;https://example.test\u{1b}\\link\u{1b}]8;;\u{1b}\\H",
+        )
+        .as_bytes();
+
+        for split in 0..=input.len() {
+            assert_eq!(
+                sanitize_for_role(
+                    WebShareConnectRole::Spectator,
+                    &[&input[..split], &input[split..]]
+                ),
+                expected,
+                "split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn operator_role_preserves_authorized_private_metadata() {
+        let input = concat!(
+            "A\u{1b}]0;private icon and title\u{1b}\\",
+            "B\u{1b}]1;private icon\u{1b}\\",
+            "C\u{1b}]2;private title\u{1b}\\",
+            "D\u{1b}]7;file:///home/owner/private\u{1b}\\",
+            "E\u{1b}]133;P;Cwd=/home/owner/private\u{1b}\\F",
+        )
+        .as_bytes();
+
+        for split in 0..=input.len() {
+            assert_eq!(
+                sanitize_for_role(
+                    WebShareConnectRole::Operator,
+                    &[&input[..split], &input[split..]]
+                ),
+                input,
+                "split {split}"
+            );
+        }
     }
 
     #[test]
@@ -597,7 +669,7 @@ mod tests {
 
     #[test]
     fn reset_discards_an_incomplete_control_string() {
-        let mut sanitizer = WebTerminalSanitizer::default();
+        let mut sanitizer = WebTerminalSanitizer::for_role(WebShareConnectRole::Operator);
         let mut output = Vec::new();
         sanitizer.push(b"safe\x1b]52;c;partial", &mut output);
         sanitizer.reset();

@@ -8,7 +8,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 
 use crate::pane_io::PaneOutputReceiver;
 use crate::web::{
-    WebSessionTarget, WebShareAccess, WebShareConnectionCounts, WebShareRevokeReason,
+    WebSessionTarget, WebShareAccess, WebShareConnectRole, WebShareConnectionCounts,
+    WebShareRevokeReason,
 };
 
 use super::{WebPaneSnapshot, WebSessionSnapshot};
@@ -58,6 +59,10 @@ impl WebPaneStream {
 
     pub(crate) fn is_operator(&self) -> bool {
         self.access.is_operator()
+    }
+
+    pub(crate) fn connect_role(&self) -> WebShareConnectRole {
+        self.access.connect_role()
     }
 
     pub(crate) fn has_operator_access(&self) -> bool {
@@ -206,6 +211,10 @@ impl WebSessionStream {
 
     pub(crate) fn is_operator(&self) -> bool {
         self.access.is_operator()
+    }
+
+    pub(crate) fn connect_role(&self) -> WebShareConnectRole {
+        self.access.connect_role()
     }
 
     pub(crate) fn has_operator_access(&self) -> bool {

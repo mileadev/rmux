@@ -296,7 +296,7 @@ mod tests {
     use crate::pane_recovery::MAX_RECOVERY_KEYFRAME_BYTES;
     use crate::web::protocol::{PANE_FRAME_CAPABILITY, PANE_RECOVERY_COVERAGE_CAPABILITY};
     use crate::web::stream_sanitizer::WebTerminalSanitizer;
-    use crate::web::{WebShareConnectionCounts, WebShareRevokeReason};
+    use crate::web::{WebShareConnectRole, WebShareConnectionCounts, WebShareRevokeReason};
 
     #[test]
     fn ready_message_wire_shape_is_v1_and_capability_gated() {
@@ -396,7 +396,7 @@ mod tests {
         let snapshot =
             WebSessionSnapshot::new(size, b"paint".to_vec(), TestWebSessionView::new(size), 0, 0)
                 .expect("snapshot fits");
-        let mut sanitizer = WebTerminalSanitizer::default();
+        let mut sanitizer = WebTerminalSanitizer::for_role(WebShareConnectRole::Operator);
 
         let frames = session_keyframe_payloads(Some(size), &snapshot, &mut sanitizer)
             .expect("view serializes");
@@ -431,7 +431,7 @@ mod tests {
         )
         .expect("pane frame fits");
 
-        let mut sanitizer = WebTerminalSanitizer::default();
+        let mut sanitizer = WebTerminalSanitizer::for_role(WebShareConnectRole::Operator);
         let payload = session_pane_frame_payload(&frame, &mut sanitizer).expect("pane frame fits");
 
         assert_eq!(payload[0], WS_SESSION_PANE_FRAME);
@@ -462,7 +462,7 @@ mod tests {
             0,
         )
         .expect("snapshot fits");
-        let mut sanitizer = WebTerminalSanitizer::default();
+        let mut sanitizer = WebTerminalSanitizer::for_role(WebShareConnectRole::Operator);
         let frames =
             session_keyframe_payloads(None, &snapshot, &mut sanitizer).expect("view serializes");
         assert!(
@@ -515,7 +515,7 @@ mod tests {
             metadata_complete: false,
             recovery_keyframe: Some(b"safe\x1b]52;c;partial".to_vec()),
         };
-        let mut sanitizer = WebTerminalSanitizer::default();
+        let mut sanitizer = WebTerminalSanitizer::for_role(WebShareConnectRole::Operator);
         let payload =
             pane_snapshot_payload(&snapshot, &mut sanitizer, false).expect("snapshot fits");
         assert_eq!(&payload[1..], b"safe");
@@ -548,7 +548,7 @@ mod tests {
             metadata_complete: false,
             recovery_keyframe: Some(b"$ cat logo.bin\r\n".to_vec()),
         };
-        let mut sanitizer = WebTerminalSanitizer::default();
+        let mut sanitizer = WebTerminalSanitizer::for_role(WebShareConnectRole::Operator);
         let payload =
             pane_snapshot_payload(&snapshot, &mut sanitizer, false).expect("snapshot fits");
         assert_eq!(&payload[1..], b"$ cat logo.bin\r\n");
@@ -584,7 +584,7 @@ mod tests {
             metadata_complete: false,
             recovery_keyframe: Some(b"screen".to_vec()),
         };
-        let mut sanitizer = WebTerminalSanitizer::default();
+        let mut sanitizer = WebTerminalSanitizer::for_role(WebShareConnectRole::Operator);
         let legacy =
             pane_snapshot_payload(&snapshot, &mut sanitizer, false).expect("snapshot fits");
         assert_eq!(legacy, b"\x10screen");
@@ -624,7 +624,7 @@ mod tests {
             metadata_complete: true,
             recovery_keyframe: Some(vec![b'x'; MAX_RECOVERY_KEYFRAME_BYTES]),
         };
-        let mut sanitizer = WebTerminalSanitizer::default();
+        let mut sanitizer = WebTerminalSanitizer::for_role(WebShareConnectRole::Operator);
         assert!(
             pane_snapshot_payload(&pane_snapshot, &mut sanitizer, true).is_some(),
             "the largest accepted recovery keyframe must fit with Web coverage metadata"

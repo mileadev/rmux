@@ -485,6 +485,109 @@ async fn share_websocket_auth_ready_snapshot_operator_and_revoke_loop() {
 }
 
 #[tokio::test]
+async fn pane_keyframe_redacts_spectator_metadata_and_preserves_operator_access() {
+    const STACKED_TITLE: &[u8] = b"private-stacked-title";
+    const CURRENT_TITLE: &[u8] = b"private-current-title";
+    const CURRENT_DIRECTORY: &[u8] = b"file:///home/owner/private-project";
+    const VISIBLE_CONTENT: &[u8] = b"visible terminal content";
+
+    let handler = Arc::new(RequestHandler::new());
+    let session_name = create_session(&handler, "websocket-metadata-policy").await;
+    let target = PaneTarget::new(session_name.clone(), 0);
+    let mut pane_bytes = b"\x1b]2;".to_vec();
+    pane_bytes.extend_from_slice(STACKED_TITLE);
+    pane_bytes.extend_from_slice(b"\x1b\\\x1b[22;2t\x1b]2;");
+    pane_bytes.extend_from_slice(CURRENT_TITLE);
+    pane_bytes.extend_from_slice(b"\x1b\\\x1b]7;");
+    pane_bytes.extend_from_slice(CURRENT_DIRECTORY);
+    pane_bytes.extend_from_slice(b"\x1b\\");
+    pane_bytes.extend_from_slice(VISIBLE_CONTENT);
+    handler
+        .publish_web_pane_bytes_for_test(&target.clone().into(), pane_bytes)
+        .await
+        .expect("publish pane metadata and visible content");
+
+    let spectator_share = create_share(
+        &handler,
+        share_request(WebShareScope::Pane(target.clone().into())),
+    )
+    .await;
+    let operator_share = create_share(
+        &handler,
+        CreateWebShareRequest {
+            operator: true,
+            ..share_request(WebShareScope::Pane(target.into()))
+        },
+    )
+    .await;
+    let auth = auth_text_with_pane_recovery_coverage();
+
+    let mut spectator = TestWebSocket::connect_with_auth(
+        Arc::clone(&handler),
+        &token_from_url(
+            spectator_share
+                .spectator_url
+                .as_deref()
+                .expect("spectator URL"),
+        ),
+        &auth,
+    )
+    .await;
+    assert_eq!(spectator.read_json().await["role"], "spectator");
+    let spectator_keyframe = spectator
+        .read_binary_with_prefix_payload(0x13, "spectator pane recovery keyframe")
+        .await;
+    assert!(
+        spectator_keyframe
+            .windows(VISIBLE_CONTENT.len())
+            .any(|window| window == VISIBLE_CONTENT),
+        "spectator keyframe must retain terminal rendering content"
+    );
+    for private_metadata in [STACKED_TITLE, CURRENT_TITLE, CURRENT_DIRECTORY] {
+        assert!(
+            !spectator_keyframe
+                .windows(private_metadata.len())
+                .any(|window| window == private_metadata),
+            "spectator keyframe leaked pane metadata {:?}",
+            String::from_utf8_lossy(private_metadata)
+        );
+    }
+
+    let mut operator = TestWebSocket::connect_with_auth(
+        Arc::clone(&handler),
+        &token_from_url(
+            operator_share
+                .operator_url
+                .as_deref()
+                .expect("operator URL"),
+        ),
+        &auth,
+    )
+    .await;
+    assert_eq!(operator.read_json().await["role"], "operator");
+    let operator_keyframe = operator
+        .read_binary_with_prefix_payload(0x13, "operator pane recovery keyframe")
+        .await;
+    for authorized_content in [
+        STACKED_TITLE,
+        CURRENT_TITLE,
+        CURRENT_DIRECTORY,
+        VISIBLE_CONTENT,
+    ] {
+        assert!(
+            operator_keyframe
+                .windows(authorized_content.len())
+                .any(|window| window == authorized_content),
+            "operator keyframe lost authorized content {:?}",
+            String::from_utf8_lossy(authorized_content)
+        );
+    }
+
+    spectator.close().await;
+    operator.close().await;
+}
+
+#[tokio::test]
 async fn authenticated_idle_pane_and_session_shares_survive_with_matching_pongs() {
     let handler = Arc::new(RequestHandler::new());
     let session_name = create_session(&handler, "websocket-idle-keepalive").await;
