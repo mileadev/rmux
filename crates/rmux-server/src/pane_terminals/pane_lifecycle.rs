@@ -594,6 +594,7 @@ impl HandlerState {
                 removed_pane_ids,
                 affected_sessions,
                 destroyed_sessions: vec![(session_name, removed_session.id().as_u32())],
+                reindexed_windows: Vec::new(),
             });
         }
         if addressed_last_pane
@@ -666,6 +667,19 @@ impl HandlerState {
                 }
             }
         };
+        let mut reindexed_windows = Vec::new();
+        if committed_outcome.window_destroyed() {
+            match self.renumber_windows_if_enabled(&session_name) {
+                Ok(index_map) if !index_map.is_empty() => {
+                    reindexed_windows.push((session_name.clone(), index_map));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    transfer_snapshot.restore(self);
+                    return Err(error);
+                }
+            }
+        }
 
         #[cfg(windows)]
         let terminal_pane_ids = committed_outcome
@@ -761,6 +775,7 @@ impl HandlerState {
             removed_pane_ids,
             affected_sessions,
             destroyed_sessions: Vec::new(),
+            reindexed_windows,
         })
     }
 
@@ -793,6 +808,7 @@ impl HandlerState {
             removed_pane_ids: result.removed_pane_ids,
             affected_sessions,
             destroyed_sessions: Vec::new(),
+            reindexed_windows: Vec::new(),
         })
     }
 

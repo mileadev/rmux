@@ -317,6 +317,7 @@ pub(crate) struct KilledPaneResult {
     pub(crate) removed_pane_ids: Vec<PaneId>,
     pub(crate) affected_sessions: Vec<SessionName>,
     pub(crate) destroyed_sessions: Vec<(SessionName, u32)>,
+    pub(crate) reindexed_windows: Vec<(SessionName, BTreeMap<u32, u32>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

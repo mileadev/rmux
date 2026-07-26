@@ -370,7 +370,7 @@ impl RequestHandler {
                                         &state,
                                         timer_mutation,
                                         Vec::new(),
-                                        &[],
+                                        &result.reindexed_windows,
                                     );
                                     if result.response.window_destroyed {
                                         let _ =

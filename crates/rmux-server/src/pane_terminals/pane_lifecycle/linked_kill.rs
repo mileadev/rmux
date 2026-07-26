@@ -103,9 +103,36 @@ impl HandlerState {
         };
         let mut removed_outputs = self.remove_pane_outputs(&runtime_session_name, &[pane_id]);
 
-        let commit = self.commit_linked_window_removals(&direct_slots, &removals, false, true);
-        let destroyed_runtime_plans = match commit {
-            Ok(destroyed_sessions) => destroyed_sessions,
+        let mut affected_sessions = removals
+            .iter()
+            .map(|removal| removal.session_name.clone())
+            .collect::<Vec<_>>();
+        affected_sessions.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        affected_sessions.dedup();
+        let commit = (|| {
+            let destroyed_sessions =
+                self.commit_linked_window_removals(&direct_slots, &removals, false, false)?;
+            let mut reindexed_windows = Vec::new();
+            for affected_session in &affected_sessions {
+                if self.sessions.session(affected_session).is_none() {
+                    continue;
+                }
+                let index_map = self.renumber_windows_if_enabled(affected_session)?;
+                if !index_map.is_empty() {
+                    reindexed_windows.push((affected_session.clone(), index_map));
+                }
+            }
+            for affected_session in &affected_sessions {
+                if self.sessions.session(affected_session).is_none() {
+                    continue;
+                }
+                self.synchronize_session_group_from(affected_session)?;
+                self.sync_pane_lifecycle_dimensions_for_session(affected_session);
+            }
+            Ok::<_, RmuxError>((destroyed_sessions, reindexed_windows))
+        })();
+        let (destroyed_runtime_plans, reindexed_windows) = match commit {
+            Ok(committed) => committed,
             Err(error) => {
                 snapshot.restore(self);
                 restore_linked_pane_runtime(
@@ -136,12 +163,6 @@ impl HandlerState {
             .map(|destroyed| (destroyed.session_name, destroyed.session_id))
             .collect::<Vec<_>>();
 
-        let mut affected_sessions = removals
-            .iter()
-            .map(|removal| removal.session_name.clone())
-            .collect::<Vec<_>>();
-        affected_sessions.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        affected_sessions.dedup();
         let removed_session_id =
             destroyed_sessions
                 .iter()
@@ -162,6 +183,7 @@ impl HandlerState {
             removed_pane_ids,
             affected_sessions,
             destroyed_sessions,
+            reindexed_windows,
         })
     }
 

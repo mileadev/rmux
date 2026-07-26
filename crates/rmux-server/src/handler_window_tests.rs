@@ -1,17 +1,17 @@
 use super::RequestHandler;
 use crate::pane_io::AttachControl;
 use rmux_proto::{
-    DisplayMessageRequest, HookLifecycle, HookName, KillSessionRequest, KillWindowRequest,
-    LastPaneRequest, LastWindowRequest, LinkWindowRequest, ListPanesRequest, ListWindowsRequest,
-    MoveWindowRequest, MoveWindowTarget, NewSessionExtRequest, NewSessionRequest, NewWindowRequest,
-    NextWindowRequest, OptionName, PaneSelectRequest, PaneTarget, PaneTargetRef,
-    PreviousWindowRequest, ProcessCommand, RenameSessionRequest, RenameWindowRequest, Request,
-    ResizeWindowAdjustment, ResizeWindowRequest, ResolveTargetRequest, ResolveTargetType,
-    RespawnWindowRequest, Response, RotateWindowDirection, RotateWindowRequest, ScopeSelector,
-    SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneRequest, SelectWindowRequest,
-    SessionName, SetHookMutationRequest, SetOptionMode, SetOptionRequest, SplitDirection,
-    SplitWindowRequest, SplitWindowTarget, SwapWindowRequest, Target, TerminalSize,
-    UnlinkWindowRequest, WindowTarget,
+    DisplayMessageRequest, HookLifecycle, HookName, KillPaneRequest, KillSessionRequest,
+    KillWindowRequest, LastPaneRequest, LastWindowRequest, LinkWindowRequest, ListPanesRequest,
+    ListWindowsRequest, MoveWindowRequest, MoveWindowTarget, NewSessionExtRequest,
+    NewSessionRequest, NewWindowRequest, NextWindowRequest, OptionName, PaneSelectRequest,
+    PaneTarget, PaneTargetRef, PreviousWindowRequest, ProcessCommand, RenameSessionRequest,
+    RenameWindowRequest, Request, ResizeWindowAdjustment, ResizeWindowRequest,
+    ResolveTargetRequest, ResolveTargetType, RespawnWindowRequest, Response, RotateWindowDirection,
+    RotateWindowRequest, ScopeSelector, SelectPaneAdjacentRequest, SelectPaneDirection,
+    SelectPaneRequest, SelectWindowRequest, SessionName, SetHookMutationRequest, SetOptionMode,
+    SetOptionRequest, SplitDirection, SplitWindowRequest, SplitWindowTarget, SwapWindowRequest,
+    Target, TerminalSize, UnlinkWindowRequest, WindowTarget,
 };
 use std::fs;
 use std::path::{Path, PathBuf};

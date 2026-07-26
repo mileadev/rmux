@@ -331,7 +331,7 @@ impl RequestHandler {
                         &state,
                         timer_mutation,
                         Vec::new(),
-                        &[],
+                        &result.reindexed_windows,
                     );
                     let mut affected_sessions = result.affected_sessions.clone();
                     state.expand_with_active_window_linked_session_families(&mut affected_sessions);
