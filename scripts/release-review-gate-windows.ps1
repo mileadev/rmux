@@ -3,33 +3,36 @@ param(
     [string]$TargetDir = "target\release-review-gate-windows-cargo",
     [switch]$SkipPackage,
     [switch]$SkipClippy,
-    [switch]$RunCtrlMatrixSmoke
+    [switch]$RunCtrlMatrixSmoke,
+    [switch]$EndpointSmokeOnly
 )
 
 $ErrorActionPreference = "Stop"
 
 $env:RUST_MIN_STACK = "8388608"
 $env:CARGO_TARGET_DIR = $TargetDir
-if (-not $env:CARGO_INCREMENTAL) {
-    $env:CARGO_INCREMENTAL = "0"
-}
-if (-not $env:CARGO_BUILD_JOBS) {
-    $env:CARGO_BUILD_JOBS = "1"
-}
-if (-not $env:CARGO_PROFILE_DEV_DEBUG) {
-    $env:CARGO_PROFILE_DEV_DEBUG = "0"
-}
-if (-not $env:CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG) {
-    $env:CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG = "0"
-}
-if (-not $env:CARGO_PROFILE_TEST_DEBUG) {
-    $env:CARGO_PROFILE_TEST_DEBUG = "0"
-}
-$pdbSuppressFlag = "-Clink-arg=/DEBUG:NONE"
-if (-not $env:RUSTFLAGS) {
-    $env:RUSTFLAGS = $pdbSuppressFlag
-} elseif ($env:RUSTFLAGS -notlike "*$pdbSuppressFlag*") {
-    $env:RUSTFLAGS = "$env:RUSTFLAGS $pdbSuppressFlag"
+if (-not $EndpointSmokeOnly) {
+    if (-not $env:CARGO_INCREMENTAL) {
+        $env:CARGO_INCREMENTAL = "0"
+    }
+    if (-not $env:CARGO_BUILD_JOBS) {
+        $env:CARGO_BUILD_JOBS = "1"
+    }
+    if (-not $env:CARGO_PROFILE_DEV_DEBUG) {
+        $env:CARGO_PROFILE_DEV_DEBUG = "0"
+    }
+    if (-not $env:CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG) {
+        $env:CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG = "0"
+    }
+    if (-not $env:CARGO_PROFILE_TEST_DEBUG) {
+        $env:CARGO_PROFILE_TEST_DEBUG = "0"
+    }
+    $pdbSuppressFlag = "-Clink-arg=/DEBUG:NONE"
+    if (-not $env:RUSTFLAGS) {
+        $env:RUSTFLAGS = $pdbSuppressFlag
+    } elseif ($env:RUSTFLAGS -notlike "*$pdbSuppressFlag*") {
+        $env:RUSTFLAGS = "$env:RUSTFLAGS $pdbSuppressFlag"
+    }
 }
 
 $assertCargoFilter = Join-Path $PSScriptRoot "assert-cargo-filter-nonempty.ps1"
@@ -209,6 +212,22 @@ function Check-WorktreeHygiene {
     Write-Host "worktree-hygiene=ok"
 }
 
+function Invoke-WindowsEndpointSmoke {
+    Assert-CargoFilter 1 @("test", "-p", "rmux-ipc", "--locked", "--test", "named_pipe_integration")
+    Run "cargo" @("test", "-p", "rmux-ipc", "--locked", "--test", "named_pipe_integration", "--", "--test-threads=1")
+    Assert-CargoFilter 1 @("test", "-p", "rmux-client", "--locked", "--test", "windows_legacy_shutdown")
+    Run "cargo" @("test", "-p", "rmux-client", "--locked", "--test", "windows_legacy_shutdown", "--", "--test-threads=1")
+}
+
+if ($EndpointSmokeOnly) {
+    Step "Windows endpoint discovery and legacy shutdown" {
+        Invoke-WindowsEndpointSmoke
+    }
+    Write-Host ""
+    Write-Host "release-review-gate-windows=ok"
+    return
+}
+
 Step "release TOML reader self-test" { Run-PythonScript "scripts\toml_reader.py" @("--self-test") }
 Step "release versions" { Check-ReleaseVersions }
 Step "changelog release audit" { Run-PythonScript "scripts\check-changelog-release.py" @("CHANGELOG.md") }
@@ -280,10 +299,7 @@ Step "Windows attach stream queue regressions" {
     Run "cargo" @("test", "-p", "rmux-client", "--locked", "output_backpressure_keeps_local_input_and_resize_live", "--", "--test-threads=1")
 }
 Step "Windows endpoint discovery and legacy shutdown" {
-    Assert-CargoFilter 1 @("test", "-p", "rmux-ipc", "--locked", "--test", "named_pipe_integration")
-    Run "cargo" @("test", "-p", "rmux-ipc", "--locked", "--test", "named_pipe_integration", "--", "--test-threads=1")
-    Assert-CargoFilter 1 @("test", "-p", "rmux-client", "--locked", "--test", "windows_legacy_shutdown")
-    Run "cargo" @("test", "-p", "rmux-client", "--locked", "--test", "windows_legacy_shutdown", "--", "--test-threads=1")
+    Invoke-WindowsEndpointSmoke
 }
 Step "Windows CLI queue formats" {
     Assert-CargoFilter 1 @("test", "-p", "rmux", "--locked", "--test", "windows_cli_queue_formats")

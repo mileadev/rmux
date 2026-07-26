@@ -930,6 +930,10 @@ jobs:
         if: runner.os == 'macOS'
         run: cargo test --locked -p rmux --test cli_surface socket_path_flag_can_start_directly_under_tmp -- --exact --test-threads=1
 
+      - name: macOS PTY backend and native runtime smoke
+        shell: bash
+        run: scripts/smoke-macos.sh
+
       - name: rmux binary smoke
         run: cargo run --package rmux --bin rmux --locked -- -V
 
@@ -1074,6 +1078,10 @@ jobs:
 
       - name: cargo test Windows doctests
         run: cargo test --workspace --doc --locked -- --test-threads=1
+
+      - name: Windows endpoint discovery and legacy shutdown smoke
+        shell: pwsh
+        run: ./scripts/release-review-gate-windows.ps1 -TargetDir target -EndpointSmokeOnly
 
       - name: rmux binary smoke
         run: cargo run --package rmux --bin rmux --locked -- -V

@@ -579,6 +579,104 @@ fn github_windows_tests_keep_debug_daemons_inside_the_runner_job() {
 }
 
 #[test]
+fn live_ci_owns_the_portable_macos_and_windows_release_smokes() {
+    let ci = include_str!("../.github/workflows/ci.yml");
+    let legacy = include_str!("../.github/workflows/release.yml");
+    let windows_gate = include_str!("../scripts/release-review-gate-windows.ps1");
+    let triggers = ci
+        .split_once("\npermissions:\n")
+        .map(|(triggers, _)| triggers)
+        .expect("bounded CI triggers");
+
+    for trigger in [
+        "\n  push:\n",
+        "\n  pull_request:\n",
+        "\n  workflow_dispatch:\n",
+    ] {
+        assert!(
+            triggers.contains(trigger),
+            "portable platform smokes lost live CI trigger {trigger:?}"
+        );
+    }
+
+    let macos = ci
+        .split("\n  platform-runtime:\n")
+        .nth(1)
+        .expect("live macOS platform runtime job")
+        .split("\n  windows-test-archive:\n")
+        .next()
+        .expect("bounded macOS platform runtime job");
+    let windows = ci
+        .split("\n  windows-test-build:\n")
+        .nth(1)
+        .expect("live Windows test build job")
+        .split("\n  windows-tests:\n")
+        .next()
+        .expect("bounded Windows test build job");
+
+    for (name, job) in [("macOS", macos), ("Windows", windows)] {
+        assert!(
+            !job.lines()
+                .any(|line| matches!(line.trim(), "if: false" | "if: ${{ false }}")),
+            "{name} portable smoke job is conditioned by false"
+        );
+        assert!(
+            job.contains(
+                "if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.release_qualification) }}"
+            ),
+            "{name} portable smoke is no longer part of the protected fast run"
+        );
+        assert!(
+            !job.contains("self-hosted"),
+            "{name} portable smoke must stay on GitHub-hosted runners"
+        );
+    }
+
+    for runner in ["macos-15-intel", "macos-15"] {
+        assert!(
+            macos.contains(runner),
+            "macOS PTY smoke lost hosted runner {runner}"
+        );
+    }
+    assert!(macos.contains("run: scripts/smoke-macos.sh"));
+    assert!(
+        !macos.contains("--require-expect"),
+        "the portable macOS gate must not require an interactive attach diagnostic"
+    );
+
+    assert!(windows.contains("runs-on: windows-latest"));
+    assert!(windows.contains(
+        "run: ./scripts/release-review-gate-windows.ps1 -TargetDir target -EndpointSmokeOnly"
+    ));
+    assert!(
+        !windows.contains("-RunCtrlMatrixSmoke"),
+        "the protected fast run must not require the interactive Ctrl diagnostic"
+    );
+    for required in [
+        "[switch]$EndpointSmokeOnly",
+        "if ($EndpointSmokeOnly)",
+        "Invoke-WindowsEndpointSmoke",
+    ] {
+        assert!(
+            windows_gate.contains(required),
+            "Windows endpoint-only gate lost {required:?}"
+        );
+    }
+
+    let legacy_source_gate = legacy
+        .split("\n  source-gates:\n")
+        .nth(1)
+        .expect("legacy source gate")
+        .split("\n  build:\n")
+        .next()
+        .expect("bounded legacy source gate");
+    assert!(
+        legacy_source_gate.contains("if: ${{ false }}"),
+        "the legacy release workflow must remain disabled"
+    );
+}
+
+#[test]
 fn ci_builds_windows_tests_once_and_runs_eighteen_hosted_shards() {
     let ci = include_str!("../.github/workflows/ci.yml");
     let nextest = include_str!("../.config/nextest.toml");
