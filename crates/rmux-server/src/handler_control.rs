@@ -121,6 +121,12 @@ pub(crate) struct ControlClientIdentity {
     control_id: u64,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ControlCommandResponseSink {
+    identity: ControlClientIdentity,
+    sender: mpsc::Sender<String>,
+}
+
 pub(super) struct ControlClientDetachOutcome {
     pub(in crate::handler) lifecycle_event: Option<QueuedLifecycleEvent>,
 }
@@ -234,9 +240,17 @@ impl ControlClientIdentity {
     }
 }
 
+impl ControlCommandResponseSink {
+    pub(crate) fn new(identity: ControlClientIdentity, sender: mpsc::Sender<String>) -> Self {
+        Self { identity, sender }
+    }
+}
+
 tokio::task_local! {
     static CONTROL_QUEUE_IDENTITY: ControlClientIdentity;
     static CONTROL_QUEUE_EOF_CANCELLATION: ControlQueueEofCancellation;
+    static CONTROL_COMMAND_RESPONSE_SINK: ControlCommandResponseSink;
+    static CONTROL_COMMAND_RESPONSE_CAPTURE: ();
 }
 
 #[derive(Debug, Clone)]
@@ -311,6 +325,28 @@ where
     CONTROL_QUEUE_EOF_CANCELLATION
         .scope(cancellation, future)
         .await
+}
+
+pub(crate) async fn with_control_command_response_sink<T, F>(
+    sink: ControlCommandResponseSink,
+    future: F,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    CONTROL_COMMAND_RESPONSE_SINK.scope(sink, future).await
+}
+
+pub(in crate::handler) async fn with_control_command_response_capture<T, F>(future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    CONTROL_COMMAND_RESPONSE_CAPTURE.scope((), future).await
+}
+
+fn current_control_command_response_sink() -> Option<ControlCommandResponseSink> {
+    CONTROL_COMMAND_RESPONSE_CAPTURE.try_with(|()| ()).ok()?;
+    CONTROL_COMMAND_RESPONSE_SINK.try_with(Clone::clone).ok()
 }
 
 pub(in crate::handler) fn current_control_queue_identity(
@@ -1648,7 +1684,16 @@ impl RequestHandler {
         deliver_control_notification(&mut active_control, requester_pid, line);
     }
 
-    pub(in crate::handler) async fn send_control_notification_to_queue(
+    pub(in crate::handler) async fn send_control_response_notification_to(
+        &self,
+        requester_pid: u32,
+        line: String,
+    ) {
+        let mut active_control = self.active_control.lock().await;
+        deliver_control_response_notification(&mut active_control, requester_pid, line);
+    }
+
+    pub(in crate::handler) async fn send_control_response_notification_to_queue(
         &self,
         identity: ControlClientIdentity,
         line: String,
@@ -1661,7 +1706,7 @@ impl RequestHandler {
                 active.id == identity.control_id() && !active.closing.load(Ordering::SeqCst)
             })
         {
-            return deliver_control_notification(
+            return deliver_control_response_notification(
                 &mut active_control,
                 identity.requester_pid(),
                 line,
@@ -2027,6 +2072,30 @@ fn deliver_control_notification(
     let Some(active) = active_control.by_pid.get_mut(&requester_pid) else {
         return false;
     };
+    try_send_control_event(active, ControlServerEvent::Notification(line))
+}
+
+fn deliver_control_response_notification(
+    active_control: &mut ActiveControlState,
+    requester_pid: u32,
+    line: String,
+) -> bool {
+    let Some(active) = active_control.by_pid.get_mut(&requester_pid) else {
+        return false;
+    };
+    let target_identity = ControlClientIdentity::new(requester_pid, active.id);
+    if let Some(sink) =
+        current_control_command_response_sink().filter(|sink| sink.identity == target_identity)
+    {
+        if active.closing.load(Ordering::SeqCst) {
+            return false;
+        }
+        if sink.sender.try_send(line).is_ok() {
+            return true;
+        }
+        active.closing.store(true, Ordering::SeqCst);
+        return false;
+    }
     try_send_control_event(active, ControlServerEvent::Notification(line))
 }
 

@@ -4,7 +4,8 @@ pub(crate) use crate::control_mode::ControlModeUpgrade;
 use crate::daemon::ShutdownHandle;
 #[cfg(any(unix, windows))]
 use crate::handler::{
-    with_control_queue_eof_cancellation, with_control_queue_identity, ControlClientIdentity,
+    with_control_command_response_sink, with_control_queue_eof_cancellation,
+    with_control_queue_identity, ControlClientIdentity, ControlCommandResponseSink,
     ControlQueueDrainLease, ControlQueueEofCancellation, RequestHandler,
 };
 #[cfg(any(unix, windows))]
@@ -319,6 +320,7 @@ async fn forward_control_inner(
         .await
         .unwrap_or_default();
     let mut current_command: Option<ActiveControlCommand> = None;
+    let mut current_response_notifications: Option<mpsc::Receiver<String>> = None;
     let mut initial_command_completion_pending = false;
     let mut command_numbering = if initial_command_count == 0 {
         let initial_timestamp = unix_epoch_seconds();
@@ -530,6 +532,10 @@ async fn forward_control_inner(
                         eof_cancellation.cancel_for_eof();
                     }
                     let task_eof_cancellation = eof_cancellation.clone();
+                    let (response_tx, response_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
+                    let response_sink =
+                        ControlCommandResponseSink::new(control_identity, response_tx);
+                    current_response_notifications = Some(response_rx);
                     current_command = Some(ActiveControlCommand {
                         timestamp,
                         command_number: command_frame.number,
@@ -538,12 +544,15 @@ async fn forward_control_inner(
                         eof_cancellation,
                         task: Some(tokio::spawn(async move {
                             let _normal_request_guard = normal_request_guard;
-                            with_control_queue_eof_cancellation(
-                                task_eof_cancellation,
-                                handler.execute_control_commands_identity(
-                                    requester_pid,
-                                    control_id,
-                                    commands,
+                            with_control_command_response_sink(
+                                response_sink,
+                                with_control_queue_eof_cancellation(
+                                    task_eof_cancellation,
+                                    handler.execute_control_commands_identity(
+                                        requester_pid,
+                                        control_id,
+                                        commands,
+                                    ),
                                 ),
                             )
                             .await
@@ -669,6 +678,30 @@ async fn forward_control_inner(
                     }
                 }
             }
+            Some(line) = async {
+                match current_response_notifications.as_mut() {
+                    Some(notifications) => notifications.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if current_command.is_some() => {
+                let mut event_context = ServerEventContext {
+                    handler: &handler,
+                    control_identity,
+                    requester_pid,
+                    session_name: attachment.session_name_mut(),
+                    subscriptions: &mut subscriptions,
+                    pane_event_tx: pane_event_tx.clone(),
+                    pane_event_rx: &mut pane_event_rx,
+                    output_queue: &mut output_queue,
+                    write_half: &mut write_half,
+                    paused_panes: &mut paused_panes,
+                    flags: &mut flags,
+                    deferred: &mut deferred_server_events,
+                };
+                if write_control_notification(line, &mut event_context).await? {
+                    return Ok(());
+                }
+            }
             result = async {
                 match current_command.as_mut() {
                     Some(command) => match command.task.as_mut() {
@@ -703,6 +736,33 @@ async fn forward_control_inner(
                     )
                     .await?;
                     return Ok(());
+                }
+                // The per-command response sender is dropped before the task
+                // joins, and its channel has the same finite capacity as the
+                // server-event channel. Drain it without waiting so the exact
+                // synchronous response closes inside this guard while unrelated
+                // server events retain their existing deferred path.
+                let mut response_notifications = current_response_notifications
+                    .take()
+                    .expect("active control command owns a response channel");
+                while let Ok(line) = response_notifications.try_recv() {
+                    let mut event_context = ServerEventContext {
+                        handler: &handler,
+                        control_identity,
+                        requester_pid,
+                        session_name: attachment.session_name_mut(),
+                        subscriptions: &mut subscriptions,
+                        pane_event_tx: pane_event_tx.clone(),
+                        pane_event_rx: &mut pane_event_rx,
+                        output_queue: &mut output_queue,
+                        write_half: &mut write_half,
+                        paused_panes: &mut paused_panes,
+                        flags: &mut flags,
+                        deferred: &mut deferred_server_events,
+                    };
+                    if write_control_notification(line, &mut event_context).await? {
+                        return Ok(());
+                    }
                 }
                 let server_shutdown_started = result.server_shutdown_started;
                 match result.error {
@@ -834,8 +894,7 @@ async fn forward_control_inner(
                     flags: &mut flags,
                     deferred: &mut deferred_server_events,
                 };
-                if handle_server_event(event, &mut event_context, current_command.is_some())
-                .await?
+                if handle_server_event(event, &mut event_context, current_command.is_some()).await?
                 {
                     return Ok(());
                 }
@@ -1216,31 +1275,9 @@ async fn handle_server_event(
                 context.deferred.defer_notification(line);
                 return Ok(false);
             }
-            if drain_ready_pane_events(
-                context.pane_event_rx,
-                context.output_queue,
-                context.paused_panes,
-                *context.flags,
-            )? {
-                flush_output_queue(
-                    context.output_queue,
-                    context.write_half,
-                    *context.flags,
-                    context.paused_panes,
-                )
-                .await?;
+            if write_control_notification(line, context).await? {
                 return Ok(true);
             }
-            context
-                .output_queue
-                .enqueue_line(ensure_control_newline(line.into_bytes()), false);
-            flush_output_queue(
-                context.output_queue,
-                context.write_half,
-                *context.flags,
-                context.paused_panes,
-            )
-            .await?;
         }
         ControlServerEvent::Exit(reason) => {
             if command_active || !context.deferred.notifications.is_empty() {
@@ -1266,6 +1303,39 @@ async fn handle_server_event(
         .control_client_flags(context.requester_pid)
         .await
         .unwrap_or(*context.flags);
+    Ok(false)
+}
+
+#[cfg(any(unix, windows))]
+async fn write_control_notification(
+    line: String,
+    context: &mut ServerEventContext<'_>,
+) -> io::Result<bool> {
+    if drain_ready_pane_events(
+        context.pane_event_rx,
+        context.output_queue,
+        context.paused_panes,
+        *context.flags,
+    )? {
+        flush_output_queue(
+            context.output_queue,
+            context.write_half,
+            *context.flags,
+            context.paused_panes,
+        )
+        .await?;
+        return Ok(true);
+    }
+    context
+        .output_queue
+        .enqueue_line(ensure_control_newline(line.into_bytes()), false);
+    flush_output_queue(
+        context.output_queue,
+        context.write_half,
+        *context.flags,
+        context.paused_panes,
+    )
+    .await?;
     Ok(false)
 }
 

@@ -14,8 +14,9 @@ use std::future::Future;
 use super::attach_support::ActiveAttachIdentity;
 use super::client_support::capture_switch_client_target_identity;
 use super::control_support::{
-    control_queue_eof_action, current_control_queue_identity, with_control_queue_identity,
-    ControlClientIdentity, ControlQueueEofAction, ManagedClient,
+    control_queue_eof_action, current_control_queue_identity,
+    with_control_command_response_capture, with_control_queue_identity, ControlClientIdentity,
+    ControlQueueEofAction, ManagedClient,
 };
 #[cfg(windows)]
 use super::pane_support::format_references_pane_pid;
@@ -27,6 +28,17 @@ use crate::client_names::control_client_name;
 use crate::control::ControlCommandResult;
 use crate::hook_runtime::capture_inline_hooks;
 use crate::mouse::{AttachedMouseEvent, MouseLocation};
+
+async fn maybe_capture_control_command_response<T, F>(capture: bool, future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    if capture {
+        with_control_command_response_capture(future).await
+    } else {
+        future.await
+    }
+}
 
 #[path = "handler_scripting/buffer_parse.rs"]
 mod buffer_parse;
@@ -1068,19 +1080,28 @@ impl RequestHandler {
                 };
                 let request = apply_queue_context_to_request(request, context, false);
                 let request = crate::server_access::apply_access_policy(request, can_write)?;
+                let capture_control_response = mode == QueueMode::Control
+                    && context.run_shell_command_depth() == 0
+                    && matches!(
+                        &request,
+                        Request::DisplayMessage(_) | Request::DisplayMessageExt(_)
+                    );
                 let request_for_hooks = request.clone();
                 let captures_client_transition = captures_attached_client_transition(&request);
-                let dispatch = Box::pin(with_queued_display_target_client(
-                    queued_display_target_client,
-                    super::with_expected_stable_target_identities(
-                        target_identities,
-                        retained_lifecycle_target,
-                        retained_lifecycle_identity,
-                        self.dispatch_captured_with_client_name(
-                            requester_pid,
-                            u64::from(requester_pid),
-                            request,
-                            context.client_name.clone(),
+                let dispatch = Box::pin(maybe_capture_control_command_response(
+                    capture_control_response,
+                    with_queued_display_target_client(
+                        queued_display_target_client,
+                        super::with_expected_stable_target_identities(
+                            target_identities,
+                            retained_lifecycle_target,
+                            retained_lifecycle_identity,
+                            self.dispatch_captured_with_client_name(
+                                requester_pid,
+                                u64::from(requester_pid),
+                                request,
+                                context.client_name.clone(),
+                            ),
                         ),
                     ),
                 ));

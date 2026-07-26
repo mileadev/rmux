@@ -163,7 +163,8 @@ use control_support::ActiveControlState;
 #[cfg(all(test, unix))]
 pub(crate) use control_support::ControlRegistrationError;
 pub(crate) use control_support::{
-    with_control_queue_eof_cancellation, with_control_queue_identity, ControlClientIdentity,
+    with_control_command_response_sink, with_control_queue_eof_cancellation,
+    with_control_queue_identity, ControlClientIdentity, ControlCommandResponseSink,
     ControlQueueDrainLease, ControlQueueEofCancellation, ControlRegistration,
 };
 use exited_output_support::RetainedExitedPaneOutputs;
