@@ -5,6 +5,7 @@ use std::os::windows::process::ExitStatusExt;
 use std::process::ExitStatus;
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
+use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
     DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS, ERROR_ACCESS_DENIED,
@@ -13,9 +14,11 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+    TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
@@ -298,6 +301,37 @@ pub(crate) fn try_wait_child(child: &mut WindowsChild) -> Result<Option<ExitStat
     }
 }
 
+pub(crate) fn wait_child_process_tree(child: &mut WindowsChild) -> Result<ExitStatus> {
+    const POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+    let status = wait_child(child)?;
+    while active_child_process_count(child)? != 0 {
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    Ok(status)
+}
+
+pub(crate) fn try_wait_child_process_tree(child: &mut WindowsChild) -> Result<Option<ExitStatus>> {
+    let Some(status) = try_wait_child(child)? else {
+        return Ok(None);
+    };
+    if active_child_process_count(child)? == 0 {
+        Ok(Some(status))
+    } else {
+        Ok(None)
+    }
+}
+
+fn active_child_process_count(child: &WindowsChild) -> Result<u32> {
+    let Some(job) = &child.job else {
+        return Err(io::Error::other(
+            "Windows child has no Job Object handle for process-tree liveness",
+        )
+        .into());
+    };
+    Ok(job.active_process_count()?)
+}
+
 pub(crate) fn try_clone_child_for_wait(child: &WindowsChild) -> Result<WindowsChild> {
     clone_child_with_job(child, None)
 }
@@ -484,6 +518,27 @@ impl JobObjectGuard {
             return Err(last_os_error());
         }
         Ok(())
+    }
+
+    fn active_process_count(&self) -> io::Result<u32> {
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // SAFETY: `self.handle` is a live job handle and `accounting` is
+        // writable for the exact information-class size. No pointer is
+        // retained after the call.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.handle.as_raw_handle() as HANDLE,
+                JobObjectBasicAccountingInformation,
+                (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                u32::try_from(size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>())
+                    .map_err(|_| io::Error::other("job accounting size exceeds u32"))?,
+                null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(last_os_error());
+        }
+        Ok(accounting.ActiveProcesses)
     }
 }
 
