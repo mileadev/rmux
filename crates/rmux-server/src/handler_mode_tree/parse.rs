@@ -321,6 +321,12 @@ fn join_command_arguments(
     if args.is_empty() {
         return Err(RmuxError::Server(format!("missing {what}")));
     }
+    if args.len() == 1 {
+        return Ok(match args.pop_front().expect("one argument remains") {
+            CommandArgument::String(value) => value,
+            argument => argument.to_tmux_reparse_string(),
+        });
+    }
     Ok(args
         .drain(..)
         .map(|argument| argument.to_tmux_reparse_string())
