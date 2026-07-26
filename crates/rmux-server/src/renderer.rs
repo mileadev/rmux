@@ -572,5 +572,8 @@ const ATTR_CODES: &[(u16, i32)] = &[
 ];
 
 #[cfg(test)]
+#[path = "renderer/erase_wrap_tests.rs"]
+mod erase_wrap_tests;
+#[cfg(test)]
 #[path = "renderer/tests.rs"]
 mod tests;

@@ -242,6 +242,26 @@ impl Grid {
         self.visible.get_mut(y as usize)
     }
 
+    /// Breaks the soft-wrap boundary immediately before one visible row.
+    ///
+    /// The predecessor may be the final history row when the first viewport
+    /// row is a continuation. Alternate-screen rows never continue main-screen
+    /// history, which is retained in the same grid with history disabled.
+    pub(crate) fn break_wrap_before_visible_line(&mut self, y: u32) {
+        let previous = if y == 0 {
+            if self.history_enabled {
+                self.history.back_mut()
+            } else {
+                None
+            }
+        } else {
+            self.visible.get_mut(y.saturating_sub(1) as usize)
+        };
+        if let Some(previous) = previous {
+            previous.set_wrapped(false);
+        }
+    }
+
     /// Returns one absolute line where rows `0..hsize` are history and
     /// `hsize..hsize+sy` are the visible screen.
     #[allow(dead_code)]

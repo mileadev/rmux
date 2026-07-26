@@ -659,6 +659,10 @@ impl Screen {
         self.clear_selected_cells();
         let sx = self.grid.sx();
         let end = end_inclusive.min(sx.saturating_sub(1));
+        let clears_whole_line = start == 0 && end == sx.saturating_sub(1);
+        if clears_whole_line {
+            self.grid.break_wrap_before_visible_line(y);
+        }
         let Some(line) = self.grid.visible_line_mut(y) else {
             return;
         };
@@ -668,13 +672,16 @@ impl Screen {
             }
         }
         Self::repair_wide_cells_on_line(line, sx, bg);
-        line.set_wrapped(false);
+        if clears_whole_line {
+            line.set_wrapped(false);
+        }
         line.touch();
     }
 
     fn clear_screen_region(&mut self, start_y: u32, end_y_inclusive: u32, bg: i32) {
         self.clear_selected_cells();
         for y in start_y..=end_y_inclusive.min(self.grid.sy().saturating_sub(1)) {
+            self.grid.break_wrap_before_visible_line(y);
             if let Some(line) = self.grid.visible_line_mut(y) {
                 line.clear(bg);
             }
@@ -953,6 +960,9 @@ impl Screen {
     }
 }
 
+#[cfg(test)]
+#[path = "screen/erase_tests.rs"]
+mod erase_tests;
 #[cfg(test)]
 #[path = "screen/tests.rs"]
 mod tests;

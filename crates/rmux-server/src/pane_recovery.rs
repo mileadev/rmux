@@ -1368,14 +1368,23 @@ mod tests {
     }
 
     #[test]
-    fn keyframe_keeps_a_wrapped_row_whose_continuation_was_erased() {
-        // `EL` on the continuation row leaves a wrapped row followed by a row
-        // that paints nothing: the pending wrap can never resolve, so every
-        // later row would climb one line.
+    fn keyframe_preserves_complete_continuation_erase_wrap_boundaries() {
+        // tmux 3.7b clears both soft-wrap boundaries when `EL` erases the
+        // complete continuation row. Recovery must retain the hard breaks.
         let initial = b"0123456789abcdefXYZ\x1b[2;1H\x1b[K\x1b[3;1Hthird";
         let (actual, expected) = recovered(initial, b"");
         assert_complete_equal(&actual, &expected);
         assert_reflow_equal(initial, b"");
+        assert_eq!(
+            expected.screen().capture_transcript(
+                ScreenCaptureRange::default(),
+                GridRenderOptions {
+                    join_wrapped: true,
+                    ..GridRenderOptions::default()
+                },
+            ),
+            b"0123456789abcdef\n\nthird\n\n\n\n"
+        );
     }
 
     #[test]
@@ -2044,13 +2053,12 @@ mod tests {
                 b"0123456789abcdefGHIJ\x1b[1;1H\x1b[3P\x1b[6;1Hbottom\r\ntail".as_slice(),
                 b"\r\nafter".as_slice(),
             ),
-            // A wrapped row whose continuation was erased is deliberately not
-            // an oracle vector: rmux keeps the row's soft-wrap flag where tmux
-            // 3.7b and xterm.js drop it (see
-            // .rmux-audit/h-recovery-keyframe/oracle-probe.txt), so the vector
-            // would measure that grid divergence instead of the keyframe. The
-            // keyframe's own behaviour is pinned by
-            // `keyframe_keeps_a_wrapped_row_whose_continuation_was_erased`.
+            (
+                "complete-erased-soft-wrap-continuation",
+                TerminalSize { cols: 16, rows: 6 },
+                b"0123456789abcdefXYZ\x1b[2;1H\x1b[K\x1b[3;1Hthird".as_slice(),
+                b"".as_slice(),
+            ),
             (
                 "wide-glyph-pre-wrap-gap",
                 TerminalSize { cols: 16, rows: 6 },
