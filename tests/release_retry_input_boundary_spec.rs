@@ -185,6 +185,92 @@ validate_no_direct_input_expressions(
 }
 
 #[test]
+fn retry_boundary_scanner_covers_twelve_yaml_scalar_and_context_forms() {
+    assert_python(
+        r###"
+import pathlib
+import sys
+
+sys.path.insert(0, "scripts/release")
+from workflow_run_input_boundary import find_direct_input_expressions
+
+safe = "${{ steps.marker.outputs.value }}"
+active = "${{ inputs.marker }}"
+active_bare_context = "${{ format('{0}', inputs) }}"
+forms = (
+    ("plain", """steps:
+  - run: echo __EXPR__
+""", active),
+    ("single_quoted", """steps:
+  - run: 'echo __EXPR__'
+""", active),
+    ("double_quoted", """steps:
+  - run: "echo __EXPR__"
+""", active),
+    ("literal", """steps:
+  - run: |-
+      echo __EXPR__
+""", active),
+    ("folded", """steps:
+  - run: >+
+      echo __EXPR__
+""", active),
+    ("flow_quoted", """steps:
+  - {name: flow quoted, run: "echo __EXPR__"}
+""", active),
+    ("flow_plain", """steps:
+  - [{name: flow plain, run: echo-__EXPR__}]
+""", active),
+    ("multiline_plain", """steps:
+  - run: echo first
+      __EXPR__
+""", active),
+    ("multiline_single", """steps:
+  - run: 'echo first
+      __EXPR__'
+""", active),
+    ("multiline_double", """steps:
+  - run: "echo first
+      __EXPR__"
+""", active),
+    ("quoted_flow_key", """steps:
+  - {"run": "echo __EXPR__", name: quoted key}
+""", active),
+    ("bare_inputs_context", """steps:
+  - run: "echo __EXPR__"
+""", active_bare_context),
+)
+
+missed = []
+false_positives = []
+for name, template, mutant in forms:
+    inert = template.replace("__EXPR__", safe)
+    if find_direct_input_expressions(inert):
+        false_positives.append(name)
+    active_fixture = template.replace("__EXPR__", mutant)
+    if len(find_direct_input_expressions(active_fixture)) != 1:
+        missed.append(name)
+
+if false_positives:
+    raise SystemExit(f"safe YAML forms were rejected: {false_positives}")
+if missed:
+    raise SystemExit(f"active YAML forms were missed: {missed}")
+
+root = pathlib.Path.cwd()
+for relative in (
+    ".github/workflows/release-chocolatey-retry.yml",
+    ".github/workflows/release-snap-retry.yml",
+):
+    findings = find_direct_input_expressions(
+        (root / relative).read_text(encoding="utf-8")
+    )
+    if findings:
+        raise SystemExit(f"clean workflow rejected: {relative}: {findings}")
+"###,
+    );
+}
+
+#[test]
 fn retry_input_validators_accept_canonical_and_reject_invalid_forms() {
     let identity = identity_args("snap_candidate");
     let output = run_validator("validate-identity-inputs", &identity);
