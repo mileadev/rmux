@@ -455,10 +455,25 @@ impl Grid {
         let mut pending = String::new();
 
         for line in self.history.iter().chain(self.visible.iter()) {
-            let rendered = line.render_text();
+            let wrapped = line.flags.contains(GridLineFlags::WRAPPED);
+            let rendered = if join_wrapped && wrapped {
+                line.render_with_options(
+                    self.sx as usize,
+                    GridRenderOptions {
+                        join_wrapped: true,
+                        include_empty_cells: false,
+                        trim_spaces: false,
+                        ..GridRenderOptions::default()
+                    },
+                    &mut GridStringState::default(),
+                    None,
+                )
+            } else {
+                line.render_text()
+            };
             if join_wrapped {
                 pending.push_str(&rendered);
-                if !line.flags.contains(GridLineFlags::WRAPPED) {
+                if !wrapped {
                     lines.push(std::mem::take(&mut pending));
                 }
                 continue;
