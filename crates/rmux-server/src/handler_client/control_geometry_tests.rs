@@ -773,6 +773,14 @@ async fn assert_switch_notifies_the_destination_layout_change(
         .iter()
         .position(|line| line.starts_with("%client-session-changed "))
         .expect("the destination control client must be told the client arrived");
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("%client-session-changed "))
+            .count(),
+        1,
+        "the shared attach-session/switch-client commit must publish once: {lines:?}"
+    );
     assert!(
         session_changed_index < layout_index,
         "tmux 3.7b reports the client move before the layout it causes: {lines:?}"
@@ -835,6 +843,7 @@ async fn attaching_client_notifies_the_destination_session_layout_change_like_tm
     // matrix): a 60x20 control client already on `target`, default one-line
     // status and `window-size largest`, watches a brand-new 101x41 PTY client
     // attach. The window grows 60x20 -> 101x40 and the control client receives
+    // `%client-session-changed /dev/pts/19 $0 target` immediately before
     // `%layout-change @0 aefd,101x40,0,0,0 ...`.
     let handler = RequestHandler::new();
     let target = session_name("attach-arrival-dest");
@@ -900,6 +909,22 @@ async fn attaching_client_notifies_the_destination_session_layout_change_like_tm
         Some("101x40"),
         "{:?}",
         lines[layout_index]
+    );
+    let session_changed_index = lines
+        .iter()
+        .position(|line| line.starts_with("%client-session-changed "))
+        .expect("the control client must be told the PTY attached");
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.starts_with("%client-session-changed "))
+            .count(),
+        1,
+        "the initial attach commit must publish once: {lines:?}"
+    );
+    assert!(
+        session_changed_index < layout_index,
+        "tmux 3.7b reports the PTY attach before the layout it causes: {lines:?}"
     );
 }
 

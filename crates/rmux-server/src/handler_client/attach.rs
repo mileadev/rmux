@@ -7,7 +7,7 @@ use rmux_proto::{
 use tokio::sync::mpsc;
 
 use super::super::{
-    attach_support::attach_target_for_session, client_environment_snapshot,
+    attach_support::attach_target_for_session, attached_client_name, client_environment_snapshot,
     effective_client_terminal_context, parse_client_flags, update_environment_from_client,
     validate_expected_attach_identity, RequestHandler,
 };
@@ -241,6 +241,17 @@ impl RequestHandler {
             request.client_size,
             render_stream,
         );
+        // Frozen tmux 3.7b reports a newly attached PTY by its tty path before
+        // the layout change caused by its geometry. Publish at the attach
+        // commit, while that resize is still queued, rather than at the later
+        // listener registration. Existing PTY and control clients took the
+        // managed-client arm above and publish from their switch commit.
+        self.emit_client_session_changed(
+            attached_client_name(requester_pid),
+            session_name.clone(),
+            session_id,
+        )
+        .await;
         HandleOutcome::attach(
             Response::AttachSession(AttachSessionResponse { session_name }),
             upgrade,

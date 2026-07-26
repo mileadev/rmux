@@ -1048,6 +1048,15 @@ impl LiveControlClient {
         self.sink().lock().expect("control notification sink").len()
     }
 
+    pub(super) fn notifications_since(&self, cursor: usize) -> Vec<String> {
+        let captured = self
+            .sink()
+            .lock()
+            .expect("control notification sink")
+            .clone();
+        captured[cursor.min(captured.len())..].to_vec()
+    }
+
     /// Waits for the first captured line at or after `cursor` matching
     /// `predicate`.
     pub(super) fn wait_for_notification(

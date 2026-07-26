@@ -601,6 +601,215 @@ fn tmux_compat_switch_client_round_trips_the_listed_control_name_when_frozen_tmu
     Ok(())
 }
 
+/// Frozen tmux 3.7b, measured 2026-07-26 with an 80x24 session and a real
+/// 101x40 PTY client. A control client already on the session receives exactly
+///
+/// ```text
+/// %client-session-changed /dev/pts/19 $0 alpha
+/// %layout-change @0 ccfd,101x39,0,0,0 ccfd,101x39,0,0,0 *
+/// ```
+///
+/// in that order. The client token is the same tty path `list-clients` reports,
+/// and the `client-session-changed` hook receives that path as `hook_client`.
+#[test]
+fn tmux_compat_initial_pty_attach_notifies_once_before_layout_and_runs_hook_when_frozen_tmux_is_available(
+) -> Result<(), Box<dyn Error>> {
+    let harness = TmuxCompatHarness::new("tmux-compat-initial-pty-session-changed")?;
+    let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
+        return Ok(());
+    };
+    let _guard = pty_tmux_compat_lock();
+    let config = tmux_compat_config().with_timeout(Duration::from_secs(10));
+
+    let create = harness.run_pair_with(
+        &tmux_binary,
+        &[
+            "new-session",
+            "-d",
+            "-s",
+            "alpha",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "sleep 1000",
+        ],
+        config.clone(),
+    )?;
+    assert_quiet_success(&create);
+    let window_size = harness.run_pair_with(
+        &tmux_binary,
+        &["set-option", "-g", "window-size", "largest"],
+        config.clone(),
+    )?;
+    assert_quiet_success(&window_size);
+    let hook_buffer = harness.run_pair_with(
+        &tmux_binary,
+        &["set-buffer", "-b", "initial-pty-hook", "start,"],
+        config.clone(),
+    )?;
+    assert_quiet_success(&hook_buffer);
+    let hook = harness.run_pair_with(
+        &tmux_binary,
+        &[
+            "set-hook",
+            "-g",
+            "client-session-changed",
+            "if-shell -F '#{m/r:^/dev/(pts/[0-9]+|tty[^/]+)$,#{hook_client}}' \
+             'set-buffer -a -b initial-pty-hook pty,'",
+        ],
+        config.clone(),
+    )?;
+    assert_quiet_success(&hook);
+
+    let mut tmux_watching = LiveControlClient::spawn_capturing(tmux_control_mode_command(
+        &harness,
+        &tmux_binary,
+        &[],
+        &[],
+    )?)?;
+    let mut rmux_watching =
+        LiveControlClient::spawn_capturing(rmux_control_mode_command(&harness, &[], &[])?)?;
+    tmux_watching.send("attach-session -t alpha\n")?;
+    rmux_watching.send("attach-session -t alpha\n")?;
+    let watching = wait_for_pair_run(
+        &harness,
+        &tmux_binary,
+        &["list-clients", "-t", "alpha", "-F", "#{client_name}"],
+        config.clone(),
+        Duration::from_secs(5),
+        |run| {
+            run.tmux.stdout_string().lines().count() == 1
+                && run.rmux.stdout_string().lines().count() == 1
+        },
+    )?;
+    assert_success_without_stderr(&watching);
+
+    let tmux_cursor = tmux_watching.notification_cursor();
+    let rmux_cursor = rmux_watching.notification_cursor();
+    let client_size = PtyTerminalSize {
+        cols: 101,
+        rows: 40,
+    };
+    let mut tmux_attach =
+        spawn_tmux_attached_input_client_at_size(&harness, &tmux_binary, "alpha", client_size)?;
+    let mut rmux_attach = spawn_rmux_attached_input_client_at_size(&harness, "alpha", client_size)?;
+
+    let listed = wait_for_pair_run(
+        &harness,
+        &tmux_binary,
+        &["list-clients", "-t", "alpha", "-F", "#{client_name}"],
+        config.clone(),
+        Duration::from_secs(5),
+        |run| {
+            run.tmux.stdout_string().lines().count() == 2
+                && run.rmux.stdout_string().lines().count() == 2
+        },
+    )?;
+    assert_success_without_stderr(&listed);
+    tmux_attach.assert_running("tmux PTY")?;
+    rmux_attach.assert_running("rmux PTY")?;
+    let tmux_pty_name = listed_pty_client_name(&listed.tmux.stdout_string())?;
+    let rmux_pty_name = listed_pty_client_name(&listed.rmux.stdout_string())?;
+
+    let changed =
+        |line: &str| line.starts_with("%client-session-changed ") && line.ends_with(" alpha");
+    let resized = |line: &str| line.starts_with("%layout-change ") && line.contains(",101x39,");
+    let tmux_changed = tmux_watching.wait_for_notification(
+        tmux_cursor,
+        Duration::from_secs(5),
+        "tmux control observing initial PTY attach",
+        changed,
+    )?;
+    let rmux_changed = rmux_watching.wait_for_notification(
+        rmux_cursor,
+        Duration::from_secs(5),
+        "rmux control observing initial PTY attach",
+        changed,
+    )?;
+    tmux_watching.wait_for_notification(
+        tmux_cursor,
+        Duration::from_secs(5),
+        "tmux control observing initial PTY resize",
+        resized,
+    )?;
+    rmux_watching.wait_for_notification(
+        rmux_cursor,
+        Duration::from_secs(5),
+        "rmux control observing initial PTY resize",
+        resized,
+    )?;
+
+    assert_eq!(
+        notification_client_name(&tmux_changed),
+        Some(tmux_pty_name.as_str()),
+        "frozen tmux oracle changed: {tmux_changed}"
+    );
+    assert_eq!(
+        notification_client_name(&rmux_changed),
+        Some(rmux_pty_name.as_str()),
+        "rmux must report the PTY name list-clients exposes: {rmux_changed}"
+    );
+    for (label, client, cursor) in [
+        ("tmux", &tmux_watching, tmux_cursor),
+        ("rmux", &rmux_watching, rmux_cursor),
+    ] {
+        let (changed_index, layout_index) = client
+            .notification_index_pair(cursor, changed, resized)
+            .unwrap_or_else(|| panic!("{label} did not report both attach notifications"));
+        assert!(
+            changed_index < layout_index,
+            "{label} must report the PTY session change before its layout change"
+        );
+        assert_eq!(
+            client
+                .notifications_since(cursor)
+                .iter()
+                .filter(|line| changed(line))
+                .count(),
+            1,
+            "{label} must report one PTY session change"
+        );
+    }
+
+    let hook_output = wait_for_pair_run(
+        &harness,
+        &tmux_binary,
+        &["show-buffer", "-b", "initial-pty-hook"],
+        config,
+        Duration::from_secs(5),
+        |run| {
+            run.tmux.status_code == Some(0)
+                && run.rmux.status_code == Some(0)
+                && run.tmux.stdout_string() != "start,"
+                && run.rmux.stdout_string() != "start,"
+        },
+    )?;
+    assert_success_without_stderr(&hook_output);
+    assert_eq!(
+        hook_output.tmux.stdout_string(),
+        "start,pty,",
+        "frozen tmux must run the hook once with a PTY hook_client"
+    );
+    assert_eq!(
+        hook_output.rmux.stdout_string(),
+        "start,pty,",
+        "rmux must run the hook once with a PTY hook_client"
+    );
+
+    tmux_watching.assert_running("tmux watching control")?;
+    rmux_watching.assert_running("rmux watching control")?;
+    Ok(())
+}
+
+fn listed_pty_client_name(output: &str) -> Result<String, Box<dyn Error>> {
+    output
+        .lines()
+        .find(|line| !line.starts_with("client-"))
+        .map(str::to_owned)
+        .ok_or_else(|| format!("list-clients did not report a PTY client: {output:?}").into())
+}
+
 /// Frozen tmux 3.7b, measured 2026-07-25 with two `-C` clients on one session:
 /// the client that stays behind is told
 ///
