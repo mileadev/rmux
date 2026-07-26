@@ -4,23 +4,21 @@
 //! OSC commands, and every APC/DCS/PM/SOS string (including Kitty graphics and
 //! SIXEL) are dropped rather than delegated to browser-terminal behavior.
 //!
-//! A control is recognized exactly where the viewer recognizes one. The viewer
-//! decodes the stream as UTF-8, so a C1 control only exists in its encoded
-//! `0xc2 0x80..=0x9f` form. A bare 8-bit `0x80..=0x9f` byte is invalid UTF-8:
-//! the browser, rmux's own emulator and tmux all render it as U+FFFD. Reading
-//! such a byte as an OSC/DCS/PM/APC/SOS introducer — or as a string terminator
-//! — would delete pane output the owner can plainly see, so bare C1 bytes are
-//! forwarded as the data bytes they are.
+//! RMUX decodes UTF-8 only in Ground. Encoded C1 code points are therefore
+//! zero-width text for the pane owner, while xterm.js would reinterpret them as
+//! terminal controls. This boundary removes those nonprinting code points and
+//! replaces malformed Ground UTF-8 with U+FFFD before xterm.js sees it.
 
 use super::WebShareConnectRole;
 
 const MAX_BUFFERED_OSC_BYTES: usize = 1024 * 1024;
+const UTF8_REPLACEMENT: &[u8] = "\u{fffd}".as_bytes();
 
 #[derive(Debug)]
 pub(crate) struct WebTerminalSanitizer {
     role: WebShareConnectRole,
     state: State,
-    pending_c2: bool,
+    pending_utf8: Option<PendingUtf8>,
 }
 
 #[derive(Debug, Default)]
@@ -32,10 +30,94 @@ enum State {
         bytes: Vec<u8>,
         escaped: bool,
     },
-    DiscardString {
-        escaped: bool,
-        bell_terminates: bool,
-    },
+    DiscardString(DiscardString),
+    Dcs(DcsState),
+}
+
+#[derive(Debug)]
+struct DiscardString {
+    escaped: bool,
+    terminator: StringTerminator,
+}
+
+impl DiscardString {
+    const fn new(terminator: StringTerminator) -> Self {
+        Self {
+            escaped: false,
+            terminator,
+        }
+    }
+
+    const fn with_escape(terminator: StringTerminator, escaped: bool) -> Self {
+        Self {
+            escaped,
+            terminator,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StringTerminator {
+    St,
+    StOrBel,
+}
+
+#[derive(Debug)]
+enum DcsState {
+    Entry,
+    Parameter,
+    Intermediate,
+    Ignore,
+    Passthrough,
+    PassthroughEscape,
+}
+
+#[derive(Debug)]
+struct PendingUtf8 {
+    bytes: [u8; 4],
+    len: u8,
+    expected: u8,
+}
+
+impl PendingUtf8 {
+    fn start(byte: u8) -> Option<Self> {
+        let expected = match byte {
+            0xc0..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf7 => 4,
+            _ => return None,
+        };
+        let mut bytes = [0; 4];
+        bytes[0] = byte;
+        Some(Self {
+            bytes,
+            len: 1,
+            expected,
+        })
+    }
+
+    fn push_continuation(&mut self, byte: u8) -> bool {
+        if byte & 0xc0 != 0x80 {
+            return false;
+        }
+        self.bytes[usize::from(self.len)] = byte;
+        self.len += 1;
+        true
+    }
+
+    const fn is_complete(&self) -> bool {
+        self.len == self.expected
+    }
+
+    fn bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+}
+
+impl Default for WebTerminalSanitizer {
+    fn default() -> Self {
+        Self::for_role(WebShareConnectRole::Operator)
+    }
 }
 
 impl WebTerminalSanitizer {
@@ -43,7 +125,7 @@ impl WebTerminalSanitizer {
         Self {
             role,
             state: State::Ground,
-            pending_c2: false,
+            pending_utf8: None,
         }
     }
 
@@ -55,217 +137,200 @@ impl WebTerminalSanitizer {
 
     pub(crate) fn reset(&mut self) {
         self.state = State::Ground;
-        self.pending_c2 = false;
+        self.pending_utf8 = None;
     }
 
     fn push_byte(&mut self, byte: u8, output: &mut Vec<u8>) {
-        // `0xc2` is the only lead byte that can encode a C1 control, and it can
-        // never be a UTF-8 continuation byte, so one byte of lookahead decides
-        // whether a control code point is on the wire.
-        if self.pending_c2 {
-            self.pending_c2 = false;
-            match byte {
-                0x80..=0x9f => {
-                    self.process_byte(InputByte::encoded_c1(byte), output);
-                    return;
+        if let Some(mut pending) = self.pending_utf8.take() {
+            if pending.push_continuation(byte) {
+                if pending.is_complete() {
+                    forward_ground_utf8(&pending, output);
+                } else {
+                    self.pending_utf8 = Some(pending);
                 }
-                // A complete two-byte character: both halves stay adjacent.
-                0xa0..=0xbf => self.process_byte(InputByte::plain(0xc2), output),
-                // A truncated sequence. Forwarding the orphaned lead byte would
-                // let a later `0x80..=0x9f` byte recombine with it once this
-                // boundary deletes what sat between them — a C1 control the
-                // pane never emitted and the owner's screen never shows.
-                _ => {}
+                return;
             }
+            output.extend_from_slice(UTF8_REPLACEMENT);
         }
-        if byte == 0xc2 {
-            self.pending_c2 = true;
+
+        if matches!(self.state, State::Ground) && byte >= 0x80 {
+            if let Some(pending) = PendingUtf8::start(byte) {
+                self.pending_utf8 = Some(pending);
+            } else {
+                output.extend_from_slice(UTF8_REPLACEMENT);
+            }
             return;
         }
 
-        self.process_byte(InputByte::plain(byte), output);
+        self.process_byte(byte, output);
     }
 
-    fn process_byte(&mut self, input: InputByte, output: &mut Vec<u8>) {
+    fn process_byte(&mut self, byte: u8, output: &mut Vec<u8>) {
         let state = std::mem::take(&mut self.state);
         self.state = match state {
-            State::Ground => ground(input, output),
-            State::Escape => escape_sequence(input, output),
+            State::Ground => ground(byte, output),
+            State::Escape => escape_sequence(byte, output),
             State::Osc { mut bytes, escaped } => {
-                if cancelled(input) {
+                if cancelled(byte) {
                     State::Ground
-                } else if escaped && input.byte != b'\\' {
-                    escape_sequence(input, output)
-                } else if string_ended(input, escaped, true) {
-                    input.append_to(&mut bytes);
+                } else if escaped && byte != b'\\' {
+                    escape_sequence(byte, output)
+                } else if (escaped && byte == b'\\') || byte == 0x07 {
+                    bytes.push(byte);
                     if allowed_osc(&bytes, self.role) {
                         output.extend_from_slice(&bytes);
                     }
                     State::Ground
-                } else if let Some(state) = string_introducer(input) {
-                    state
                 } else if bytes.len() >= MAX_BUFFERED_OSC_BYTES {
-                    State::DiscardString {
-                        escaped: input.byte == 0x1b,
-                        bell_terminates: true,
-                    }
+                    State::DiscardString(DiscardString::with_escape(
+                        StringTerminator::StOrBel,
+                        byte == 0x1b,
+                    ))
                 } else {
-                    input.append_to(&mut bytes);
+                    bytes.push(byte);
                     State::Osc {
                         bytes,
-                        escaped: input.byte == 0x1b,
+                        escaped: byte == 0x1b,
                     }
                 }
             }
-            State::DiscardString {
-                escaped,
-                bell_terminates,
-            } => {
-                if cancelled(input) {
-                    State::Ground
-                } else if escaped && input.byte != b'\\' {
-                    escape_sequence(input, output)
-                } else if string_ended(input, escaped, bell_terminates) {
-                    State::Ground
-                } else if let Some(state) = string_introducer(input) {
-                    state
-                } else {
-                    State::DiscardString {
-                        escaped: input.byte == 0x1b,
-                        bell_terminates,
-                    }
-                }
-            }
+            State::DiscardString(string) => discard_string(string, byte, output),
+            State::Dcs(dcs) => dcs_sequence(dcs, byte),
         };
     }
 }
 
-#[derive(Clone, Copy)]
-struct InputByte {
-    byte: u8,
-    /// The byte is the trailing half of a `0xc2 0x80..=0x9f` sequence, i.e. a
-    /// C1 code point the viewer's UTF-8 decoder really produces.
-    encoded_c1: bool,
-}
-
-impl InputByte {
-    const fn plain(byte: u8) -> Self {
-        Self {
-            byte,
-            encoded_c1: false,
-        }
-    }
-
-    const fn encoded_c1(byte: u8) -> Self {
-        Self {
-            byte,
-            encoded_c1: true,
-        }
-    }
-
-    fn append_to(self, output: &mut Vec<u8>) {
-        if self.encoded_c1 {
-            output.extend_from_slice(&[0xc2, self.byte]);
-        } else {
-            output.push(self.byte);
-        }
+fn forward_ground_utf8(sequence: &PendingUtf8, output: &mut Vec<u8>) {
+    let Ok(value) = std::str::from_utf8(sequence.bytes()) else {
+        output.extend_from_slice(UTF8_REPLACEMENT);
+        return;
+    };
+    let Some(character) = value.chars().next() else {
+        output.extend_from_slice(UTF8_REPLACEMENT);
+        return;
+    };
+    if !matches!(u32::from(character), 0x80..=0x9f) {
+        output.extend_from_slice(sequence.bytes());
     }
 }
 
-fn ground(input: InputByte, output: &mut Vec<u8>) -> State {
-    if let Some(state) = string_introducer(input) {
-        return state;
-    }
-    match input.byte {
+fn ground(byte: u8, output: &mut Vec<u8>) -> State {
+    match byte {
         0x1b => State::Escape,
         0x18 | 0x1a => State::Ground,
         _ => {
-            input.append_to(output);
+            output.push(byte);
             State::Ground
         }
     }
 }
 
-fn escape_sequence(input: InputByte, output: &mut Vec<u8>) -> State {
-    if cancelled(input) {
+fn escape_sequence(byte: u8, output: &mut Vec<u8>) -> State {
+    if cancelled(byte) {
         return State::Ground;
     }
-    if let Some(state) = string_introducer(input) {
-        return state;
-    }
-    match input.byte {
+    match byte {
         b']' => State::Osc {
             bytes: vec![0x1b, b']'],
             escaped: false,
         },
-        b'P' | b'X' | b'^' | b'_' => State::DiscardString {
-            escaped: false,
-            bell_terminates: false,
-        },
+        b'P' => State::Dcs(DcsState::Entry),
+        b'X' | b'^' | b'_' | b'k' => State::DiscardString(DiscardString::new(StringTerminator::St)),
         0x1b => State::Escape,
+        0x7f..=0xff => State::Escape,
         _ => {
             output.push(0x1b);
-            input.append_to(output);
+            output.push(byte);
             State::Ground
         }
     }
 }
 
-fn string_introducer(input: InputByte) -> Option<State> {
-    // Only a decoded C1 code point introduces a control string. A bare
-    // `0x90`/`0x98`/`0x9d`/`0x9e`/`0x9f` byte is invalid UTF-8 that the viewer
-    // renders as U+FFFD, so opening a string here would silently discard every
-    // following byte of ordinary pane output.
-    if !input.encoded_c1 {
-        return None;
+fn discard_string(mut string: DiscardString, byte: u8, output: &mut Vec<u8>) -> State {
+    if cancelled(byte) {
+        return State::Ground;
     }
-    match input.byte {
-        0x9d => {
-            let mut bytes = Vec::with_capacity(2);
-            input.append_to(&mut bytes);
-            Some(State::Osc {
-                bytes,
-                escaped: false,
-            })
+    if string.escaped {
+        return if byte == b'\\' {
+            State::Ground
+        } else {
+            escape_sequence(byte, output)
+        };
+    }
+    if matches!(string.terminator, StringTerminator::StOrBel) && byte == 0x07 {
+        return State::Ground;
+    }
+    string.escaped = byte == 0x1b;
+    State::DiscardString(string)
+}
+
+fn dcs_sequence(state: DcsState, byte: u8) -> State {
+    match state {
+        DcsState::Entry => match byte {
+            0x18 | 0x1a => State::Ground,
+            0x1b => State::Escape,
+            0x20..=0x2f => State::Dcs(DcsState::Intermediate),
+            0x30..=0x39 | 0x3b..=0x3f => State::Dcs(DcsState::Parameter),
+            0x3a => State::Dcs(DcsState::Ignore),
+            0x40..=0x7e => State::Dcs(DcsState::Passthrough),
+            _ => State::Dcs(DcsState::Entry),
+        },
+        DcsState::Parameter => match byte {
+            0x18 | 0x1a => State::Ground,
+            0x1b => State::Escape,
+            0x20..=0x2f => State::Dcs(DcsState::Intermediate),
+            0x30..=0x39 | 0x3b => State::Dcs(DcsState::Parameter),
+            0x3a | 0x3c..=0x3f => State::Dcs(DcsState::Ignore),
+            0x40..=0x7e => State::Dcs(DcsState::Passthrough),
+            _ => State::Dcs(DcsState::Parameter),
+        },
+        DcsState::Intermediate => match byte {
+            0x18 | 0x1a => State::Ground,
+            0x1b => State::Escape,
+            0x20..=0x2f => State::Dcs(DcsState::Intermediate),
+            0x30..=0x3f => State::Dcs(DcsState::Ignore),
+            0x40..=0x7e => State::Dcs(DcsState::Passthrough),
+            _ => State::Dcs(DcsState::Intermediate),
+        },
+        DcsState::Ignore => match byte {
+            0x18 | 0x1a => State::Ground,
+            0x1b => State::Escape,
+            _ => State::Dcs(DcsState::Ignore),
+        },
+        DcsState::Passthrough => {
+            if byte == 0x1b {
+                State::Dcs(DcsState::PassthroughEscape)
+            } else {
+                State::Dcs(DcsState::Passthrough)
+            }
         }
-        0x90 | 0x98 | 0x9e | 0x9f => Some(State::DiscardString {
-            escaped: false,
-            bell_terminates: false,
-        }),
-        _ => None,
+        DcsState::PassthroughEscape => {
+            if byte == b'\\' {
+                State::Ground
+            } else {
+                State::Dcs(DcsState::Passthrough)
+            }
+        }
     }
 }
 
-fn cancelled(input: InputByte) -> bool {
-    // CAN and SUB are C0 bytes: they are never part of a UTF-8 sequence, so the
-    // viewer always sees them as controls.
-    !input.encoded_c1 && matches!(input.byte, 0x18 | 0x1a)
-}
-
-fn string_ended(input: InputByte, escaped: bool, bell_terminates: bool) -> bool {
-    // A bare `0x9c` is data, not ST: the viewer keeps the string open, so
-    // ending it here would forward its tail as visible text.
-    (input.encoded_c1 && input.byte == 0x9c)
-        || (escaped && input.byte == b'\\')
-        || (bell_terminates && input.byte == 0x07)
+const fn cancelled(byte: u8) -> bool {
+    matches!(byte, 0x18 | 0x1a)
 }
 
 fn allowed_osc(sequence: &[u8], role: WebShareConnectRole) -> bool {
-    let Some(payload) = sequence
-        .strip_prefix(b"\x1b]".as_slice())
-        .or_else(|| sequence.strip_prefix([0xc2, 0x9d].as_slice()))
-    else {
+    let Some(payload) = sequence.strip_prefix(b"\x1b]".as_slice()) else {
         return false;
     };
+    if payload
+        .windows(2)
+        .any(|pair| pair[0] == 0xc2 && (0x80..=0x9f).contains(&pair[1]))
+    {
+        return false;
+    }
     let code_end = payload
         .iter()
-        .enumerate()
-        .position(|(index, byte)| {
-            *byte == b';'
-                || *byte == 0x07
-                || *byte == 0x1b
-                || (*byte == 0xc2 && payload.get(index + 1) == Some(&0x9c))
-        })
+        .position(|byte| *byte == b';' || *byte == 0x07 || *byte == 0x1b)
         .unwrap_or(payload.len());
     let Ok(code) = std::str::from_utf8(&payload[..code_end]) else {
         return false;
@@ -304,7 +369,7 @@ fn allowed_hyperlink(payload: &[u8]) -> bool {
 }
 
 fn strip_osc_terminator(mut payload: &[u8]) -> &[u8] {
-    if payload.ends_with(b"\x1b\\") || payload.ends_with(&[0xc2, 0x9c]) {
+    if payload.ends_with(b"\x1b\\") {
         payload = &payload[..payload.len() - 2];
     } else if payload.last() == Some(&0x07) {
         payload = &payload[..payload.len() - 1];
@@ -313,367 +378,9 @@ fn strip_osc_terminator(mut payload: &[u8]) -> &[u8] {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+#[path = "stream_sanitizer/oracle_tests.rs"]
+mod oracle_tests;
 
-    fn sanitize_for_role(role: WebShareConnectRole, chunks: &[&[u8]]) -> Vec<u8> {
-        let mut sanitizer = WebTerminalSanitizer::for_role(role);
-        let mut output = Vec::new();
-        for chunk in chunks {
-            sanitizer.push(chunk, &mut output);
-        }
-        output
-    }
-
-    fn sanitize(chunks: &[&[u8]]) -> Vec<u8> {
-        sanitize_for_role(WebShareConnectRole::Operator, chunks)
-    }
-
-    #[test]
-    fn spectator_role_removes_private_metadata_and_keeps_visual_osc() {
-        let input = concat!(
-            "A\u{1b}]0;private icon and title\u{1b}\\",
-            "B\u{1b}]1;private icon\u{1b}\\",
-            "C\u{1b}]2;private title\u{1b}\\",
-            "D\u{1b}]7;file:///home/owner/private\u{1b}\\",
-            "E\u{1b}]133;P;Cwd=/home/owner/private\u{1b}\\",
-            "F\u{1b}]4;1;rgb:ff/00/00\u{1b}\\",
-            "G\u{1b}]8;;https://example.test\u{1b}\\link\u{1b}]8;;\u{1b}\\H",
-        )
-        .as_bytes();
-        let expected = concat!(
-            "ABCDEF",
-            "\u{1b}]4;1;rgb:ff/00/00\u{1b}\\",
-            "G",
-            "\u{1b}]8;;https://example.test\u{1b}\\link\u{1b}]8;;\u{1b}\\H",
-        )
-        .as_bytes();
-
-        for split in 0..=input.len() {
-            assert_eq!(
-                sanitize_for_role(
-                    WebShareConnectRole::Spectator,
-                    &[&input[..split], &input[split..]]
-                ),
-                expected,
-                "split {split}"
-            );
-        }
-    }
-
-    #[test]
-    fn operator_role_preserves_authorized_private_metadata() {
-        let input = concat!(
-            "A\u{1b}]0;private icon and title\u{1b}\\",
-            "B\u{1b}]1;private icon\u{1b}\\",
-            "C\u{1b}]2;private title\u{1b}\\",
-            "D\u{1b}]7;file:///home/owner/private\u{1b}\\",
-            "E\u{1b}]133;P;Cwd=/home/owner/private\u{1b}\\F",
-        )
-        .as_bytes();
-
-        for split in 0..=input.len() {
-            assert_eq!(
-                sanitize_for_role(
-                    WebShareConnectRole::Operator,
-                    &[&input[..split], &input[split..]]
-                ),
-                input,
-                "split {split}"
-            );
-        }
-    }
-
-    #[test]
-    fn osc_52_is_removed_at_every_fragmentation_boundary() {
-        let input = b"before\x1b]52;c;Zm9v\x1b\\after";
-        for split in 0..=input.len() {
-            assert_eq!(
-                sanitize(&[&input[..split], &input[split..]]),
-                b"beforeafter",
-                "split {split}"
-            );
-        }
-    }
-
-    #[test]
-    fn allowed_visual_osc_survives_all_fragmentation_boundaries() {
-        let input = b"A\x1b]8;;https://example.test\x1b\\link\x1b]8;;\x07B";
-        for split in 0..=input.len() {
-            assert_eq!(
-                sanitize(&[&input[..split], &input[split..]]),
-                input,
-                "split {split}"
-            );
-        }
-    }
-
-    #[test]
-    fn osc_8_allows_web_links_and_closures_but_drops_active_content_schemes() {
-        for input in [
-            b"A\x1b]8;;javascript:alert(1)\x1b\\B".as_slice(),
-            b"A\x1b]8;;data:text/html,unsafe\x07B".as_slice(),
-            b"A\x1b]8;;file:///etc/passwd\x1b\\B".as_slice(),
-            b"A\x1b]8;;relative/path\x1b\\B".as_slice(),
-        ] {
-            for split in 0..=input.len() {
-                assert_eq!(
-                    sanitize(&[&input[..split], &input[split..]]),
-                    b"AB",
-                    "split {split}"
-                );
-            }
-        }
-        for input in [
-            b"A\x1b]8;;https://example.test\x1b\\B".as_slice(),
-            b"A\x1b]8;id=1;MAILTO:user@example.test\x07B".as_slice(),
-            b"A\x1b]8;;\x1b\\B".as_slice(),
-        ] {
-            assert_eq!(sanitize(&[input]), input);
-        }
-    }
-
-    #[test]
-    fn apc_dcs_pm_and_sos_are_explicitly_dropped() {
-        let input = b"a\x1b_Gi=1;kitty\x1b\\b\x1bPqSIXEL\x1b\\c\x1b^pm\x1b\\d\x1bXsos\x1b\\e";
-        for first in 0..=input.len() {
-            for second in first..=input.len() {
-                assert_eq!(
-                    sanitize(&[&input[..first], &input[first..second], &input[second..]]),
-                    b"abcde",
-                    "splits {first}/{second}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn bare_c1_bytes_are_data_and_never_introduce_a_control_string() {
-        // Invalid UTF-8 for the viewer, so none of these open a string. tmux
-        // 3.7b and rmux's own emulator both render each byte as U+FFFD, which
-        // is exactly what the browser's UTF-8 decoder produces from them.
-        let input = b"a\x9d52;c;Zm9v\x9cb\x9fGkitty\x9cc\x90qsixel\x9cd";
-        for split in 0..=input.len() {
-            assert_eq!(
-                sanitize(&[&input[..split], &input[split..]]),
-                input.as_slice(),
-                "split {split}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_bare_c1_byte_never_swallows_the_rest_of_a_pane_stream() {
-        // `cat` of a binary file, then ordinary shell output. Before the fix
-        // the viewer received the first chunk's prefix and nothing else.
-        let chunks: [&[u8]; 3] = [
-            b"$ cat logo.bin\r\n\x9f\x8a\x00PNG",
-            b"\r\n$ echo hello\r\nhello\r\n$ ",
-            b"date\r\nFri Jul 25 12:00:00 CEST 2026\r\n$ ",
-        ];
-        assert_eq!(sanitize(&chunks), chunks.concat());
-    }
-
-    #[test]
-    fn every_bare_c1_byte_reaches_the_viewer_unchanged() {
-        for byte in 0x80..=0x9f_u8 {
-            let input = [b'A', byte, b'B', b'C', b'\r', b'\n'];
-            for split in 0..=input.len() {
-                assert_eq!(
-                    sanitize(&[&input[..split], &input[split..]]),
-                    input.as_slice(),
-                    "byte {byte:#04x}, split {split}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_bare_c1_terminator_cannot_end_a_string_the_viewer_keeps_open() {
-        // The viewer decodes 0x9c as U+FFFD and keeps buffering the OSC, so
-        // treating it as ST would forward the clipboard tail as visible text.
-        let input = b"a\x1b]52;c;Zm9vYmFy\x9cdGFpbA==\x07b";
-        for split in 0..=input.len() {
-            assert_eq!(
-                sanitize(&[&input[..split], &input[split..]]),
-                b"ab",
-                "split {split}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_bare_c1_byte_inside_an_allowed_osc_stays_part_of_its_payload() {
-        let input = b"a\x1b]2;ti\x9ctle\x07b";
-        for split in 0..=input.len() {
-            assert_eq!(
-                sanitize(&[&input[..split], &input[split..]]),
-                input.as_slice(),
-                "split {split}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_bare_c1_byte_inside_an_osc_identifier_fails_closed() {
-        // The viewer's OSC identifier would be `2<U+FFFD>` — not a number, so
-        // its parser aborts the string. Forwarding it would be a divergence.
-        let input = b"a\x1b]2\x9c;title\x07b";
-        for split in 0..=input.len() {
-            assert_eq!(
-                sanitize(&[&input[..split], &input[split..]]),
-                b"ab",
-                "split {split}"
-            );
-        }
-    }
-
-    #[test]
-    fn an_orphaned_c2_lead_byte_cannot_be_recombined_into_a_forged_c1_control() {
-        // The input holds no C1 control: `0xc2` is a truncated lead and `0x9f`
-        // is invalid UTF-8. Forwarding the lead byte after deleting what sat
-        // between them would hand the viewer a real U+009F APC introducer and
-        // swallow the rest of the pane's output.
-        for input in [
-            b"A\xc2\x18\x9fplain text".as_slice(),
-            b"A\xc2\x1b]52;c;Zm9v\x07\x9fplain text".as_slice(),
-            b"A\xc2\x1b\x1b\x9fplain text".as_slice(),
-        ] {
-            for split in 0..=input.len() {
-                let output = sanitize(&[&input[..split], &input[split..]]);
-                assert!(
-                    !output
-                        .windows(2)
-                        .any(|pair| pair[0] == 0xc2 && (0x80..=0x9f).contains(&pair[1])),
-                    "split {split}: forged C1 control in {output:02x?}"
-                );
-                assert!(
-                    output.ends_with(b"plain text"),
-                    "split {split}: pane output must survive, got {output:02x?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_complete_two_byte_character_keeps_both_halves() {
-        let input = "A\u{a0}\u{ff}B".as_bytes();
-        for split in 0..=input.len() {
-            assert_eq!(
-                sanitize(&[&input[..split], &input[split..]]),
-                input,
-                "split {split}"
-            );
-        }
-    }
-
-    #[test]
-    fn utf8_encoded_c1_strings_follow_the_same_policy() {
-        let blocked = b"a\xc2\x9d52;c;Zm9v\xc2\x9cb\xc2\x9fGkitty\xc2\x9cc";
-        for split in 0..=blocked.len() {
-            assert_eq!(
-                sanitize(&[&blocked[..split], &blocked[split..]]),
-                b"abc",
-                "blocked split {split}"
-            );
-        }
-
-        let allowed = b"a\xc2\x9d2;title\xc2\x9cb";
-        for split in 0..=allowed.len() {
-            assert_eq!(
-                sanitize(&[&allowed[..split], &allowed[split..]]),
-                allowed,
-                "allowed split {split}"
-            );
-        }
-    }
-
-    #[test]
-    fn utf8_continuations_that_overlap_c1_controls_are_never_reinterpreted() {
-        let input = "a\u{a0}НÜ\u{259c}b".as_bytes();
-        for split in 0..=input.len() {
-            assert_eq!(
-                sanitize(&[&input[..split], &input[split..]]),
-                input,
-                "split {split}"
-            );
-        }
-    }
-
-    #[test]
-    fn utf8_inside_an_allowed_osc_cannot_terminate_it_as_a_c1_string() {
-        let input = "\u{1b}]2;Н\u{259c} title\u{1b}\\safe".as_bytes();
-        for split in 0..=input.len() {
-            assert_eq!(
-                sanitize(&[&input[..split], &input[split..]]),
-                input,
-                "split {split}"
-            );
-        }
-    }
-
-    #[test]
-    fn escape_reentry_never_emits_a_forbidden_string_prefix() {
-        for input in [
-            b"a\x1b\x1b]52;c;WA==\x07b".as_slice(),
-            b"a\x1b]2;safe\x1b]52;c;WA==\x07b".as_slice(),
-            b"a\x1bPignored\x1b]52;c;WA==\x07b".as_slice(),
-        ] {
-            for first in 0..=input.len() {
-                for second in first..=input.len() {
-                    assert_eq!(
-                        sanitize(&[&input[..first], &input[first..second], &input[second..]]),
-                        b"ab",
-                        "splits {first}/{second}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn can_and_sub_cancel_strings_before_following_input_is_reparsed() {
-        for cancel in [0x18, 0x1a] {
-            let mut input = b"a\x1b]2;safe".to_vec();
-            input.push(cancel);
-            input.extend_from_slice(b"\x1b]52;c;WA==\x07b");
-            for split in 0..=input.len() {
-                assert_eq!(
-                    sanitize(&[&input[..split], &input[split..]]),
-                    b"ab",
-                    "cancel {cancel:#x}, split {split}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn oversized_osc_discard_ends_at_bell() {
-        let mut input = b"before\x1b]2;".to_vec();
-        input.resize(input.len() + MAX_BUFFERED_OSC_BYTES + 1, b'x');
-        input.extend_from_slice(b"\x07after");
-        assert_eq!(sanitize(&[&input]), b"beforeafter");
-    }
-
-    #[test]
-    fn unknown_osc_is_removed_at_every_fragmentation_boundary() {
-        let input = b"before\x1b]999;not-a-web-contract\x07after";
-        for split in 0..=input.len() {
-            assert_eq!(
-                sanitize(&[&input[..split], &input[split..]]),
-                b"beforeafter",
-                "split {split}"
-            );
-        }
-    }
-
-    #[test]
-    fn reset_discards_an_incomplete_control_string() {
-        let mut sanitizer = WebTerminalSanitizer::for_role(WebShareConnectRole::Operator);
-        let mut output = Vec::new();
-        sanitizer.push(b"safe\x1b]52;c;partial", &mut output);
-        sanitizer.reset();
-        sanitizer.push(b"fresh", &mut output);
-        assert_eq!(output, b"safefresh");
-    }
-}
+#[cfg(test)]
+#[path = "stream_sanitizer/tests.rs"]
+mod tests;
