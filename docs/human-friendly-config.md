@@ -34,7 +34,7 @@ bind b split-window -v -c "#{pane_current_path}"
 bind c new-window -c "#{pane_current_path}"
 
 # Pick one clipboard command for your platform, then uncomment it.
-# set -s copy-command 'clip.exe'
+# set -s copy-command 'powershell -NoProfile -NonInteractive -Command "[Console]::InputEncoding=[Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())"'
 # set -s copy-command 'pbcopy'
 # set -s copy-command 'wl-copy'
 # set -s copy-command 'xclip -selection clipboard'
@@ -79,10 +79,33 @@ With `copy-command` configured, copy-mode actions can send text directly to your
 
 Common clipboard commands:
 
-- Windows: `clip.exe`
+- Windows: `powershell -NoProfile -NonInteractive -Command "[Console]::InputEncoding=[Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())"`
 - macOS: `pbcopy`
 - Linux Wayland: `wl-copy`
 - Linux X11: `xclip -selection clipboard`
+
+### The copy-command encoding contract
+
+RMUX writes the selection to the command's standard input as **raw UTF-8
+bytes**, byte for byte, exactly like tmux. It never transcodes, and the command
+is responsible for declaring how it reads those bytes.
+
+That contract is invisible on Unix, where `pbcopy`, `wl-copy`, and `xclip` all
+read UTF-8. It is not invisible on Windows: RMUX runs the command in a hidden
+console, and a Windows console child that does not say otherwise decodes its
+standard input with the machine's **OEM code page** (`437` on a US install,
+`850` on a Western European one). Feeding UTF-8 to such a command turns every
+non-ASCII glyph into mojibake: on code page `437`, `─` (`E2 94 80`) arrives as
+`ΓöÇ` and `│` (`E2 94 82`) as `Γöé`.
+
+`clip.exe` and a bare `$input | Set-Clipboard` both take the OEM path, so
+neither is safe for box-drawing characters, accents, CJK, or emoji. The Windows
+command above sets `[Console]::InputEncoding` to UTF-8 before reading, which is
+why it round-trips the full selection unchanged.
+
+To avoid an external command entirely, `set-clipboard on` routes copies to the
+outer terminal over OSC 52 instead; that payload is base64, so it is immune to
+code pages end to end.
 
 `set-clipboard` defaults to `external`, matching tmux. That mode allows
 RMUX-initiated copies, such as `set-buffer -w`, to reach the outer terminal,
