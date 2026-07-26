@@ -1,10 +1,9 @@
 use std::collections::BTreeMap;
-use std::ops::Bound::{Excluded, Unbounded};
 
 use rmux_proto::{RmuxError, RotateWindowDirection, TerminalSize};
 
 use super::target_error::{invalid_window_target, invalid_window_target_with_reason};
-use super::Session;
+use super::{cyclic_previous_window_index, Session};
 use crate::{Pane, PaneId, Window};
 
 #[path = "window_ops/navigation.rs"]
@@ -181,7 +180,7 @@ impl Session {
             .expect("replaced window must exist at the addressed index"))
     }
 
-    /// Removes the addressed window and returns it, using tmux's last-then-previous-then-next active fallback when needed.
+    /// Removes the addressed window and returns it, using tmux's last-window then cyclic-previous fallback when needed.
     pub fn remove_window(&mut self, window_index: u32) -> Result<Window, RmuxError> {
         if !self.windows.contains_key(&window_index) {
             return Err(invalid_window_target(&self.name, window_index));
@@ -531,14 +530,7 @@ impl Session {
             }
         }
 
-        if let Some((window_index, _)) = self.windows.range(..removed_index).next_back() {
-            return *window_index;
-        }
-
-        self.windows
-            .range((Excluded(removed_index), Unbounded))
-            .next()
-            .map(|(window_index, _)| *window_index)
+        cyclic_previous_window_index(&self.windows, removed_index)
             .expect("a non-empty session must have a replacement window")
     }
 

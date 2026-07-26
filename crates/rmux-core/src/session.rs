@@ -562,14 +562,7 @@ impl Session {
             }
         }
 
-        if let Some((window_index, _)) = self.windows.range(..removed_index).next_back() {
-            return *window_index;
-        }
-
-        self.windows
-            .range((Excluded(removed_index), Unbounded))
-            .next()
-            .map(|(window_index, _)| *window_index)
+        cyclic_previous_window_index(&self.windows, removed_index)
             .expect("a non-empty session must have a replacement window")
     }
 
@@ -626,16 +619,23 @@ fn synchronized_active_window(
         }
     }
 
-    if let Some((window_index, _)) = windows.range(..previous_active).next_back() {
-        return *window_index;
-    }
-
-    windows
-        .range((Excluded(previous_active), Unbounded))
-        .next()
-        .map(|(window_index, _)| *window_index)
-        .or_else(|| windows.keys().next().copied())
+    cyclic_previous_window_index(windows, previous_active)
         .expect("group synchronization requires at least one window")
+}
+
+fn cyclic_previous_window_index(
+    windows: &BTreeMap<u32, Window>,
+    removed_index: u32,
+) -> Option<u32> {
+    windows
+        .range(..removed_index)
+        .next_back()
+        .or_else(|| {
+            windows
+                .range((Excluded(removed_index), Unbounded))
+                .next_back()
+        })
+        .map(|(window_index, _)| *window_index)
 }
 
 fn current_unix_timestamp() -> i64 {

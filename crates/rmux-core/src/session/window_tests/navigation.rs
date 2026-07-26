@@ -246,6 +246,38 @@ fn remove_window_falls_back_to_the_next_window_when_no_previous_exists() {
 }
 
 #[test]
+fn remove_window_wraps_to_tmux_previous_window_when_no_history_exists() {
+    // tmux 3.7b, measured 2026-07-27: removing active index 0 with no
+    // last-window selects the highest surviving index, the cyclic previous
+    // window. Capture the stable identity before mutation.
+    let mut session = Session::new(
+        session_name("alpha"),
+        TerminalSize {
+            cols: 120,
+            rows: 40,
+        },
+    );
+    session
+        .insert_window_with_initial_pane(2, TerminalSize { cols: 90, rows: 30 })
+        .expect("window 2 insert succeeds");
+    session
+        .insert_window_with_initial_pane(7, TerminalSize { cols: 90, rows: 30 })
+        .expect("window 7 insert succeeds");
+    let expected_window_id = session
+        .window_at(7)
+        .expect("oracle-selected window exists before removal")
+        .id();
+
+    session
+        .remove_window(0)
+        .expect("active window removal succeeds");
+
+    assert_eq!(session.active_window_index(), 7);
+    assert_eq!(session.window().id(), expected_window_id);
+    assert_eq!(session.last_window_index(), None);
+}
+
+#[test]
 fn remove_window_rejects_killing_the_only_window() {
     let mut session = Session::new(
         session_name("alpha"),

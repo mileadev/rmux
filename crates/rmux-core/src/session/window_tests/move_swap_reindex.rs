@@ -48,6 +48,34 @@ fn move_window_relocates_the_active_window_without_rewriting_pane_ids() {
 }
 
 #[test]
+fn detached_move_without_history_uses_tmux_cyclic_previous_identity() {
+    // tmux 3.7b, measured 2026-07-27: moving active index 0 to index 3
+    // with -d and no last-window keeps that stable window active at index 3.
+    let mut session = Session::new(
+        session_name("alpha"),
+        TerminalSize {
+            cols: 120,
+            rows: 40,
+        },
+    );
+    session
+        .insert_window_with_initial_pane(1, TerminalSize { cols: 90, rows: 30 })
+        .expect("window 1 insert succeeds");
+    session
+        .insert_window_with_initial_pane(2, TerminalSize { cols: 90, rows: 30 })
+        .expect("window 2 insert succeeds");
+    let moved_window_id = session.window().id();
+
+    session
+        .move_window(0, 3, false, false)
+        .expect("detached move succeeds");
+
+    assert_eq!(session.active_window_index(), 3);
+    assert_eq!(session.window().id(), moved_window_id);
+    assert_eq!(session.last_window_index(), None);
+}
+
+#[test]
 fn move_window_clears_last_tracking_when_the_last_window_becomes_active() {
     let mut session = Session::new(
         session_name("alpha"),

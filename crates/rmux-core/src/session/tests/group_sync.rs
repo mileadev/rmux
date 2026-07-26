@@ -67,6 +67,36 @@ fn group_sync_duplicate_alias_removal_preserves_surviving_slot_flags() {
 }
 
 #[test]
+fn group_sync_uses_tmux_cyclic_previous_identity_after_active_removal() {
+    let size = TerminalSize { cols: 80, rows: 24 };
+    let mut source = Session::new(session_name("owner-fallback"), size);
+    source
+        .insert_window_with_initial_pane(1, size)
+        .expect("window 1 insert succeeds");
+    source
+        .insert_window_with_initial_pane(2, size)
+        .expect("window 2 insert succeeds");
+    let expected_window_id = source
+        .window_at(2)
+        .expect("oracle fallback exists before removal")
+        .id();
+    let mut peer = source.clone_as_group_member(
+        session_name("peer-fallback"),
+        session_name("owner-fallback"),
+        SessionId::new(5),
+    );
+
+    source
+        .remove_window(0)
+        .expect("active source window removal succeeds");
+    peer.synchronize_group_from(&source);
+
+    assert_eq!(source.window().id(), expected_window_id);
+    assert_eq!(peer.window().id(), expected_window_id);
+    assert_eq!(peer.active_window_index(), 2);
+}
+
+#[test]
 fn group_sync_separates_peer_selection_from_duplicate_alias_alert_permutation() {
     let size = TerminalSize { cols: 80, rows: 24 };
     let mut source = Session::new(session_name("owner-swap-duplicate"), size);
