@@ -409,6 +409,42 @@ fn cancelled_rejected_osc_8_keeps_the_prior_hyperlink_active() {
 }
 
 #[test]
+fn escape_terminated_rejected_osc_8_closes_before_escape_recovery() {
+    for (name, input, expected) in [
+        (
+            "CSI recovery",
+            b"\x1b]8;;https://old.example\x1b\\OLD\x1b]8;;file:///blocked\x1b[31mNEXT\x1b]8;;\x1b\\END"
+                .as_slice(),
+            b"\x1b]8;;https://old.example\x1b\\OLD\x1b]8;;\x1b\\\x1b[31mNEXT\x1b]8;;\x1b\\END"
+                .as_slice(),
+        ),
+        (
+            "C0 then ST",
+            b"\x1b]8;;https://old.example\x1b\\OLD\x1b]8;;file:///blocked\x1b\r\\NEXT\x1b]8;;\x1b\\END"
+                .as_slice(),
+            b"\x1b]8;;https://old.example\x1b\\OLD\x1b]8;;\x1b\\\r\x1b\\NEXT\x1b]8;;\x1b\\END"
+                .as_slice(),
+        ),
+        (
+            "cancel after escape",
+            b"\x1b]8;;https://old.example\x1b\\OLD\x1b]8;;file:///blocked\x1b\x18\\NEXT\x1b]8;;\x1b\\END"
+                .as_slice(),
+            b"\x1b]8;;https://old.example\x1b\\OLD\x1b]8;;\x1b\\\\NEXT\x1b]8;;\x1b\\END"
+                .as_slice(),
+        ),
+        (
+            "new escape and C0",
+            b"\x1b]8;;https://old.example\x1b\\OLD\x1b]8;;file:///blocked\x1b\x1b\0[31mNEXT\x1b]8;;\x1b\\END"
+                .as_slice(),
+            b"\x1b]8;;https://old.example\x1b\\OLD\x1b]8;;\x1b\\\0\x1b[31mNEXT\x1b]8;;\x1b\\END"
+                .as_slice(),
+        ),
+    ] {
+        assert_sanitized_for_roles_at_every_boundary(name, input, expected);
+    }
+}
+
+#[test]
 fn rejected_non_hyperlink_osc_does_not_close_a_prior_hyperlink() {
     let clipboard = b"\x1b]8;;https://old.example\x1b\\OLD\x1b]52;c;WA==\x07NEXT\x1b]8;;\x1b\\END";
     let clipboard_expected = b"\x1b]8;;https://old.example\x1b\\OLDNEXT\x1b]8;;\x1b\\END";
@@ -838,6 +874,50 @@ fn oversized_osc_8_closes_a_prior_hyperlink_for_bel_st_and_both_roles() {
                 "{name}, role {role:?}, bytewise"
             );
         }
+    }
+}
+
+#[test]
+fn oversized_osc_8_closes_before_escape_recovery() {
+    let mut input = b"\x1b]8;;https://old.example\x1b\\OLD".to_vec();
+    let osc_start = input.len();
+    input.extend_from_slice(b"\x1b]8;;file:///overflow/");
+    input.resize(osc_start + MAX_BUFFERED_OSC_BYTES + 2, b'x');
+    input.extend_from_slice(b"\x1b[31mNEXT\x1b]8;;\x1b\\END");
+    let expected =
+        b"\x1b]8;;https://old.example\x1b\\OLD\x1b]8;;\x1b\\\x1b[31mNEXT\x1b]8;;\x1b\\END";
+    let escape = input.len() - b"\x1b[31mNEXT\x1b]8;;\x1b\\END".len();
+    let mut boundaries = vec![
+        0,
+        1,
+        osc_start,
+        osc_start + 1,
+        osc_start + MAX_BUFFERED_OSC_BYTES - 1,
+        osc_start + MAX_BUFFERED_OSC_BYTES,
+        osc_start + MAX_BUFFERED_OSC_BYTES + 1,
+        escape,
+        escape + 1,
+        input.len(),
+    ];
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    for role in [
+        WebShareConnectRole::Operator,
+        WebShareConnectRole::Spectator,
+    ] {
+        for split in boundaries.iter().copied() {
+            assert_eq!(
+                sanitize_for_role(role, &[&input[..split], &input[split..]]),
+                expected,
+                "role {role:?}, split {split}"
+            );
+        }
+        assert_eq!(
+            sanitize_bytewise(role, &input),
+            expected,
+            "role {role:?}, bytewise"
+        );
     }
 }
 

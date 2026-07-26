@@ -185,19 +185,14 @@ impl WebTerminalSanitizer {
             State::Ground => ground(byte, output),
             State::Escape => escape_sequence(byte, output),
             State::Osc { mut bytes, escaped } => {
-                if cancelled(byte) {
-                    State::Ground
-                } else if escaped && byte != b'\\' {
+                if escaped && byte != b'\\' {
+                    close_rejected_hyperlink(&bytes, self.role, output);
                     escape_sequence(byte, output)
-                } else if (escaped && byte == b'\\') || byte == 0x07 {
+                } else if escaped || byte == 0x07 {
                     bytes.push(byte);
-                    match osc_disposition(&bytes, self.role) {
-                        OscDisposition::Forward => output.extend_from_slice(&bytes),
-                        OscDisposition::Drop => {}
-                        OscDisposition::CloseHyperlink => {
-                            output.extend_from_slice(HYPERLINK_CLOSE_ST);
-                        }
-                    }
+                    complete_osc(&bytes, self.role, output);
+                    State::Ground
+                } else if cancelled(byte) {
                     State::Ground
                 } else if bytes.len() >= MAX_BUFFERED_OSC_BYTES {
                     State::DiscardString(DiscardString::with_escape(
@@ -275,16 +270,17 @@ fn escape_sequence(byte: u8, output: &mut Vec<u8>) -> State {
 }
 
 fn discard_string(mut string: DiscardString, byte: u8, output: &mut Vec<u8>) -> State {
-    if cancelled(byte) {
-        return State::Ground;
-    }
     if string.escaped {
         return if byte == b'\\' {
             complete_discard(string.completion, output);
             State::Ground
         } else {
+            complete_discard(string.completion, output);
             escape_sequence(byte, output)
         };
+    }
+    if cancelled(byte) {
+        return State::Ground;
     }
     if matches!(string.terminator, StringTerminator::StOrBel) && byte == 0x07 {
         complete_discard(string.completion, output);
@@ -296,6 +292,23 @@ fn discard_string(mut string: DiscardString, byte: u8, output: &mut Vec<u8>) -> 
 
 fn complete_discard(completion: DiscardCompletion, output: &mut Vec<u8>) {
     if matches!(completion, DiscardCompletion::CloseHyperlink) {
+        output.extend_from_slice(HYPERLINK_CLOSE_ST);
+    }
+}
+
+fn complete_osc(sequence: &[u8], role: WebShareConnectRole, output: &mut Vec<u8>) {
+    match osc_disposition(sequence, role) {
+        OscDisposition::Forward => output.extend_from_slice(sequence),
+        OscDisposition::Drop => {}
+        OscDisposition::CloseHyperlink => output.extend_from_slice(HYPERLINK_CLOSE_ST),
+    }
+}
+
+fn close_rejected_hyperlink(sequence: &[u8], role: WebShareConnectRole, output: &mut Vec<u8>) {
+    if matches!(
+        osc_disposition(sequence, role),
+        OscDisposition::CloseHyperlink
+    ) {
         output.extend_from_slice(HYPERLINK_CLOSE_ST);
     }
 }
