@@ -55,7 +55,9 @@ use super::window_commands::{
     run_respawn_window, run_rotate_window, run_select_window, run_swap_window, run_unlink_window,
 };
 use super::{connect_with_startserver, ExitFailure, StartupOptions};
-use crate::cli_args::{Command, NewSessionArgs, SetOptionCommandKind, ShowOptionsCommandKind};
+use crate::cli_args::{
+    Command, NewSessionArgs, SelectLayoutMode, SetOptionCommandKind, ShowOptionsCommandKind,
+};
 use crate::cli_response::tmux_cli_error_message;
 use crate::tmux_error_surface::source_file_error_uses_stdout;
 
@@ -365,7 +367,32 @@ fn dispatch(
             })
         }
         Command::SelectLayout(args) => {
-            if args.spread {
+            let mode = args.mode();
+            if mode == Some(SelectLayoutMode::Next) {
+                return run_command_resolved(socket_path, "select-layout", move |connection| {
+                    let target = resolve_window_target_or_current(
+                        connection,
+                        args.target.as_ref(),
+                        "select-layout",
+                    )?;
+                    connection
+                        .next_layout(target)
+                        .map_err(ExitFailure::from_client)
+                });
+            }
+            if mode == Some(SelectLayoutMode::Previous) {
+                return run_command_resolved(socket_path, "select-layout", move |connection| {
+                    let target = resolve_window_target_or_current(
+                        connection,
+                        args.target.as_ref(),
+                        "select-layout",
+                    )?;
+                    connection
+                        .previous_layout(target)
+                        .map_err(ExitFailure::from_client)
+                });
+            }
+            if mode == Some(SelectLayoutMode::Spread) {
                 return run_command_resolved(socket_path, "select-layout", move |connection| {
                     let target = match args.target.as_ref() {
                         Some(target) => resolve_select_layout_target_spec(connection, target)?,
@@ -378,31 +405,7 @@ fn dispatch(
                         .map_err(ExitFailure::from_client)
                 });
             }
-            if args.next {
-                return run_command_resolved(socket_path, "select-layout", move |connection| {
-                    let target = resolve_window_target_or_current(
-                        connection,
-                        args.target.as_ref(),
-                        "select-layout",
-                    )?;
-                    connection
-                        .next_layout(target)
-                        .map_err(ExitFailure::from_client)
-                });
-            }
-            if args.previous {
-                return run_command_resolved(socket_path, "select-layout", move |connection| {
-                    let target = resolve_window_target_or_current(
-                        connection,
-                        args.target.as_ref(),
-                        "select-layout",
-                    )?;
-                    connection
-                        .previous_layout(target)
-                        .map_err(ExitFailure::from_client)
-                });
-            }
-            if args.old {
+            if mode == Some(SelectLayoutMode::Old) && args.layout.is_none() {
                 return run_command_resolved(socket_path, "select-layout", move |connection| {
                     let target = match args.target.as_ref() {
                         Some(target) => resolve_select_layout_target_spec(connection, target)?,
@@ -426,6 +429,11 @@ fn dispatch(
                     ),
                 };
                 let layout = args.layout.as_ref().expect("handled no-op layout");
+                if mode == Some(SelectLayoutMode::Old) {
+                    return connection
+                        .select_custom_layout(target, layout.clone())
+                        .map_err(ExitFailure::from_client);
+                }
                 match layout.parse::<LayoutName>() {
                     Ok(parsed) => connection
                         .select_layout(target, parsed)

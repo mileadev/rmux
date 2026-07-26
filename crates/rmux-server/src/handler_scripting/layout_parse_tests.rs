@@ -57,6 +57,68 @@ fn select_layout_preserves_legitimate_flags_and_separator() {
 }
 
 #[test]
+fn select_layout_mode_clusters_use_tmux_priority_independent_of_spelling() {
+    for arguments in [
+        &["-En", "-t", "alpha:0"][..],
+        &["-nE", "-t", "alpha:0"][..],
+        &["-E", "-n", "-t", "alpha:0"][..],
+        &["-Enop", "-t", "alpha:0"][..],
+    ] {
+        assert!(
+            matches!(
+                parse(arguments),
+                Ok(ParsedSelectLayout::Request(Request::NextLayout(_)))
+            ),
+            "-n must govern {arguments:?}"
+        );
+    }
+
+    for arguments in [&["-Ep", "-t", "alpha:0"][..], &["-op", "-t", "alpha:0"][..]] {
+        assert!(
+            matches!(
+                parse(arguments),
+                Ok(ParsedSelectLayout::Request(Request::PreviousLayout(_)))
+            ),
+            "-p must govern {arguments:?}"
+        );
+    }
+
+    assert!(matches!(
+        parse(&["-Eo", "-t", "alpha:0"]),
+        Ok(ParsedSelectLayout::Request(Request::SpreadLayout(_)))
+    ));
+    assert!(matches!(
+        parse(&["-o", "-t", "alpha:0"]),
+        Ok(ParsedSelectLayout::Request(Request::SelectOldLayout(_)))
+    ));
+}
+
+#[test]
+fn select_layout_mode_operand_semantics_match_tmux() {
+    for arguments in [
+        &["-n", "-t", "alpha:0", "tiled"][..],
+        &["-p", "-t", "alpha:0", "tiled"][..],
+        &["-E", "-t", "alpha:0", "tiled"][..],
+    ] {
+        parse(arguments).unwrap_or_else(|error| {
+            panic!("governing navigation/spread mode must ignore one operand: {error}")
+        });
+    }
+
+    let ParsedSelectLayout::Request(Request::SelectCustomLayout(request)) =
+        parse(&["-o", "-t", "alpha:0", "tiled"]).expect("-o accepts one custom-layout operand")
+    else {
+        panic!("-o with an operand must use strict custom-layout parsing at runtime");
+    };
+    assert_eq!(request.layout, "tiled");
+
+    assert!(
+        parse(&["-En", "-t", "alpha:0", "tiled", "extra"]).is_err(),
+        "a governing mode must still reject a second operand"
+    );
+}
+
+#[test]
 fn select_layout_preserves_missing_target_error() {
     assert_eq!(
         parse(&["-t"]).expect_err("-t without a target must fail"),

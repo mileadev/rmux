@@ -21,6 +21,14 @@ pub(super) enum ParsedSelectLayout {
     Request(Request),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectLayoutMode {
+    Next,
+    Previous,
+    Spread,
+    Old,
+}
+
 pub(super) fn parse_display_panes(
     mut args: CommandTokens,
     sessions: &SessionStore,
@@ -160,50 +168,54 @@ pub(super) fn parse_select_layout(
         find_context,
         "select-layout",
     )?));
-    let mode_count = [spread, next_layout, old_layout, previous_layout]
-        .into_iter()
-        .filter(|present| *present)
-        .count();
-    if mode_count > 1 {
-        return Err(RmuxError::Server(
-            "select-layout accepts only one mode flag".to_owned(),
-        ));
-    }
-    if mode_count == 1 && !args.is_empty() {
-        return Err(RmuxError::Server(
-            "command select-layout: too many arguments (need at most 0)".to_owned(),
-        ));
-    }
-    if spread {
-        return Ok(ParsedSelectLayout::Request(Request::SpreadLayout(
-            SpreadLayoutRequest { target },
-        )));
-    }
-    if next_layout {
-        return Ok(ParsedSelectLayout::Request(Request::NextLayout(
-            NextLayoutRequest {
-                target: select_layout_window_target(&target, sessions)?,
-            },
-        )));
-    }
-    if old_layout {
-        return Ok(ParsedSelectLayout::Request(Request::SelectOldLayout(
-            SelectOldLayoutRequest { target },
-        )));
-    }
-    if previous_layout {
-        return Ok(ParsedSelectLayout::Request(Request::PreviousLayout(
-            PreviousLayoutRequest {
-                target: select_layout_window_target(&target, sessions)?,
-            },
-        )));
-    }
-    if args.is_empty() {
-        return Ok(ParsedSelectLayout::NoOp);
+    let mode = if next_layout {
+        Some(SelectLayoutMode::Next)
+    } else if previous_layout {
+        Some(SelectLayoutMode::Previous)
+    } else if spread {
+        Some(SelectLayoutMode::Spread)
+    } else if old_layout {
+        Some(SelectLayoutMode::Old)
+    } else {
+        None
+    };
+    let layout = args.optional();
+    args.no_extra("select-layout")?;
+
+    match mode {
+        Some(SelectLayoutMode::Next) => {
+            return Ok(ParsedSelectLayout::Request(Request::NextLayout(
+                NextLayoutRequest {
+                    target: select_layout_window_target(&target, sessions)?,
+                },
+            )));
+        }
+        Some(SelectLayoutMode::Previous) => {
+            return Ok(ParsedSelectLayout::Request(Request::PreviousLayout(
+                PreviousLayoutRequest {
+                    target: select_layout_window_target(&target, sessions)?,
+                },
+            )));
+        }
+        Some(SelectLayoutMode::Spread) => {
+            return Ok(ParsedSelectLayout::Request(Request::SpreadLayout(
+                SpreadLayoutRequest { target },
+            )));
+        }
+        Some(SelectLayoutMode::Old) => {
+            return Ok(ParsedSelectLayout::Request(match layout {
+                Some(layout) => {
+                    Request::SelectCustomLayout(SelectCustomLayoutRequest { target, layout })
+                }
+                None => Request::SelectOldLayout(SelectOldLayoutRequest { target }),
+            }));
+        }
+        None => {}
     }
 
-    let layout = args.required("select-layout layout")?;
-    args.no_extra("select-layout")?;
+    let Some(layout) = layout else {
+        return Ok(ParsedSelectLayout::NoOp);
+    };
 
     match parse_layout_name(&layout) {
         Ok(layout) => Ok(ParsedSelectLayout::Request(Request::SelectLayout(
