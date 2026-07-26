@@ -59,6 +59,7 @@ use crate::cli_args::{
     Command, NewSessionArgs, SelectLayoutMode, SetOptionCommandKind, ShowOptionsCommandKind,
 };
 use crate::cli_response::tmux_cli_error_message;
+use crate::empty_server_lifecycle::shutdown_started_empty_server_at;
 use crate::tmux_error_surface::source_file_error_uses_stdout;
 
 pub(super) fn default_client_command() -> Command {
@@ -118,6 +119,9 @@ fn dispatch_commands(
         .count()
         > 1;
     let mut queued_attach_session = None::<QueuedAttachSession>;
+    let queue_includes_start_server = commands
+        .iter()
+        .any(|command| matches!(command, Command::StartServer(_)));
     for (index, command) in commands.iter().cloned().enumerate() {
         // A queued command may auto-start the daemon on a different endpoint
         // than the one resolved at process start (Windows rotates a stale
@@ -178,6 +182,10 @@ fn dispatch_commands(
         if attach_exit_code != 0 {
             exit_code = attach_exit_code;
         }
+    }
+    if queue_includes_start_server {
+        shutdown_started_empty_server_at(&startup.socket_path(), startup.endpoint.provenance())
+            .map_err(|error| ExitFailure::new(1, error.to_string()))?;
     }
     Ok(exit_code)
 }

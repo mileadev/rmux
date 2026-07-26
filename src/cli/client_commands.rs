@@ -1,8 +1,12 @@
 use std::ffi::OsStr;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use rmux_client::{
-    connect, detect_context, drive_control_mode, ClientContext, Connection, ControlTransition,
+    connect, detect_context, drive_control_mode_with_stdio, ClientContext, Connection,
+    ControlTransition,
 };
 use rmux_proto::request::{
     AttachSessionExt2Request, DetachClientExtRequest, ListClientsRequest, RefreshClientRequest,
@@ -15,16 +19,16 @@ use super::attach_transport::{
 };
 use super::json_output::{list_clients_json_format, write_list_clients_json};
 use super::{
-    connect_with_startserver, connect_with_startserver_outcome, current_terminal_size,
-    expect_command_success, finish_command_success, list_session_names,
-    resolve_session_target_spec, run_command, run_payload_command_resolved, unexpected_response,
-    ExitFailure, StartupOptions,
+    connect_with_startserver_outcome, current_terminal_size, expect_command_success,
+    finish_command_success, list_session_names, resolve_session_target_spec, run_command,
+    run_payload_command_resolved, unexpected_response, ExitFailure, StartupOptions,
 };
 use crate::cli_args::{
     AttachSessionArgs, Cli, DetachClientArgs, ListClientsArgs, RefreshClientArgs,
     SuspendClientArgs, SwitchClientArgs,
 };
 use crate::client_terminal::client_terminal_context_from_parts;
+use crate::empty_server_lifecycle::shutdown_started_empty_server_at;
 
 pub(super) fn client_terminal_context_from_cli(cli: &Cli) -> ClientTerminalContext {
     let mut terminal_features = cli
@@ -239,7 +243,12 @@ pub(super) fn run_control_mode(
     socket_path: &Path,
     startup: StartupOptions,
 ) -> Result<i32, ExitFailure> {
-    let connection = connect_with_startserver(socket_path, startup)?;
+    let cleanup_start_server =
+        control_initial_commands_include_start_server(cli.control_command_lines());
+    let endpoint = startup.endpoint.clone();
+    let outcome = connect_with_startserver_outcome(socket_path, startup)?;
+    let provenance = outcome.provenance;
+    let connection = outcome.into_connection();
     match connection
         .begin_control_mode_with_initial_commands(
             ControlMode::from_count(cli.control_mode),
@@ -249,7 +258,17 @@ pub(super) fn run_control_mode(
         .map_err(ExitFailure::from_client)?
     {
         ControlTransition::Upgraded(upgrade) => {
-            drive_control_mode(upgrade, &[]).map_err(ExitFailure::from_client)?;
+            let substantive_input = Arc::new(AtomicBool::new(false));
+            let input = ObservedControlInput {
+                inner: io::stdin(),
+                substantive_input: Arc::clone(&substantive_input),
+            };
+            drive_control_mode_with_stdio(upgrade, &[], input, io::stdout())
+                .map_err(ExitFailure::from_client)?;
+            if cleanup_start_server && !substantive_input.load(Ordering::SeqCst) {
+                shutdown_started_empty_server_at(&endpoint.socket_path(), provenance)
+                    .map_err(|error| ExitFailure::new(1, error.to_string()))?;
+            }
             Ok(0)
         }
         ControlTransition::Rejected(Response::Error(ErrorResponse { error })) => {
@@ -258,6 +277,33 @@ pub(super) fn run_control_mode(
         ControlTransition::Rejected(response) => {
             Err(unexpected_response("control-mode", &response))
         }
+    }
+}
+
+fn control_initial_commands_include_start_server(command_lines: &[String]) -> bool {
+    command_lines.iter().any(|command_line| {
+        command_line
+            .split_ascii_whitespace()
+            .next()
+            .is_some_and(|command| matches!(command, "start-server" | "start"))
+    })
+}
+
+struct ObservedControlInput<R> {
+    inner: R,
+    substantive_input: Arc<AtomicBool>,
+}
+
+impl<R: Read> Read for ObservedControlInput<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let bytes_read = self.inner.read(buffer)?;
+        if buffer[..bytes_read]
+            .iter()
+            .any(|byte| !byte.is_ascii_whitespace())
+        {
+            self.substantive_input.store(true, Ordering::SeqCst);
+        }
+        Ok(bytes_read)
     }
 }
 
