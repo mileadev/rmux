@@ -434,6 +434,9 @@ impl RequestHandler {
                 }
             }
         }
+        for event in post_lifecycle_events {
+            self.emit_prepared(event).await;
+        }
         if matches!(response, Response::KillPane(_)) {
             self.drain_removed_pane_output_subscriptions(&removed_subscription_keys)
                 .await;
@@ -468,9 +471,6 @@ impl RequestHandler {
             }
             if !destroyed_names.is_empty() {
                 let _ = self.queue_shutdown_if_server_empty().await;
-            }
-            for event in post_lifecycle_events {
-                self.emit_prepared(event).await;
             }
         }
 

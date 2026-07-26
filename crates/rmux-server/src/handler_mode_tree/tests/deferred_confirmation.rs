@@ -386,17 +386,19 @@ async fn confirmed_pane_kill_rejects_a_respawned_output_generation() {
 #[tokio::test]
 async fn confirmed_pane_kill_accepts_the_unchanged_output_generation() {
     let fixture = deferred_pane_fixture("tree-confirm-pane-current", 791).await;
-    fixture
-        .handler
-        .confirm_mode_tree_action_for_identity(
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fixture.handler.confirm_mode_tree_action_for_identity(
             fixture.action_identity,
             "kill selected pane?".to_owned(),
             ModeTreeDeferredAction::KillCurrentTreeSelection {
                 targets: vec![fixture.action],
             },
-        )
-        .await
-        .expect("the exact pane generation is killed");
+        ),
+    )
+    .await
+    .expect("confirmed pane kill must not wait behind prepared selection notifications")
+    .expect("the exact pane generation is killed");
 
     let state = fixture.handler.state.lock().await;
     let window = state
