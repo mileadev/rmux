@@ -10,6 +10,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $env:RUST_MIN_STACK = "8388608"
+$env:RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB = "1"
 $env:CARGO_TARGET_DIR = $TargetDir
 if (-not $EndpointSmokeOnly) {
     if (-not $env:CARGO_INCREMENTAL) {

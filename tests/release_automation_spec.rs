@@ -564,6 +564,7 @@ fn release_workflows_bind_perf_and_do_not_mask_snap_or_ctrl_failures() {
 fn github_windows_tests_keep_debug_daemons_inside_the_runner_job() {
     let ci = include_str!("../.github/workflows/ci.yml");
     let release = include_str!("../.github/workflows/release.yml");
+    let release_gate = include_str!("../scripts/release-review-gate-windows.ps1");
     let opt_in = "RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB: \"1\"";
 
     assert_eq!(
@@ -575,6 +576,10 @@ fn github_windows_tests_keep_debug_daemons_inside_the_runner_job() {
         release.matches(opt_in).count(),
         2,
         "both GitHub-hosted Windows release test surfaces must opt into the runner-owned job"
+    );
+    assert!(
+        release_gate.contains("$env:RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB = \"1\""),
+        "the native Windows release gate must opt into its caller-owned job"
     );
 }
 
