@@ -636,6 +636,9 @@ async fn clock_mode_fires_hooks_and_control_notifications_on_entry_and_exit() {
     let _attach_id = handler
         .register_attach(requester_pid, target.session_name().clone(), control_tx)
         .await;
+    handler
+        .refresh_automatic_window_name_for_pane_target(&target)
+        .await;
     let mut notifications =
         register_control_client(&handler, 700, target.session_name().clone()).await;
     let _ = drain_control_notifications(&mut notifications);
