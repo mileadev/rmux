@@ -25,6 +25,8 @@ use crate::status_jobs::StatusJobRuntime;
 #[cfg(windows)]
 use crate::terminal::TerminalProfile;
 
+#[path = "pane_terminals/applied_window_resize.rs"]
+mod applied_window_resize;
 #[cfg(windows)]
 #[path = "pane_terminals/deferred_initial.rs"]
 mod deferred_initial;
@@ -74,6 +76,7 @@ mod window_links;
 #[path = "pane_terminals_window.rs"]
 mod window_support;
 
+pub(crate) use applied_window_resize::{AppliedWindowResize, AppliedWindowResizeQueue};
 #[cfg(test)]
 pub(crate) use lifecycle_state::PaneLifecycleProcessState;
 use lifecycle_state::PaneLifecycleSpawn;
@@ -254,7 +257,7 @@ pub(crate) struct HandlerState {
     /// (`mutate_session_and_resize_window_terminal_with_family_if`) but has to
     /// publish asynchronously, so the chokepoint records the applied resize here
     /// and `RequestHandler::publish_applied_window_resizes` drains it.
-    applied_window_resizes: Vec<WindowTarget>,
+    applied_window_resizes: AppliedWindowResizeQueue,
     lifecycle_commit_order: crate::lifecycle_commit_order::LifecycleCommitOrder,
     status_jobs: StatusJobRuntime,
     startup_config_files: String,
@@ -363,13 +366,27 @@ impl HandlerState {
     /// Linked window aliases share one window identity, so the same window is
     /// only ever recorded once per publication round.
     pub(crate) fn record_applied_window_resize(&mut self, target: WindowTarget) {
-        if !self.applied_window_resizes.contains(&target) {
-            self.applied_window_resizes.push(target);
-        }
+        let window_id = self.window_id_at(&target);
+        self.applied_window_resizes.record(target, window_id);
     }
 
-    pub(crate) fn take_applied_window_resizes(&mut self) -> Vec<WindowTarget> {
-        std::mem::take(&mut self.applied_window_resizes)
+    /// Gives an explicit layout event ownership of the layout half of a
+    /// pending applied resize. The resize half remains pending.
+    pub(crate) fn claim_applied_resize_layout_change(&mut self, target: &WindowTarget) {
+        let window_id = self.window_id_at(target);
+        self.applied_window_resizes
+            .claim_layout_change(target, window_id);
+    }
+
+    pub(crate) fn take_applied_window_resizes(&mut self) -> Vec<AppliedWindowResize> {
+        self.applied_window_resizes.take()
+    }
+
+    fn window_id_at(&self, target: &WindowTarget) -> Option<rmux_core::WindowId> {
+        self.sessions
+            .session(target.session_name())
+            .and_then(|session| session.window_at(target.window_index()))
+            .map(rmux_core::Window::id)
     }
 
     pub(crate) fn reserve_lifecycle_commit_order(

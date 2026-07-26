@@ -223,6 +223,8 @@ impl RequestHandler {
             );
             let source_identity = PaneTransferWindowIdentity::capture(&state, &request.source);
             let target_identity = PaneTransferWindowIdentity::capture(&state, &request.target);
+            let same_pane_identity =
+                pane_targets_share_pane_identity(&state, &request.source, &request.target);
             let refresh_sessions =
                 pane_transfer_refresh_sessions(&state, &source_window, Some(&target_window));
             let response = match state.swap_pane(request) {
@@ -232,17 +234,18 @@ impl RequestHandler {
                 }
                 Err(error) => Response::Error(ErrorResponse { error }),
             };
-            let layout_targets = matches!(response, Response::SwapPane(_))
-                .then(|| {
-                    swap_layout_targets(
-                        &state,
-                        &source_window,
-                        &target_window,
-                        source_identity.as_ref(),
-                        target_identity.as_ref(),
-                    )
-                })
-                .unwrap_or_default();
+            let layout_targets = if matches!(response, Response::SwapPane(_)) && !same_pane_identity
+            {
+                swap_layout_targets(
+                    &state,
+                    &source_window,
+                    &target_window,
+                    source_identity.as_ref(),
+                    target_identity.as_ref(),
+                )
+            } else {
+                Vec::new()
+            };
             (response, layout_targets, refresh_sessions)
         };
 
@@ -658,6 +661,22 @@ fn pane_transfer_refresh_sessions(
         }
     }
     sessions
+}
+
+fn pane_targets_share_pane_identity(
+    state: &HandlerState,
+    source: &PaneTarget,
+    target: &PaneTarget,
+) -> bool {
+    let pane_identity = |target: &PaneTarget| {
+        let session = state.sessions.session(target.session_name())?;
+        let window = session.window_at(target.window_index())?;
+        let pane = window.pane(target.pane_index())?;
+        Some((window.id(), pane.id()))
+    };
+    pane_identity(source)
+        .zip(pane_identity(target))
+        .is_some_and(|(source, target)| source == target)
 }
 
 fn swap_layout_targets(

@@ -276,7 +276,7 @@ impl RequestHandler {
         let adjustment = request.adjustment;
         let response_target =
             PaneTarget::with_window(session_name.clone(), window_index, pane_index);
-        let (response, refresh_sessions) = {
+        let (response, refresh_sessions, layout_changed) = {
             let mut state = self.state.lock().await;
             match adjustment {
                 ResizePaneAdjustment::TrimBelow => {
@@ -287,48 +287,97 @@ impl RequestHandler {
                         }),
                         Err(error) => Response::Error(ErrorResponse { error }),
                     };
-                    (response, Vec::new())
+                    (response, Vec::new(), false)
                 }
                 _ => match state.mutate_session_and_resize_window_terminal_with_family(
                     &session_name,
                     window_index,
                     |session| {
-                        session.resize_pane_in_window(window_index, pane_index, adjustment)?;
-
-                        Ok(ResizePaneResponse {
-                            target: response_target,
+                        let layout_changed = resize_pane_layout_changed(
+                            session,
+                            window_index,
+                            pane_index,
                             adjustment,
-                        })
+                        )?;
+
+                        Ok((
+                            ResizePaneResponse {
+                                target: response_target,
+                                adjustment,
+                            },
+                            layout_changed,
+                        ))
                     },
                 ) {
-                    Ok((response, refresh_sessions)) => {
-                        (Response::ResizePane(response), refresh_sessions)
-                    }
-                    Err(error) => (Response::Error(ErrorResponse { error }), Vec::new()),
+                    Ok(((response, layout_changed), refresh_sessions)) => (
+                        Response::ResizePane(response),
+                        refresh_sessions,
+                        layout_changed,
+                    ),
+                    Err(error) => (Response::Error(ErrorResponse { error }), Vec::new(), false),
                 },
             }
         };
 
-        if matches!(response, Response::ResizePane(_))
-            && !matches!(adjustment, ResizePaneAdjustment::NoOp)
-        {
-            self.emit(LifecycleEvent::WindowLayoutChanged {
-                target: WindowTarget::with_window(session_name.clone(), window_index),
-            })
-            .await;
-            // See handle_select_pane: skip the refresh (and its deferred-pane
-            // wait on Windows) when nothing is attached to the session.
-            if refresh_sessions.is_empty() {
-                if self.attached_count(&session_name).await > 0 {
-                    self.refresh_attached_session(&session_name).await;
+        if matches!(response, Response::ResizePane(_)) {
+            if layout_changed {
+                self.emit(LifecycleEvent::WindowLayoutChanged {
+                    target: WindowTarget::with_window(session_name.clone(), window_index),
+                })
+                .await;
+            }
+            if !matches!(adjustment, ResizePaneAdjustment::NoOp) {
+                // See handle_select_pane: skip the refresh (and its
+                // deferred-pane wait on Windows) when nothing is attached to
+                // the session.
+                if refresh_sessions.is_empty() {
+                    if self.attached_count(&session_name).await > 0 {
+                        self.refresh_attached_session(&session_name).await;
+                    }
+                } else {
+                    self.refresh_linked_window_sessions(refresh_sessions).await;
                 }
-            } else {
-                self.refresh_linked_window_sessions(refresh_sessions).await;
             }
         }
 
         response
     }
+}
+
+#[derive(PartialEq, Eq)]
+struct LayoutNotificationState {
+    layout: String,
+    zoomed: bool,
+    active_pane_index: u32,
+}
+
+pub(super) fn resize_pane_layout_changed(
+    session: &mut rmux_core::Session,
+    window_index: u32,
+    pane_index: u32,
+    adjustment: ResizePaneAdjustment,
+) -> Result<bool, rmux_proto::RmuxError> {
+    let before = layout_notification_state(session, window_index)?;
+    session.resize_pane_in_window(window_index, pane_index, adjustment)?;
+    let after = layout_notification_state(session, window_index)?;
+    Ok(before != after)
+}
+
+fn layout_notification_state(
+    session: &rmux_core::Session,
+    window_index: u32,
+) -> Result<LayoutNotificationState, rmux_proto::RmuxError> {
+    let window = session.window_at(window_index).ok_or_else(|| {
+        rmux_proto::RmuxError::invalid_target(
+            format!("{}:{window_index}", session.name()),
+            "window index does not exist in session",
+        )
+    })?;
+    Ok(LayoutNotificationState {
+        layout: window.layout_dump(),
+        zoomed: window.is_zoomed(),
+        active_pane_index: window.active_pane_index(),
+    })
 }
 
 fn layout_window_index(

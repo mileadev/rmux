@@ -4,8 +4,8 @@ use rmux_core::{EnvironmentStore, HookStore, OptionStore, PaneId, Session, Sessi
 use rmux_proto::{RmuxError, SessionName, TerminalPixels, WindowTarget};
 
 use super::{
-    session_not_found, HandlerState, PaneExitMetadata, PaneLifecycleState, WindowLinkGroup,
-    WindowLinkSlot,
+    session_not_found, AppliedWindowResizeQueue, HandlerState, PaneExitMetadata,
+    PaneLifecycleState, WindowLinkGroup, WindowLinkSlot,
 };
 
 pub(crate) struct SessionTransferSnapshot {
@@ -22,7 +22,7 @@ pub(crate) struct SessionTransferSnapshot {
     window_link_occurrences: HashMap<WindowLinkSlot, super::WindowLinkOccurrenceId>,
     next_window_link_group_id: u64,
     next_window_link_occurrence_id: u64,
-    applied_window_resizes: Vec<WindowTarget>,
+    applied_window_resizes: AppliedWindowResizeQueue,
 }
 
 impl SessionTransferSnapshot {

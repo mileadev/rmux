@@ -951,13 +951,16 @@ pub(in crate::handler) fn prepare_applied_window_resize_events(
 ) -> Vec<crate::handler::QueuedLifecycleEvent> {
     let targets = state.take_applied_window_resizes();
     let mut prepared = Vec::with_capacity(targets.len().saturating_mul(2));
-    for target in targets {
-        prepared.push(crate::handler::prepare_lifecycle_event(
-            state,
-            &LifecycleEvent::WindowLayoutChanged {
-                target: target.clone(),
-            },
-        ));
+    for resize in targets {
+        let (target, layout_change_prepared) = resize.into_parts();
+        if !layout_change_prepared {
+            prepared.push(crate::handler::prepare_lifecycle_event(
+                state,
+                &LifecycleEvent::WindowLayoutChanged {
+                    target: target.clone(),
+                },
+            ));
+        }
         prepared.push(crate::handler::prepare_lifecycle_event(
             state,
             &LifecycleEvent::WindowResized { target },

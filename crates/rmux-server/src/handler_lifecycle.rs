@@ -1363,6 +1363,9 @@ pub(in crate::handler) fn prepare_lifecycle_event(
     state: &mut crate::pane_terminals::HandlerState,
     event: &LifecycleEvent,
 ) -> QueuedLifecycleEvent {
+    if let LifecycleEvent::WindowLayoutChanged { target } = event {
+        state.claim_applied_resize_layout_change(target);
+    }
     let event = prepare_unsequenced_lifecycle_event(state, event);
     sequence_prepared_lifecycle_event(state, event)
 }

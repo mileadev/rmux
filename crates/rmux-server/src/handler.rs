@@ -1454,6 +1454,10 @@ mod zoom_tests;
 mod layout_tests;
 
 #[cfg(test)]
+#[path = "handler_layout_notification_tests.rs"]
+mod layout_notification_tests;
+
+#[cfg(test)]
 #[path = "handler_show_tests.rs"]
 mod show_tests;
 

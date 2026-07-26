@@ -162,7 +162,7 @@ impl RequestHandler {
     ) -> Response {
         let session_name = request.target.session_name().clone();
         let adjustment = request.adjustment;
-        let (response, window_index, refresh_sessions) = {
+        let (response, window_index, refresh_sessions, layout_changed) = {
             let mut state = self.state.lock().await;
             let target = match resolve_pane_target_ref(&state, &request.target) {
                 Ok(target) => target,
@@ -176,7 +176,7 @@ impl RequestHandler {
             let window_index = target.window_index();
             let pane_index = target.pane_index();
             let response_target = target.clone();
-            let (response, refresh_sessions) = match adjustment {
+            let (response, refresh_sessions, layout_changed) = match adjustment {
                 ResizePaneAdjustment::TrimBelow => {
                     let response = match state.trim_pane_below_cursor(&response_target) {
                         Ok(()) => Response::ResizePane(ResizePaneResponse {
@@ -185,44 +185,56 @@ impl RequestHandler {
                         }),
                         Err(error) => Response::Error(ErrorResponse { error }),
                     };
-                    (response, Vec::new())
+                    (response, Vec::new(), false)
                 }
                 _ => match state.mutate_session_and_resize_window_terminal_with_family(
                     &session_name,
                     window_index,
                     |session| {
-                        session.resize_pane_in_window(window_index, pane_index, adjustment)?;
-                        Ok(ResizePaneResponse {
-                            target: response_target,
+                        let layout_changed = super::pane_layout::resize_pane_layout_changed(
+                            session,
+                            window_index,
+                            pane_index,
                             adjustment,
-                        })
+                        )?;
+                        Ok((
+                            ResizePaneResponse {
+                                target: response_target,
+                                adjustment,
+                            },
+                            layout_changed,
+                        ))
                     },
                 ) {
-                    Ok((response, refresh_sessions)) => {
-                        (Response::ResizePane(response), refresh_sessions)
-                    }
-                    Err(error) => (Response::Error(ErrorResponse { error }), Vec::new()),
+                    Ok(((response, layout_changed), refresh_sessions)) => (
+                        Response::ResizePane(response),
+                        refresh_sessions,
+                        layout_changed,
+                    ),
+                    Err(error) => (Response::Error(ErrorResponse { error }), Vec::new(), false),
                 },
             };
-            (response, window_index, refresh_sessions)
+            (response, window_index, refresh_sessions, layout_changed)
         };
 
-        if matches!(response, Response::ResizePane(_))
-            && !matches!(adjustment, rmux_proto::ResizePaneAdjustment::NoOp)
-        {
-            self.emit(LifecycleEvent::WindowLayoutChanged {
-                target: WindowTarget::with_window(session_name.clone(), window_index),
-            })
-            .await;
-            // See handle_resize_pane in layout.rs: skip the refresh (and its
-            // Windows deferred-pane wait) when nothing is attached so a
-            // still-starting sibling cannot stall a detached resize.
-            if refresh_sessions.is_empty() {
-                if self.attached_count(&session_name).await > 0 {
-                    self.refresh_attached_session(&session_name).await;
+        if matches!(response, Response::ResizePane(_)) {
+            if layout_changed {
+                self.emit(LifecycleEvent::WindowLayoutChanged {
+                    target: WindowTarget::with_window(session_name.clone(), window_index),
+                })
+                .await;
+            }
+            if !matches!(adjustment, ResizePaneAdjustment::NoOp) {
+                // See handle_resize_pane in layout.rs: skip the refresh (and
+                // its Windows deferred-pane wait) when nothing is attached so
+                // a still-starting sibling cannot stall a detached resize.
+                if refresh_sessions.is_empty() {
+                    if self.attached_count(&session_name).await > 0 {
+                        self.refresh_attached_session(&session_name).await;
+                    }
+                } else {
+                    self.refresh_linked_window_sessions(refresh_sessions).await;
                 }
-            } else {
-                self.refresh_linked_window_sessions(refresh_sessions).await;
             }
         }
 
