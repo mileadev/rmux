@@ -12,7 +12,7 @@ use super::{
     DeferredInitialPaneConsoleInputAction, DeferredInitialPaneIdentity, DeferredInitialPaneInput,
     DeferredInitialPaneInputDrain, DeferredInitialPaneInputFlush, DeferredInitialPaneSpawn,
     HandlerState, InitialPaneSpawnOptions, PaneExitMetadata, PaneLifecycleSpawn, PaneOutputSpawn,
-    StartingPane,
+    StartingPane, WindowNameApplication,
 };
 
 const STARTING_PANE_INPUT_MAX_BYTES: usize = 64 * 1024;
@@ -66,12 +66,25 @@ impl HandlerState {
             requested_cwd,
         )?;
         crate::terminal::validate_windows_process_command_for_profile(&profile, spawn.command)?;
-        let automatic_window_name = profile.automatic_window_name(spawn.command);
         let runtime_window_name = profile.runtime_window_name(spawn.command);
+        let initial_window_name = if crate::automatic_rename::automatic_rename_enabled(
+            &self.options,
+            session_name,
+            pane.window_index,
+        ) {
+            profile.automatic_window_name(spawn.command)
+        } else {
+            runtime_window_name.clone()
+        };
         let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
         let respawn_shell = profile.shell().to_path_buf();
-        self.apply_automatic_window_name(session_name, pane.window_index, automatic_window_name)?;
+        self.apply_window_name(
+            session_name,
+            pane.window_index,
+            initial_window_name,
+            WindowNameApplication::Initial,
+        )?;
         self.terminals.insert_pending_session(
             runtime_session_name.clone(),
             crate::terminal::SessionBaseEnvironment::from_profile(&profile),

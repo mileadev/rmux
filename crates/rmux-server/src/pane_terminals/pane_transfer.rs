@@ -150,6 +150,32 @@ impl HandlerState {
             return Err(RmuxError::Server("sessions are grouped".to_owned()));
         }
 
+        let creates_window = self
+            .sessions
+            .session(request.source.session_name())
+            .and_then(|session| session.window_at(request.source.window_index()))
+            .is_some_and(|window| window.pane_count() > 1);
+        let initial_name = if !explicit_name
+            && creates_window
+            && !crate::automatic_rename::automatic_rename_enabled_for_new_window(
+                &self.options,
+                &destination_session_name,
+            ) {
+            self.pane_runtime_window_name_in_window(
+                request.source.session_name(),
+                request.source.window_index(),
+                request.source.pane_index(),
+            )?
+            .filter(|name| !name.is_empty())
+        } else {
+            None
+        };
+        if let Some(name) = initial_name.as_ref() {
+            // Feed the stored runtime name into the core creation transaction.
+            // The original request remains implicit for marker semantics.
+            request.name = Some(name.clone());
+        }
+
         let response = if shares_grouped_window_state {
             self.break_pane_within_group(request, destination_session_name)
         } else {
@@ -160,6 +186,11 @@ impl HandlerState {
             // source's auto-name marker, which would otherwise override the
             // explicit name on the next pane activity callback.
             self.clear_auto_named_window_family(
+                response.target.session_name(),
+                response.target.window_index(),
+            );
+        } else if initial_name.is_some() {
+            self.mark_auto_named_window(
                 response.target.session_name(),
                 response.target.window_index(),
             );

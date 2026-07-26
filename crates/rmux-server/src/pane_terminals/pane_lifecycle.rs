@@ -17,7 +17,7 @@ use super::lifecycle_state::terminal_size_from_geometry;
 use super::{
     pane_terminal_geometry_for_session, session_not_found, HandlerState, InitialPaneSpawnOptions,
     KilledPaneHookContext, KilledPaneResult, PaneLifecycleSpawn, PaneOutputSpawn,
-    SessionTransferSnapshot, WindowSpawnOptions,
+    SessionTransferSnapshot, WindowNameApplication, WindowSpawnOptions,
 };
 
 #[path = "pane_lifecycle/preview.rs"]
@@ -229,8 +229,16 @@ impl HandlerState {
             Some(pane.id),
             requested_cwd,
         )?;
-        let automatic_window_name = profile.automatic_window_name(spawn.command);
         let runtime_window_name = profile.runtime_window_name(spawn.command);
+        let initial_window_name = if crate::automatic_rename::automatic_rename_enabled(
+            &self.options,
+            session_name,
+            pane.window_index,
+        ) {
+            profile.automatic_window_name(spawn.command)
+        } else {
+            runtime_window_name.clone()
+        };
         let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
         let respawn_shell = profile.shell().to_path_buf();
@@ -245,7 +253,12 @@ impl HandlerState {
         #[cfg(windows)]
         let exit_watcher = clone_terminal_for_exit_watcher(&terminal, session_name, pane.id)?;
 
-        self.apply_automatic_window_name(session_name, pane.window_index, automatic_window_name)?;
+        self.apply_window_name(
+            session_name,
+            pane.window_index,
+            initial_window_name,
+            WindowNameApplication::Initial,
+        )?;
 
         self.terminals
             .insert_session(runtime_session_name.clone(), pane.id, terminal)?;
@@ -425,8 +438,16 @@ impl HandlerState {
         if let Some(shell) = spawn.respawn_shell {
             profile = profile.with_respawn_shell(shell.to_path_buf());
         }
-        let automatic_window_name = profile.automatic_window_name(spawn.command);
         let runtime_window_name = profile.runtime_window_name(spawn.command);
+        let initial_window_name = if crate::automatic_rename::automatic_rename_enabled(
+            &self.options,
+            session_name,
+            window_index,
+        ) {
+            profile.automatic_window_name(spawn.command)
+        } else {
+            runtime_window_name.clone()
+        };
         let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
         let respawn_shell = profile.shell().to_path_buf();
@@ -441,7 +462,12 @@ impl HandlerState {
         #[cfg(windows)]
         let exit_watcher = clone_terminal_for_exit_watcher(&terminal, session_name, pane_id)?;
 
-        self.apply_automatic_window_name(session_name, window_index, automatic_window_name)?;
+        self.apply_window_name(
+            session_name,
+            window_index,
+            initial_window_name,
+            WindowNameApplication::Initial,
+        )?;
 
         self.terminals.insert_pane(
             runtime_session_name.clone(),
@@ -996,7 +1022,12 @@ impl HandlerState {
                 pane_exit_callback,
             },
         )?;
-        self.apply_automatic_window_name(&session_name, window_index, automatic_window_name)?;
+        self.apply_window_name(
+            &session_name,
+            window_index,
+            automatic_window_name,
+            WindowNameApplication::AutomaticUpdate,
+        )?;
         self.record_pane_lifecycle_spawn(PaneLifecycleSpawn {
             session_id,
             window_id,

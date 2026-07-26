@@ -97,6 +97,12 @@ pub(crate) use pane_transcripts::PaneCaptureRequest;
 pub(crate) use window_links::WindowLinkOccurrenceId;
 use window_links::{WindowLinkGroup, WindowLinkSlot};
 
+#[derive(Clone, Copy)]
+enum WindowNameApplication {
+    Initial,
+    AutomaticUpdate,
+}
+
 #[derive(Clone)]
 pub(crate) struct WindowSpawnOptions<'a> {
     pub(crate) start_directory: Option<&'a Path>,
@@ -531,13 +537,14 @@ impl HandlerState {
             .unwrap_or(1000)
     }
 
-    fn apply_automatic_window_name(
+    fn apply_window_name(
         &mut self,
         session_name: &SessionName,
         window_index: u32,
-        automatic_window_name: Option<String>,
+        candidate_name: Option<String>,
+        application: WindowNameApplication,
     ) -> Result<(), RmuxError> {
-        let Some(window_name) = automatic_window_name else {
+        let Some(window_name) = candidate_name else {
             return Ok(());
         };
         let tracked = self.tracks_auto_named_window(session_name, window_index);
@@ -546,15 +553,19 @@ impl HandlerState {
             .session(session_name)
             .ok_or_else(|| session_not_found(session_name))?;
         let should_update = match session.window_at(window_index) {
-            Some(window) => {
-                crate::automatic_rename::window_allows_automatic_rename(
-                    &self.options,
-                    session_name,
-                    window_index,
-                    window,
-                    tracked,
-                ) && window.name().is_none()
-            }
+            Some(window) if window.name().is_none() => match application {
+                WindowNameApplication::Initial => true,
+                WindowNameApplication::AutomaticUpdate => {
+                    crate::automatic_rename::window_allows_automatic_rename(
+                        &self.options,
+                        session_name,
+                        window_index,
+                        window,
+                        tracked,
+                    )
+                }
+            },
+            Some(_) => false,
             None => {
                 return Err(RmuxError::invalid_target(
                     format!("{session_name}:{window_index}"),

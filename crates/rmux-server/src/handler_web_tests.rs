@@ -182,6 +182,48 @@ async fn shutdown_drains_a_web_session_mutation_admitted_before_close() {
 }
 
 #[tokio::test]
+async fn web_new_window_uses_shared_initial_name_primitive_when_automatic_rename_is_off() {
+    let handler = RequestHandler::new();
+    let session_name = new_session(&handler, "web-initial-window-name").await;
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Global,
+                option: OptionName::AutomaticRename,
+                value: "off".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+    let session_target = {
+        let state = handler.state.lock().await;
+        let session = state
+            .sessions
+            .session(&session_name)
+            .expect("session exists");
+        crate::web::WebSessionTarget::new(session_name.clone(), session.id())
+    };
+
+    handler
+        .web_session_new_window(&session_target, std::process::id())
+        .await
+        .expect("Web new-window succeeds");
+
+    let state = handler.state.lock().await;
+    let window = state
+        .sessions
+        .session(&session_name)
+        .and_then(|session| session.window_at(1))
+        .expect("Web created a second window");
+    let runtime_name = state
+        .pane_runtime_window_name_in_window(&session_name, 1, 0)
+        .expect("Web pane has runtime state")
+        .expect("Web pane has a useful runtime name");
+    assert_eq!(window.name(), Some(runtime_name.as_str()));
+}
+
+#[tokio::test]
 async fn web_share_create_starts_lazy_listener() {
     let handler = handler_with_automatic_web_port();
     let session_name = new_session(&handler, "lazy-start").await;

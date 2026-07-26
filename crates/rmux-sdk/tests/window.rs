@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use rmux_proto::{
     encode_frame, FrameDecoder, HasSessionRequest, LinkWindowRequest, ListPanesRequest,
-    ListWindowsRequest, NewWindowRequest, Request, Response, WindowListEntry, WindowTarget,
+    ListWindowsRequest, NewWindowRequest, OptionName, Request, Response, ScopeSelector,
+    SetOptionMode, SetOptionRequest, WindowListEntry, WindowTarget,
 };
 use rmux_sdk::{
     EnsureSession, RmuxBuilder, RmuxError, SessionName, SplitDirection, WindowCloseOutcome,
@@ -27,6 +28,47 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 static LIVE_DAEMON_LOCK: common::unix_smoke::LiveDaemonLock =
     common::unix_smoke::LiveDaemonLock::new();
 static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
+
+#[tokio::test]
+async fn sdk_creation_requests_receive_initial_names_when_automatic_rename_is_off() -> TestResult {
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("window-initial-name-off").await?;
+    let set_option = framed_request(
+        harness.socket_path(),
+        Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::AutomaticRename,
+            value: "off".to_owned(),
+            mode: SetOptionMode::Replace,
+        }),
+    )
+    .await?;
+    assert!(matches!(set_option, Response::SetOption(_)));
+
+    let rmux = harness.rmux();
+    let alpha = session_name("sdkinitialnameoff");
+    let session = EnsureSession::named(alpha.clone())
+        .create_only()
+        .argv(["/bin/sleep", "60"])
+        .ensure(&rmux)
+        .await?;
+    let _window = session
+        .new_window_with()
+        .detached(true)
+        .spawn(["/bin/sleep", "60"])
+        .await?;
+
+    let windows = raw_list_windows(harness.socket_path(), alpha).await?;
+    let names = [0_u32, 1_u32].map(|window_index| {
+        windows
+            .iter()
+            .find(|entry| entry.target.window_index() == window_index)
+            .and_then(|entry| entry.name.as_deref())
+    });
+    assert_eq!(names, [Some("sleep"), Some("sleep")]);
+
+    harness.finish().await
+}
 
 #[tokio::test]
 async fn session_new_window_creates_live_window_and_selects_it_by_default() -> TestResult {
