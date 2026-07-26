@@ -332,8 +332,14 @@ fn prepare_control_size_layout_echo_events(
     else {
         let applied_resizes = state.take_applied_window_resizes();
         let mut prepared = Vec::with_capacity(applied_resizes.len().saturating_mul(2));
-        for target in &applied_resizes {
-            prepare_applied_window_resize_pair(state, target, &mut prepared);
+        for resize in applied_resizes {
+            let (target, layout_change_prepared) = resize.into_parts();
+            prepare_applied_window_resize_pair(
+                state,
+                &target,
+                layout_change_prepared,
+                &mut prepared,
+            );
         }
         return prepared;
     };
@@ -342,12 +348,19 @@ fn prepare_control_size_layout_echo_events(
         .keys()
         .map(|window_index| WindowTarget::with_window(session_name.clone(), *window_index))
         .collect::<Vec<_>>();
-    let applied_resizes = state.take_applied_window_resizes();
+    let applied_resizes = state
+        .take_applied_window_resizes()
+        .into_iter()
+        .map(crate::pane_terminals::AppliedWindowResize::into_parts)
+        .collect::<Vec<_>>();
     let layout_target_set = layout_targets.iter().cloned().collect::<HashSet<_>>();
-    let applied_resize_set = applied_resizes.iter().cloned().collect::<HashSet<_>>();
+    let applied_resize_set = applied_resizes
+        .iter()
+        .map(|(target, _)| target.clone())
+        .collect::<HashSet<_>>();
     let insert_at = applied_resizes
         .iter()
-        .position(|target| layout_target_set.contains(target))
+        .position(|(target, _)| layout_target_set.contains(target))
         .unwrap_or(applied_resizes.len());
     let mut prepared = Vec::with_capacity(
         layout_targets
@@ -355,7 +368,7 @@ fn prepare_control_size_layout_echo_events(
             .saturating_add(applied_resizes.len().saturating_mul(2)),
     );
 
-    for (index, target) in applied_resizes.iter().enumerate() {
+    for (index, (target, layout_change_prepared)) in applied_resizes.iter().enumerate() {
         if index == insert_at {
             prepare_control_size_layout_batch(
                 state,
@@ -365,7 +378,12 @@ fn prepare_control_size_layout_echo_events(
             );
         }
         if !layout_target_set.contains(target) {
-            prepare_applied_window_resize_pair(state, target, &mut prepared);
+            prepare_applied_window_resize_pair(
+                state,
+                target,
+                *layout_change_prepared,
+                &mut prepared,
+            );
         }
     }
     if insert_at == applied_resizes.len() {
@@ -406,14 +424,17 @@ fn prepare_control_size_layout_batch(
 fn prepare_applied_window_resize_pair(
     state: &mut HandlerState,
     target: &WindowTarget,
+    layout_change_prepared: bool,
     prepared: &mut Vec<QueuedLifecycleEvent>,
 ) {
-    prepared.push(super::super::prepare_lifecycle_event(
-        state,
-        &LifecycleEvent::WindowLayoutChanged {
-            target: target.clone(),
-        },
-    ));
+    if !layout_change_prepared {
+        prepared.push(super::super::prepare_lifecycle_event(
+            state,
+            &LifecycleEvent::WindowLayoutChanged {
+                target: target.clone(),
+            },
+        ));
+    }
     prepared.push(super::super::prepare_lifecycle_event(
         state,
         &LifecycleEvent::WindowResized {
