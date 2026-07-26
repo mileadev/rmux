@@ -447,3 +447,6 @@ mod command_blocks;
 
 #[path = "handler_scripting_tests/parser_flags.rs"]
 mod parser_flags;
+
+#[path = "handler_scripting_tests/parser_option_flags.rs"]
+mod parser_option_flags;

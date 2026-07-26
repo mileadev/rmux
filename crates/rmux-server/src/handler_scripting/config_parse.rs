@@ -113,7 +113,10 @@ pub(super) fn parse_set_option_invocation(
                     .expect("peeked set-option flag cluster must be present");
                 flags.apply_cluster(command_name, &token, force_window)?;
             }
-            _ => break,
+            _ => {
+                reject_unknown_option_before_positional(command_name, token)?;
+                break;
+            }
         }
     }
 
@@ -520,7 +523,10 @@ pub(super) fn parse_show_options(
                     }
                 }
             }
-            _ => break,
+            _ => {
+                reject_unknown_option_before_positional(command_name, token)?;
+                break;
+            }
         }
     }
 

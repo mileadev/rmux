@@ -4,7 +4,7 @@ use crate::handler::scripting_support::parse_request_from_parts;
 use rmux_core::{OptionStore, SessionStore};
 use rmux_proto::RmuxError;
 
-const UNKNOWN_FLAG_COMMANDS: [(&str, &str); 6] = [
+const UNKNOWN_FLAG_COMMANDS: [(&str, &str); 13] = [
     ("set-buffer", "set-buffer -x payload"),
     ("rename-session", "rename-session -x"),
     ("rename-window", "rename-window -x"),
@@ -14,9 +14,17 @@ const UNKNOWN_FLAG_COMMANDS: [(&str, &str); 6] = [
         "set-environment",
         "set-environment -g -x parser-flag-poison",
     ),
+    ("set-option", "set-option -x value"),
+    ("set-window-option", "set-window-option -x value"),
+    ("show-options", "show-options -x"),
+    ("show-window-options", "show-window-options -x"),
+    ("unbind-key", "unbind-key -x"),
+    ("list-keys", "list-keys -x"),
+    ("select-layout", "select-layout -x"),
 ];
 
 const DAEMON_TEST_STACK_SIZE: usize = 8 * 1024 * 1024;
+const NEW_UNKNOWN_FLAG_COMMAND_START: usize = 6;
 
 fn run_on_daemon_test_stack<F, Fut>(test: F)
 where
@@ -462,4 +470,38 @@ async fn parsed_queue_rejects_set_environment_unknown_flag_without_follow_on_eff
     assert_named_buffer_absent(&handler, canary).await;
     assert_global_environment_absent(&handler, "-x").await;
     assert_stable_session(&handler, &alpha, pane_id).await;
+}
+
+#[test]
+fn parsed_queue_rejects_new_unknown_flags_without_follow_on_effects() {
+    run_on_daemon_test_stack(parsed_queue_rejects_new_unknown_flags_without_follow_on_effects_body);
+}
+
+async fn parsed_queue_rejects_new_unknown_flags_without_follow_on_effects_body() {
+    for (index, (command, invalid)) in UNKNOWN_FLAG_COMMANDS[NEW_UNKNOWN_FLAG_COMMAND_START..]
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        let handler = RequestHandler::new();
+        let alpha = session_name("queue-new-parser-flags");
+        let pane_id = create_stable_session(&handler, &alpha).await;
+        let canary = format!("queue-new-parser-flag-{index}");
+        let commands = CommandParser::new()
+            .parse(&format!("{invalid} ; set-buffer -b {canary} must-not-run"))
+            .unwrap_or_else(|error| panic!("multi-command queue parses for {invalid}: {error}"));
+
+        let error = handler
+            .execute_parsed_commands_for_test(std::process::id(), commands)
+            .await
+            .expect_err("unknown option must reject before its positional tail");
+
+        assert_eq!(
+            error,
+            RmuxError::Server(format!("command {command}: unknown flag -x")),
+            "{invalid} returned the wrong parser error"
+        );
+        assert_named_buffer_absent(&handler, &canary).await;
+        assert_stable_session(&handler, &alpha, pane_id).await;
+    }
 }

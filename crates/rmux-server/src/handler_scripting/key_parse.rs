@@ -261,6 +261,7 @@ pub(super) fn parse_unbind_key(mut args: CommandTokens) -> Result<Request, RmuxE
             }
             _ => {
                 let Some(cluster) = parse_compact_flag_cluster(&token, "anq", "T") else {
+                    reject_unknown_option_before_positional("unbind-key", &token)?;
                     break;
                 };
                 let _ = args.optional();
@@ -340,6 +341,7 @@ pub(super) fn parse_list_keys(mut args: CommandTokens) -> Result<Request, RmuxEr
             }
             _ => {
                 let Some(cluster) = parse_compact_flag_cluster(&token, "1aNr", "FOPT") else {
+                    reject_unknown_option_before_positional("list-keys", &token)?;
                     break;
                 };
                 let _ = args.optional();

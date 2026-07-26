@@ -111,6 +111,46 @@ fn direct_cli_rejects_unknown_options_before_command_tails() {
 }
 
 #[test]
+fn direct_cli_rejects_new_unknown_option_shapes_before_positionals() {
+    for (command, arguments) in [
+        ("set-option", &["-x", "value"][..]),
+        ("set-option", &["--bogus", "value"][..]),
+        ("set-option", &["-gx", "value"][..]),
+        ("set-window-option", &["-x", "value"][..]),
+        ("set-window-option", &["--bogus", "value"][..]),
+        ("set-window-option", &["-gx", "value"][..]),
+        ("show-options", &["-x"][..]),
+        ("show-options", &["--bogus"][..]),
+        ("show-options", &["-gx"][..]),
+        ("show-window-options", &["-x"][..]),
+        ("show-window-options", &["--bogus"][..]),
+        ("show-window-options", &["-gx"][..]),
+        ("unbind-key", &["-x"][..]),
+        ("unbind-key", &["--bogus"][..]),
+        ("unbind-key", &["-nx"][..]),
+        ("list-keys", &["-x"][..]),
+        ("list-keys", &["--bogus"][..]),
+        ("list-keys", &["-ax"][..]),
+        ("select-layout", &["-x"][..]),
+        ("select-layout", &["--bogus"][..]),
+        ("select-layout", &["-nx"][..]),
+    ] {
+        let mut invocation = Vec::with_capacity(arguments.len() + 1);
+        invocation.push(command);
+        invocation.extend_from_slice(arguments);
+
+        let error =
+            parse_args(&invocation).expect_err("unknown option must fail direct CLI parsing");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("unknown flag") || rendered.contains("unexpected argument"),
+            "unexpected direct CLI error for {command} {arguments:?}: {rendered}"
+        );
+    }
+}
+
+#[test]
 fn direct_cli_stops_parsing_options_after_the_first_positional() {
     for arguments in [
         &["rename-session", "renamed", "-t", "audit"][..],

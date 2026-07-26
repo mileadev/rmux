@@ -105,8 +105,8 @@ pub(super) fn parse_select_layout(
     let mut old_layout = false;
     let mut previous_layout = false;
 
-    while let Some(token) = args.peek() {
-        match token {
+    while let Some(token) = args.peek().map(str::to_owned) {
+        match token.as_str() {
             "--" => {
                 let _ = args.optional();
                 break;
@@ -131,7 +131,27 @@ pub(super) fn parse_select_layout(
                 let _ = args.optional();
                 target = Some(parse_select_layout_target(args.required("-t target")?)?);
             }
-            _ => break,
+            _ => {
+                let Some(cluster) = parse_compact_flag_cluster(&token, "Enop", "t") else {
+                    reject_unknown_option_before_positional("select-layout", &token)?;
+                    break;
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('E') => spread = true,
+                        CompactFlag::Bare('n') => next_layout = true,
+                        CompactFlag::Bare('o') => old_layout = true,
+                        CompactFlag::Bare('p') => previous_layout = true,
+                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                            target = Some(parse_select_layout_target(
+                                compact_flag.value_or_next(&mut args, "-t target")?,
+                            )?);
+                        }
+                        _ => unreachable!("compact select-layout flags are prevalidated"),
+                    }
+                }
+            }
         }
     }
 
@@ -597,3 +617,7 @@ fn resize_pane_adjustment(
         (None, None, None) => None,
     }
 }
+
+#[cfg(test)]
+#[path = "layout_parse_tests.rs"]
+mod tests;
