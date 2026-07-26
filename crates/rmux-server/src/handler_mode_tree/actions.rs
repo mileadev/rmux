@@ -321,13 +321,8 @@ impl RequestHandler {
             Ok(outcome) => outcome,
             Err(failure) => return Err(self.finish_attached_switch_failure(failure).await),
         };
-        self.finish_attached_session_switch(
-            outcome.client_name,
-            session_name.clone(),
-            session_id,
-            outcome.previous_session_id,
-        )
-        .await;
+        self.finish_attached_session_switch(outcome, session_name.clone(), session_id)
+            .await;
         for refresh in refresh_sessions {
             self.refresh_attached_session(&refresh).await;
         }

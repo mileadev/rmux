@@ -13,7 +13,9 @@ use super::{
     AttachedClientControlOutcome, ClientFlags, RequestHandler, ATTACH_CONTROL_BACKLOG_LIMIT,
 };
 use crate::handler::client_support::SwitchTargetSelection;
-use crate::handler::update_environment_from_client;
+use crate::handler::{
+    update_environment_from_client, QueuedLifecycleEvent, SelectionTargetTransitionSnapshot,
+};
 use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::AttachControl;
 use crate::pane_terminals::{session_not_found, SessionTransferSnapshot};
@@ -46,6 +48,7 @@ pub(in crate::handler) struct AttachedSwitchCommitOutcome {
     pub(in crate::handler) previous_session_id: SessionId,
     pub(in crate::handler) client_name: String,
     pub(in crate::handler) committed_target: AttachedSwitchCommittedTarget,
+    selection_events: Vec<QueuedLifecycleEvent>,
 }
 
 #[derive(Debug)]
@@ -294,6 +297,13 @@ impl RequestHandler {
                         .render_override(window_target.window_index()),
                 },
             )?;
+            let selection_transition = request
+                .target_selection
+                .as_ref()
+                .map(|selection| {
+                    SelectionTargetTransitionSnapshot::capture(&state, selection.window_target())
+                })
+                .transpose()?;
             let snapshot = SessionTransferSnapshot::capture(&state);
             if let Some(client_environment) = request.client_environment.as_ref() {
                 update_environment_from_client(
@@ -423,6 +433,9 @@ impl RequestHandler {
                     detached_client,
                 ));
             }
+            let selection_events = selection_transition
+                .map(|transition| transition.prepare(&mut state))
+                .unwrap_or_default();
 
             let mode_tree_effects = mode_tree_dismiss_plan.map(|plan| {
                 self.apply_committed_mode_tree_dismissal(
@@ -485,6 +498,7 @@ impl RequestHandler {
                 previous_session_id,
                 client_name,
                 committed_target,
+                selection_events,
             });
         }
 
@@ -519,15 +533,25 @@ impl RequestHandler {
     ///     %client-session-changed /dev/ttys007 $1 target
     ///     %layout-change @0 a1dd,60x20,0,0,0 a1dd,60x20,0,0,0 *
     /// in that order, and the source window really does shrink to the surviving
-    /// client's geometry. The session-changed notification is therefore
-    /// published first, and only then is the source session reconciled.
+    /// client's geometry. Targeted selection transitions already prepared by
+    /// the commit are published first (pane, then window), followed by this
+    /// client move. Only then is the source session reconciled, preserving the
+    /// measured client-before-layout order.
     pub(in crate::handler) async fn finish_attached_session_switch(
         &self,
-        client_name: String,
+        outcome: AttachedSwitchCommitOutcome,
         session_name: SessionName,
         session_id: SessionId,
-        previous_session_id: SessionId,
     ) {
+        let AttachedSwitchCommitOutcome {
+            previous_session_id,
+            client_name,
+            selection_events,
+            ..
+        } = outcome;
+        for event in selection_events {
+            self.emit_prepared(event).await;
+        }
         self.emit_client_session_changed(client_name, session_name, session_id)
             .await;
         if previous_session_id != session_id {

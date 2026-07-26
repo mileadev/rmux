@@ -2,10 +2,11 @@
 //! halves of a switch the same geometry notifications any other `switch-client`
 //! owes.
 
-use super::super::mode_tree_order::session_item_id;
+use super::super::mode_tree_order::{pane_item_id, session_item_id};
 use super::*;
 
 use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
+use rmux_proto::NewWindowRequest;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -155,6 +156,191 @@ async fn choose_tree_switch_notifies_the_destination_session_layout_change_like_
         session_changed_index < layout_index,
         "tmux 3.7b reports the client move before the layout it causes: {lines:?}"
     );
+}
+
+#[tokio::test]
+async fn choose_tree_pane_switch_keeps_the_control_selection_model_current() {
+    let handler = RequestHandler::new();
+    let source = SessionName::new("choose-tree-selection-source").expect("valid session");
+    let target = SessionName::new("choose-tree-selection-target").expect("valid session");
+    create_test_session(&handler, &source).await;
+    create_test_session(&handler, &target).await;
+    let response = handler
+        .handle(Request::NewWindow(Box::new(NewWindowRequest {
+            target: target.clone(),
+            name: None,
+            detached: true,
+            start_directory: None,
+            environment: None,
+            command: None,
+            process_command: None,
+            target_window_index: None,
+            insert_at_target: false,
+        })))
+        .await;
+    let Response::NewWindow(window) = response else {
+        panic!("target window creation failed: {response:?}");
+    };
+    assert_eq!(window.target.window_index(), 1);
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Pane(PaneTarget::with_window(target.clone(), 1, 0,)),
+                direction: SplitDirection::Horizontal,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+    handler.wait_for_initial_panes_for_test().await;
+
+    let (
+        pane_item,
+        session_id,
+        initial_window_id,
+        target_window_id,
+        initial_pane_id,
+        target_pane_id,
+    ) = {
+        let mut state = handler.state.lock().await;
+        state.ensure_live_window_link_occurrences();
+        let session = state
+            .sessions
+            .session_mut(&target)
+            .expect("target session exists");
+        session
+            .select_pane_in_window(1, 0)
+            .expect("inactive target pane selected for setup");
+        session
+            .select_window(0)
+            .expect("source target window selected for setup");
+        let session_id = session.id();
+        let initial_window_id = session.window().id();
+        let target_window = session.window_at(1).expect("target window exists");
+        let target_window_id = target_window.id();
+        let initial_pane_id = target_window
+            .active_pane()
+            .expect("target window has an active pane")
+            .id();
+        let target_pane_id = target_window
+            .pane(1)
+            .expect("inactive target pane exists")
+            .id();
+        let occurrence_id = state
+            .window_link_occurrence_id(&target, 1)
+            .expect("target occurrence has a stable identity");
+        (
+            pane_item_id(
+                session_id,
+                1,
+                target_window_id,
+                occurrence_id,
+                target_pane_id,
+            ),
+            session_id,
+            initial_window_id,
+            target_window_id,
+            initial_pane_id,
+            target_pane_id,
+        )
+    };
+
+    let attach_pid = std::process::id().saturating_add(212);
+    let control_pid = attach_pid.saturating_add(1);
+    let (attach_tx, _attach_rx) = mpsc::unbounded_channel();
+    handler.register_attach(attach_pid, source, attach_tx).await;
+    let (event_tx, mut control_events) = tokio::sync::mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
+    handler
+        .register_control_with_closing(
+            control_pid,
+            ControlModeUpgrade {
+                initial_command_count: 0,
+                mode: rmux_proto::ControlMode::Plain,
+                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
+            },
+            event_tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+    handler
+        .set_control_session(control_pid, Some(target.clone()))
+        .await
+        .expect("set control session");
+
+    let parsed = CommandParser::new()
+        .parse_arguments(["choose-tree"])
+        .expect("choose-tree parses");
+    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+        .expect("mode-tree command parses")
+        .expect("mode-tree command recognized");
+    handler
+        .execute_queued_mode_tree(
+            attach_pid,
+            command,
+            &QueueExecutionContext::without_caller_cwd(),
+        )
+        .await
+        .expect("choose-tree opens");
+    handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .get_mut(&attach_pid)
+        .and_then(|active| active.mode_tree.as_mut())
+        .expect("choose-tree remains active")
+        .selected_id = Some(pane_item);
+    settle_notifications(&mut control_events).await;
+
+    handler
+        .accept_mode_tree_selection(attach_pid)
+        .await
+        .expect("choose-tree pane switch succeeds");
+    let lines = notifications_through(&mut control_events, "%client-session-changed ").await;
+    let transitions = lines
+        .iter()
+        .filter_map(|line| {
+            let event = line.split_whitespace().next()?;
+            matches!(
+                event,
+                "%window-pane-changed" | "%session-window-changed" | "%client-session-changed"
+            )
+            .then_some(event)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        transitions,
+        vec![
+            "%window-pane-changed",
+            "%session-window-changed",
+            "%client-session-changed",
+        ]
+    );
+
+    let session_id = session_id.to_string();
+    let target_window_id = target_window_id.to_string();
+    let target_pane_id = target_pane_id.to_string();
+    let mut predicted_window_id = initial_window_id.to_string();
+    let mut predicted_pane_id = initial_pane_id.to_string();
+    for line in &lines {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        match fields.first().copied() {
+            Some("%session-window-changed")
+                if fields.get(1).copied() == Some(session_id.as_str()) =>
+            {
+                predicted_window_id = fields[2].to_owned();
+            }
+            Some("%window-pane-changed")
+                if fields.get(1).copied() == Some(target_window_id.as_str()) =>
+            {
+                predicted_pane_id = fields[2].to_owned();
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(predicted_window_id, target_window_id);
+    assert_eq!(predicted_pane_id, target_pane_id);
 }
 
 async fn create_test_session(handler: &RequestHandler, session_name: &SessionName) {

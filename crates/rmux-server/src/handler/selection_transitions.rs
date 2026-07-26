@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
 use rmux_core::{LifecycleEvent, PaneId, WindowId};
-use rmux_proto::{SessionId, SessionName, WindowTarget};
+use rmux_proto::{RmuxError, SessionId, SessionName, WindowTarget};
 
 use super::{prepare_lifecycle_event, prepare_lifecycle_event_if_enabled, QueuedLifecycleEvent};
-use crate::pane_terminals::HandlerState;
+use crate::pane_terminals::{session_not_found, HandlerState};
 
 #[derive(Debug, Clone, Copy)]
 struct ActiveWindowIdentity {
@@ -26,6 +26,96 @@ struct ActivePaneIdentity {
 pub(in crate::handler) struct SelectionTransitionSnapshot {
     sessions: HashMap<SessionId, ActiveWindowIdentity>,
     windows: HashMap<WindowId, ActivePaneIdentity>,
+}
+
+/// The two stable selections a targeted `switch-client` commit can change.
+///
+/// Unlike [`SelectionTransitionSnapshot`], this snapshot is intentionally
+/// O(1): the command can only select its target session's active window and
+/// its target window's active pane. Capturing the whole server here would turn
+/// a targeted commit into a catch-up scan.
+pub(in crate::handler) struct SelectionTargetTransitionSnapshot {
+    target: WindowTarget,
+    session_id: SessionId,
+    target_window_id: WindowId,
+    previous_active_window_id: WindowId,
+    previous_target_pane_id: PaneId,
+}
+
+impl SelectionTargetTransitionSnapshot {
+    pub(in crate::handler) fn capture(
+        state: &HandlerState,
+        target: WindowTarget,
+    ) -> Result<Self, RmuxError> {
+        let session = state
+            .sessions
+            .session(target.session_name())
+            .ok_or_else(|| session_not_found(target.session_name()))?;
+        let active_window = session
+            .window_at(session.active_window_index())
+            .ok_or_else(|| {
+                RmuxError::Server("switch target session has no active window".to_owned())
+            })?;
+        let target_window = session
+            .window_at(target.window_index())
+            .ok_or_else(|| RmuxError::invalid_target(target.to_string(), "window not found"))?;
+        let target_pane = target_window.active_pane().ok_or_else(|| {
+            RmuxError::invalid_target(target.to_string(), "window has no active pane")
+        })?;
+        Ok(Self {
+            target,
+            session_id: session.id(),
+            target_window_id: target_window.id(),
+            previous_active_window_id: active_window.id(),
+            previous_target_pane_id: target_pane.id(),
+        })
+    }
+
+    /// Prepares only the transitions committed since [`Self::capture`], in
+    /// tmux 3.7b order: pane, then window. The caller publishes these before
+    /// the client/session transition.
+    pub(in crate::handler) fn prepare(self, state: &mut HandlerState) -> Vec<QueuedLifecycleEvent> {
+        let (current_active_window_id, current_target_pane_id) = {
+            let session = state
+                .sessions
+                .session(self.target.session_name())
+                .filter(|session| session.id() == self.session_id)
+                .expect("committed switch target session remains locked");
+            let active_window = session
+                .window_at(session.active_window_index())
+                .expect("committed switch target session has an active window");
+            let target_window = session
+                .window_at(self.target.window_index())
+                .filter(|window| window.id() == self.target_window_id)
+                .expect("committed switch target window remains locked");
+            let target_pane = target_window
+                .active_pane()
+                .expect("committed switch target window has an active pane");
+            (active_window.id(), target_pane.id())
+        };
+
+        let mut events = Vec::with_capacity(2);
+        if current_target_pane_id != self.previous_target_pane_id {
+            if let Some(event) = prepare_lifecycle_event_if_enabled(
+                state,
+                &LifecycleEvent::WindowPaneChanged {
+                    target: self.target.clone(),
+                },
+            ) {
+                events.push(event);
+            }
+        }
+        if current_active_window_id != self.previous_active_window_id {
+            let event = LifecycleEvent::SessionWindowChanged {
+                session_name: self.target.session_name().clone(),
+            };
+            if let Some(mut prepared) = prepare_lifecycle_event_if_enabled(state, &event) {
+                prepared.control_session_identity = Some(self.session_id);
+                events.push(prepared);
+            }
+        }
+        events
+    }
 }
 
 impl SelectionTransitionSnapshot {

@@ -19,9 +19,7 @@ use crate::pane_terminals::{session_not_found, HandlerState};
 
 use super::super::{
     active_session_target,
-    attach_support::{
-        AttachedSwitchCommitOutcome, AttachedSwitchCommitRequest, AttachedSwitchCommittedTarget,
-    },
+    attach_support::{AttachedSwitchCommitRequest, AttachedSwitchCommittedTarget},
     attached_client_matches_target, client_environment_snapshot, control_client_target_pid,
     control_support::{current_control_queue_identity, ManagedClient},
     normalize_target_client, parse_session_sort_order, switch_client_target_find_type,
@@ -1067,17 +1065,15 @@ impl RequestHandler {
                     )
                     .await
                 {
-                    Ok(AttachedSwitchCommitOutcome {
-                        previous_session_id,
-                        client_name,
-                        committed_target,
-                    }) => {
-                        record_switch_client_committed_target(client, committed_target);
+                    Ok(outcome) => {
+                        record_switch_client_committed_target(
+                            client,
+                            outcome.committed_target.clone(),
+                        );
                         self.finish_attached_session_switch(
-                            client_name,
+                            outcome,
                             session_name.clone(),
                             session_id,
-                            previous_session_id,
                         )
                         .await;
                         Response::SwitchClient(SwitchClientResponse { session_name })

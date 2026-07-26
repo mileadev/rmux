@@ -189,7 +189,9 @@ pub(in crate::handler) use pane_output_subscription_rekeys::{
     PaneOutputSubscriptionKeySnapshot, PaneOutputSubscriptionReconciliation,
 };
 use pane_support::PaneSnapshotRevisionRegistry;
-pub(in crate::handler) use selection_transitions::SelectionTransitionSnapshot;
+pub(in crate::handler) use selection_transitions::{
+    SelectionTargetTransitionSnapshot, SelectionTransitionSnapshot,
+};
 use session_lease_support::SessionLeaseStore;
 pub(crate) use session_lease_support::{
     with_session_lease_create_addressing, SessionLeaseCreateAddressing,
@@ -1510,6 +1512,10 @@ mod control_notification_tests;
 #[cfg(test)]
 #[path = "handler_selection_control_notification_tests.rs"]
 mod selection_control_notification_tests;
+
+#[cfg(test)]
+#[path = "handler_switch_selection_notification_tests.rs"]
+mod switch_selection_notification_tests;
 
 #[cfg(test)]
 #[path = "handler_control_lifecycle_tests.rs"]

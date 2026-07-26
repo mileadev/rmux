@@ -181,7 +181,7 @@ pub(super) use state::{
 };
 pub(crate) use state::{ActiveAttachIdentity, AttachRegistration};
 pub(in crate::handler) use switch_commit::{
-    AttachedSwitchCommitOutcome, AttachedSwitchCommitRequest, AttachedSwitchCommittedTarget,
+    AttachedSwitchCommitRequest, AttachedSwitchCommittedTarget,
 };
 pub(in crate::handler) use transient_message::{
     append_transient_message_frame, cancel_transient_message, compose_transient_message_refresh,

@@ -13,7 +13,7 @@ use super::{
     attach_support::{switch_control_session_for_client, ControlResizeClient},
     client_support::SwitchTargetSelection,
     current_client_activity_timestamp, update_environment_from_client, QueuedLifecycleEvent,
-    RequestHandler,
+    RequestHandler, SelectionTargetTransitionSnapshot,
 };
 use crate::client_names::control_client_name;
 use crate::control::{ControlClientFlags, ControlModeUpgrade, ControlServerEvent};
@@ -1286,6 +1286,12 @@ impl RequestHandler {
                 .expect("a switch target selection carries a stable session identity");
             selection.validate_for_session_identity(&state, session_name, session_id)?;
         }
+        let selection_transition = target_selection
+            .as_ref()
+            .map(|selection| {
+                SelectionTargetTransitionSnapshot::capture(&state, selection.window_target())
+            })
+            .transpose()?;
         let control_size = active.size_declared.then_some(TerminalSize {
             cols: active.client_width,
             rows: active.client_height,
@@ -1348,9 +1354,15 @@ impl RequestHandler {
                 .expect("target session stayed locked across the control update")
                 .touch_attached();
         }
+        let selection_events = selection_transition
+            .map(|transition| transition.prepare(&mut state))
+            .unwrap_or_default();
         drop(active_control);
         drop(active_attach);
         drop(state);
+        for event in selection_events {
+            self.emit_prepared(event).await;
+        }
         if session_changed_notice == ControlSessionChangedNotice::Publish
             || (session_changed_notice == ControlSessionChangedNotice::PublishIfChanged
                 && session_changed)
