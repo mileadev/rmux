@@ -51,6 +51,12 @@ enum KillSessionExecution {
     OnlyLinkedWindowChanged,
 }
 
+#[derive(Clone, Copy)]
+struct OnlyWindowPrecondition {
+    window_id: WindowId,
+    kill_if_last: bool,
+}
+
 impl KillSessionExecution {
     fn into_unconditional_response(self) -> Response {
         match self {
@@ -1149,9 +1155,18 @@ impl RequestHandler {
         request: rmux_proto::KillSessionRequest,
         session_id: SessionId,
         window_id: WindowId,
+        kill_if_last: bool,
     ) -> Option<Response> {
         match self
-            .handle_kill_session_with_identity(request, Some(session_id), None, Some(window_id))
+            .handle_kill_session_with_identity(
+                request,
+                Some(session_id),
+                None,
+                Some(OnlyWindowPrecondition {
+                    window_id,
+                    kill_if_last,
+                }),
+            )
             .await
         {
             KillSessionExecution::Completed(response) => Some(response),
@@ -1175,7 +1190,7 @@ impl RequestHandler {
         request: rmux_proto::KillSessionRequest,
         expected_session_id: Option<SessionId>,
         expected_expired_lease_token: Option<u64>,
-        expected_only_linked_window_id: Option<WindowId>,
+        expected_only_window: Option<OnlyWindowPrecondition>,
     ) -> KillSessionExecution {
         let (session_name, selected_session_id) = {
             let state = self.state.lock().await;
@@ -1294,7 +1309,7 @@ impl RequestHandler {
                 })
                 .into();
             }
-            if let Some(expected_window_id) = expected_only_linked_window_id {
+            if let Some(expected_window) = expected_only_window {
                 let session = state
                     .sessions
                     .session(&session_name)
@@ -1304,8 +1319,9 @@ impl RequestHandler {
                 let only_window_is_still_linked =
                     only_window.is_some_and(|(window_index, window)| {
                         windows.next().is_none()
-                            && window.id() == expected_window_id
-                            && state.window_link_count(&session_name, *window_index) > 1
+                            && window.id() == expected_window.window_id
+                            && (expected_window.kill_if_last
+                                || state.window_link_count(&session_name, *window_index) > 1)
                     });
                 if !only_window_is_still_linked {
                     return KillSessionExecution::OnlyLinkedWindowChanged;

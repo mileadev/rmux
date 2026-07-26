@@ -1289,11 +1289,9 @@ impl RequestHandler {
                 return Some(Response::Error(ErrorResponse { error }));
             }
             let session = state.sessions.session(request.target.session_name())?;
-            if session.windows().len() != 1
-                || state
-                    .window_link_count(request.target.session_name(), request.target.window_index())
-                    <= 1
-            {
+            let link_count = state
+                .window_link_count(request.target.session_name(), request.target.window_index());
+            if session.windows().len() != 1 || (link_count <= 1 && !request.kill_if_last) {
                 return None;
             }
             let window = session.window_at(request.target.window_index())?;
@@ -1310,6 +1308,7 @@ impl RequestHandler {
                 },
                 session_id,
                 window_id,
+                request.kill_if_last,
             )
             .await?;
         Some(match response {
