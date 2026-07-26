@@ -69,31 +69,7 @@ runs:
         test "$GITHUB_REPOSITORY" = "Helvesec/rmux"
         test "$GITHUB_REPOSITORY_ID" = "1239918790"
         test "$GITHUB_RUN_ATTEMPT" = 1
-        scripts/release/prepare-channel-retry.py validate-prepare-inputs \
-          --channel "$RMUX_CHANNEL" \
-          --receipt-run-id "$RMUX_RECEIPT_RUN_ID" \
-          --receipt-run-workflow-id "$RMUX_RECEIPT_RUN_WORKFLOW_ID" \
-          --receipt-workflow-id "$RMUX_RECEIPT_WORKFLOW_ID" \
-          --receipt-artifact-id "$RMUX_RECEIPT_ARTIFACT_ID" \
-          --receipt-artifact-digest "$RMUX_RECEIPT_ARTIFACT_DIGEST" \
-          --receipt-envelope-artifact-id "$RMUX_RECEIPT_ENVELOPE_ARTIFACT_ID" \
-          --receipt-envelope-artifact-digest "$RMUX_RECEIPT_ENVELOPE_ARTIFACT_DIGEST" \
-          --receipt-predicate-sha256 "$RMUX_RECEIPT_PREDICATE_SHA256" \
-          --receipt-envelope-sha256 "$RMUX_RECEIPT_ENVELOPE_SHA256" \
-          --prior-result-run-id "$RMUX_PRIOR_RESULT_RUN_ID" \
-          --prior-result-run-workflow-id "$RMUX_PRIOR_RESULT_RUN_WORKFLOW_ID" \
-          --prior-result-producer-workflow-id "$RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_ID" \
-          --prior-result-producer-workflow-path "$RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_PATH" \
-          --prior-result-artifact-id "$RMUX_PRIOR_RESULT_ARTIFACT_ID" \
-          --prior-result-artifact-digest "$RMUX_PRIOR_RESULT_ARTIFACT_DIGEST" \
-          --prior-result-predicate-sha256 "$RMUX_PRIOR_RESULT_PREDICATE_SHA256" \
-          --prior-result-envelope-artifact-id "$RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_ID" \
-          --prior-result-envelope-artifact-digest "$RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_DIGEST" \
-          --prior-result-envelope-sha256 "$RMUX_PRIOR_RESULT_ENVELOPE_SHA256" \
-          --source-sha "$RMUX_SOURCE_SHA" \
-          --release-id "$RMUX_RELEASE_ID" \
-          --release-ref "$RMUX_RELEASE_REF" \
-          --idempotency-key "$RMUX_REQUEST_IDEMPOTENCY_KEY"
+        scripts/release/prepare-channel-retry.py validate-prepare-inputs --from-env
         [[ "$RMUX_CHANNEL" =~ ^(chocolatey|snap_candidate)$ ]]
         for value in \
           "$RMUX_RECEIPT_RUN_ID" "$RMUX_RECEIPT_RUN_WORKFLOW_ID" \
@@ -327,31 +303,9 @@ runs:
         RMUX_RELEASE_REF: ${{ inputs.release-ref }}
       run: |
         set -euo pipefail
-        scripts/release/prepare-channel-retry.py prepare \
+        scripts/release/prepare-channel-retry.py prepare --from-env \
           --root "${{ steps.paths.outputs.root }}" \
-          --output "${{ steps.paths.outputs.root }}/prepared" \
-          --channel "$RMUX_CHANNEL" \
-          --source-sha "$RMUX_SOURCE_SHA" \
-          --release-id "$RMUX_RELEASE_ID" \
-          --release-ref "$RMUX_RELEASE_REF" \
-          --idempotency-key "$RMUX_REQUEST_IDEMPOTENCY_KEY" \
-          --receipt-run-id "$RMUX_RECEIPT_RUN_ID" \
-          --receipt-workflow-id "$RMUX_RECEIPT_WORKFLOW_ID" \
-          --receipt-artifact-id "$RMUX_RECEIPT_ARTIFACT_ID" \
-          --receipt-artifact-digest "$RMUX_RECEIPT_ARTIFACT_DIGEST" \
-          --receipt-envelope-artifact-id "$RMUX_RECEIPT_ENVELOPE_ARTIFACT_ID" \
-          --receipt-envelope-artifact-digest "$RMUX_RECEIPT_ENVELOPE_ARTIFACT_DIGEST" \
-          --receipt-predicate-sha256 "$RMUX_RECEIPT_PREDICATE_SHA256" \
-          --receipt-envelope-sha256 "$RMUX_RECEIPT_ENVELOPE_SHA256" \
-          --prior-result-run-id "$RMUX_PRIOR_RESULT_RUN_ID" \
-          --prior-result-producer-workflow-id "$RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_ID" \
-          --prior-result-producer-workflow-path "$RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_PATH" \
-          --prior-result-artifact-id "$RMUX_PRIOR_RESULT_ARTIFACT_ID" \
-          --prior-result-artifact-digest "$RMUX_PRIOR_RESULT_ARTIFACT_DIGEST" \
-          --prior-result-predicate-sha256 "$RMUX_PRIOR_RESULT_PREDICATE_SHA256" \
-          --prior-result-envelope-artifact-id "$RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_ID" \
-          --prior-result-envelope-artifact-digest "$RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_DIGEST" \
-          --prior-result-envelope-sha256 "$RMUX_PRIOR_RESULT_ENVELOPE_SHA256"
+          --output "${{ steps.paths.outputs.root }}/prepared"
 
     - id: upload
       name: Upload only the exact prepared retry bundle

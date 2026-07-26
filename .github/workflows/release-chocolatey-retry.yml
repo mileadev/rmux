@@ -105,17 +105,13 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          RMUX_CHANNEL: chocolatey
           RMUX_SOURCE_SHA: ${{ inputs.expected_source_sha }}
           RMUX_RELEASE_ID: ${{ inputs.release_id }}
           RMUX_RELEASE_REF: ${{ inputs.release_ref }}
           RMUX_REQUEST_IDEMPOTENCY_KEY: ${{ inputs.request_idempotency_key }}
         run: |
-          python scripts/release/prepare-channel-retry.py validate-identity-inputs `
-            --channel chocolatey `
-            --source-sha "$env:RMUX_SOURCE_SHA" `
-            --release-id "$env:RMUX_RELEASE_ID" `
-            --release-ref "$env:RMUX_RELEASE_REF" `
-            --idempotency-key "$env:RMUX_REQUEST_IDEMPOTENCY_KEY"
+          python scripts/release/prepare-channel-retry.py validate-identity-inputs --from-env
           if ($LASTEXITCODE -ne 0) { throw "invalid Chocolatey retry inputs" }
           python scripts/release/actions-artifact.py verify `
             --repository "$env:GITHUB_REPOSITORY" --run-id "$env:GITHUB_RUN_ID" `
@@ -135,6 +131,7 @@ jobs:
       - name: Revalidate retry authority and original payload bytes
         shell: pwsh
         env:
+          RMUX_CHANNEL: chocolatey
           RMUX_SOURCE_SHA: ${{ inputs.expected_source_sha }}
           RMUX_RELEASE_ID: ${{ inputs.release_id }}
           RMUX_RELEASE_REF: ${{ inputs.release_ref }}
@@ -142,13 +139,8 @@ jobs:
         run: |
           python scripts/release/assert-release-capability.py downstream_channels
           if ($LASTEXITCODE -ne 0) { throw "downstream retry authority is disabled" }
-          python scripts/release/prepare-channel-retry.py verify-prepared `
-            --prepared "$env:RUNNER_TEMP/rmux-chocolatey-retry-prepared" `
-            --channel chocolatey `
-            --source-sha "$env:RMUX_SOURCE_SHA" `
-            --release-id "$env:RMUX_RELEASE_ID" `
-            --release-ref "$env:RMUX_RELEASE_REF" `
-            --idempotency-key "$env:RMUX_REQUEST_IDEMPOTENCY_KEY"
+          python scripts/release/prepare-channel-retry.py verify-prepared --from-env `
+            --prepared "$env:RUNNER_TEMP/rmux-chocolatey-retry-prepared"
           if ($LASTEXITCODE -ne 0) { throw "prepared Chocolatey retry differs" }
 
       - id: decision

@@ -116,11 +116,11 @@ fn retry_wrappers_use_one_common_exact_evidence_preparer() {
         assert!(workflow.contains(&format!("channel: {channel}")));
         assert!(workflow.contains("environment: release"));
         assert!(workflow.contains("assert-release-capability.py downstream_channels"));
-        assert!(workflow.contains("prepare-channel-retry.py validate-identity-inputs"));
-        assert!(workflow.contains("prepare-channel-retry.py verify-prepared"));
+        assert!(workflow.contains("prepare-channel-retry.py validate-identity-inputs --from-env"));
+        assert!(workflow.contains("prepare-channel-retry.py verify-prepared --from-env"));
         assert!(
             workflow
-                .find("prepare-channel-retry.py validate-identity-inputs")
+                .find("prepare-channel-retry.py validate-identity-inputs --from-env")
                 .expect("retry input validator")
                 < workflow
                     .find("actions-artifact.py verify")
@@ -192,11 +192,11 @@ fn common_retry_preparer_binds_receipt_result_attestation_and_original_bytes() {
     assert!(PREPARE.contains("install-gh-2.93.0.sh"));
     assert!(PREPARE.contains("--include-retention"));
     assert!(PREPARE.contains("artifact-ids: ${{ steps.payload.outputs.artifact_id }}"));
-    assert!(PREPARE.contains("prepare-channel-retry.py validate-prepare-inputs"));
-    assert!(PREPARE.contains("prepare-channel-retry.py prepare"));
+    assert!(PREPARE.contains("prepare-channel-retry.py validate-prepare-inputs --from-env"));
+    assert!(PREPARE.contains("prepare-channel-retry.py prepare --from-env"));
     assert!(
         PREPARE
-            .find("prepare-channel-retry.py validate-prepare-inputs")
+            .find("prepare-channel-retry.py validate-prepare-inputs --from-env")
             .expect("prepare input validator")
             < PREPARE
                 .find("[[ \"$RMUX_CHANNEL\" =~")

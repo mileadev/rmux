@@ -4,6 +4,11 @@ mod python3;
 use std::path::PathBuf;
 use std::process::Output;
 
+const CHOCOLATEY: &str = include_str!("../.github/workflows/release-chocolatey-retry.yml");
+const PREPARE_ACTION: &str =
+    include_str!("../.github/actions/release-channel-retry-prepare/action.yml");
+const SNAP: &str = include_str!("../.github/workflows/release-snap-retry.yml");
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -119,6 +124,36 @@ fn assert_rejected(command: &str, args: &[(String, String)], label: &str) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn run_environment_identity_validator(idempotency_key: &str, omitted: Option<&str>) -> Output {
+    let mut process = python3::command();
+    process
+        .args([
+            "scripts/release/prepare-channel-retry.py",
+            "validate-identity-inputs",
+            "--from-env",
+        ])
+        .current_dir(repo_root());
+    for (name, value) in [
+        ("RMUX_CHANNEL", "chocolatey"),
+        (
+            "RMUX_SOURCE_SHA",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        ("RMUX_RELEASE_ID", "17"),
+        ("RMUX_RELEASE_REF", "v1.2.3"),
+        ("RMUX_REQUEST_IDEMPOTENCY_KEY", idempotency_key),
+    ] {
+        if omitted != Some(name) {
+            process.env(name, value);
+        } else {
+            process.env_remove(name);
+        }
+    }
+    process
+        .output()
+        .expect("run retry environment input validator")
 }
 
 #[test]
@@ -268,6 +303,79 @@ for relative in (
         raise SystemExit(f"clean workflow rejected: {relative}: {findings}")
 "###,
     );
+}
+
+#[test]
+fn retry_validators_read_untrusted_values_from_fixed_environment_names() {
+    let canonical_key = format!("rmux-downstream-v1:{}", repeated('b', 64));
+    let output = run_environment_identity_validator(&canonical_key, None);
+    assert!(
+        output.status.success(),
+        "canonical environment validation failed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    for (value, label) in [
+        (
+            format!(
+                "rmux-downstream-v1:{}\"{}",
+                repeated('b', 32),
+                repeated('b', 32)
+            ),
+            "embedded double quote",
+        ),
+        (String::new(), "explicit empty value"),
+    ] {
+        let output = run_environment_identity_validator(&value, None);
+        assert!(
+            !output.status.success(),
+            "{label} was accepted after direct environment transport"
+        );
+    }
+    let output = run_environment_identity_validator(&canonical_key, Some("RMUX_RELEASE_ID"));
+    assert!(
+        !output.status.success(),
+        "missing environment value was mistaken for an explicit value"
+    );
+
+    assert!(
+        PREPARE_ACTION.contains("validate-prepare-inputs --from-env"),
+        "prepare validator must read the fixed environment projection"
+    );
+    assert!(
+        PREPARE_ACTION.contains("prepare --from-env"),
+        "prepare must revalidate the fixed environment projection before I/O"
+    );
+    for (name, workflow) in [("Chocolatey", CHOCOLATEY), ("Snap", SNAP)] {
+        assert!(
+            workflow.contains("validate-identity-inputs --from-env"),
+            "{name} identity validator still receives raw argv values"
+        );
+        assert!(
+            workflow.contains("verify-prepared --from-env"),
+            "{name} prepared verifier still receives raw argv values"
+        );
+    }
+    for (source, forbidden) in [
+        (
+            CHOCOLATEY,
+            "validate-identity-inputs `\n            --channel",
+        ),
+        (CHOCOLATEY, "verify-prepared `\n            --prepared"),
+        (SNAP, "validate-identity-inputs \\\n            --channel"),
+        (SNAP, "verify-prepared \\\n            --prepared"),
+        (
+            PREPARE_ACTION,
+            "validate-prepare-inputs \\\n          --channel",
+        ),
+        (PREPARE_ACTION, "prepare \\\n          --root"),
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "untrusted retry value remains on a shell argv boundary: {forbidden}"
+        );
+    }
 }
 
 #[test]

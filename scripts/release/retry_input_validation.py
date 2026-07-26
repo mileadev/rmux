@@ -60,6 +60,42 @@ ACTION_ONLY_INPUT_FIELDS = (
 )
 
 ACTION_INPUT_FIELDS = (*PREPARE_EVIDENCE_INPUT_FIELDS, *ACTION_ONLY_INPUT_FIELDS)
+INPUT_ENVIRONMENT_NAMES = {
+    "channel": "RMUX_CHANNEL",
+    "source_sha": "RMUX_SOURCE_SHA",
+    "release_id": "RMUX_RELEASE_ID",
+    "release_ref": "RMUX_RELEASE_REF",
+    "idempotency_key": "RMUX_REQUEST_IDEMPOTENCY_KEY",
+    "receipt_run_id": "RMUX_RECEIPT_RUN_ID",
+    "receipt_workflow_id": "RMUX_RECEIPT_WORKFLOW_ID",
+    "receipt_artifact_id": "RMUX_RECEIPT_ARTIFACT_ID",
+    "receipt_envelope_artifact_id": "RMUX_RECEIPT_ENVELOPE_ARTIFACT_ID",
+    "prior_result_run_id": "RMUX_PRIOR_RESULT_RUN_ID",
+    "prior_result_producer_workflow_id": (
+        "RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_ID"
+    ),
+    "prior_result_artifact_id": "RMUX_PRIOR_RESULT_ARTIFACT_ID",
+    "prior_result_envelope_artifact_id": (
+        "RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_ID"
+    ),
+    "receipt_artifact_digest": "RMUX_RECEIPT_ARTIFACT_DIGEST",
+    "receipt_envelope_artifact_digest": (
+        "RMUX_RECEIPT_ENVELOPE_ARTIFACT_DIGEST"
+    ),
+    "prior_result_artifact_digest": "RMUX_PRIOR_RESULT_ARTIFACT_DIGEST",
+    "prior_result_envelope_artifact_digest": (
+        "RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_DIGEST"
+    ),
+    "receipt_predicate_sha256": "RMUX_RECEIPT_PREDICATE_SHA256",
+    "receipt_envelope_sha256": "RMUX_RECEIPT_ENVELOPE_SHA256",
+    "prior_result_predicate_sha256": "RMUX_PRIOR_RESULT_PREDICATE_SHA256",
+    "prior_result_envelope_sha256": "RMUX_PRIOR_RESULT_ENVELOPE_SHA256",
+    "prior_result_producer_workflow_path": (
+        "RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_PATH"
+    ),
+    "receipt_run_workflow_id": "RMUX_RECEIPT_RUN_WORKFLOW_ID",
+    "prior_result_run_workflow_id": "RMUX_PRIOR_RESULT_RUN_WORKFLOW_ID",
+}
 
 CANONICAL_POSITIVE = re.compile(r"[1-9][0-9]*")
 IDEMPOTENCY_KEY = re.compile(r"rmux-downstream-v1:[0-9a-f]{64}")
@@ -73,6 +109,25 @@ def _required(values: Mapping[str, Any], field: str) -> Any:
 
 def _label(field: str) -> str:
     return f"retry input {field.replace('_', ' ')}"
+
+
+def input_values_from_environment(
+    environment: Mapping[str, str], fields: tuple[str, ...]
+) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for field in fields:
+        environment_name = INPUT_ENVIRONMENT_NAMES[field]
+        if environment_name not in environment:
+            raise ValueError(
+                f"retry input environment {environment_name} is missing"
+            )
+        value = environment[environment_name]
+        if not isinstance(value, str):
+            raise ValueError(
+                f"retry input environment {environment_name} is not text"
+            )
+        values[field] = value
+    return values
 
 
 def canonical_positive(value: Any, label: str) -> int:

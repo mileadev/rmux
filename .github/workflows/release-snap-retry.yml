@@ -104,18 +104,14 @@ jobs:
       - name: Verify exact prepared retry artifact identity
         env:
           GH_TOKEN: ${{ github.token }}
+          RMUX_CHANNEL: snap_candidate
           RMUX_SOURCE_SHA: ${{ inputs.expected_source_sha }}
           RMUX_RELEASE_ID: ${{ inputs.release_id }}
           RMUX_RELEASE_REF: ${{ inputs.release_ref }}
           RMUX_REQUEST_IDEMPOTENCY_KEY: ${{ inputs.request_idempotency_key }}
         run: |
           set -euo pipefail
-          scripts/release/prepare-channel-retry.py validate-identity-inputs \
-            --channel snap_candidate \
-            --source-sha "$RMUX_SOURCE_SHA" \
-            --release-id "$RMUX_RELEASE_ID" \
-            --release-ref "$RMUX_RELEASE_REF" \
-            --idempotency-key "$RMUX_REQUEST_IDEMPOTENCY_KEY"
+          scripts/release/prepare-channel-retry.py validate-identity-inputs --from-env
           scripts/release/actions-artifact.py verify \
             --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
             --artifact-id "${{ needs.prepare.outputs.bundle_artifact_id }}" \
@@ -133,6 +129,7 @@ jobs:
 
       - name: Revalidate retry authority and original payload bytes
         env:
+          RMUX_CHANNEL: snap_candidate
           RMUX_SOURCE_SHA: ${{ inputs.expected_source_sha }}
           RMUX_RELEASE_ID: ${{ inputs.release_id }}
           RMUX_RELEASE_REF: ${{ inputs.release_ref }}
@@ -140,13 +137,8 @@ jobs:
         run: |
           set -euo pipefail
           scripts/release/assert-release-capability.py downstream_channels
-          scripts/release/prepare-channel-retry.py verify-prepared \
-            --prepared "$RUNNER_TEMP/rmux-snap-retry-prepared" \
-            --channel snap_candidate \
-            --source-sha "$RMUX_SOURCE_SHA" \
-            --release-id "$RMUX_RELEASE_ID" \
-            --release-ref "$RMUX_RELEASE_REF" \
-            --idempotency-key "$RMUX_REQUEST_IDEMPOTENCY_KEY"
+          scripts/release/prepare-channel-retry.py verify-prepared --from-env \
+            --prepared "$RUNNER_TEMP/rmux-snap-retry-prepared"
 
       - id: decision
         name: Resolve exact Snap candidate retry authority

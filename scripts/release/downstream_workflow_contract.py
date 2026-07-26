@@ -249,8 +249,11 @@ def _validate_retry(path: Path) -> None:
     workflow_id = "316439352" if channel == "chocolatey" else "316439354"
     required = (
         "uses: ./.github/actions/release-channel-retry-prepare",
-        "scripts/release/prepare-channel-retry.py validate-identity-inputs",
-        "scripts/release/prepare-channel-retry.py verify-prepared",
+        (
+            "scripts/release/prepare-channel-retry.py "
+            "validate-identity-inputs --from-env"
+        ),
+        "scripts/release/prepare-channel-retry.py verify-prepared --from-env",
         "scripts/release/assert-release-capability.py downstream_channels",
         "uses: ./.github/actions/release-channel-result",
         f'producer-workflow-id: "{workflow_id}"',
@@ -292,8 +295,8 @@ def _validate_retry_prepare(path: Path) -> None:
         'test "$RMUX_RECEIPT_RUN_ID" = "$RMUX_PRIOR_RESULT_RUN_ID"',
         "verify-receipt-attestation.py",
         "verify-channel-result-attestation.py",
-        "prepare-channel-retry.py validate-prepare-inputs",
-        "prepare-channel-retry.py prepare",
+        "prepare-channel-retry.py validate-prepare-inputs --from-env",
+        "prepare-channel-retry.py prepare --from-env",
         "artifact-ids: ${{ steps.payload.outputs.artifact_id }}",
     )
     if any(text.count(value) != 1 for value in required):
