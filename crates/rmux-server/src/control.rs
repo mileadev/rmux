@@ -68,6 +68,11 @@ mod session_attachment;
 #[cfg(any(unix, windows))]
 use session_attachment::ControlSessionAttachment;
 
+#[path = "control/eof_completion.rs"]
+mod eof_completion;
+#[cfg(any(unix, windows))]
+use eof_completion::ControlEofCompletion;
+
 #[cfg(any(unix, windows))]
 const MAX_DEFERRED_CONTROL_NOTIFICATIONS: usize = 1024;
 #[cfg(any(unix, windows))]
@@ -324,11 +329,13 @@ async fn forward_control_inner(
     let mut eof_queue_lease = None;
     let mut eof_transition = None;
     #[cfg(windows)]
-    if consume_control_eof_marker(
+    let initial_stdin_eof_marker = consume_control_eof_marker(
         &mut input_buffer,
         &mut queued_lines,
         &mut queued_input_bytes,
-    ) {
+    );
+    #[cfg(windows)]
+    if initial_stdin_eof_marker {
         input_closed = true;
         acquire_control_eof_queue_lease(&mut eof_queue_lease, &handler, control_identity).await;
         arm_control_eof_transition(&mut eof_transition);
@@ -344,6 +351,11 @@ async fn forward_control_inner(
     let mut current_response_notifications: Option<mpsc::Receiver<ControlCommandResponseEvent>> =
         None;
     let mut initial_command_completion_pending = false;
+    let mut eof_completion = ControlEofCompletion::default();
+    #[cfg(windows)]
+    if initial_stdin_eof_marker {
+        eof_completion.observe_stdin_eof_marker(attachment.is_attached(), !queued_lines.is_empty());
+    }
     let mut command_numbering = if initial_command_count == 0 {
         let initial_timestamp = unix_epoch_seconds();
         output_queue.enqueue_line(
@@ -440,6 +452,10 @@ async fn forward_control_inner(
                 }
             }
         }
+        eof_completion.observe_attachment(
+            attachment.is_attached(),
+            current_command.is_some() || !queued_lines.is_empty(),
+        );
         if shutdown_draining && current_command.is_none() {
             output_queue.enqueue_line(
                 format_exit_line(Some("server shutting down")).into_bytes(),
@@ -498,6 +514,7 @@ async fn forward_control_inner(
                 input_buffer.clear();
                 queued_lines.clear();
                 queued_input_bytes = 0;
+                eof_completion.observe_stdin_eof_marker(attachment.is_attached(), false);
                 break;
             }
             if next_line.is_empty() {
@@ -548,6 +565,7 @@ async fn forward_control_inner(
 
             match parsed_commands {
                 Ok(commands) => {
+                    eof_completion.command_started(&commands);
                     let handler = Arc::clone(&handler);
                     let eof_cancellation = ControlQueueEofCancellation::new(control_identity);
                     if input_closed {
@@ -700,6 +718,10 @@ async fn forward_control_inner(
                         if let Some(command) = current_command.as_ref() {
                             command.eof_cancellation.cancel_for_eof();
                         }
+                        eof_completion.observe_stdin_eof_marker(
+                            attachment.is_attached(),
+                            current_command.is_some() || !queued_lines.is_empty(),
+                        );
                         arm_control_eof_transition(&mut eof_transition);
                     }
                 }
@@ -798,6 +820,7 @@ async fn forward_control_inner(
                 let Some(command) = current_command.take() else {
                     continue;
                 };
+                eof_completion.command_finished();
                 let response_frame = current_response_frame
                     .take()
                     .expect("completed commands own response frame state");
@@ -848,7 +871,8 @@ async fn forward_control_inner(
                 if !shutdown_draining
                     && input_closed
                     && current_command.is_some()
-                    && !mode.is_control_control() =>
+                    && !mode.is_control_control()
+                    && eof_completion.allows_detached_drain_transition() =>
             {
                 // The transport can close as soon as the active guard has
                 // been terminated, but every complete frame accepted before
