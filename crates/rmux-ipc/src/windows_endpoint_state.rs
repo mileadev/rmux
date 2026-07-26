@@ -22,13 +22,14 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use crate::endpoint::{current_integrity_label, pipe_component, LocalEndpoint, PIPE_PREFIX};
+use crate::windows_endpoint_components::parse_managed_hex_components;
 use crate::windows_endpoint_legacy;
 use crate::windows_endpoint_naming::{
     endpoint_key, pipe_path, random_nonce, random_nonce_excluding,
 };
 use crate::windows_endpoint_record::{
-    is_lower_hex, parse as parse_record, serialize as serialize_record, EndpointPhase,
-    EndpointRecord, ProcessStamp, KEY_HEX_LEN, NONCE_HEX_LEN,
+    parse as parse_record, serialize as serialize_record, EndpointPhase, EndpointRecord,
+    ProcessStamp,
 };
 use crate::windows_endpoint_reservation::{
     decide as decide_reservation, ManagedEndpointStartReservation, ManagedStartClaim,
@@ -323,20 +324,13 @@ fn managed_components(pipe_name: &OsStr) -> io::Result<Option<ManagedComponents>
     let Some(rest) = strip_ascii_prefix(&display, &prefix) else {
         return Ok(None);
     };
-    if rest.len() != KEY_HEX_LEN + 1 + NONCE_HEX_LEN {
-        return Ok(None);
-    }
-    let (key, nonce) = rest.split_at(KEY_HEX_LEN);
-    let Some(nonce) = nonce.strip_prefix('-') else {
+    let Some(parsed) = parse_managed_hex_components(rest) else {
         return Ok(None);
     };
-    if !is_lower_hex(key) || !is_lower_hex(nonce) {
-        return Ok(None);
-    }
     Ok(Some(ManagedComponents {
         sid,
-        key: key.to_owned(),
-        nonce: nonce.to_owned(),
+        key: parsed.key.to_owned(),
+        nonce: parsed.nonce.to_owned(),
         integrity,
     }))
 }
@@ -581,3 +575,7 @@ fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
 fn invalid_state(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
+
+#[cfg(test)]
+#[path = "windows_endpoint_state_tests.rs"]
+mod tests;

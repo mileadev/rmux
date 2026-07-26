@@ -139,7 +139,7 @@ mod tests {
     fn record(phase: EndpointPhase, nonce: &str, process: ProcessStamp) -> EndpointRecord {
         EndpointRecord {
             phase,
-            key: "a".repeat(crate::windows_endpoint_record::KEY_HEX_LEN),
+            key: "a".repeat(crate::windows_endpoint_components::KEY_HEX_LEN),
             nonce: nonce.to_owned(),
             legacy_component: None,
             process,

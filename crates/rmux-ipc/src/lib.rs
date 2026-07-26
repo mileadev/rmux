@@ -11,6 +11,8 @@ mod listener;
 #[cfg(unix)]
 mod managed_socket_unix;
 mod stream;
+#[cfg(any(windows, test))]
+mod windows_endpoint_components;
 #[cfg(windows)]
 mod windows_endpoint_directory;
 #[cfg(windows)]

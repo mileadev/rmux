@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use sha2::{Digest, Sha256};
 
 use crate::endpoint::PIPE_PREFIX;
-use crate::windows_endpoint_record::NONCE_HEX_LEN;
+use crate::windows_endpoint_components::NONCE_HEX_LEN;
 
 const MANAGED_PIPE_MARKER: &str = "-g-";
 

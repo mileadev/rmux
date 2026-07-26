@@ -4,8 +4,8 @@
 
 use std::io;
 
-pub(crate) const KEY_HEX_LEN: usize = 64;
-pub(crate) const NONCE_HEX_LEN: usize = 32;
+use crate::windows_endpoint_components::{is_lower_hex, KEY_HEX_LEN, NONCE_HEX_LEN};
+
 pub(crate) const LEGACY_COMPONENT_MAX_LEN: usize = 256;
 const STATE_FORMAT_V1: &str = "rmux-endpoint-state-v1";
 const STATE_FORMAT_V2: &str = "rmux-endpoint-state-v2";
@@ -109,13 +109,6 @@ fn is_legacy_component(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
-}
-
-pub(crate) fn is_lower_hex(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn field<'a>(lines: &mut impl Iterator<Item = &'a str>, name: &str) -> io::Result<&'a str> {
