@@ -7,11 +7,12 @@ use rmux_proto::{
 use tokio::sync::mpsc;
 
 use super::super::{
-    attach_support::attach_target_for_session, attached_client_name, client_environment_snapshot,
+    attach_support::attach_target_for_session, client_environment_snapshot,
     effective_client_terminal_context, parse_client_flags, update_environment_from_client,
     validate_expected_attach_identity, RequestHandler,
 };
 use super::switching::SwitchManagedClientIdentity;
+use crate::client_names::attached_client_name;
 use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::HandleOutcome;
 
