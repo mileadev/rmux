@@ -12,6 +12,7 @@
 use super::WebShareConnectRole;
 
 const MAX_BUFFERED_OSC_BYTES: usize = 1024 * 1024;
+const HYPERLINK_CLOSE_ST: &[u8] = b"\x1b]8;;\x1b\\";
 const UTF8_REPLACEMENT: &[u8] = "\u{fffd}".as_bytes();
 
 #[derive(Debug)]
@@ -38,6 +39,7 @@ enum State {
 struct DiscardString {
     escaped: bool,
     terminator: StringTerminator,
+    completion: DiscardCompletion,
 }
 
 impl DiscardString {
@@ -45,15 +47,27 @@ impl DiscardString {
         Self {
             escaped: false,
             terminator,
+            completion: DiscardCompletion::Drop,
         }
     }
 
-    const fn with_escape(terminator: StringTerminator, escaped: bool) -> Self {
+    const fn with_escape(
+        terminator: StringTerminator,
+        escaped: bool,
+        completion: DiscardCompletion,
+    ) -> Self {
         Self {
             escaped,
             terminator,
+            completion,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DiscardCompletion {
+    Drop,
+    CloseHyperlink,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -177,14 +191,23 @@ impl WebTerminalSanitizer {
                     escape_sequence(byte, output)
                 } else if (escaped && byte == b'\\') || byte == 0x07 {
                     bytes.push(byte);
-                    if allowed_osc(&bytes, self.role) {
-                        output.extend_from_slice(&bytes);
+                    match osc_disposition(&bytes, self.role) {
+                        OscDisposition::Forward => output.extend_from_slice(&bytes),
+                        OscDisposition::Drop => {}
+                        OscDisposition::CloseHyperlink => {
+                            output.extend_from_slice(HYPERLINK_CLOSE_ST);
+                        }
                     }
                     State::Ground
                 } else if bytes.len() >= MAX_BUFFERED_OSC_BYTES {
                     State::DiscardString(DiscardString::with_escape(
                         StringTerminator::StOrBel,
                         byte == 0x1b,
+                        if is_hyperlink_osc(&bytes) {
+                            DiscardCompletion::CloseHyperlink
+                        } else {
+                            DiscardCompletion::Drop
+                        },
                     ))
                 } else {
                     bytes.push(byte);
@@ -257,16 +280,24 @@ fn discard_string(mut string: DiscardString, byte: u8, output: &mut Vec<u8>) -> 
     }
     if string.escaped {
         return if byte == b'\\' {
+            complete_discard(string.completion, output);
             State::Ground
         } else {
             escape_sequence(byte, output)
         };
     }
     if matches!(string.terminator, StringTerminator::StOrBel) && byte == 0x07 {
+        complete_discard(string.completion, output);
         return State::Ground;
     }
     string.escaped = byte == 0x1b;
     State::DiscardString(string)
+}
+
+fn complete_discard(completion: DiscardCompletion, output: &mut Vec<u8>) {
+    if matches!(completion, DiscardCompletion::CloseHyperlink) {
+        output.extend_from_slice(HYPERLINK_CLOSE_ST);
+    }
 }
 
 fn dcs_sequence(state: DcsState, byte: u8) -> State {
@@ -323,32 +354,58 @@ const fn cancelled(byte: u8) -> bool {
     matches!(byte, 0x18 | 0x1a)
 }
 
-fn allowed_osc(sequence: &[u8], role: WebShareConnectRole) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OscDisposition {
+    Forward,
+    Drop,
+    CloseHyperlink,
+}
+
+fn osc_disposition(sequence: &[u8], role: WebShareConnectRole) -> OscDisposition {
     let Some(payload) = sequence.strip_prefix(b"\x1b]".as_slice()) else {
-        return false;
+        return OscDisposition::Drop;
     };
-    if payload
+    let encoded_c1 = payload
         .windows(2)
-        .any(|pair| pair[0] == 0xc2 && (0x80..=0x9f).contains(&pair[1]))
-    {
-        return false;
-    }
+        .any(|pair| pair[0] == 0xc2 && (0x80..=0x9f).contains(&pair[1]));
     let code_end = payload
         .iter()
         .position(|byte| *byte == b';' || *byte == 0x07 || *byte == 0x1b)
         .unwrap_or(payload.len());
     let Ok(code) = std::str::from_utf8(&payload[..code_end]) else {
-        return false;
+        return OscDisposition::Drop;
     };
     if code == "8" {
-        return allowed_hyperlink(&payload[code_end..]);
+        return if !encoded_c1 && allowed_hyperlink(&payload[code_end..]) {
+            OscDisposition::Forward
+        } else {
+            OscDisposition::CloseHyperlink
+        };
+    }
+    if encoded_c1 {
+        return OscDisposition::Drop;
     }
     let visual = matches!(
         code,
         "4" | "10" | "11" | "12" | "104" | "110" | "111" | "112"
     );
     let private_metadata = matches!(code, "0" | "1" | "2" | "7" | "133");
-    visual || (matches!(role, WebShareConnectRole::Operator) && private_metadata)
+    if visual || (matches!(role, WebShareConnectRole::Operator) && private_metadata) {
+        OscDisposition::Forward
+    } else {
+        OscDisposition::Drop
+    }
+}
+
+fn is_hyperlink_osc(sequence: &[u8]) -> bool {
+    let Some(payload) = sequence.strip_prefix(b"\x1b]".as_slice()) else {
+        return false;
+    };
+    let code_end = payload
+        .iter()
+        .position(|byte| *byte == b';' || *byte == 0x07 || *byte == 0x1b)
+        .unwrap_or(payload.len());
+    std::str::from_utf8(&payload[..code_end]) == Ok("8")
 }
 
 fn allowed_hyperlink(payload: &[u8]) -> bool {

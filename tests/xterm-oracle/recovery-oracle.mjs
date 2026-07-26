@@ -19,6 +19,14 @@ function optional(cell, method) {
   return typeof cell[method] === 'function' ? cell[method]() : null;
 }
 
+function hyperlink(terminal, cell) {
+  const urlId = cell?.extended?.urlId ?? 0;
+  const uri = urlId === 0
+    ? null
+    : terminal._core?._oscLinkService?.getLinkData(urlId)?.uri ?? null;
+  return { urlId, uri };
+}
+
 function capture(terminal, title) {
   const buffer = terminal.buffer.active;
   const lines = [];
@@ -33,6 +41,7 @@ function capture(terminal, title) {
       const cell = line.getCell(col);
       const width = cell?.getWidth();
       const chars = cell?.getChars();
+      const link = hyperlink(terminal, cell);
       cells.push(cell ? {
         // xterm distinguishes an untouched default cell from an explicitly
         // written default space in its allocation details. They are the same
@@ -51,7 +60,9 @@ function capture(terminal, title) {
         fgMode: optional(cell, 'getFgColorMode'),
         fg: optional(cell, 'getFgColor'),
         bgMode: optional(cell, 'getBgColorMode'),
-        bg: optional(cell, 'getBgColor')
+        bg: optional(cell, 'getBgColor'),
+        urlId: link.urlId,
+        uri: link.uri
       } : null);
     }
     lines.push({
@@ -112,7 +123,15 @@ for (const vector of input.vectors) {
       modes: state.modes,
       lines: state.lines.map((line) => line && ({
         wrapped: line.wrapped,
-        text: line.text
+        text: line.text,
+        linkedCells: line.cells
+          .filter((cell) => cell && (cell.urlId !== 0 || cell.chars !== ' '))
+          .map((cell) => ({
+            chars: cell.chars,
+            width: cell.width,
+            urlId: cell.urlId,
+            uri: cell.uri
+          }))
       }))
     });
     process.stderr.write(`expected=${JSON.stringify(summarize(expected))}\n`);

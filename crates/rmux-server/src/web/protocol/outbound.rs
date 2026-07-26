@@ -454,6 +454,7 @@ mod tests {
     fn session_keyframes_and_pane_frames_apply_the_web_terminal_policy() {
         let size = TerminalSize { cols: 80, rows: 24 };
         let unsafe_link = b"before\x1b\r]8;;javascript:alert(1)\x1b\\link\x1b]8;;\x1b\\after";
+        let safe_link = b"before\r\x1b]8;;\x1b\\link\x1b]8;;\x1b\\after";
         let snapshot = WebSessionSnapshot::new(
             size,
             unsafe_link.to_vec(),
@@ -471,7 +472,7 @@ mod tests {
                 .any(|window| window == b"javascript:"),
             "session recovery frame must not retain an active-content URI"
         );
-        assert!(frames[0].ends_with(b"before\rlink\x1b]8;;\x1b\\after"));
+        assert!(frames[0].ends_with(safe_link));
 
         let pane_frame = WebSessionPaneFrame::new(
             size,
@@ -492,7 +493,77 @@ mod tests {
         .expect("pane frame fits");
         let payload =
             session_pane_frame_payload(&pane_frame, &mut sanitizer).expect("pane frame fits");
-        assert_eq!(&payload[25..], b"before\rlink\x1b]8;;\x1b\\after");
+        assert_eq!(&payload[25..], safe_link);
+
+        let pane_snapshot = WebPaneSnapshot {
+            cols: 80,
+            rows: 24,
+            output_sequence: 0,
+            ansi_lines: Vec::new(),
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: true,
+            mode_bits: 0,
+            cursor_style: 0,
+            alternate: false,
+            scroll_top: 0,
+            scroll_bottom: 23,
+            history_rows_total: 0,
+            history_rows_included: 0,
+            metadata_complete: true,
+            recovery_keyframe: Some(unsafe_link.to_vec()),
+        };
+        let payload =
+            pane_snapshot_payload(&pane_snapshot, &mut sanitizer, false).expect("snapshot fits");
+        assert_eq!(&payload[1..], safe_link);
+    }
+
+    #[test]
+    fn pane_and_session_recovery_to_live_paths_close_rejected_hyperlinks() {
+        let old_link = b"\x1b]8;;https://old.example\x1b\\OLD";
+        let rejected_and_text = b"\x1b]8;;file:///etc/passwd\x1b\\NEXT\x1b]8;;\x1b\\END";
+        let safe_live = b"\x1b]8;;\x1b\\NEXT\x1b]8;;\x1b\\END";
+        let pane_snapshot = WebPaneSnapshot {
+            cols: 80,
+            rows: 24,
+            output_sequence: 0,
+            ansi_lines: Vec::new(),
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: true,
+            mode_bits: 0,
+            cursor_style: 0,
+            alternate: false,
+            scroll_top: 0,
+            scroll_bottom: 23,
+            history_rows_total: 0,
+            history_rows_included: 0,
+            metadata_complete: true,
+            recovery_keyframe: Some(old_link.to_vec()),
+        };
+        let mut pane_sanitizer = WebTerminalSanitizer::for_role(WebShareConnectRole::Operator);
+        let pane_recovery = pane_snapshot_payload(&pane_snapshot, &mut pane_sanitizer, false)
+            .expect("pane snapshot fits");
+        assert_eq!(&pane_recovery[1..], old_link);
+        let mut pane_live = Vec::new();
+        for chunk in rejected_and_text.chunks(1) {
+            pane_sanitizer.push(chunk, &mut pane_live);
+        }
+        assert_eq!(pane_live, safe_live);
+
+        let size = TerminalSize { cols: 80, rows: 24 };
+        let session_snapshot =
+            WebSessionSnapshot::new(size, old_link.to_vec(), TestWebSessionView::new(size), 0, 0)
+                .expect("session snapshot fits");
+        let mut session_sanitizer = WebTerminalSanitizer::for_role(WebShareConnectRole::Spectator);
+        let frames = session_keyframe_payloads(None, &session_snapshot, &mut session_sanitizer)
+            .expect("session snapshot fits");
+        assert!(frames[0].ends_with(old_link));
+        let mut session_live = Vec::new();
+        for chunk in rejected_and_text.chunks(1) {
+            session_sanitizer.push(chunk, &mut session_live);
+        }
+        assert_eq!(session_live, safe_live);
     }
 
     #[test]

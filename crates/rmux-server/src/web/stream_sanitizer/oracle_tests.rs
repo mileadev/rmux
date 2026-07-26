@@ -3,14 +3,18 @@ use std::process::{Command, Stdio};
 
 use rmux_core::{GridRenderOptions, ScreenCaptureRange, TerminalScreen};
 use rmux_proto::TerminalSize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::*;
 
 type OracleCase = (&'static str, &'static [u8], &'static [u8]);
 
 fn sanitize(input: &[u8]) -> Vec<u8> {
-    let mut sanitizer = WebTerminalSanitizer::default();
+    sanitize_for_role(WebShareConnectRole::Operator, input)
+}
+
+fn sanitize_for_role(role: WebShareConnectRole, input: &[u8]) -> Vec<u8> {
+    let mut sanitizer = WebTerminalSanitizer::for_role(role);
     let mut output = Vec::new();
     sanitizer.push(input, &mut output);
     output
@@ -63,6 +67,31 @@ fn oracle_cases() -> Vec<OracleCase> {
     ]
 }
 
+fn assert_xterm_vectors(vectors: Vec<Value>) {
+    let oracle = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/xterm-oracle/recovery-oracle.mjs");
+    let mut child = Command::new("node")
+        .arg(oracle)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start pinned xterm.js sanitizer oracle");
+    child
+        .stdin
+        .take()
+        .expect("oracle stdin")
+        .write_all(json!({ "vectors": vectors }).to_string().as_bytes())
+        .expect("write sanitizer vectors");
+    let output = child.wait_with_output().expect("wait for xterm.js oracle");
+    assert!(
+        output.status.success(),
+        "xterm.js sanitizer oracle failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn sanitized_bytes_match_rmux_printable_text() {
     for (name, input, expected) in oracle_cases() {
@@ -89,26 +118,168 @@ fn sanitized_bytes_match_pinned_xterm_viewer() {
             })
         })
         .collect::<Vec<_>>();
-    let oracle = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/xterm-oracle/recovery-oracle.mjs");
-    let mut child = Command::new("node")
-        .arg(oracle)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("start pinned xterm.js sanitizer oracle");
-    child
-        .stdin
-        .take()
-        .expect("oracle stdin")
-        .write_all(json!({ "vectors": vectors }).to_string().as_bytes())
-        .expect("write sanitizer vectors");
-    let output = child.wait_with_output().expect("wait for xterm.js oracle");
-    assert!(
-        output.status.success(),
-        "xterm.js sanitizer oracle failed:\nstdout={}\nstderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+    assert_xterm_vectors(vectors);
+}
+
+#[test]
+#[ignore = "requires the pinned xterm.js package installed from package-lock.json"]
+fn rejected_osc_8_closes_prior_hyperlink_in_pinned_xterm() {
+    let input = concat!(
+        "\u{1b}]8;;https://old.example\u{1b}\\",
+        "OLD",
+        "\u{1b}]8;;file:///etc/passwd\u{1b}\\",
+        "NEXT",
+        "\u{1b}]8;;\u{1b}\\",
+        "END",
+    )
+    .as_bytes();
+    let expected = concat!(
+        "\u{1b}]8;;https://old.example\u{1b}\\",
+        "OLD",
+        "\u{1b}]8;;\u{1b}\\",
+        "NEXT",
+        "\u{1b}]8;;\u{1b}\\",
+        "END",
+    )
+    .as_bytes();
+    let mut vectors = [
+        WebShareConnectRole::Operator,
+        WebShareConnectRole::Spectator,
+    ]
+    .into_iter()
+    .map(|role| {
+        json!({
+            "name": format!("rejected-osc-8-closes-prior-link-{role:?}"),
+            "cols": 120,
+            "rows": 2,
+            "scrollback": 0,
+            "initial": expected,
+            "keyframe": sanitize_for_role(role, input),
+            "tail": []
+        })
+    })
+    .collect::<Vec<_>>();
+
+    let blocked_clipboard = concat!(
+        "\u{1b}]8;;https://old.example\u{1b}\\",
+        "OLD",
+        "\u{1b}]52;c;WA==\u{7}",
+        "NEXT",
+        "\u{1b}]8;;\u{1b}\\",
+        "END",
+    )
+    .as_bytes();
+    let blocked_clipboard_expected = concat!(
+        "\u{1b}]8;;https://old.example\u{1b}\\",
+        "OLDNEXT",
+        "\u{1b}]8;;\u{1b}\\",
+        "END",
+    )
+    .as_bytes();
+    vectors.extend(
+        [
+            WebShareConnectRole::Operator,
+            WebShareConnectRole::Spectator,
+        ]
+        .into_iter()
+        .map(|role| {
+            json!({
+                "name": format!("blocked-non-hyperlink-osc-keeps-prior-link-{role:?}"),
+                "cols": 120,
+                "rows": 2,
+                "scrollback": 0,
+                "initial": blocked_clipboard_expected,
+                "keyframe": sanitize_for_role(role, blocked_clipboard),
+                "tail": []
+            })
+        }),
     );
+
+    let spectator_metadata = concat!(
+        "\u{1b}]8;;https://old.example\u{1b}\\",
+        "OLD",
+        "\u{1b}]2;private-title\u{7}",
+        "NEXT",
+        "\u{1b}]8;;\u{1b}\\",
+        "END",
+    )
+    .as_bytes();
+    vectors.push(json!({
+        "name": "spectator-metadata-removal-keeps-prior-link",
+        "cols": 120,
+        "rows": 2,
+        "scrollback": 0,
+        "initial": blocked_clipboard_expected,
+        "keyframe": sanitize_for_role(WebShareConnectRole::Spectator, spectator_metadata),
+        "tail": []
+    }));
+
+    let rejected_then_allowed = concat!(
+        "\u{1b}]8;;https://old.example\u{1b}\\",
+        "OLD",
+        "\u{1b}]8;;file:///blocked\u{1b}\\",
+        "\u{1b}]8;;https://new.example\u{7}",
+        "NEW",
+        "\u{1b}]8;;\u{1b}\\",
+        "END",
+    )
+    .as_bytes();
+    let rejected_then_allowed_expected = concat!(
+        "\u{1b}]8;;https://old.example\u{1b}\\",
+        "OLD",
+        "\u{1b}]8;;\u{1b}\\",
+        "\u{1b}]8;;https://new.example\u{7}",
+        "NEW",
+        "\u{1b}]8;;\u{1b}\\",
+        "END",
+    )
+    .as_bytes();
+    vectors.extend(
+        [
+            WebShareConnectRole::Operator,
+            WebShareConnectRole::Spectator,
+        ]
+        .into_iter()
+        .map(|role| {
+            json!({
+                "name": format!("allowed-link-reopens-after-rejected-link-{role:?}"),
+                "cols": 120,
+                "rows": 2,
+                "scrollback": 0,
+                "initial": rejected_then_allowed_expected,
+                "keyframe": sanitize_for_role(role, rejected_then_allowed),
+                "tail": []
+            })
+        }),
+    );
+
+    let cancelled = concat!(
+        "\u{1b}]8;;https://old.example\u{1b}\\",
+        "OLD",
+        "\u{1b}]8;;file:///cancelled\u{18}",
+        "NEXT",
+        "\u{1b}]8;;\u{1b}\\",
+        "END",
+    )
+    .as_bytes();
+    vectors.extend(
+        [
+            WebShareConnectRole::Operator,
+            WebShareConnectRole::Spectator,
+        ]
+        .into_iter()
+        .map(|role| {
+            json!({
+                "name": format!("cancelled-hyperlink-keeps-prior-link-{role:?}"),
+                "cols": 120,
+                "rows": 2,
+                "scrollback": 0,
+                "initial": blocked_clipboard_expected,
+                "keyframe": sanitize_for_role(role, cancelled),
+                "tail": []
+            })
+        }),
+    );
+
+    assert_xterm_vectors(vectors);
 }

@@ -13,6 +13,35 @@ fn sanitize_for_role(role: WebShareConnectRole, chunks: &[&[u8]]) -> Vec<u8> {
     output
 }
 
+fn sanitize_bytewise(role: WebShareConnectRole, input: &[u8]) -> Vec<u8> {
+    let mut sanitizer = WebTerminalSanitizer::for_role(role);
+    let mut output = Vec::new();
+    for byte in input {
+        sanitizer.push(std::slice::from_ref(byte), &mut output);
+    }
+    output
+}
+
+fn assert_sanitized_for_roles_at_every_boundary(name: &str, input: &[u8], expected: &[u8]) {
+    for role in [
+        WebShareConnectRole::Operator,
+        WebShareConnectRole::Spectator,
+    ] {
+        for split in 0..=input.len() {
+            assert_eq!(
+                sanitize_for_role(role, &[&input[..split], &input[split..]]),
+                expected,
+                "{name}, role {role:?}, split {split}"
+            );
+        }
+        assert_eq!(
+            sanitize_bytewise(role, input),
+            expected,
+            "{name}, role {role:?}, bytewise"
+        );
+    }
+}
+
 fn escape_state_c0_bytes() -> impl Iterator<Item = u8> {
     (0x00..=0x17)
         .chain(std::iter::once(0x19))
@@ -220,7 +249,7 @@ fn osc_8_allows_web_links_and_closures_but_drops_active_content_schemes() {
         for split in 0..=input.len() {
             assert_eq!(
                 sanitize(&[&input[..split], &input[split..]]),
-                b"AB",
+                b"A\x1b]8;;\x1b\\B",
                 "split {split}"
             );
         }
@@ -232,6 +261,170 @@ fn osc_8_allows_web_links_and_closures_but_drops_active_content_schemes() {
     ] {
         assert_eq!(sanitize(&[input]), input);
     }
+}
+
+#[test]
+fn rejected_osc_8_closes_a_prior_hyperlink_at_every_fragmentation_boundary() {
+    // Pinned xterm.js 6.0.0 assigns urlId=0 to the following cells for these
+    // expected streams; see the W13-H12 pre-change matrix.
+    for (name, input, expected) in [
+        (
+            "file ST ASCII",
+            concat!(
+                "\u{1b}]8;;http://old.example\u{7}",
+                "OLD",
+                "\u{1b}]8;;file:///etc/passwd\u{1b}\\",
+                "FILE",
+                "\u{1b}]8;;\u{1b}\\",
+                "END",
+            )
+            .as_bytes(),
+            concat!(
+                "\u{1b}]8;;http://old.example\u{7}",
+                "OLD",
+                "\u{1b}]8;;\u{1b}\\",
+                "FILE",
+                "\u{1b}]8;;\u{1b}\\",
+                "END",
+            )
+            .as_bytes(),
+        ),
+        (
+            "javascript BEL ASCII",
+            concat!(
+                "\u{1b}]8;;https://old.example\u{1b}\\",
+                "OLD",
+                "\u{1b}]8;;javascript:alert(1)\u{7}",
+                "JS",
+                "\u{1b}]8;;\u{7}",
+                "END",
+            )
+            .as_bytes(),
+            concat!(
+                "\u{1b}]8;;https://old.example\u{1b}\\",
+                "OLD",
+                "\u{1b}]8;;\u{1b}\\",
+                "JS",
+                "\u{1b}]8;;\u{7}",
+                "END",
+            )
+            .as_bytes(),
+        ),
+        (
+            "data ST UTF-8",
+            concat!(
+                "\u{1b}]8;;http://old.example\u{7}",
+                "VIEUX",
+                "\u{1b}]8;;data:text/plain,unsafe\u{1b}\\",
+                "APRÈS界",
+                "\u{1b}]8;;\u{1b}\\",
+                "FIN",
+            )
+            .as_bytes(),
+            concat!(
+                "\u{1b}]8;;http://old.example\u{7}",
+                "VIEUX",
+                "\u{1b}]8;;\u{1b}\\",
+                "APRÈS界",
+                "\u{1b}]8;;\u{1b}\\",
+                "FIN",
+            )
+            .as_bytes(),
+        ),
+        (
+            "encoded C1 ST",
+            b"\x1b]8;;http://old.example\x07OLD\x1b]8;;https://c1.example/\xc2\x80/next\x1b\\C1NEXT\x1b]8;;\x1b\\END",
+            b"\x1b]8;;http://old.example\x07OLD\x1b]8;;\x1b\\C1NEXT\x1b]8;;\x1b\\END",
+        ),
+    ] {
+        assert_sanitized_for_roles_at_every_boundary(name, input, expected);
+    }
+}
+
+#[test]
+fn repeated_rejected_osc_8_sequences_each_close_without_changing_text() {
+    let input = concat!(
+        "\u{1b}]8;;https://old.example\u{1b}\\",
+        "OLD",
+        "\u{1b}]8;;file:///one\u{7}",
+        "ONE",
+        "\u{1b}]8;;javascript:two()\u{1b}\\",
+        "TWO",
+        "\u{1b}]8;;data:text/plain,three\u{7}",
+        "THREE",
+        "\u{1b}]8;;\u{1b}\\",
+        "END",
+    )
+    .as_bytes();
+    let expected = concat!(
+        "\u{1b}]8;;https://old.example\u{1b}\\",
+        "OLD",
+        "\u{1b}]8;;\u{1b}\\",
+        "ONE",
+        "\u{1b}]8;;\u{1b}\\",
+        "TWO",
+        "\u{1b}]8;;\u{1b}\\",
+        "THREE",
+        "\u{1b}]8;;\u{1b}\\",
+        "END",
+    )
+    .as_bytes();
+
+    assert_sanitized_for_roles_at_every_boundary("repeated rejects", input, expected);
+}
+
+#[test]
+fn allowed_hyperlink_after_a_rejection_opens_normally() {
+    let input = concat!(
+        "\u{1b}]8;;http://old.example\u{7}",
+        "OLD",
+        "\u{1b}]8;;file:///blocked\u{1b}\\",
+        "\u{1b}]8;;https://new.example\u{7}",
+        "NEW",
+        "\u{1b}]8;;\u{1b}\\",
+        "END",
+    )
+    .as_bytes();
+    let expected = concat!(
+        "\u{1b}]8;;http://old.example\u{7}",
+        "OLD",
+        "\u{1b}]8;;\u{1b}\\",
+        "\u{1b}]8;;https://new.example\u{7}",
+        "NEW",
+        "\u{1b}]8;;\u{1b}\\",
+        "END",
+    )
+    .as_bytes();
+
+    assert_sanitized_for_roles_at_every_boundary("rejected then allowed", input, expected);
+}
+
+#[test]
+fn cancelled_rejected_osc_8_keeps_the_prior_hyperlink_active() {
+    let input =
+        b"\x1b]8;;https://old.example\x1b\\OLD\x1b]8;;file:///cancelled\x18NEXT\x1b]8;;\x1b\\END";
+    let expected = b"\x1b]8;;https://old.example\x1b\\OLDNEXT\x1b]8;;\x1b\\END";
+
+    assert_sanitized_for_roles_at_every_boundary("cancelled hyperlink", input, expected);
+}
+
+#[test]
+fn rejected_non_hyperlink_osc_does_not_close_a_prior_hyperlink() {
+    let clipboard = b"\x1b]8;;https://old.example\x1b\\OLD\x1b]52;c;WA==\x07NEXT\x1b]8;;\x1b\\END";
+    let clipboard_expected = b"\x1b]8;;https://old.example\x1b\\OLDNEXT\x1b]8;;\x1b\\END";
+    assert_sanitized_for_roles_at_every_boundary("blocked OSC 52", clipboard, clipboard_expected);
+
+    let title = b"\x1b]8;;https://old.example\x1b\\OLD\x1b]2;private\x07NEXT\x1b]8;;\x1b\\END";
+    assert_eq!(
+        sanitize_for_role(WebShareConnectRole::Operator, &[title]),
+        title,
+        "operator title policy remains unchanged"
+    );
+    assert_eq!(
+        sanitize_for_role(WebShareConnectRole::Spectator, &[title]),
+        b"\x1b]8;;https://old.example\x1b\\OLDNEXT\x1b]8;;\x1b\\END",
+        "spectator metadata removal must not close an unrelated hyperlink"
+    );
 }
 
 #[test]
@@ -600,6 +793,78 @@ fn oversized_osc_discard_ends_at_bell() {
     input.resize(input.len() + MAX_BUFFERED_OSC_BYTES + 1, b'x');
     input.extend_from_slice(b"\x07after");
     assert_eq!(sanitize(&[&input]), b"beforeafter");
+}
+
+#[test]
+fn oversized_osc_8_closes_a_prior_hyperlink_for_bel_st_and_both_roles() {
+    for (name, terminator) in [("BEL", b"\x07".as_slice()), ("ST", b"\x1b\\".as_slice())] {
+        let mut input = b"\x1b]8;;https://old.example\x1b\\OLD".to_vec();
+        let osc_start = input.len();
+        input.extend_from_slice(b"\x1b]8;;https://overflow.example/");
+        input.resize(osc_start + MAX_BUFFERED_OSC_BYTES + 2, b'x');
+        input.extend_from_slice(terminator);
+        input.extend_from_slice(b"NEXT");
+        let expected = b"\x1b]8;;https://old.example\x1b\\OLD\x1b]8;;\x1b\\NEXT";
+        let mut boundaries = vec![
+            0,
+            1,
+            osc_start,
+            osc_start + 1,
+            osc_start + 2,
+            osc_start + MAX_BUFFERED_OSC_BYTES - 1,
+            osc_start + MAX_BUFFERED_OSC_BYTES,
+            osc_start + MAX_BUFFERED_OSC_BYTES + 1,
+            input.len() - terminator.len() - b"NEXT".len(),
+            input.len() - b"NEXT".len(),
+            input.len(),
+        ];
+        boundaries.sort_unstable();
+        boundaries.dedup();
+
+        for role in [
+            WebShareConnectRole::Operator,
+            WebShareConnectRole::Spectator,
+        ] {
+            for split in boundaries.iter().copied() {
+                assert_eq!(
+                    sanitize_for_role(role, &[&input[..split], &input[split..]]),
+                    expected,
+                    "{name}, role {role:?}, split {split}"
+                );
+            }
+            assert_eq!(
+                sanitize_bytewise(role, &input),
+                expected,
+                "{name}, role {role:?}, bytewise"
+            );
+        }
+    }
+}
+
+#[test]
+fn cancelled_oversized_osc_8_does_not_inject_a_close() {
+    let mut input = b"\x1b]8;;https://old.example\x1b\\OLD".to_vec();
+    let osc_start = input.len();
+    input.extend_from_slice(b"\x1b]8;;file:///cancelled/");
+    input.resize(osc_start + MAX_BUFFERED_OSC_BYTES + 2, b'x');
+    input.extend_from_slice(b"\x18NEXT\x1b]8;;\x1b\\END");
+    let expected = b"\x1b]8;;https://old.example\x1b\\OLDNEXT\x1b]8;;\x1b\\END";
+
+    for role in [
+        WebShareConnectRole::Operator,
+        WebShareConnectRole::Spectator,
+    ] {
+        assert_eq!(
+            sanitize_for_role(role, &[&input]),
+            expected,
+            "role {role:?}, whole"
+        );
+        assert_eq!(
+            sanitize_bytewise(role, &input),
+            expected,
+            "role {role:?}, bytewise"
+        );
+    }
 }
 
 #[test]
