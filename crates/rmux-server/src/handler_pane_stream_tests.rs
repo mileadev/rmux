@@ -1614,6 +1614,7 @@ async fn assert_exit_commit_keeps_stream_source_available(
                 .collect::<String>()
                 .contains("commit-tail")
         })),
+        _ => panic!("test requested an unsupported pane stream projection"),
     }
 
     pause.release.notify_one();

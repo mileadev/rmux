@@ -720,6 +720,7 @@ pub struct PaneOutputCursorRequest {
 
 /// Projection selected for a recoverable pane stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum PaneStreamMode {
     /// Raw terminal bytes with automatic in-band renderer rebases.
     Raw,

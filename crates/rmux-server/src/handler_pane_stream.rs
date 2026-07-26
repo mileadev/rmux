@@ -31,8 +31,9 @@ use capture::{
 use protocol::{
     not_owned_error, owned_stream, owned_stream_record, reserved_stream_key_if_owned,
     reserved_stream_lost_response, slow_consumer_response, stream_cursor_response,
-    stream_subscription_limit_error, subscribe_response, validate_detached_response,
-    validate_raw_rebase_size, validate_surface_frame_size, wrong_stream_mode,
+    stream_subscription_limit_error, subscribe_response, unsupported_stream_mode,
+    validate_detached_response, validate_raw_rebase_size, validate_surface_frame_size,
+    wrong_stream_mode,
 };
 use raw::{RawInitializationOutcome, RawSubscriptionStart};
 use types::SurfacePaneStream;
@@ -372,6 +373,10 @@ impl RequestHandler {
                 );
                 self.finish_new_surface_subscription(connection_id, subscription_id, source, driver)
             }
+            _ => {
+                self.remove_reserved_stream(subscription_id);
+                unsupported_stream_mode()
+            }
         };
         if matches!(response, Response::SubscribePaneStream(_)) {
             reservation_guard.disarm();
@@ -403,6 +408,7 @@ impl RequestHandler {
         match mode {
             PaneStreamMode::Raw => self.poll_raw_stream(connection_id, request).await,
             PaneStreamMode::Surface => self.poll_surface_stream(connection_id, request).await,
+            _ => unsupported_stream_mode(),
         }
     }
 

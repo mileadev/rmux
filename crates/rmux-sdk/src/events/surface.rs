@@ -10,8 +10,8 @@ use rmux_proto::{
 };
 
 use super::pane_stream::{
-    end_from_proto, lifecycle_from_proto, MappedEvent, PaneStreamEndReason,
-    PaneStreamLifecycleEvent, RecoverablePaneStream,
+    end_from_proto, lifecycle_from_proto, unsupported_stream_variant, MappedEvent,
+    PaneStreamEndReason, PaneStreamLifecycleEvent, RecoverablePaneStream,
 };
 use crate::handles::pane::snapshot::{cell_from_wire, cursor_from_wire};
 use crate::transport::TransportClient;
@@ -19,6 +19,7 @@ use crate::{PaneSnapshot, Result, RmuxError};
 
 /// Complete authoritative structured pane state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct PaneSurfaceSnapshot {
     /// Visible row-major pane grid and cursor.
     pub grid: PaneSnapshot,
@@ -71,6 +72,7 @@ impl PaneSurfaceSnapshot {
 
 /// Application-defined OSC 10/11/12 colours.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct PaneSurfaceDynamicColors {
     /// OSC 10 default foreground colour.
     pub foreground: Option<String>,
@@ -82,6 +84,7 @@ pub struct PaneSurfaceDynamicColors {
 
 /// A self-contained pane surface frame.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct PaneSurfaceFrame {
     /// Stream-local epoch established by the latest reset.
     pub epoch: u64,
@@ -364,12 +367,13 @@ fn map_event(event: ProtoEvent) -> Result<MappedEvent<PaneSurfaceEvent>> {
             frame_from_proto(*frame)?,
         ))),
         ProtoEvent::Lifecycle(event) => Ok(MappedEvent::live(PaneSurfaceEvent::Lifecycle(
-            lifecycle_from_proto(event),
+            lifecycle_from_proto(event)?,
         ))),
         ProtoEvent::End(reason) => Ok(MappedEvent::terminal(PaneSurfaceEvent::End(
-            end_from_proto(reason),
+            end_from_proto(reason)?,
         ))),
         ProtoEvent::RawRebase(_) | ProtoEvent::RawBytes(_) => Err(wrong_projection()),
+        _ => Err(unsupported_stream_variant("event")),
     }
 }
 

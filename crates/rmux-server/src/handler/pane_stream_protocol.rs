@@ -187,3 +187,9 @@ pub(super) fn wrong_stream_mode() -> Response {
         error: RmuxError::Server("subscription uses a different pane stream projection".to_owned()),
     })
 }
+
+pub(super) fn unsupported_stream_mode() -> Response {
+    Response::Error(ErrorResponse {
+        error: RmuxError::Server("unsupported pane stream projection".to_owned()),
+    })
+}

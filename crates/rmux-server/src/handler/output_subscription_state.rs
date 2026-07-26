@@ -355,6 +355,7 @@ impl OutputSubscriptionState {
                 self.surface_drivers.remove(pane);
                 self.cancel_surface_initialization(pane);
             }
+            _ => {}
         }
     }
 
@@ -511,6 +512,7 @@ impl OutputSubscriptionState {
                     mode: PaneStreamMode::Surface,
                     ..
                 }) => has_surface = true,
+                Some(PaneStreamSubscription::Reserved { .. }) => {}
                 Some(PaneStreamSubscription::Raw(_)) => has_raw = true,
                 Some(PaneStreamSubscription::Surface(_)) => has_surface = true,
                 None => {}

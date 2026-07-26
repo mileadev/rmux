@@ -9,8 +9,8 @@ use rmux_proto::{
 };
 
 use super::pane_stream::{
-    end_from_proto, lifecycle_from_proto, MappedEvent, PaneStreamEndReason,
-    PaneStreamLifecycleEvent, RecoverablePaneStream,
+    end_from_proto, lifecycle_from_proto, unsupported_stream_variant, MappedEvent,
+    PaneStreamEndReason, PaneStreamLifecycleEvent, RecoverablePaneStream,
 };
 use crate::handles::pane::snapshot::snapshot_from_response;
 use crate::transport::TransportClient;
@@ -51,6 +51,7 @@ pub enum PaneRecoveryRebaseReason {
 
 /// Completeness report for a transport-bounded recovery keyframe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct PaneRecoveryCoverage {
     /// Total scrollback rows retained by the daemon at capture time.
     pub history_rows_total: u64,
@@ -76,6 +77,7 @@ impl PaneRecoveryCoverage {
 
 /// Complete raw-emulator recovery state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct PaneRecoveryRebase {
     /// Stream-local epoch stamped onto following byte events.
     pub epoch: u64,
@@ -445,12 +447,13 @@ fn map_event(event: ProtoEvent) -> Result<MappedEvent<PaneRecoveryEvent>> {
             bytes: bytes.bytes,
         })),
         ProtoEvent::Lifecycle(event) => Ok(MappedEvent::live(PaneRecoveryEvent::Lifecycle(
-            lifecycle_from_proto(event),
+            lifecycle_from_proto(event)?,
         ))),
         ProtoEvent::End(reason) => Ok(MappedEvent::terminal(PaneRecoveryEvent::End(
-            end_from_proto(reason),
+            end_from_proto(reason)?,
         ))),
         ProtoEvent::SurfaceReset(_) | ProtoEvent::SurfacePatch(_) => Err(wrong_projection()),
+        _ => Err(unsupported_stream_variant("event")),
     }
 }
 
@@ -471,12 +474,12 @@ fn rebase_from_proto(value: ProtoRebase) -> Result<PaneRecoveryRebase> {
             metadata_complete: value.coverage.metadata_complete,
         },
         snapshot,
-        reason: reason_from_proto(value.reason),
+        reason: reason_from_proto(value.reason)?,
     })
 }
 
-const fn reason_from_proto(reason: ProtoReason) -> PaneRecoveryRebaseReason {
-    match reason {
+fn reason_from_proto(reason: ProtoReason) -> Result<PaneRecoveryRebaseReason> {
+    Ok(match reason {
         ProtoReason::Initial => PaneRecoveryRebaseReason::Initial,
         ProtoReason::Resize => PaneRecoveryRebaseReason::Resize,
         ProtoReason::ClearHistory => PaneRecoveryRebaseReason::ClearHistory,
@@ -485,7 +488,8 @@ const fn reason_from_proto(reason: ProtoReason) -> PaneRecoveryRebaseReason {
         ProtoReason::TranscriptMutation => PaneRecoveryRebaseReason::TranscriptMutation,
         ProtoReason::Lag => PaneRecoveryRebaseReason::Lag,
         ProtoReason::GenerationChanged => PaneRecoveryRebaseReason::GenerationChanged,
-    }
+        _ => return Err(unsupported_stream_variant("raw-rebase reason")),
+    })
 }
 
 fn wrong_projection() -> RmuxError {

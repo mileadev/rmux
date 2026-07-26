@@ -484,6 +484,7 @@ pub struct PaneOutputLagResponse {
 
 /// Why a raw pane stream emitted a new authoritative keyframe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum PaneRawRebaseReason {
     /// Initial authoritative boundary created when the stream opens.
     Initial,
@@ -639,6 +640,7 @@ pub struct PaneSurfaceFrame {
 
 /// Pane lifecycle observations that do not terminate the logical stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum PaneStreamLifecycleEvent {
     /// The current child process exited after its output reached EOF.
     ///
@@ -654,6 +656,7 @@ pub enum PaneStreamLifecycleEvent {
 
 /// Distinguishes logical pane removal from subscription termination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum PaneStreamEndReason {
     /// The logical pane resource was removed.
     PaneRemoved,
@@ -671,6 +674,7 @@ pub enum PaneStreamEndReason {
 
 /// One item in either recoverable pane projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum PaneStreamEvent {
     /// Authoritative raw-emulator reset and reconstruction payload.
     RawRebase(Box<PaneRawRebase>),

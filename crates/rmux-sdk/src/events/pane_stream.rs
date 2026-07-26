@@ -231,16 +231,19 @@ impl<T> RecoverablePaneStream<T> {
     }
 }
 
-pub(super) const fn lifecycle_from_proto(lifecycle: ProtoLifecycle) -> PaneStreamLifecycleEvent {
-    match lifecycle {
+pub(super) fn lifecycle_from_proto(lifecycle: ProtoLifecycle) -> Result<PaneStreamLifecycleEvent> {
+    Ok(match lifecycle {
         ProtoLifecycle::ProcessExited { output_sequence } => {
             PaneStreamLifecycleEvent::ProcessExited { output_sequence }
         }
-    }
+        _ => return Err(unsupported_stream_variant("lifecycle")),
+    })
 }
 
-pub(super) const fn end_from_proto(reason: rmux_proto::PaneStreamEndReason) -> PaneStreamEndReason {
-    match reason {
+pub(super) fn end_from_proto(
+    reason: rmux_proto::PaneStreamEndReason,
+) -> Result<PaneStreamEndReason> {
+    Ok(match reason {
         rmux_proto::PaneStreamEndReason::PaneRemoved => PaneStreamEndReason::PaneRemoved,
         rmux_proto::PaneStreamEndReason::AccessRevoked => PaneStreamEndReason::AccessRevoked,
         rmux_proto::PaneStreamEndReason::SlowConsumer => PaneStreamEndReason::SlowConsumer,
@@ -249,5 +252,12 @@ pub(super) const fn end_from_proto(reason: rmux_proto::PaneStreamEndReason) -> P
             PaneStreamEndReason::SubscriptionExpired
         }
         rmux_proto::PaneStreamEndReason::TransportLost => PaneStreamEndReason::TransportLost,
-    }
+        _ => return Err(unsupported_stream_variant("end-reason")),
+    })
+}
+
+pub(super) fn unsupported_stream_variant(kind: &str) -> RmuxError {
+    RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+        "rmux daemon sent an unsupported pane-stream {kind} variant"
+    )))
 }
