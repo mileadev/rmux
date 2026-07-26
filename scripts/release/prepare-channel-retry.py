@@ -24,11 +24,17 @@ from downstream_channels import (
 from downstream_plan import validate_plan
 from downstream_result import validate_retryable_previous
 from downstream_result_document import validate_envelope, validate_predicate
-
-CHANNEL_PRODUCERS = {
-    "chocolatey": ".github/workflows/release-chocolatey-channel.yml",
-    "snap_candidate": ".github/workflows/release-snap-channel.yml",
-}
+from retry_input_validation import (
+    ACTION_INPUT_FIELDS,
+    ACTION_ONLY_INPUT_FIELDS,
+    CHANNEL_PRODUCERS,
+    IDENTITY_INPUT_FIELDS,
+    PREPARE_EVIDENCE_INPUT_FIELDS,
+    PREPARE_POSITIVE_INPUT_FIELDS,
+    validate_action_inputs,
+    validate_identity_inputs,
+    validate_prepare_evidence_inputs,
+)
 
 EVIDENCE_FILES = {
     "receipt": {
@@ -418,45 +424,66 @@ def prepare(args: argparse.Namespace) -> None:
 
 
 def add_identity_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--channel", choices=tuple(CHANNEL_PRODUCERS), required=True)
+    parser.add_argument("--channel", required=True)
     parser.add_argument("--source-sha", required=True)
-    parser.add_argument("--release-id", type=int, required=True)
+    parser.add_argument("--release-id", required=True)
     parser.add_argument("--release-ref", required=True)
     parser.add_argument("--idempotency-key", required=True)
+
+
+def add_prepare_evidence_args(parser: argparse.ArgumentParser) -> None:
+    for name in PREPARE_POSITIVE_INPUT_FIELDS:
+        parser.add_argument(f"--{name.replace('_', '-')}", required=True)
+    for name in PREPARE_EVIDENCE_INPUT_FIELDS:
+        if (
+            name not in IDENTITY_INPUT_FIELDS
+            and name not in PREPARE_POSITIVE_INPUT_FIELDS
+        ):
+            parser.add_argument(f"--{name.replace('_', '-')}", required=True)
+
+
+def input_values(
+    args: argparse.Namespace, fields: tuple[str, ...]
+) -> dict[str, str]:
+    return {field: getattr(args, field) for field in fields}
+
+
+def validate_cli_inputs(args: argparse.Namespace) -> None:
+    if args.command == "validate-prepare-inputs":
+        validate_action_inputs(input_values(args, ACTION_INPUT_FIELDS))
+        return
+    if args.command == "prepare":
+        validate_prepare_evidence_inputs(
+            input_values(args, PREPARE_EVIDENCE_INPUT_FIELDS)
+        )
+        for field in ("release_id", *PREPARE_POSITIVE_INPUT_FIELDS):
+            setattr(args, field, int(getattr(args, field)))
+        return
+
+    validate_identity_inputs(input_values(args, IDENTITY_INPUT_FIELDS))
+    if args.command == "verify-prepared":
+        args.release_id = int(args.release_id)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
+
+    identity_parser = commands.add_parser("validate-identity-inputs")
+    add_identity_args(identity_parser)
+
+    action_parser = commands.add_parser("validate-prepare-inputs")
+    add_identity_args(action_parser)
+    add_prepare_evidence_args(action_parser)
+    for name in ACTION_ONLY_INPUT_FIELDS:
+        action_parser.add_argument(f"--{name.replace('_', '-')}", required=True)
+
     prepare_parser = commands.add_parser("prepare")
     add_identity_args(prepare_parser)
     prepare_parser.add_argument("--root", type=Path, required=True)
     prepare_parser.add_argument("--output", type=Path, required=True)
-    for name in (
-        "receipt_run_id",
-        "receipt_workflow_id",
-        "receipt_artifact_id",
-        "receipt_envelope_artifact_id",
-        "prior_result_run_id",
-        "prior_result_producer_workflow_id",
-        "prior_result_artifact_id",
-        "prior_result_envelope_artifact_id",
-    ):
-        prepare_parser.add_argument(
-            f"--{name.replace('_', '-')}", type=int, required=True
-        )
-    for name in (
-        "receipt_artifact_digest",
-        "receipt_envelope_artifact_digest",
-        "receipt_predicate_sha256",
-        "receipt_envelope_sha256",
-        "prior_result_producer_workflow_path",
-        "prior_result_artifact_digest",
-        "prior_result_predicate_sha256",
-        "prior_result_envelope_artifact_digest",
-        "prior_result_envelope_sha256",
-    ):
-        prepare_parser.add_argument(f"--{name.replace('_', '-')}", required=True)
+    add_prepare_evidence_args(prepare_parser)
+
     verify_parser = commands.add_parser("verify-prepared")
     add_identity_args(verify_parser)
     verify_parser.add_argument("--prepared", type=Path, required=True)
@@ -466,9 +493,10 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     try:
         arguments = parse_args()
+        validate_cli_inputs(arguments)
         if arguments.command == "prepare":
             prepare(arguments)
-        else:
+        elif arguments.command == "verify-prepared":
             verify_prepared(arguments)
     except (OSError, ValueError) as error:
         print(f"prepare-channel-retry: {error}", file=sys.stderr)

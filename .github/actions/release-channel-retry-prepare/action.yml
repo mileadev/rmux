@@ -44,10 +44,23 @@ runs:
         RMUX_RECEIPT_RUN_ID: ${{ inputs.receipt-run-id }}
         RMUX_RECEIPT_RUN_WORKFLOW_ID: ${{ inputs.receipt-run-workflow-id }}
         RMUX_RECEIPT_WORKFLOW_ID: ${{ inputs.receipt-workflow-id }}
+        RMUX_RECEIPT_ARTIFACT_ID: ${{ inputs.receipt-artifact-id }}
+        RMUX_RECEIPT_ARTIFACT_DIGEST: ${{ inputs.receipt-artifact-digest }}
+        RMUX_RECEIPT_ENVELOPE_ARTIFACT_ID: ${{ inputs.receipt-envelope-artifact-id }}
+        RMUX_RECEIPT_ENVELOPE_ARTIFACT_DIGEST: ${{ inputs.receipt-envelope-artifact-digest }}
+        RMUX_RECEIPT_PREDICATE_SHA256: ${{ inputs.receipt-predicate-sha256 }}
+        RMUX_RECEIPT_ENVELOPE_SHA256: ${{ inputs.receipt-envelope-sha256 }}
         RMUX_PRIOR_RESULT_RUN_ID: ${{ inputs.prior-result-run-id }}
         RMUX_PRIOR_RESULT_RUN_WORKFLOW_ID: ${{ inputs.prior-result-run-workflow-id }}
         RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_ID: ${{ inputs.prior-result-producer-workflow-id }}
         RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_PATH: ${{ inputs.prior-result-producer-workflow-path }}
+        RMUX_PRIOR_RESULT_ARTIFACT_ID: ${{ inputs.prior-result-artifact-id }}
+        RMUX_PRIOR_RESULT_ARTIFACT_DIGEST: ${{ inputs.prior-result-artifact-digest }}
+        RMUX_PRIOR_RESULT_PREDICATE_SHA256: ${{ inputs.prior-result-predicate-sha256 }}
+        RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_ID: ${{ inputs.prior-result-envelope-artifact-id }}
+        RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_DIGEST: ${{ inputs.prior-result-envelope-artifact-digest }}
+        RMUX_PRIOR_RESULT_ENVELOPE_SHA256: ${{ inputs.prior-result-envelope-sha256 }}
+        RMUX_REQUEST_IDEMPOTENCY_KEY: ${{ inputs.request-idempotency-key }}
         RMUX_SOURCE_SHA: ${{ inputs.source-sha }}
         RMUX_RELEASE_ID: ${{ inputs.release-id }}
         RMUX_RELEASE_REF: ${{ inputs.release-ref }}
@@ -56,6 +69,31 @@ runs:
         test "$GITHUB_REPOSITORY" = "Helvesec/rmux"
         test "$GITHUB_REPOSITORY_ID" = "1239918790"
         test "$GITHUB_RUN_ATTEMPT" = 1
+        scripts/release/prepare-channel-retry.py validate-prepare-inputs \
+          --channel "$RMUX_CHANNEL" \
+          --receipt-run-id "$RMUX_RECEIPT_RUN_ID" \
+          --receipt-run-workflow-id "$RMUX_RECEIPT_RUN_WORKFLOW_ID" \
+          --receipt-workflow-id "$RMUX_RECEIPT_WORKFLOW_ID" \
+          --receipt-artifact-id "$RMUX_RECEIPT_ARTIFACT_ID" \
+          --receipt-artifact-digest "$RMUX_RECEIPT_ARTIFACT_DIGEST" \
+          --receipt-envelope-artifact-id "$RMUX_RECEIPT_ENVELOPE_ARTIFACT_ID" \
+          --receipt-envelope-artifact-digest "$RMUX_RECEIPT_ENVELOPE_ARTIFACT_DIGEST" \
+          --receipt-predicate-sha256 "$RMUX_RECEIPT_PREDICATE_SHA256" \
+          --receipt-envelope-sha256 "$RMUX_RECEIPT_ENVELOPE_SHA256" \
+          --prior-result-run-id "$RMUX_PRIOR_RESULT_RUN_ID" \
+          --prior-result-run-workflow-id "$RMUX_PRIOR_RESULT_RUN_WORKFLOW_ID" \
+          --prior-result-producer-workflow-id "$RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_ID" \
+          --prior-result-producer-workflow-path "$RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_PATH" \
+          --prior-result-artifact-id "$RMUX_PRIOR_RESULT_ARTIFACT_ID" \
+          --prior-result-artifact-digest "$RMUX_PRIOR_RESULT_ARTIFACT_DIGEST" \
+          --prior-result-predicate-sha256 "$RMUX_PRIOR_RESULT_PREDICATE_SHA256" \
+          --prior-result-envelope-artifact-id "$RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_ID" \
+          --prior-result-envelope-artifact-digest "$RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_DIGEST" \
+          --prior-result-envelope-sha256 "$RMUX_PRIOR_RESULT_ENVELOPE_SHA256" \
+          --source-sha "$RMUX_SOURCE_SHA" \
+          --release-id "$RMUX_RELEASE_ID" \
+          --release-ref "$RMUX_RELEASE_REF" \
+          --idempotency-key "$RMUX_REQUEST_IDEMPOTENCY_KEY"
         [[ "$RMUX_CHANNEL" =~ ^(chocolatey|snap_candidate)$ ]]
         for value in \
           "$RMUX_RECEIPT_RUN_ID" "$RMUX_RECEIPT_RUN_WORKFLOW_ID" \
@@ -90,41 +128,56 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
+        RMUX_CHANNEL: ${{ inputs.channel }}
+        RMUX_RECEIPT_RUN_ID: ${{ inputs.receipt-run-id }}
+        RMUX_RECEIPT_WORKFLOW_ID: ${{ inputs.receipt-workflow-id }}
+        RMUX_RECEIPT_ARTIFACT_ID: ${{ inputs.receipt-artifact-id }}
+        RMUX_RECEIPT_ARTIFACT_DIGEST: ${{ inputs.receipt-artifact-digest }}
+        RMUX_RECEIPT_ENVELOPE_ARTIFACT_ID: ${{ inputs.receipt-envelope-artifact-id }}
+        RMUX_RECEIPT_ENVELOPE_ARTIFACT_DIGEST: ${{ inputs.receipt-envelope-artifact-digest }}
+        RMUX_PRIOR_RESULT_RUN_ID: ${{ inputs.prior-result-run-id }}
+        RMUX_PRIOR_RESULT_ARTIFACT_ID: ${{ inputs.prior-result-artifact-id }}
+        RMUX_PRIOR_RESULT_ARTIFACT_DIGEST: ${{ inputs.prior-result-artifact-digest }}
+        RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_ID: ${{ inputs.prior-result-envelope-artifact-id }}
+        RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_DIGEST: ${{ inputs.prior-result-envelope-artifact-digest }}
+        RMUX_SOURCE_SHA: ${{ inputs.source-sha }}
+        RMUX_RELEASE_ID: ${{ inputs.release-id }}
+        RMUX_RELEASE_REF: ${{ inputs.release-ref }}
       run: |
         set -euo pipefail
         root="${{ steps.paths.outputs.root }}"
         common=(
           --repository "$GITHUB_REPOSITORY"
-          --expected-source-sha "${{ inputs.source-sha }}"
-          --expected-workflow-id "${{ inputs.receipt-workflow-id }}"
+          --expected-source-sha "$RMUX_SOURCE_SHA"
+          --expected-workflow-id "$RMUX_RECEIPT_WORKFLOW_ID"
           --expected-workflow-path .github/workflows/release-receipt.yml
           --expected-event workflow_dispatch
-          --expected-head-branch "${{ inputs.release-ref }}"
+          --expected-head-branch "$RMUX_RELEASE_REF"
           --max-attempts 1
         )
         scripts/release/actions-artifact.py verify "${common[@]}" \
-          --run-id "${{ inputs.receipt-run-id }}" \
-          --artifact-id "${{ inputs.receipt-artifact-id }}" \
-          --name "rmux-publication-receipt-${{ inputs.source-sha }}-${{ inputs.release-id }}" \
-          --expected-digest "${{ inputs.receipt-artifact-digest }}" \
+          --run-id "$RMUX_RECEIPT_RUN_ID" \
+          --artifact-id "$RMUX_RECEIPT_ARTIFACT_ID" \
+          --name "rmux-publication-receipt-$RMUX_SOURCE_SHA-$RMUX_RELEASE_ID" \
+          --expected-digest "$RMUX_RECEIPT_ARTIFACT_DIGEST" \
           --include-retention > "$root/receipt-artifact.json"
         scripts/release/actions-artifact.py verify "${common[@]}" \
-          --run-id "${{ inputs.receipt-run-id }}" \
-          --artifact-id "${{ inputs.receipt-envelope-artifact-id }}" \
-          --name "rmux-publication-receipt-envelope-${{ inputs.source-sha }}-${{ inputs.release-id }}" \
-          --expected-digest "${{ inputs.receipt-envelope-artifact-digest }}" \
+          --run-id "$RMUX_RECEIPT_RUN_ID" \
+          --artifact-id "$RMUX_RECEIPT_ENVELOPE_ARTIFACT_ID" \
+          --name "rmux-publication-receipt-envelope-$RMUX_SOURCE_SHA-$RMUX_RELEASE_ID" \
+          --expected-digest "$RMUX_RECEIPT_ENVELOPE_ARTIFACT_DIGEST" \
           --include-retention > "$root/receipt-envelope-artifact.json"
         scripts/release/actions-artifact.py verify "${common[@]}" \
-          --run-id "${{ inputs.prior-result-run-id }}" \
-          --artifact-id "${{ inputs.prior-result-artifact-id }}" \
-          --name "rmux-downstream-${{ inputs.channel }}-result-${{ inputs.source-sha }}-${{ inputs.release-id }}" \
-          --expected-digest "${{ inputs.prior-result-artifact-digest }}" \
+          --run-id "$RMUX_PRIOR_RESULT_RUN_ID" \
+          --artifact-id "$RMUX_PRIOR_RESULT_ARTIFACT_ID" \
+          --name "rmux-downstream-$RMUX_CHANNEL-result-$RMUX_SOURCE_SHA-$RMUX_RELEASE_ID" \
+          --expected-digest "$RMUX_PRIOR_RESULT_ARTIFACT_DIGEST" \
           --include-retention > "$root/result-artifact.json"
         scripts/release/actions-artifact.py verify "${common[@]}" \
-          --run-id "${{ inputs.prior-result-run-id }}" \
-          --artifact-id "${{ inputs.prior-result-envelope-artifact-id }}" \
-          --name "rmux-downstream-${{ inputs.channel }}-result-envelope-${{ inputs.source-sha }}-${{ inputs.release-id }}" \
-          --expected-digest "${{ inputs.prior-result-envelope-artifact-digest }}" \
+          --run-id "$RMUX_PRIOR_RESULT_RUN_ID" \
+          --artifact-id "$RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_ID" \
+          --name "rmux-downstream-$RMUX_CHANNEL-result-envelope-$RMUX_SOURCE_SHA-$RMUX_RELEASE_ID" \
+          --expected-digest "$RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_DIGEST" \
           --include-retention > "$root/result-envelope-artifact.json"
 
     - name: Download the exact receipt predicate bundle
@@ -170,9 +223,11 @@ runs:
     - id: gh
       name: Install the pinned attestation verifier
       shell: bash
+      env:
+        RMUX_CHANNEL: ${{ inputs.channel }}
       run: |
         set -euo pipefail
-        install_root="$RUNNER_TEMP/rmux-gh-2.93.0-${{ inputs.channel }}-retry"
+        install_root="$RUNNER_TEMP/rmux-gh-2.93.0-$RMUX_CHANNEL-retry"
         scripts/release/install-gh-2.93.0.sh "$install_root"
         echo "binary=$install_root/gh" >> "$GITHUB_OUTPUT"
 
@@ -180,6 +235,9 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
+        RMUX_CHANNEL: ${{ inputs.channel }}
+        RMUX_SOURCE_SHA: ${{ inputs.source-sha }}
+        RMUX_RELEASE_REF: ${{ inputs.release-ref }}
       run: |
         set -euo pipefail
         root="${{ steps.paths.outputs.root }}"
@@ -188,8 +246,8 @@ runs:
           --release-state "$root/receipt/release-state.json" \
           --bundle "$root/receipt/publication-receipt.sigstore.json" \
           --predicate "$root/receipt/publication-receipt-predicate.json" \
-          --source-sha "${{ inputs.source-sha }}" \
-          --release-ref "${{ inputs.release-ref }}"
+          --source-sha "$RMUX_SOURCE_SHA" \
+          --release-ref "$RMUX_RELEASE_REF"
         scripts/release/verify-channel-result-attestation.py \
           --gh "${{ steps.gh.outputs.binary }}" \
           --request "$root/result/downstream-channel-request.json" \
@@ -197,15 +255,17 @@ runs:
           --bundle "$root/result/downstream-channel-result.sigstore.json" \
           --predicate "$root/result/downstream-channel-result-predicate.json" \
           --envelope "$root/result-envelope/downstream-channel-result-envelope.json" \
-          --source-sha "${{ inputs.source-sha }}" \
-          --release-ref "${{ inputs.release-ref }}" \
-          --channel "${{ inputs.channel }}"
+          --source-sha "$RMUX_SOURCE_SHA" \
+          --release-ref "$RMUX_RELEASE_REF" \
+          --channel "$RMUX_CHANNEL"
 
     - id: payload
       name: Revalidate the original payload artifact identity
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
+        RMUX_SOURCE_SHA: ${{ inputs.source-sha }}
+        RMUX_RELEASE_REF: ${{ inputs.release-ref }}
       run: |
         set -euo pipefail
         root="${{ steps.paths.outputs.root }}"
@@ -218,11 +278,11 @@ runs:
         scripts/release/actions-artifact.py verify \
           --repository "$GITHUB_REPOSITORY" --run-id "$run_id" \
           --artifact-id "$artifact_id" --name "$artifact_name" \
-          --expected-source-sha "${{ inputs.source-sha }}" \
+          --expected-source-sha "$RMUX_SOURCE_SHA" \
           --expected-workflow-id 316435347 \
           --expected-workflow-path .github/workflows/release-receipt.yml \
           --expected-event workflow_dispatch \
-          --expected-head-branch "${{ inputs.release-ref }}" \
+          --expected-head-branch "$RMUX_RELEASE_REF" \
           --expected-digest "$artifact_digest" --include-retention \
           --max-attempts 1 > "$root/payload-artifact-live.json"
         {
@@ -242,33 +302,56 @@ runs:
 
     - name: Prepare and revalidate the exact retry bundle
       shell: bash
+      env:
+        RMUX_CHANNEL: ${{ inputs.channel }}
+        RMUX_RECEIPT_RUN_ID: ${{ inputs.receipt-run-id }}
+        RMUX_RECEIPT_WORKFLOW_ID: ${{ inputs.receipt-workflow-id }}
+        RMUX_RECEIPT_ARTIFACT_ID: ${{ inputs.receipt-artifact-id }}
+        RMUX_RECEIPT_ARTIFACT_DIGEST: ${{ inputs.receipt-artifact-digest }}
+        RMUX_RECEIPT_ENVELOPE_ARTIFACT_ID: ${{ inputs.receipt-envelope-artifact-id }}
+        RMUX_RECEIPT_ENVELOPE_ARTIFACT_DIGEST: ${{ inputs.receipt-envelope-artifact-digest }}
+        RMUX_RECEIPT_PREDICATE_SHA256: ${{ inputs.receipt-predicate-sha256 }}
+        RMUX_RECEIPT_ENVELOPE_SHA256: ${{ inputs.receipt-envelope-sha256 }}
+        RMUX_PRIOR_RESULT_RUN_ID: ${{ inputs.prior-result-run-id }}
+        RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_ID: ${{ inputs.prior-result-producer-workflow-id }}
+        RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_PATH: ${{ inputs.prior-result-producer-workflow-path }}
+        RMUX_PRIOR_RESULT_ARTIFACT_ID: ${{ inputs.prior-result-artifact-id }}
+        RMUX_PRIOR_RESULT_ARTIFACT_DIGEST: ${{ inputs.prior-result-artifact-digest }}
+        RMUX_PRIOR_RESULT_PREDICATE_SHA256: ${{ inputs.prior-result-predicate-sha256 }}
+        RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_ID: ${{ inputs.prior-result-envelope-artifact-id }}
+        RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_DIGEST: ${{ inputs.prior-result-envelope-artifact-digest }}
+        RMUX_PRIOR_RESULT_ENVELOPE_SHA256: ${{ inputs.prior-result-envelope-sha256 }}
+        RMUX_REQUEST_IDEMPOTENCY_KEY: ${{ inputs.request-idempotency-key }}
+        RMUX_SOURCE_SHA: ${{ inputs.source-sha }}
+        RMUX_RELEASE_ID: ${{ inputs.release-id }}
+        RMUX_RELEASE_REF: ${{ inputs.release-ref }}
       run: |
         set -euo pipefail
         scripts/release/prepare-channel-retry.py prepare \
           --root "${{ steps.paths.outputs.root }}" \
           --output "${{ steps.paths.outputs.root }}/prepared" \
-          --channel "${{ inputs.channel }}" \
-          --source-sha "${{ inputs.source-sha }}" \
-          --release-id "${{ inputs.release-id }}" \
-          --release-ref "${{ inputs.release-ref }}" \
-          --idempotency-key "${{ inputs.request-idempotency-key }}" \
-          --receipt-run-id "${{ inputs.receipt-run-id }}" \
-          --receipt-workflow-id "${{ inputs.receipt-workflow-id }}" \
-          --receipt-artifact-id "${{ inputs.receipt-artifact-id }}" \
-          --receipt-artifact-digest "${{ inputs.receipt-artifact-digest }}" \
-          --receipt-envelope-artifact-id "${{ inputs.receipt-envelope-artifact-id }}" \
-          --receipt-envelope-artifact-digest "${{ inputs.receipt-envelope-artifact-digest }}" \
-          --receipt-predicate-sha256 "${{ inputs.receipt-predicate-sha256 }}" \
-          --receipt-envelope-sha256 "${{ inputs.receipt-envelope-sha256 }}" \
-          --prior-result-run-id "${{ inputs.prior-result-run-id }}" \
-          --prior-result-producer-workflow-id "${{ inputs.prior-result-producer-workflow-id }}" \
-          --prior-result-producer-workflow-path "${{ inputs.prior-result-producer-workflow-path }}" \
-          --prior-result-artifact-id "${{ inputs.prior-result-artifact-id }}" \
-          --prior-result-artifact-digest "${{ inputs.prior-result-artifact-digest }}" \
-          --prior-result-predicate-sha256 "${{ inputs.prior-result-predicate-sha256 }}" \
-          --prior-result-envelope-artifact-id "${{ inputs.prior-result-envelope-artifact-id }}" \
-          --prior-result-envelope-artifact-digest "${{ inputs.prior-result-envelope-artifact-digest }}" \
-          --prior-result-envelope-sha256 "${{ inputs.prior-result-envelope-sha256 }}"
+          --channel "$RMUX_CHANNEL" \
+          --source-sha "$RMUX_SOURCE_SHA" \
+          --release-id "$RMUX_RELEASE_ID" \
+          --release-ref "$RMUX_RELEASE_REF" \
+          --idempotency-key "$RMUX_REQUEST_IDEMPOTENCY_KEY" \
+          --receipt-run-id "$RMUX_RECEIPT_RUN_ID" \
+          --receipt-workflow-id "$RMUX_RECEIPT_WORKFLOW_ID" \
+          --receipt-artifact-id "$RMUX_RECEIPT_ARTIFACT_ID" \
+          --receipt-artifact-digest "$RMUX_RECEIPT_ARTIFACT_DIGEST" \
+          --receipt-envelope-artifact-id "$RMUX_RECEIPT_ENVELOPE_ARTIFACT_ID" \
+          --receipt-envelope-artifact-digest "$RMUX_RECEIPT_ENVELOPE_ARTIFACT_DIGEST" \
+          --receipt-predicate-sha256 "$RMUX_RECEIPT_PREDICATE_SHA256" \
+          --receipt-envelope-sha256 "$RMUX_RECEIPT_ENVELOPE_SHA256" \
+          --prior-result-run-id "$RMUX_PRIOR_RESULT_RUN_ID" \
+          --prior-result-producer-workflow-id "$RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_ID" \
+          --prior-result-producer-workflow-path "$RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_PATH" \
+          --prior-result-artifact-id "$RMUX_PRIOR_RESULT_ARTIFACT_ID" \
+          --prior-result-artifact-digest "$RMUX_PRIOR_RESULT_ARTIFACT_DIGEST" \
+          --prior-result-predicate-sha256 "$RMUX_PRIOR_RESULT_PREDICATE_SHA256" \
+          --prior-result-envelope-artifact-id "$RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_ID" \
+          --prior-result-envelope-artifact-digest "$RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_DIGEST" \
+          --prior-result-envelope-sha256 "$RMUX_PRIOR_RESULT_ENVELOPE_SHA256"
 
     - id: upload
       name: Upload only the exact prepared retry bundle
