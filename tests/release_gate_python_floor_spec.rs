@@ -9,13 +9,16 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::{Command, Output};
+#[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+#[cfg(unix)]
 fn temp_dir(label: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -26,6 +29,7 @@ fn temp_dir(label: &str) -> PathBuf {
     path
 }
 
+#[cfg(unix)]
 fn describe(script: &str, output: &Output) -> String {
     format!(
         "{script} failed with {}\nstdout:\n{}\nstderr:\n{}",
@@ -37,6 +41,7 @@ fn describe(script: &str, output: &Output) -> String {
 
 /// Every release-tooling Python invocation the gate makes, with arguments that
 /// reach the manifest/ledger parse rather than stopping in `argparse`.
+#[cfg(unix)]
 fn release_python_steps(output_dir: &Path) -> Vec<(&'static str, Vec<String>)> {
     let intent = output_dir.join("candidate-intent.json");
     let sha = "0".repeat(40);
@@ -73,6 +78,7 @@ fn release_python_steps(output_dir: &Path) -> Vec<(&'static str, Vec<String>)> {
     ]
 }
 
+#[cfg(unix)]
 fn run_with(
     interpreter: &Path,
     script: &str,
@@ -92,6 +98,7 @@ fn run_with(
 /// Reproduce the release host on any interpreter: a `PYTHONPATH` entry that
 /// hides `tomllib` even from a 3.11+ CPython, so the gate is proven portable
 /// instead of proven only where the newer stdlib happens to exist.
+#[cfg(unix)]
 fn interpreter_without_tomllib() -> PathBuf {
     let shim = temp_dir("tomllib-hidden");
     fs::write(
