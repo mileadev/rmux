@@ -3125,7 +3125,7 @@ fn if_shell_supports_representative_public_commands() -> Result<(), Box<dyn Erro
     assert_eq!(windows.status.code(), Some(0));
     assert_eq!(
         stdout(&windows),
-        "89f5,80x24,0,0{39x24,0,0,0,40x24,40,0,1}\n"
+        "8205,80x24,0,0{40x24,0,0,0,39x24,41,0,1}\n"
     );
     assert!(stderr(&windows).is_empty());
 

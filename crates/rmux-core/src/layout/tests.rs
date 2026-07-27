@@ -6,18 +6,25 @@ fn pane(index: u32) -> Pane {
     Pane::new(index, PaneGeometry::new(0, 0, 0, 0))
 }
 
+fn layout_geometries(
+    layout: LayoutName,
+    pane_count: usize,
+    size: TerminalSize,
+    requested_main_width: Option<u16>,
+) -> Vec<PaneGeometry> {
+    let mut panes = (0..pane_count as u32).map(pane).collect::<Vec<_>>();
+    apply_layout(&mut panes, layout, size, requested_main_width);
+    panes.iter().map(|pane| pane.geometry()).collect()
+}
+
 fn assert_layout(
     layout: LayoutName,
     size: TerminalSize,
     requested_main_width: Option<u16>,
     expected: Vec<PaneGeometry>,
 ) {
-    let mut panes = (0..expected.len() as u32).map(pane).collect::<Vec<_>>();
-
-    apply_layout(&mut panes, layout, size, requested_main_width);
-
     assert_eq!(
-        panes.iter().map(|pane| pane.geometry()).collect::<Vec<_>>(),
+        layout_geometries(layout, expected.len(), size, requested_main_width),
         expected
     );
 }
@@ -94,8 +101,8 @@ fn three_panes_spread_the_secondary_column_using_tmux_order() {
         Some(34),
         vec![
             PaneGeometry::new(0, 0, 34, 50),
-            PaneGeometry::new(35, 0, 65, 24),
-            PaneGeometry::new(35, 25, 65, 25),
+            PaneGeometry::new(35, 0, 65, 25),
+            PaneGeometry::new(35, 26, 65, 24),
         ],
     );
 }
@@ -111,23 +118,23 @@ fn three_panes_spread_the_secondary_row_using_tmux_defaults() {
         None,
         vec![
             PaneGeometry::new(0, 0, 100, 24),
-            PaneGeometry::new(0, 25, 49, 25),
-            PaneGeometry::new(50, 25, 50, 25),
+            PaneGeometry::new(0, 25, 50, 25),
+            PaneGeometry::new(51, 25, 49, 25),
         ],
     );
 }
 
 #[test]
-fn remainder_rows_are_distributed_to_the_bottom_in_tmux_secondary_columns() {
+fn remainder_rows_are_distributed_from_the_top_in_tmux_secondary_columns() {
     assert_layout(
         LayoutName::MainVertical,
         TerminalSize { cols: 90, rows: 10 },
         Some(30),
         vec![
             PaneGeometry::new(0, 0, 30, 10),
-            PaneGeometry::new(31, 0, 59, 2),
-            PaneGeometry::new(31, 3, 59, 2),
-            PaneGeometry::new(31, 6, 59, 4),
+            PaneGeometry::new(31, 0, 59, 3),
+            PaneGeometry::new(31, 4, 59, 3),
+            PaneGeometry::new(31, 8, 59, 2),
         ],
     );
 }
@@ -140,9 +147,9 @@ fn main_horizontal_preserves_a_minimum_secondary_row_on_small_windows() {
         None,
         vec![
             PaneGeometry::new(0, 0, 10, 7),
-            PaneGeometry::new(0, 8, 2, 1),
-            PaneGeometry::new(3, 8, 2, 1),
-            PaneGeometry::new(6, 8, 4, 1),
+            PaneGeometry::new(0, 8, 3, 1),
+            PaneGeometry::new(4, 8, 3, 1),
+            PaneGeometry::new(8, 8, 2, 1),
         ],
     );
 }
@@ -158,8 +165,8 @@ fn main_vertical_geometry_case_is_exact() {
         Some(34),
         vec![
             PaneGeometry::new(0, 0, 34, 50),
-            PaneGeometry::new(35, 0, 165, 24),
-            PaneGeometry::new(35, 25, 165, 25),
+            PaneGeometry::new(35, 0, 165, 25),
+            PaneGeometry::new(35, 26, 165, 24),
         ],
     );
 }
@@ -189,8 +196,8 @@ fn mirrored_main_vertical_keeps_main_pane_in_large_column() {
         Some(34),
         vec![
             PaneGeometry::new(86, 0, 34, 40),
-            PaneGeometry::new(0, 0, 85, 19),
-            PaneGeometry::new(0, 20, 85, 20),
+            PaneGeometry::new(0, 0, 85, 20),
+            PaneGeometry::new(0, 21, 85, 19),
         ],
     );
 }
@@ -207,8 +214,8 @@ fn mirrored_main_horizontal_keeps_main_pane_in_large_row() {
         None,
         vec![
             PaneGeometry::new(0, 26, 100, 24),
-            PaneGeometry::new(0, 0, 49, 25),
-            PaneGeometry::new(50, 0, 50, 25),
+            PaneGeometry::new(0, 0, 50, 25),
+            PaneGeometry::new(51, 0, 49, 25),
         ],
     );
 }
@@ -238,8 +245,8 @@ fn even_horizontal_two_panes_split_columns_with_one_border() {
         },
         None,
         vec![
-            PaneGeometry::new(0, 0, 59, 40),
-            PaneGeometry::new(60, 0, 60, 40),
+            PaneGeometry::new(0, 0, 60, 40),
+            PaneGeometry::new(61, 0, 59, 40),
         ],
     );
 }
@@ -254,8 +261,8 @@ fn even_vertical_two_panes_split_rows_with_one_border() {
         },
         None,
         vec![
-            PaneGeometry::new(0, 0, 120, 19),
-            PaneGeometry::new(0, 20, 120, 20),
+            PaneGeometry::new(0, 0, 120, 20),
+            PaneGeometry::new(0, 21, 120, 19),
         ],
     );
 }
@@ -278,7 +285,7 @@ fn even_horizontal_three_panes_with_101_columns_has_no_remainder() {
 }
 
 #[test]
-fn even_horizontal_three_panes_with_100_columns_gives_remainder_to_the_last_pane() {
+fn even_horizontal_three_panes_with_100_columns_spreads_remainder_from_the_first_pane() {
     assert_layout(
         LayoutName::EvenHorizontal,
         TerminalSize {
@@ -287,15 +294,15 @@ fn even_horizontal_three_panes_with_100_columns_gives_remainder_to_the_last_pane
         },
         None,
         vec![
-            PaneGeometry::new(0, 0, 32, 40),
-            PaneGeometry::new(33, 0, 32, 40),
-            PaneGeometry::new(66, 0, 34, 40),
+            PaneGeometry::new(0, 0, 33, 40),
+            PaneGeometry::new(34, 0, 33, 40),
+            PaneGeometry::new(68, 0, 32, 40),
         ],
     );
 }
 
 #[test]
-fn even_vertical_three_panes_gives_remainder_rows_to_the_last_pane() {
+fn even_vertical_three_panes_spreads_remainder_rows_from_the_first_pane() {
     assert_layout(
         LayoutName::EvenVertical,
         TerminalSize {
@@ -304,39 +311,39 @@ fn even_vertical_three_panes_gives_remainder_rows_to_the_last_pane() {
         },
         None,
         vec![
-            PaneGeometry::new(0, 0, 100, 12),
-            PaneGeometry::new(0, 13, 100, 12),
-            PaneGeometry::new(0, 26, 100, 14),
+            PaneGeometry::new(0, 0, 100, 13),
+            PaneGeometry::new(0, 14, 100, 13),
+            PaneGeometry::new(0, 28, 100, 12),
         ],
     );
 }
 
 #[test]
-fn even_horizontal_four_panes_gives_remainder_to_the_last_pane() {
+fn even_horizontal_four_panes_gives_remainder_to_the_first_pane() {
     assert_layout(
         LayoutName::EvenHorizontal,
         TerminalSize { cols: 80, rows: 20 },
         None,
         vec![
-            PaneGeometry::new(0, 0, 19, 20),
-            PaneGeometry::new(20, 0, 19, 20),
-            PaneGeometry::new(40, 0, 19, 20),
-            PaneGeometry::new(60, 0, 20, 20),
+            PaneGeometry::new(0, 0, 20, 20),
+            PaneGeometry::new(21, 0, 19, 20),
+            PaneGeometry::new(41, 0, 19, 20),
+            PaneGeometry::new(61, 0, 19, 20),
         ],
     );
 }
 
 #[test]
-fn even_vertical_four_panes_gives_remainder_to_the_last_pane() {
+fn even_vertical_four_panes_gives_remainder_to_the_first_pane() {
     assert_layout(
         LayoutName::EvenVertical,
         TerminalSize { cols: 80, rows: 20 },
         None,
         vec![
-            PaneGeometry::new(0, 0, 80, 4),
-            PaneGeometry::new(0, 5, 80, 4),
-            PaneGeometry::new(0, 10, 80, 4),
-            PaneGeometry::new(0, 15, 80, 5),
+            PaneGeometry::new(0, 0, 80, 5),
+            PaneGeometry::new(0, 6, 80, 4),
+            PaneGeometry::new(0, 11, 80, 4),
+            PaneGeometry::new(0, 16, 80, 4),
         ],
     );
 }
@@ -348,11 +355,11 @@ fn even_horizontal_five_panes_keeps_one_cell_separators() {
         TerminalSize { cols: 12, rows: 6 },
         None,
         vec![
-            PaneGeometry::new(0, 0, 1, 6),
-            PaneGeometry::new(2, 0, 1, 6),
-            PaneGeometry::new(4, 0, 1, 6),
-            PaneGeometry::new(6, 0, 1, 6),
-            PaneGeometry::new(8, 0, 4, 6),
+            PaneGeometry::new(0, 0, 2, 6),
+            PaneGeometry::new(3, 0, 2, 6),
+            PaneGeometry::new(6, 0, 2, 6),
+            PaneGeometry::new(9, 0, 1, 6),
+            PaneGeometry::new(11, 0, 1, 6),
         ],
     );
 }
@@ -364,13 +371,113 @@ fn even_vertical_five_panes_keeps_one_cell_separators() {
         TerminalSize { cols: 6, rows: 12 },
         None,
         vec![
-            PaneGeometry::new(0, 0, 6, 1),
-            PaneGeometry::new(0, 2, 6, 1),
-            PaneGeometry::new(0, 4, 6, 1),
-            PaneGeometry::new(0, 6, 6, 1),
-            PaneGeometry::new(0, 8, 6, 4),
+            PaneGeometry::new(0, 0, 6, 2),
+            PaneGeometry::new(0, 3, 6, 2),
+            PaneGeometry::new(0, 6, 6, 2),
+            PaneGeometry::new(0, 9, 6, 1),
+            PaneGeometry::new(0, 11, 6, 1),
         ],
     );
+}
+
+#[test]
+fn named_layout_remainders_follow_tmux_spatial_order_for_two_to_six_panes() {
+    fn expected_sizes(count: usize, remainder: usize) -> Vec<u16> {
+        (0..count)
+            .map(|index| 5 + u16::from(index < remainder))
+            .collect()
+    }
+
+    for pane_count in 2_usize..=6 {
+        for remainder in 0..pane_count {
+            let total = (5 * pane_count + (pane_count - 1) + remainder) as u16;
+            let expected = expected_sizes(pane_count, remainder);
+
+            let horizontal = layout_geometries(
+                LayoutName::EvenHorizontal,
+                pane_count,
+                TerminalSize {
+                    cols: total,
+                    rows: 40,
+                },
+                None,
+            );
+            assert_eq!(
+                horizontal
+                    .iter()
+                    .map(PaneGeometry::cols)
+                    .collect::<Vec<_>>(),
+                expected,
+                "even-horizontal pane_count={pane_count} remainder={remainder}"
+            );
+
+            let vertical = layout_geometries(
+                LayoutName::EvenVertical,
+                pane_count,
+                TerminalSize {
+                    cols: 80,
+                    rows: total,
+                },
+                None,
+            );
+            assert_eq!(
+                vertical.iter().map(PaneGeometry::rows).collect::<Vec<_>>(),
+                expected,
+                "even-vertical pane_count={pane_count} remainder={remainder}"
+            );
+        }
+
+        let secondary_count = pane_count - 1;
+        for remainder in 0..secondary_count {
+            let total = (5 * secondary_count + (secondary_count - 1) + remainder) as u16;
+            let expected = expected_sizes(secondary_count, remainder);
+
+            for layout in [
+                LayoutName::MainHorizontal,
+                LayoutName::MainHorizontalMirrored,
+            ] {
+                let geometries = layout_geometries(
+                    layout,
+                    pane_count,
+                    TerminalSize {
+                        cols: total,
+                        rows: 50,
+                    },
+                    None,
+                );
+                assert_eq!(
+                    geometries
+                        .iter()
+                        .skip(1)
+                        .map(PaneGeometry::cols)
+                        .collect::<Vec<_>>(),
+                    expected,
+                    "{layout} pane_count={pane_count} remainder={remainder}"
+                );
+            }
+
+            for layout in [LayoutName::MainVertical, LayoutName::MainVerticalMirrored] {
+                let geometries = layout_geometries(
+                    layout,
+                    pane_count,
+                    TerminalSize {
+                        cols: 100,
+                        rows: total,
+                    },
+                    Some(34),
+                );
+                assert_eq!(
+                    geometries
+                        .iter()
+                        .skip(1)
+                        .map(PaneGeometry::rows)
+                        .collect::<Vec<_>>(),
+                    expected,
+                    "{layout} pane_count={pane_count} remainder={remainder}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -401,9 +508,10 @@ fn even_vertical_two_panes_minimum_viable_height_gives_each_pane_one_row() {
 }
 
 #[test]
-fn even_horizontal_degenerate_width_gives_earlier_panes_zero_columns() {
-    // 2 cols with 2 panes: usable = 2 - 1 = 1, each = 0, remainder = 1.
-    // tmux assigns the remainder to the last pane.
+fn even_horizontal_degenerate_width_product_divergence() {
+    // tmux clamps a two-pane window to the viable three-column minimum. RMUX's
+    // core can represent this otherwise unreachable undersized geometry and
+    // preserves its existing fail-soft allocation to the final pane.
     assert_layout(
         LayoutName::EvenHorizontal,
         TerminalSize { cols: 2, rows: 10 },
@@ -416,7 +524,7 @@ fn even_horizontal_degenerate_width_gives_earlier_panes_zero_columns() {
 }
 
 #[test]
-fn even_vertical_degenerate_height_gives_earlier_panes_zero_rows() {
+fn even_vertical_degenerate_height_product_divergence() {
     assert_layout(
         LayoutName::EvenVertical,
         TerminalSize { cols: 10, rows: 2 },
@@ -435,8 +543,8 @@ fn even_horizontal_ignores_requested_main_width() {
         TerminalSize { cols: 80, rows: 20 },
         Some(79),
         vec![
-            PaneGeometry::new(0, 0, 39, 20),
-            PaneGeometry::new(40, 0, 40, 20),
+            PaneGeometry::new(0, 0, 40, 20),
+            PaneGeometry::new(41, 0, 39, 20),
         ],
     );
 }
@@ -448,8 +556,8 @@ fn even_vertical_ignores_requested_main_width() {
         TerminalSize { cols: 80, rows: 20 },
         Some(79),
         vec![
-            PaneGeometry::new(0, 0, 80, 9),
-            PaneGeometry::new(0, 10, 80, 10),
+            PaneGeometry::new(0, 0, 80, 10),
+            PaneGeometry::new(0, 11, 80, 9),
         ],
     );
 }

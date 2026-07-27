@@ -98,18 +98,9 @@ fn tmux_compat_explicit_config_layout_and_format_surfaces_when_frozen_tmux_is_av
         &["lsw", "-t", "alpha", "-F", "#{window_layout}"],
         config.clone(),
     )?;
-    // Frozen tmux next-3.7 keeps the explicit split geometry here; RMUX follows
-    // the system tmux 3.4 behavior observed in the interactive Mate-terminal
-    // check, where explicit even-horizontal recomputes balanced pane widths.
-    assert_eq!(list_windows.tmux.status_code, list_windows.rmux.status_code);
-    assert_eq!(list_windows.tmux.timed_out, list_windows.rmux.timed_out);
-    assert_eq!(list_windows.tmux.stderr, list_windows.rmux.stderr);
+    assert_exact_tmux_compat(&list_windows);
     assert_eq!(
         list_windows.rmux.stdout_string(),
-        "89f5,80x24,0,0{39x24,0,0,0,40x24,40,0,1}\n"
-    );
-    assert_eq!(
-        list_windows.tmux.stdout_string(),
         "8205,80x24,0,0{40x24,0,0,0,39x24,41,0,1}\n"
     );
     assert_run_metadata(
@@ -131,17 +122,9 @@ fn tmux_compat_explicit_config_layout_and_format_surfaces_when_frozen_tmux_is_av
         ],
         config,
     )?;
-    // Keep the same version-specific layout assertion for the format expansion
-    // path so status-left and conditional formatting remain covered.
-    assert_eq!(display.tmux.status_code, display.rmux.status_code);
-    assert_eq!(display.tmux.timed_out, display.rmux.timed_out);
-    assert_eq!(display.tmux.stderr, display.rmux.stderr);
+    assert_exact_tmux_compat(&display);
     assert_eq!(
         display.rmux.stdout_string(),
-        "alpha:89f5,80x24,0,0{39x24,0,0,0,40x24,40,0,1}:\n"
-    );
-    assert_eq!(
-        display.tmux.stdout_string(),
         "alpha:8205,80x24,0,0{40x24,0,0,0,39x24,41,0,1}:\n"
     );
     assert_run_metadata(
