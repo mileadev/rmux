@@ -12,11 +12,33 @@ use crate::pane_io::PaneObservationItem;
 use super::super::subscription_support::{cursor_event_limit, OutputSubscriptionState};
 use super::{
     capture_surface_source, materialize_surface_frame, owned_stream_record, slow_consumer_response,
-    stream_cursor_response, validate_surface_frame_size, wrong_stream_mode, PaneStreamSubscription,
-    PendingSurfaceRefresh, RequestHandler, SurfaceRefreshGuard,
+    stream_cursor_response, validate_surface_frame_size, wrong_stream_mode, PaneStreamSource,
+    PaneStreamSubscription, PendingSurfaceRefresh, RequestHandler, SurfaceRefreshGuard,
 };
 
 impl RequestHandler {
+    pub(super) async fn validate_current_surface_admission(
+        &self,
+        source: PaneStreamSource,
+    ) -> Result<PaneStreamSource, RmuxError> {
+        let (source, captured) = self.capture_current_surface_stream_source(source).await?;
+        let seed = captured
+            .seed
+            .as_ref()
+            .expect("forced surface admission capture must materialize a projection");
+        let frame = materialize_surface_frame(
+            self,
+            source.key.pane_id(),
+            1,
+            1,
+            0,
+            captured.boundary.next_output_sequence,
+            seed,
+        )?;
+        validate_surface_frame_size(&frame)?;
+        Ok(source)
+    }
+
     pub(super) async fn poll_surface_stream(
         &self,
         connection_id: u64,

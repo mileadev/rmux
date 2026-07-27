@@ -269,6 +269,10 @@ impl RequestHandler {
             loop {
                 match route {
                     SurfaceDriverRoute::Ready => {
+                        source = match self.validate_current_surface_admission(source).await {
+                            Ok(source) => source,
+                            Err(error) => return Response::Error(ErrorResponse { error }),
+                        };
                         let response = self.finish_existing_surface_subscription(
                             connection_id,
                             subscription_id,
