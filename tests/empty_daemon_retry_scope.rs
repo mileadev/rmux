@@ -18,6 +18,7 @@ use rmux_pty::TerminalSize;
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_OBSERVATION: Duration = Duration::from_millis(200);
+const CONTROL_TEARDOWN_OBSERVATION: Duration = Duration::from_millis(425);
 type SharedOutput = Arc<Mutex<Vec<u8>>>;
 type OutputCollector = JoinHandle<io::Result<Vec<u8>>>;
 
@@ -35,6 +36,63 @@ fn sdk_connection_survives_a_later_attach_drain_reevaluation() -> Result<(), Box
 #[test]
 fn sdk_connection_survives_a_later_control_drain_reevaluation() -> Result<(), Box<dyn Error>> {
     run_later_drain_case("retry-scope-control-sdk", DrainPeers::Control)
+}
+
+#[test]
+fn sdk_connection_survives_completed_session_bound_control_teardown() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("retry-scope-control-teardown-sdk")?;
+    let (_cleanup, generation) = start_alpha(&harness)?;
+    let mut control = ControlProcess::spawn(&harness)?;
+    control.wait_for_output("%session-changed ")?;
+    control.write_input("display-message -p CONTROL_READY\n")?;
+    control.wait_for_output("CONTROL_READY\n")?;
+    control.wait_for_begin_count(2)?;
+
+    let mut sdk = connect(harness.socket_path())?;
+    let Response::ListSessions(first) = sdk.list_sessions(empty_list_request())? else {
+        panic!("expected initial list-sessions response");
+    };
+    assert!(
+        String::from_utf8_lossy(first.command_output().stdout()).contains("alpha"),
+        "the SDK transport must be accepted before the last-session kill"
+    );
+
+    assert!(matches!(kill_alpha(&mut sdk)?, Response::KillSession(_)));
+    let control_output = control.wait_for_exit_with_open_stdin()?;
+    assert_eq!(control_output.status.code(), Some(0));
+    assert!(
+        control_output.stderr.is_empty(),
+        "stderr={:?}",
+        control_output.stderr
+    );
+    assert!(
+        control_output.stdout.contains("%session-changed ")
+            && control_output.stdout.contains("CONTROL_READY\n"),
+        "the control client was not proven admitted and session-bound: {:?}",
+        control_output.stdout
+    );
+    assert!(
+        control_output.stdout.matches("%begin ").count() >= 2
+            && control_output.stdout.matches("%end ").count() >= 2
+            && control_output.stdout.ends_with("%exit\n"),
+        "control terminal framing was incomplete: {:?}",
+        control_output.stdout
+    );
+
+    std::thread::sleep(CONTROL_TEARDOWN_OBSERVATION);
+    assert_empty_sessions(sdk.list_sessions(empty_list_request())?)?;
+    assert!(
+        generation_is_alive(generation)?,
+        "the accepted SDK transport must keep its daemon generation alive"
+    );
+
+    drop(sdk);
+    assert!(
+        wait_for_generation_exit(generation, PROCESS_TIMEOUT)?,
+        "idle shutdown must follow the final SDK transport closing"
+    );
+    Ok(())
 }
 
 #[test]

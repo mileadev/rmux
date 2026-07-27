@@ -1774,7 +1774,7 @@ impl RequestHandler {
         })
     }
 
-    pub(in crate::handler) async fn request_shutdown_if_server_empty(&self) -> bool {
+    pub(crate) async fn request_shutdown_if_server_empty(&self) -> bool {
         if !self.queue_shutdown_if_server_empty().await {
             return false;
         }
