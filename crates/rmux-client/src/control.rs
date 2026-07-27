@@ -21,6 +21,10 @@ use crate::{
     ClientError,
 };
 
+#[cfg(unix)]
+#[path = "control/output.rs"]
+mod output;
+
 impl Connection {
     /// Requests a control-mode upgrade and, on success, yields the raw local
     /// stream for tmux-compatible text control traffic.
@@ -148,7 +152,7 @@ where
         let _ = stdin_done_tx.send(result);
     });
 
-    let copy_result = copy_control_output(stream, output).map_err(ClientError::Io);
+    let copy_result = output::copy_control_output(stream, output).map_err(ClientError::Io);
     let stdin_result = poll_input_thread(&stdin_done_rx)?;
     if stdin_result.is_some() {
         stdin_thread
@@ -269,20 +273,6 @@ fn write_initial_commands(
             .map_err(ClientError::Io)?;
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn copy_control_output(mut stream: BlockingLocalStream, output: &mut impl Write) -> io::Result<()> {
-    let mut buffer = [0_u8; 8192];
-
-    loop {
-        let bytes_read = stream.read(&mut buffer)?;
-        if bytes_read == 0 {
-            return Ok(());
-        }
-        output.write_all(&buffer[..bytes_read])?;
-        output.flush()?;
-    }
 }
 
 #[cfg(unix)]

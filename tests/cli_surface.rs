@@ -1836,14 +1836,10 @@ fn hidden_daemon_binary_override_is_ignored_without_test_opt_in() -> Result<(), 
 
     assert_success(&output);
     assert!(
-        harness.socket_path().exists(),
-        "rmux should still auto-start its own daemon"
-    );
-    assert!(
         !marker_path.exists(),
         "the undocumented override must be ignored without the test-only opt-in"
     );
-    assert_success(&harness.run(&["kill-server"])?);
+    wait_for_socket_cleanup(harness.socket_path())?;
     Ok(())
 }
 

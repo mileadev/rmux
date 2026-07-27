@@ -4,7 +4,8 @@ use std::fmt;
 use std::path::Path;
 
 use rmux_client::{
-    connect_or_absent, ClientError, ConnectResult, Connection, ServerConnectionProvenance,
+    connect_or_absent, wait_for_server_endpoint_cleanup, ClientError, ConnectResult, Connection,
+    ServerConnectionProvenance,
 };
 use rmux_proto::{OptionScopeSelector, Response, RmuxError};
 
@@ -66,7 +67,19 @@ pub(crate) fn shutdown_started_empty_server_at(
         ConnectResult::Connected(connection) => connection,
         ConnectResult::Absent => return Ok(()),
     };
-    shutdown_started_empty_server(&mut connection, provenance)
+    let result = shutdown_started_empty_server(&mut connection, provenance);
+    drop(connection);
+    match result {
+        Err(EmptyServerLifecycleError::Client(error))
+            if server_closed_during_empty_cleanup(&error) =>
+        {
+            match wait_for_server_endpoint_cleanup(socket_path) {
+                Ok(()) => Ok(()),
+                Err(_) => Err(EmptyServerLifecycleError::Client(error)),
+            }
+        }
+        result => result,
+    }
 }
 
 /// Requests shutdown only for the empty daemon created by this invocation and
@@ -120,4 +133,20 @@ pub(crate) fn shutdown_started_empty_server(
 
 fn option_is_on(output: &[u8]) -> bool {
     matches!(output, b"on" | b"on\n" | b"on\r\n")
+}
+
+fn server_closed_during_empty_cleanup(error: &ClientError) -> bool {
+    matches!(error, ClientError::UnexpectedEof)
+        || matches!(
+            error,
+            ClientError::Io(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::NotConnected
+                        | std::io::ErrorKind::UnexpectedEof
+                )
+        )
 }
