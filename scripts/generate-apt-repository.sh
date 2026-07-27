@@ -190,15 +190,14 @@ process_previous_by_hash() {
 }
 validate_allowed_entries() {
   local root label entry name allowed matched
-  local entries=()
   root="$1"
   label="$2"
   shift 2
   [ -d "$root" ] && [ ! -L "$root" ] ||
     die "$label is missing or unsafe"
   collect_find_entries "$label" -P "$root" -mindepth 1 -maxdepth 1
-  entries=("${inventory_collected_entries[@]}")
-  for entry in "${entries[@]}"; do
+  [ "${#inventory_collected_entries[@]}" -gt 0 ] || return 0
+  for entry in "${inventory_collected_entries[@]}"; do
     name="${entry##*/}"
     matched=0
     for allowed in "$@"; do
@@ -213,14 +212,13 @@ validate_allowed_entries() {
 }
 render_packages_index() {
   local repository pool architecture deb relative size md5 sha256
-  local packages=()
   repository="$1"
   pool="$2"
   architecture="$3"
   collect_sorted_find_entries "APT package pool" \
     -P "$pool" -maxdepth 1 -type f -name "rmux_*_${architecture}.deb"
-  packages=("${inventory_collected_entries[@]}")
-  for deb in "${packages[@]}"; do
+  [ "${#inventory_collected_entries[@]}" -gt 0 ] || return 0
+  for deb in "${inventory_collected_entries[@]}"; do
     relative="${deb#"$repository"/}"
     size="$(wc -c < "$deb" | tr -d ' ')" ||
       die "cannot read APT package size: $deb"
@@ -320,13 +318,11 @@ verify_managed_index() {
 }
 validate_managed_output() {
   local suite_root pool_root release architecture binary name entry digest count matched package package_architecture
-  local output_entries=() pool_entries=() architecture_packages=() by_hash_entries=()
   [ -e "$output_dir" ] || return 0
   [ -d "$output_dir" ] && [ ! -L "$output_dir" ] ||
     die "output directory is not one real directory: $output_dir"
   inventory_tree_entries "$output_dir" "APT output"
-  output_entries=("${inventory_collected_entries[@]}")
-  [ "${#output_entries[@]}" -gt 0 ] || return 0
+  [ "${#inventory_collected_entries[@]}" -gt 0 ] || return 0
   validate_allowed_entries "$output_dir" "APT output" dists pool rmux.asc
   suite_root="$output_dir/dists/$suite"
   pool_root="$output_dir/pool/$component/r/rmux"
@@ -350,24 +346,25 @@ validate_managed_output() {
   validate_release_shape "$release"
   collect_find_entries "managed APT package pool" \
     -P "$pool_root" -mindepth 1 -maxdepth 1
-  pool_entries=("${inventory_collected_entries[@]}")
-  for package in "${pool_entries[@]}"; do
-    [ -f "$package" ] || die "managed APT pool contains a non-file"
-    name="${package##*/}"
-    case "$name" in *$'\n'*) die "managed APT package name contains a newline" ;; esac
-    matched=0
-    package_architecture=""
-    for architecture in "${architectures[@]}"; do
-      case "$name" in
-        rmux_*_"$architecture".deb)
-          matched=1
-          package_architecture="$architecture"
-          ;;
-      esac
+  if [ "${#inventory_collected_entries[@]}" -gt 0 ]; then
+    for package in "${inventory_collected_entries[@]}"; do
+      [ -f "$package" ] || die "managed APT pool contains a non-file"
+      name="${package##*/}"
+      case "$name" in *$'\n'*) die "managed APT package name contains a newline" ;; esac
+      matched=0
+      package_architecture=""
+      for architecture in "${architectures[@]}"; do
+        case "$name" in
+          rmux_*_"$architecture".deb)
+            matched=1
+            package_architecture="$architecture"
+            ;;
+        esac
+      done
+      [ "$matched" -eq 1 ] || die "managed APT pool contains an unexpected entry: $name"
+      validate_apt_package_identity "$package" "$package_architecture"
     done
-    [ "$matched" -eq 1 ] || die "managed APT pool contains an unexpected entry: $name"
-    validate_apt_package_identity "$package" "$package_architecture"
-  done
+  fi
 
   validate_allowed_entries "$suite_root/$component" "APT component indexes" \
     "${architectures[@]/#/binary-}"
@@ -377,8 +374,7 @@ validate_managed_output() {
     validate_allowed_entries "$binary/by-hash" "APT by-hash root" SHA256
     collect_find_entries "managed APT $architecture packages" \
       -P "$pool_root" -maxdepth 1 -type f -name "rmux_*_${architecture}.deb"
-    architecture_packages=("${inventory_collected_entries[@]}")
-    [ "${#architecture_packages[@]}" -gt 0 ] ||
+    [ "${#inventory_collected_entries[@]}" -gt 0 ] ||
       die "managed APT pool lacks architecture: $architecture"
     cmp -s "$binary/Packages" \
       <(render_packages_index "$output_dir" "$pool_root" "$architecture") ||
@@ -395,16 +391,17 @@ validate_managed_output() {
     count=0
     collect_find_entries "managed APT $architecture by-hash" \
       -P "$binary/by-hash/SHA256" -mindepth 1 -maxdepth 1
-    by_hash_entries=("${inventory_collected_entries[@]}")
-    for entry in "${by_hash_entries[@]}"; do
-      [ -f "$entry" ] || die "managed APT by-hash contains a non-file"
-      digest="${entry##*/}"
-      [ "${#digest}" -eq 64 ] || die "managed APT by-hash has an invalid name"
-      case "$digest" in *[!0-9a-f]*) die "managed APT by-hash has an invalid name" ;; esac
-      [ "$(hash_file sha256 "$entry")" = "$digest" ] ||
-        die "managed APT by-hash content does not match its name"
-      count=$((count + 1))
-    done
+    if [ "${#inventory_collected_entries[@]}" -gt 0 ]; then
+      for entry in "${inventory_collected_entries[@]}"; do
+        [ -f "$entry" ] || die "managed APT by-hash contains a non-file"
+        digest="${entry##*/}"
+        [ "${#digest}" -eq 64 ] || die "managed APT by-hash has an invalid name"
+        case "$digest" in *[!0-9a-f]*) die "managed APT by-hash has an invalid name" ;; esac
+        [ "$(hash_file sha256 "$entry")" = "$digest" ] ||
+          die "managed APT by-hash content does not match its name"
+        count=$((count + 1))
+      done
+    fi
     [ "$count" -le 4 ] || die "managed APT by-hash retains too many generations"
   done
 }
@@ -487,7 +484,7 @@ for architecture in "${architectures[@]}"; do
   case "$architecture" in *[!A-Za-z0-9_-]*|"") die "invalid architecture: $architecture" ;; esac
 done
 
-for command in awk basename cat cmp cp date dirname dpkg-deb find gzip md5sum mkdir mktemp readlink rm sha256sum sort tr wc; do
+for command in awk basename cat cmp cp date dirname dpkg-deb find gzip md5sum mkdir readlink rm sha256sum sort tr wc; do
   need "$command"
 done
 if [ -n "$signing_key" ]; then
@@ -502,14 +499,12 @@ case "$output_dir" in /) die "--output-dir is too broad: $output_dir" ;; esac
 paths_overlap "$input_dir" "$output_dir" &&
   die "--input-dir and --output-dir cannot overlap"
 if [ -n "$previous_repository_dir" ]; then
-  previous_entries=()
   previous_repository_dir="$(
     resolve_without_symlinks "$previous_repository_dir" "previous repository directory"
   )"
   [ -d "$previous_repository_dir" ] ||
     die "previous repository directory not found: $previous_repository_dir"
   inventory_tree_entries "$previous_repository_dir" "previous repository directory"
-  previous_entries=("${inventory_collected_entries[@]}")
   paths_overlap "$previous_repository_dir" "$output_dir" &&
     die "--previous-repository-dir and --output-dir cannot overlap"
 fi

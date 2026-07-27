@@ -272,6 +272,180 @@ fn stderr(output: &Output) -> String {
 }
 
 #[test]
+fn publishes_into_a_precreated_empty_output_with_system_bash() {
+    let root = fixture_root("empty-output");
+    let input = root.join("input");
+    let output = root.join("output");
+    let tools = root.join("tools");
+    install_tools(&tools);
+    write_packages(&input, "first");
+    fs::create_dir_all(&output).expect("precreate empty output");
+
+    let generated = generate(&input, &output, &tools, None, false);
+    let release_exists = output.join("dists/stable/Release").is_file();
+    fs::remove_dir_all(&root).expect("remove empty-output fixture");
+
+    assert!(generated.status.success(), "{}", stderr(&generated));
+    assert!(release_exists, "empty output was not populated");
+}
+
+#[test]
+fn bash32_resolver_handles_root_and_rejects_an_empty_operand() {
+    let inventory = repo_root().join("scripts/apt-repository-inventory.sh");
+    let resolve = |operand: &str| {
+        Command::new("/bin/bash")
+            .args([
+                "-euo",
+                "pipefail",
+                "-c",
+                concat!(
+                    "die(){ printf 'error: %s\\n' \"$*\" >&2; exit 1; }; ",
+                    "source \"$1\"; resolve_without_symlinks \"$2\" resolver"
+                ),
+                "bash",
+            ])
+            .arg(&inventory)
+            .arg(operand)
+            .current_dir(repo_root())
+            .output()
+            .expect("run resolver with system bash")
+    };
+
+    let root = resolve("/");
+    assert!(root.status.success(), "{}", stderr(&root));
+    assert_eq!(root.stdout, b"/\n");
+
+    let empty = resolve("");
+    assert!(
+        !empty.status.success(),
+        "empty resolver operand was accepted"
+    );
+    assert!(stderr(&empty).contains("resolver path is empty"));
+}
+
+#[test]
+fn empty_managed_inventories_reach_their_intended_outcomes() {
+    let root = fixture_root("empty-inventories");
+    let input = root.join("input");
+    let tools = root.join("tools");
+    install_tools(&tools);
+    write_packages(&input, "first");
+
+    let previous = root.join("empty-previous");
+    fs::create_dir_all(&previous).expect("create empty previous repository");
+    let previous_rejected = generate(
+        &input,
+        &root.join("previous-output"),
+        &tools,
+        Some(&previous),
+        false,
+    );
+    assert!(!previous_rejected.status.success());
+    assert!(
+        stderr(&previous_rejected)
+            .contains("authenticated previous APT Release is missing or unsafe"),
+        "{}",
+        stderr(&previous_rejected)
+    );
+
+    let empty_dists = root.join("empty-dists");
+    fs::create_dir_all(empty_dists.join("dists")).expect("create empty dists root");
+    fs::create_dir_all(empty_dists.join("pool/main/r/rmux")).expect("create package pool shape");
+    let dists_rejected = generate(&input, &empty_dists, &tools, None, false);
+    assert!(!dists_rejected.status.success());
+    assert!(
+        stderr(&dists_rejected).contains("APT suite is missing or unsafe"),
+        "{}",
+        stderr(&dists_rejected)
+    );
+
+    let empty_pool = root.join("empty-pool");
+    let generated = generate(&input, &empty_pool, &tools, None, false);
+    assert!(generated.status.success(), "{}", stderr(&generated));
+    for entry in
+        fs::read_dir(empty_pool.join("pool/main/r/rmux")).expect("read generated package pool")
+    {
+        fs::remove_file(entry.expect("read package entry").path()).expect("remove package");
+    }
+    let pool_rejected = generate(&input, &empty_pool, &tools, None, false);
+    assert!(!pool_rejected.status.success());
+    assert!(
+        stderr(&pool_rejected).contains("managed APT pool lacks architecture: amd64"),
+        "{}",
+        stderr(&pool_rejected)
+    );
+
+    let missing_architecture = root.join("missing-architecture");
+    let generated = generate(&input, &missing_architecture, &tools, None, false);
+    assert!(generated.status.success(), "{}", stderr(&generated));
+    fs::remove_file(missing_architecture.join("pool/main/r/rmux/rmux_0.10.0_amd64.deb"))
+        .expect("remove amd64 package");
+    let architecture_rejected = generate(&input, &missing_architecture, &tools, None, false);
+    assert!(!architecture_rejected.status.success());
+    assert!(
+        stderr(&architecture_rejected).contains("managed APT pool lacks architecture: amd64"),
+        "{}",
+        stderr(&architecture_rejected)
+    );
+
+    for output in [
+        &previous_rejected,
+        &dists_rejected,
+        &pool_rejected,
+        &architecture_rejected,
+    ] {
+        assert!(
+            !stderr(output).contains("unbound variable"),
+            "{}",
+            stderr(output)
+        );
+    }
+    fs::remove_dir_all(&root).expect("remove empty-inventories fixture");
+}
+
+#[test]
+fn inventory_transport_ignores_tmpdir_and_rejects_sorted_record_loss() {
+    let root = fixture_root("inventory-transport");
+    let input = root.join("input");
+    let output = root.join("output");
+    let tools = root.join("tools");
+    install_tools(&tools);
+    write_packages(&input, "first");
+    let generated = generate(&input, &output, &tools, None, false);
+    assert!(generated.status.success(), "{}", stderr(&generated));
+
+    write_packages(&input, "second");
+    let regenerated = generator_command(&input, &output, &tools, None, false)
+        .env("TMPDIR", output.join("dists"))
+        .output()
+        .expect("regenerate with TMPDIR inside managed output");
+    assert!(regenerated.status.success(), "{}", stderr(&regenerated));
+
+    let dropping_tools = root.join("dropping-tools");
+    install_tools(&dropping_tools);
+    let sort = dropping_tools.join("sort");
+    fs::write(&sort, "#!/bin/sh\n/bin/cat >/dev/null\nexit 0\n")
+        .expect("write record-dropping sort");
+    make_executable(&sort);
+    let rejected = generate(
+        &input,
+        &root.join("dropped-output"),
+        &dropping_tools,
+        None,
+        false,
+    );
+    fs::remove_dir_all(&root).expect("remove inventory-transport fixture");
+
+    assert!(!rejected.status.success(), "record loss was accepted");
+    assert!(
+        stderr(&rejected).contains("cannot sort APT package pool without record loss"),
+        "{}",
+        stderr(&rejected)
+    );
+    assert!(!String::from_utf8_lossy(&rejected.stdout).contains("repository="));
+}
+
+#[test]
 fn refuses_unreadable_output_inventory_without_mutating_tree_bytes() {
     let root = fixture_root("unreadable-inventory");
     let input = root.join("input");

@@ -6,6 +6,7 @@ resolve_without_symlinks() {
   local -a resolved_components=()
   path="$1"
   label="$2"
+  [ -n "$path" ] || die "$label path is empty"
   case "$path" in
     *$'\n'*|*$'\r'*) die "$label path contains a line break" ;;
   esac
@@ -15,31 +16,35 @@ resolve_without_symlinks() {
   esac
 
   IFS=/ read -r -a raw_components <<< "$absolute"
-  for component in "${raw_components[@]}"; do
-    case "$component" in
-      ""|.) continue ;;
-      ..)
-        if [ "${#resolved_components[@]}" -gt 0 ]; then
-          last_index=$((${#resolved_components[@]} - 1))
-          unset "resolved_components[$last_index]"
-        fi
-        continue
-        ;;
-    esac
+  if [ "${#raw_components[@]}" -gt 0 ]; then
+    for component in "${raw_components[@]}"; do
+      case "$component" in
+        ""|.) continue ;;
+        ..)
+          if [ "${#resolved_components[@]}" -gt 0 ]; then
+            last_index=$((${#resolved_components[@]} - 1))
+            unset "resolved_components[$last_index]"
+          fi
+          continue
+          ;;
+      esac
 
-    resolved_components+=("$component")
-    candidate=
+      resolved_components+=("$component")
+      candidate=
+      for component in "${resolved_components[@]}"; do
+        candidate="$candidate/$component"
+      done
+      [ ! -L "$candidate" ] ||
+        die "$label must not traverse symbolic links: $path"
+    done
+  fi
+
+  candidate=
+  if [ "${#resolved_components[@]}" -gt 0 ]; then
     for component in "${resolved_components[@]}"; do
       candidate="$candidate/$component"
     done
-    [ ! -L "$candidate" ] ||
-      die "$label must not traverse symbolic links: $path"
-  done
-
-  candidate=
-  for component in "${resolved_components[@]}"; do
-    candidate="$candidate/$component"
-  done
+  fi
   printf '%s\n' "${candidate:-/}"
 }
 
@@ -50,43 +55,46 @@ paths_overlap() {
 }
 
 collect_find_entries() {
-  local label inventory_file entry
+  local label entry complete
   label="$1"
   shift
   inventory_collected_entries=()
+  complete=0
 
-  inventory_file="$(mktemp "${TMPDIR:-/tmp}/rmux-apt-find.XXXXXX")" ||
-    die "cannot create temporary inventory for $label"
-  if ! find "$@" -print0 > "$inventory_file"; then
-    rm -f -- "$inventory_file"
-    die "cannot enumerate $label"
-  fi
   while IFS= read -r -d '' entry; do
+    if [ -z "$entry" ]; then
+      complete=1
+      continue
+    fi
+    [ "$complete" -eq 0 ] || die "cannot enumerate $label"
     inventory_collected_entries+=("$entry")
-  done < "$inventory_file"
-  rm -f -- "$inventory_file"
+  done < <(find "$@" -print0 && printf '\0')
+  [ "$complete" -eq 1 ] || die "cannot enumerate $label"
 }
 
 collect_sorted_find_entries() {
-  local label inventory_file entry
+  local label entry complete expected_count
   local unsorted=()
   label="$1"
   shift
   collect_find_entries "$label" "$@"
+  [ "${#inventory_collected_entries[@]}" -gt 0 ] || return 0
   unsorted=("${inventory_collected_entries[@]}")
   inventory_collected_entries=()
-  [ "${#unsorted[@]}" -gt 0 ] || return 0
+  expected_count="${#unsorted[@]}"
+  complete=0
 
-  inventory_file="$(mktemp "${TMPDIR:-/tmp}/rmux-apt-sort.XXXXXX")" ||
-    die "cannot create temporary inventory for $label"
-  if ! printf '%s\0' "${unsorted[@]}" | LC_ALL=C sort -z > "$inventory_file"; then
-    rm -f -- "$inventory_file"
-    die "cannot sort $label"
-  fi
   while IFS= read -r -d '' entry; do
+    if [ -z "$entry" ]; then
+      complete=1
+      continue
+    fi
+    [ "$complete" -eq 0 ] || die "cannot sort $label"
     inventory_collected_entries+=("$entry")
-  done < "$inventory_file"
-  rm -f -- "$inventory_file"
+  done < <(printf '%s\0' "${unsorted[@]}" | LC_ALL=C sort -z && printf '\0')
+  [ "$complete" -eq 1 ] &&
+    [ "${#inventory_collected_entries[@]}" -eq "$expected_count" ] ||
+    die "cannot sort $label without record loss"
 }
 
 inventory_tree_entries() {
@@ -97,6 +105,7 @@ inventory_tree_entries() {
   [ -d "$root" ] && [ ! -L "$root" ] ||
     die "$label root is missing or unsafe"
   collect_find_entries "$label" -P "$root" -mindepth 1
+  [ "${#inventory_collected_entries[@]}" -gt 0 ] || return 0
   for entry in "${inventory_collected_entries[@]}"; do
     if [ -L "$entry" ]; then
       readlink -- "$entry" >/dev/null ||
