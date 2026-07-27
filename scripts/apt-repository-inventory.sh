@@ -1,14 +1,46 @@
+inventory_collected_entries=()
+
 resolve_without_symlinks() {
-  local path label logical physical
+  local path label absolute component candidate last_index
+  local -a raw_components=()
+  local -a resolved_components=()
   path="$1"
   label="$2"
-  logical="$(realpath -ms -- "$path")" ||
-    die "cannot resolve $label: $path"
-  physical="$(realpath -m -- "$path")" ||
-    die "cannot resolve $label: $path"
-  [ "$logical" = "$physical" ] ||
-    die "$label must not traverse symbolic links: $path"
-  printf '%s\n' "$logical"
+  case "$path" in
+    *$'\n'*|*$'\r'*) die "$label path contains a line break" ;;
+  esac
+  case "$path" in
+    /*) absolute="$path" ;;
+    *) absolute="$(pwd -P)/$path" ;;
+  esac
+
+  IFS=/ read -r -a raw_components <<< "$absolute"
+  for component in "${raw_components[@]}"; do
+    case "$component" in
+      ""|.) continue ;;
+      ..)
+        if [ "${#resolved_components[@]}" -gt 0 ]; then
+          last_index=$((${#resolved_components[@]} - 1))
+          unset "resolved_components[$last_index]"
+        fi
+        continue
+        ;;
+    esac
+
+    resolved_components+=("$component")
+    candidate=
+    for component in "${resolved_components[@]}"; do
+      candidate="$candidate/$component"
+    done
+    [ ! -L "$candidate" ] ||
+      die "$label must not traverse symbolic links: $path"
+  done
+
+  candidate=
+  for component in "${resolved_components[@]}"; do
+    candidate="$candidate/$component"
+  done
+  printf '%s\n' "${candidate:-/}"
 }
 
 paths_overlap() {
@@ -18,55 +50,54 @@ paths_overlap() {
 }
 
 collect_find_entries() {
-  local destination_name label find_fd find_pid entry
-  destination_name="$1"
-  label="$2"
-  shift 2
-  local -n destination="$destination_name"
-  destination=()
+  local label inventory_file entry
+  label="$1"
+  shift
+  inventory_collected_entries=()
 
-  exec {find_fd}< <(find "$@" -print0)
-  find_pid=$!
-  while IFS= read -r -d '' entry <&"$find_fd"; do
-    destination+=("$entry")
-  done
-  exec {find_fd}<&-
-  wait "$find_pid" || die "cannot enumerate $label"
+  inventory_file="$(mktemp "${TMPDIR:-/tmp}/rmux-apt-find.XXXXXX")" ||
+    die "cannot create temporary inventory for $label"
+  if ! find "$@" -print0 > "$inventory_file"; then
+    rm -f -- "$inventory_file"
+    die "cannot enumerate $label"
+  fi
+  while IFS= read -r -d '' entry; do
+    inventory_collected_entries+=("$entry")
+  done < "$inventory_file"
+  rm -f -- "$inventory_file"
 }
 
 collect_sorted_find_entries() {
-  local destination_name label sort_fd sort_pid entry
+  local label inventory_file entry
   local unsorted=()
-  destination_name="$1"
-  label="$2"
-  shift 2
-  local -n destination="$destination_name"
-  collect_find_entries unsorted "$label" "$@"
-  destination=()
+  label="$1"
+  shift
+  collect_find_entries "$label" "$@"
+  unsorted=("${inventory_collected_entries[@]}")
+  inventory_collected_entries=()
   [ "${#unsorted[@]}" -gt 0 ] || return 0
 
-  exec {sort_fd}< <(printf '%s\0' "${unsorted[@]}" | LC_ALL=C sort -z)
-  sort_pid=$!
-  while IFS= read -r -d '' entry <&"$sort_fd"; do
-    destination+=("$entry")
-  done
-  exec {sort_fd}<&-
-  wait "$sort_pid" || die "cannot sort $label"
+  inventory_file="$(mktemp "${TMPDIR:-/tmp}/rmux-apt-sort.XXXXXX")" ||
+    die "cannot create temporary inventory for $label"
+  if ! printf '%s\0' "${unsorted[@]}" | LC_ALL=C sort -z > "$inventory_file"; then
+    rm -f -- "$inventory_file"
+    die "cannot sort $label"
+  fi
+  while IFS= read -r -d '' entry; do
+    inventory_collected_entries+=("$entry")
+  done < "$inventory_file"
+  rm -f -- "$inventory_file"
 }
 
 inventory_tree_entries() {
-  local destination_name root label entry metadata
-  destination_name="$1"
-  root="$2"
-  label="$3"
-  local -n destination="$destination_name"
+  local root label entry
+  root="$1"
+  label="$2"
 
-  stat -c '%F	%a	%s' -- "$root" >/dev/null ||
-    die "cannot stat $label root"
-  collect_find_entries "$destination_name" "$label" -P "$root" -mindepth 1
-  for entry in "${destination[@]}"; do
-    metadata="$(stat -c '%F	%a	%s' -- "$entry")" ||
-      die "cannot stat entry in $label"
+  [ -d "$root" ] && [ ! -L "$root" ] ||
+    die "$label root is missing or unsafe"
+  collect_find_entries "$label" -P "$root" -mindepth 1
+  for entry in "${inventory_collected_entries[@]}"; do
     if [ -L "$entry" ]; then
       readlink -- "$entry" >/dev/null ||
         die "cannot read symbolic link in $label"
@@ -75,7 +106,7 @@ inventory_tree_entries() {
       sha256sum -- "$entry" >/dev/null ||
         die "cannot read regular file in $label"
     elif [ ! -d "$entry" ]; then
-      die "$label contains an unsupported entry type: $metadata"
+      die "$label contains an unsupported entry type: $entry"
     fi
   done
 }

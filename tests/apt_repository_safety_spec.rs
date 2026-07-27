@@ -13,6 +13,14 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+fn pinned_system_tool(name: &str) -> PathBuf {
+    ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        .into_iter()
+        .map(|directory| Path::new(directory).join(name))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| panic!("pinned system tool is unavailable: {name}"))
+}
+
 fn fixture_root(label: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -64,7 +72,7 @@ case "$2" in
   *) exit 64 ;;
 esac
 package=rmux
-case "$(/usr/bin/cat -- "$2")" in
+case "$(/bin/cat -- "$2")" in
   *:foreign-package) package=alien-package ;;
   *:metadata-unreadable) exit 74 ;;
   *:architecture-mismatch)
@@ -144,8 +152,14 @@ fn generator_command(
     previous: Option<&Path>,
     signed: bool,
 ) -> Command {
-    let path = std::env::join_paths([tools, Path::new("/usr/bin"), Path::new("/bin")])
-        .expect("compose pinned PATH");
+    let path = std::env::join_paths([
+        tools,
+        Path::new("/usr/bin"),
+        Path::new("/bin"),
+        Path::new("/usr/sbin"),
+        Path::new("/sbin"),
+    ])
+    .expect("compose pinned PATH");
     let mut command = Command::new(repo_root().join("scripts/generate-apt-repository.sh"));
     command
         .args(["--input-dir"])
@@ -190,7 +204,7 @@ enum TreeEntry {
 
 fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, TreeEntry> {
     fn sha256(path: &Path) -> String {
-        let output = Command::new("/usr/bin/sha256sum")
+        let output = Command::new(pinned_system_tool("sha256sum"))
             .arg("--")
             .arg(path)
             .output()

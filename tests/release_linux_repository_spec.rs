@@ -16,7 +16,9 @@ fn temp_dir(label: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("clock after epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!("rmux-{label}-{}-{nonce}", std::process::id()))
+    fs::canonicalize(std::env::temp_dir())
+        .expect("canonical temporary directory")
+        .join(format!("rmux-{label}-{}-{nonce}", std::process::id()))
 }
 
 #[cfg(unix)]

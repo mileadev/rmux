@@ -196,7 +196,8 @@ validate_allowed_entries() {
   shift 2
   [ -d "$root" ] && [ ! -L "$root" ] ||
     die "$label is missing or unsafe"
-  collect_find_entries entries "$label" -P "$root" -mindepth 1 -maxdepth 1
+  collect_find_entries "$label" -P "$root" -mindepth 1 -maxdepth 1
+  entries=("${inventory_collected_entries[@]}")
   for entry in "${entries[@]}"; do
     name="${entry##*/}"
     matched=0
@@ -216,8 +217,9 @@ render_packages_index() {
   repository="$1"
   pool="$2"
   architecture="$3"
-  collect_sorted_find_entries packages "APT package pool" \
+  collect_sorted_find_entries "APT package pool" \
     -P "$pool" -maxdepth 1 -type f -name "rmux_*_${architecture}.deb"
+  packages=("${inventory_collected_entries[@]}")
   for deb in "${packages[@]}"; do
     relative="${deb#"$repository"/}"
     size="$(wc -c < "$deb" | tr -d ' ')" ||
@@ -322,7 +324,8 @@ validate_managed_output() {
   [ -e "$output_dir" ] || return 0
   [ -d "$output_dir" ] && [ ! -L "$output_dir" ] ||
     die "output directory is not one real directory: $output_dir"
-  inventory_tree_entries output_entries "$output_dir" "APT output"
+  inventory_tree_entries "$output_dir" "APT output"
+  output_entries=("${inventory_collected_entries[@]}")
   [ "${#output_entries[@]}" -gt 0 ] || return 0
   validate_allowed_entries "$output_dir" "APT output" dists pool rmux.asc
   suite_root="$output_dir/dists/$suite"
@@ -345,8 +348,9 @@ validate_managed_output() {
   fi
   release="$suite_root/Release"
   validate_release_shape "$release"
-  collect_find_entries pool_entries "managed APT package pool" \
+  collect_find_entries "managed APT package pool" \
     -P "$pool_root" -mindepth 1 -maxdepth 1
+  pool_entries=("${inventory_collected_entries[@]}")
   for package in "${pool_entries[@]}"; do
     [ -f "$package" ] || die "managed APT pool contains a non-file"
     name="${package##*/}"
@@ -371,8 +375,9 @@ validate_managed_output() {
     binary="$suite_root/$component/binary-$architecture"
     validate_allowed_entries "$binary" "APT binary index" Packages Packages.gz by-hash
     validate_allowed_entries "$binary/by-hash" "APT by-hash root" SHA256
-    collect_find_entries architecture_packages "managed APT $architecture packages" \
+    collect_find_entries "managed APT $architecture packages" \
       -P "$pool_root" -maxdepth 1 -type f -name "rmux_*_${architecture}.deb"
+    architecture_packages=("${inventory_collected_entries[@]}")
     [ "${#architecture_packages[@]}" -gt 0 ] ||
       die "managed APT pool lacks architecture: $architecture"
     cmp -s "$binary/Packages" \
@@ -388,8 +393,9 @@ validate_managed_output() {
         die "managed APT by-hash lacks the current $architecture/$name"
     done
     count=0
-    collect_find_entries by_hash_entries "managed APT $architecture by-hash" \
+    collect_find_entries "managed APT $architecture by-hash" \
       -P "$binary/by-hash/SHA256" -mindepth 1 -maxdepth 1
+    by_hash_entries=("${inventory_collected_entries[@]}")
     for entry in "${by_hash_entries[@]}"; do
       [ -f "$entry" ] || die "managed APT by-hash contains a non-file"
       digest="${entry##*/}"
@@ -481,7 +487,7 @@ for architecture in "${architectures[@]}"; do
   case "$architecture" in *[!A-Za-z0-9_-]*|"") die "invalid architecture: $architecture" ;; esac
 done
 
-for command in awk basename cat cmp cp date dirname dpkg-deb find gzip md5sum mkdir readlink realpath rm sha256sum sort stat tr wc; do
+for command in awk basename cat cmp cp date dirname dpkg-deb find gzip md5sum mkdir mktemp readlink rm sha256sum sort tr wc; do
   need "$command"
 done
 if [ -n "$signing_key" ]; then
@@ -502,8 +508,8 @@ if [ -n "$previous_repository_dir" ]; then
   )"
   [ -d "$previous_repository_dir" ] ||
     die "previous repository directory not found: $previous_repository_dir"
-  inventory_tree_entries \
-    previous_entries "$previous_repository_dir" "previous repository directory"
+  inventory_tree_entries "$previous_repository_dir" "previous repository directory"
+  previous_entries=("${inventory_collected_entries[@]}")
   paths_overlap "$previous_repository_dir" "$output_dir" &&
     die "--previous-repository-dir and --output-dir cannot overlap"
 fi
