@@ -1,9 +1,9 @@
 use rmux_core::{input::InputParser, PaneId, Screen};
 use rmux_proto::{
     KillSessionRequest, PaneOutputSubscriptionId, PaneSnapshotCell, PaneStreamEndReason,
-    PaneStreamEvent, PaneStreamMode, PaneTarget, PaneTargetRef, Request, Response, RmuxError,
-    SubscribePaneStreamRequest, TerminalSize, UnsubscribePaneStreamRequest,
-    DEFAULT_MAX_DETACHED_FRAME_LENGTH,
+    PaneStreamEvent, PaneStreamMode, PaneTarget, PaneTargetRef, Request, ResizeWindowRequest,
+    Response, RmuxError, SubscribePaneStreamRequest, TerminalSize, UnsubscribePaneStreamRequest,
+    WindowTarget, DEFAULT_MAX_DETACHED_FRAME_LENGTH,
 };
 
 use crate::pane_recovery::{PaneProjectionSeed, MAX_RECOVERY_STRING_BYTES};
@@ -156,6 +156,273 @@ async fn shared_surface_admission_rejects_current_p_plus_one_without_ending_acti
 }
 
 #[tokio::test]
+async fn ready_surface_peer_boundaries_match_for_same_and_distinct_connections() {
+    for (target_size, accepted) in [
+        (SURFACE_POLL_FRAME_LIMIT - 1, true),
+        (SURFACE_POLL_FRAME_LIMIT, true),
+        (SURFACE_POLL_FRAME_LIMIT + 1, false),
+    ] {
+        let handler = super::RequestHandler::new();
+        let (target, output, transcript) = test_pane(&handler).await;
+        let initial_size = target_size.min(SURFACE_POLL_FRAME_LIMIT);
+        let (_, title_length) = install_frame_at_size(&handler, &transcript, initial_size);
+        let active = subscribe(&handler, &target, PaneStreamMode::Surface).await;
+        if !accepted {
+            publish_title(&transcript, &output, title_length + 1, b'y');
+            assert_eq!(
+                bincode::serialized_size(materialize_frame(&handler, &transcript).as_ref())
+                    .expect("surface frame size"),
+                target_size as u64
+            );
+        }
+
+        for (connection_id, relation) in [
+            (CONNECTION_ID, "same connection"),
+            (SECOND_CONNECTION_ID, "distinct connection"),
+        ] {
+            let response = subscribe_response(&handler, connection_id, &target).await;
+            if accepted {
+                let peer = expect_surface_subscription(response);
+                assert_surface_state(&handler, 2, 1);
+                unsubscribe(&handler, connection_id, peer).await;
+            } else {
+                assert_surface_budget_error(&response);
+            }
+            assert_surface_state(&handler, 1, 1);
+            let subscriptions = handler
+                .subscriptions
+                .lock()
+                .expect("subscription registry mutex");
+            assert_eq!(
+                subscriptions
+                    .streams
+                    .get(&active.subscription_id)
+                    .and_then(super::super::PaneStreamSubscription::end_reason),
+                None,
+                "{relation} P+1 admission must not end the active peer"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn distinct_peer_cannot_join_when_surface_crosses_p_after_ready_validation() {
+    let handler = std::sync::Arc::new(super::RequestHandler::new());
+    let (target, output, transcript) = test_pane(handler.as_ref()).await;
+    let (_, title_length) =
+        install_frame_at_size(handler.as_ref(), &transcript, SURFACE_POLL_FRAME_LIMIT);
+    let existing = subscribe(handler.as_ref(), &target, PaneStreamMode::Surface).await;
+    assert_surface_state(handler.as_ref(), 1, 1);
+
+    let pause = handler.install_surface_admission_pause();
+    let peer_handler = std::sync::Arc::clone(&handler);
+    let peer_target = target.clone();
+    let peer = tokio::spawn(async move {
+        subscribe_response(peer_handler.as_ref(), SECOND_CONNECTION_ID, &peer_target).await
+    });
+
+    pause.reached.notified().await;
+    publish_title(&transcript, &output, title_length + 1, b'w');
+    let oversized = materialize_frame(handler.as_ref(), &transcript);
+    assert_eq!(
+        bincode::serialized_size(oversized.as_ref()).expect("surface frame size"),
+        (SURFACE_POLL_FRAME_LIMIT + 1) as u64,
+        "the distinct peer must be released only after current state crosses P"
+    );
+    pause.release.notify_one();
+
+    let response = peer.await.expect("distinct peer subscribe task");
+    assert_surface_budget_error(&response);
+    assert_surface_state(handler.as_ref(), 1, 1);
+
+    publish_title(&transcript, &output, title_length, b'x');
+    let events = cursor(handler.as_ref(), existing.subscription_id).await;
+    let frame = events
+        .iter()
+        .find_map(super::surface_frame)
+        .expect("active peer receives the return to P");
+    assert_eq!(
+        bincode::serialized_size(frame).expect("returned surface frame size"),
+        SURFACE_POLL_FRAME_LIMIT as u64
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, PaneStreamEvent::End(_))),
+        "a rejected concurrent peer must leave the P-sized peer live: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn waiting_surface_peer_rechecks_p_plus_one_after_driver_becomes_ready() {
+    let handler = std::sync::Arc::new(super::RequestHandler::new());
+    let (target, output, transcript) = test_pane(handler.as_ref()).await;
+    let (_, title_length) =
+        install_frame_at_size(handler.as_ref(), &transcript, SURFACE_POLL_FRAME_LIMIT);
+    let source = {
+        let state = handler.state.lock().await;
+        super::super::stream_source_for_target(&state, target.clone()).expect("stream source")
+    };
+    let initialization_token = {
+        let mut subscriptions = handler.subscriptions.lock().expect("subscription registry");
+        let super::super::SurfaceDriverRoute::Initialize { token } =
+            subscriptions.surface_driver_route(&source.key)
+        else {
+            panic!("test must own the first Surface initialization");
+        };
+        token
+    };
+
+    let peer_handler = std::sync::Arc::clone(&handler);
+    let peer_target = target.clone();
+    let peer = tokio::spawn(async move {
+        subscribe_response(peer_handler.as_ref(), SECOND_CONNECTION_ID, &peer_target).await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while handler
+            .subscriptions
+            .lock()
+            .expect("subscription registry")
+            .is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("waiting Surface peer must reserve before the driver becomes Ready");
+    {
+        let subscriptions = handler.subscriptions.lock().expect("subscription registry");
+        assert_eq!(subscriptions.registry.len(), 1);
+        assert!(subscriptions.surface_drivers.is_empty());
+        assert!(matches!(
+            subscriptions.streams.values().next(),
+            Some(super::super::PaneStreamSubscription::Reserved {
+                mode: PaneStreamMode::Surface,
+                ..
+            })
+        ));
+    }
+
+    let active_id = {
+        let mut subscriptions = handler.subscriptions.lock().expect("subscription registry");
+        let id = subscriptions
+            .registry
+            .subscribe(CONNECTION_ID, source.key.clone(), std::time::Instant::now())
+            .expect("active Surface reservation")
+            .id();
+        subscriptions.streams.insert(
+            id,
+            super::super::PaneStreamSubscription::reserved(PaneStreamMode::Surface),
+        );
+        id
+    };
+    let (source, captured) = handler
+        .capture_current_surface_stream_source(source)
+        .await
+        .expect("capture initial Surface source");
+    let seed = captured
+        .seed
+        .as_ref()
+        .expect("forced Surface capture must include a projection");
+    let driver = super::super::SurfaceDriver::new(
+        initialization_token,
+        captured.receiver,
+        super::super::materialize_surface_frame(
+            handler.as_ref(),
+            source.key.pane_id(),
+            1,
+            1,
+            1,
+            captured.boundary.next_output_sequence,
+            seed,
+        )
+        .expect("materialize active Surface frame"),
+        captured.fingerprint,
+    );
+    let response =
+        handler.finish_new_surface_subscription(CONNECTION_ID, active_id, source, driver);
+    assert_eq!(expect_surface_subscription(response), active_id);
+    assert_surface_state(handler.as_ref(), 2, 1);
+
+    publish_title(&transcript, &output, title_length + 1, b'q');
+    handler
+        .subscriptions
+        .lock()
+        .expect("subscription registry")
+        .finish_surface_initialization(initialization_token);
+
+    let response = peer.await.expect("waiting Surface peer task");
+    assert_surface_budget_error(&response);
+    assert_surface_state(handler.as_ref(), 1, 1);
+
+    publish_title(&transcript, &output, title_length, b'r');
+    let events = cursor(handler.as_ref(), active_id).await;
+    assert!(events.iter().any(|event| {
+        super::surface_frame(event).is_some_and(|frame| {
+            bincode::serialized_size(frame).expect("returned Surface frame size")
+                == SURFACE_POLL_FRAME_LIMIT as u64
+        })
+    }));
+    unsubscribe(handler.as_ref(), CONNECTION_ID, active_id).await;
+    assert_surface_state(handler.as_ref(), 0, 0);
+}
+
+#[tokio::test]
+async fn distinct_peer_rejects_real_window_resize_beyond_surface_geometry_budget() {
+    let handler = super::RequestHandler::new();
+    let (target, _, transcript) = test_pane(&handler).await;
+    resize_window(&handler, &target, 512, 331).await;
+    assert_eq!(
+        transcript
+            .lock()
+            .expect("pane transcript mutex")
+            .screen()
+            .size(),
+        TerminalSize {
+            cols: 512,
+            rows: 331,
+        }
+    );
+    let active = subscribe(&handler, &target, PaneStreamMode::Surface).await;
+
+    resize_window(&handler, &target, 512, 332).await;
+    assert_eq!(
+        transcript
+            .lock()
+            .expect("pane transcript mutex")
+            .screen()
+            .size(),
+        TerminalSize {
+            cols: 512,
+            rows: 332,
+        }
+    );
+    let response = subscribe_response(&handler, SECOND_CONNECTION_ID, &target).await;
+    assert!(
+        matches!(
+            response,
+            Response::Error(ref error) if matches!(error.error, RmuxError::Server(_))
+        ),
+        "the window resize route must reject a distinct P+1 peer: {response:?}"
+    );
+    assert_surface_state(&handler, 1, 1);
+
+    resize_window(&handler, &target, 512, 331).await;
+    let events = cursor(&handler, active.subscription_id).await;
+    let frame = events
+        .iter()
+        .find_map(super::surface_frame)
+        .expect("active peer receives the real window resize back to P");
+    assert_eq!((frame.snapshot.cols, frame.snapshot.rows), (512, 331));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, PaneStreamEvent::End(_))),
+        "rejected window-resize peer must leave the active Surface stream live: {events:?}"
+    );
+}
+
+#[tokio::test]
 async fn shared_surface_one_two_three_peers_close_and_resubscribe_in_isolation() {
     let handler = super::RequestHandler::new();
     let (target, _, _) = test_pane(&handler).await;
@@ -304,6 +571,21 @@ fn publish_title(
     payload.resize(payload.len() + title_length, byte);
     payload.push(b'\x07');
     crate::pane_io::publish_pane_bytes_for_test(transcript, output, payload);
+}
+
+async fn resize_window(handler: &super::RequestHandler, target: &PaneTarget, cols: u16, rows: u16) {
+    let response = handler
+        .handle(Request::ResizeWindow(ResizeWindowRequest {
+            target: WindowTarget::with_window(target.session_name().clone(), target.window_index()),
+            width: Some(cols),
+            height: Some(rows),
+            adjustment: None,
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::ResizeWindow(_)),
+        "window resize failed: {response:?}"
+    );
 }
 
 fn materialize_frame(

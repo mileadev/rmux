@@ -372,6 +372,8 @@ pub(crate) struct RequestHandler {
     #[cfg(test)]
     pane_exit_commit_pause: Arc<StdMutex<Option<Arc<PaneExitCommitPause>>>>,
     #[cfg(test)]
+    surface_admission_pause: Arc<StdMutex<Option<Arc<SurfaceAdmissionPause>>>>,
+    #[cfg(test)]
     alert_plan_effect_pause: Arc<StdMutex<Option<Arc<AlertPlanEffectPause>>>>,
     #[cfg(test)]
     pane_alert_apply_pause: Arc<StdMutex<Option<Arc<PaneAlertApplyPause>>>>,
@@ -464,6 +466,8 @@ impl Clone for RequestHandler {
             pane_option_journal_pause: self.pane_option_journal_pause.clone(),
             #[cfg(test)]
             pane_exit_commit_pause: self.pane_exit_commit_pause.clone(),
+            #[cfg(test)]
+            surface_admission_pause: self.surface_admission_pause.clone(),
             #[cfg(test)]
             alert_plan_effect_pause: self.alert_plan_effect_pause.clone(),
             #[cfg(test)]
@@ -611,6 +615,8 @@ impl WeakRequestHandler {
             #[cfg(test)]
             pane_exit_commit_pause: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
+            surface_admission_pause: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
             alert_plan_effect_pause: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             pane_alert_apply_pause: Arc::new(StdMutex::new(None)),
@@ -685,6 +691,13 @@ struct PaneOptionJournalPause {
 #[derive(Debug, Default)]
 struct PaneExitCommitPause {
     output_drain_started: tokio::sync::Notify,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct SurfaceAdmissionPause {
     reached: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -911,6 +924,8 @@ impl RequestHandler {
             pane_option_journal_pause: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             pane_exit_commit_pause: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            surface_admission_pause: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             alert_plan_effect_pause: Arc::new(StdMutex::new(None)),
             #[cfg(test)]

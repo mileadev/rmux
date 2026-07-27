@@ -17,26 +17,78 @@ use super::{
 };
 
 impl RequestHandler {
+    #[cfg(test)]
+    pub(in crate::handler) fn install_surface_admission_pause(
+        &self,
+    ) -> Arc<super::super::SurfaceAdmissionPause> {
+        let pause = Arc::new(super::super::SurfaceAdmissionPause::default());
+        *self
+            .surface_admission_pause
+            .lock()
+            .expect("surface admission pause") = Some(Arc::clone(&pause));
+        pause
+    }
+
+    #[cfg(test)]
+    async fn pause_after_surface_admission_validation(&self) {
+        let pause = self
+            .surface_admission_pause
+            .lock()
+            .expect("surface admission pause")
+            .take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(not(test))]
+    async fn pause_after_surface_admission_validation(&self) {}
+
     pub(super) async fn validate_current_surface_admission(
         &self,
-        source: PaneStreamSource,
+        mut source: PaneStreamSource,
     ) -> Result<PaneStreamSource, RmuxError> {
-        let (source, captured) = self.capture_current_surface_stream_source(source).await?;
-        let seed = captured
-            .seed
-            .as_ref()
-            .expect("forced surface admission capture must materialize a projection");
-        let frame = materialize_surface_frame(
-            self,
-            source.key.pane_id(),
-            1,
-            1,
-            0,
-            captured.boundary.next_output_sequence,
-            seed,
-        )?;
-        validate_surface_frame_size(&frame)?;
-        Ok(source)
+        for _ in 0..super::MAX_SOURCE_CAPTURE_ATTEMPTS {
+            let captured = capture_surface_source(&source, None, true)?;
+            if captured.boundary.generation != source.generation {
+                source = self
+                    .resolve_stream_source_for_pane(
+                        source.key.pane_id(),
+                        source.key.runtime_session_name(),
+                    )
+                    .await?;
+                continue;
+            }
+            let seed = captured
+                .seed
+                .as_ref()
+                .expect("forced surface admission capture must materialize a projection");
+            let validation = materialize_surface_frame(
+                self,
+                source.key.pane_id(),
+                1,
+                1,
+                0,
+                captured.boundary.next_output_sequence,
+                seed,
+            )
+            .and_then(|frame| validate_surface_frame_size(&frame));
+            self.pause_after_surface_admission_validation().await;
+            if source.output.is_current_boundary(captured.boundary) {
+                validation?;
+                return Ok(source);
+            }
+            source = self
+                .resolve_stream_source_for_pane(
+                    source.key.pane_id(),
+                    source.key.runtime_session_name(),
+                )
+                .await?;
+        }
+        Err(RmuxError::Server(
+            "pane surface changed repeatedly while validating stream admission".to_owned(),
+        ))
     }
 
     pub(super) async fn poll_surface_stream(

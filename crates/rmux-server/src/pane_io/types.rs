@@ -870,6 +870,20 @@ impl PaneOutputSender {
         ))
     }
 
+    /// Reports whether a previously captured boundary is still current.
+    ///
+    /// Admission paths use this as their linearization point after expensive
+    /// projection serialization. Unlike `subscribe_at_boundary`, this does
+    /// not allocate a receiver that the caller would immediately discard.
+    pub(crate) fn is_current_boundary(&self, expected: PaneBoundary) -> bool {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .expect("pane output state mutex must not be poisoned");
+        state.boundary(self.current_generation()) == expected
+    }
+
     /// Applies a transcript mutation and its invalidation at one linearization
     /// point. Output publication uses the same output-state -> transcript lock
     /// order, so bytes cannot appear between mutation and revision bump.
