@@ -456,7 +456,7 @@ impl Grid {
 
         for line in self.history.iter().chain(self.visible.iter()) {
             let wrapped = line.flags.contains(GridLineFlags::WRAPPED);
-            let rendered = if join_wrapped && wrapped {
+            let rendered = if join_wrapped {
                 line.render_with_options(
                     self.sx as usize,
                     GridRenderOptions {

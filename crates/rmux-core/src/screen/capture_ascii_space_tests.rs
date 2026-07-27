@@ -110,6 +110,15 @@ fn joined_capture_restores_compact_ascii_boundary_spaces() {
             expected_joined,
             "{label}: repeated joined capture"
         );
+        let expected_grid = std::str::from_utf8(expected_joined)
+            .expect("oracle capture is UTF-8")
+            .lines()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            screen.capture_grid(true).lines,
+            expected_grid,
+            "{label}: joined grid capture"
+        );
     }
 }
 
@@ -213,6 +222,24 @@ fn joined_capture_preserves_explicit_hard_terminal_and_blank_suffix_spaces() {
             b"\nnext\n\n\n".as_slice(),
             b"  \nnext\n\n\n".as_slice(),
         ),
+        (
+            "blank-only-three",
+            b"   ".as_slice(),
+            b"\n\n\n\n".as_slice(),
+            b"   \n\n\n\n".as_slice(),
+        ),
+        (
+            "wrapped-suffix-three",
+            b"abc def gh   ".as_slice(),
+            b"abc def\ngh\n\n\n".as_slice(),
+            b"abc def gh   \n\n\n".as_slice(),
+        ),
+        (
+            "repeated-hard-one",
+            b"abc \r\nabc \r\nabc ".as_slice(),
+            b"abc\nabc\nabc\n\n".as_slice(),
+            b"abc \nabc \nabc \n\n".as_slice(),
+        ),
     ];
 
     for (label, payload, expected_raw, expected_joined) in cases {
@@ -222,6 +249,11 @@ fn joined_capture_preserves_explicit_hard_terminal_and_blank_suffix_spaces() {
             joined_capture(&screen),
             expected_joined,
             "{label}: joined capture"
+        );
+        assert_eq!(
+            joined_capture(&screen),
+            expected_joined,
+            "{label}: repeated joined capture"
         );
     }
 }
