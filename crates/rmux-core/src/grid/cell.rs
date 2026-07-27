@@ -1235,7 +1235,7 @@ impl GridLine {
     }
 
     fn plain_text_render_end(&self, text_len: usize, options: GridRenderOptions) -> usize {
-        if options.join_wrapped && self.flags.contains(GridLineFlags::WRAPPED) {
+        if options.join_wrapped && !options.trim_spaces {
             usize::from(self.plain_text_data_end).max(text_len)
         } else {
             text_len

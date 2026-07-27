@@ -172,14 +172,58 @@ fn joined_capture_keeps_exact_utf8_and_sgr_sentinels() {
 }
 
 #[test]
-fn joined_capture_hard_and_terminal_spaces_product_divergence() {
-    let hard_break = screen(8, 4, 20, b"abc   \r\nnext");
-    assert_eq!(raw_capture(&hard_break), b"abc\nnext\n\n\n");
-    assert_eq!(joined_capture(&hard_break), b"abc\nnext\n\n\n");
+fn joined_capture_preserves_explicit_hard_terminal_and_blank_suffix_spaces() {
+    // Frozen tmux 3.7b, measured 2026-07-27 in an 8x4 pane: ordinary capture
+    // trims these suffixes, while -J preserves exactly the cells written by
+    // the application without extending them through implicit blank padding.
+    let cases = [
+        (
+            "hard-one",
+            b"abc \r\nnext".as_slice(),
+            b"abc\nnext\n\n\n".as_slice(),
+            b"abc \nnext\n\n\n".as_slice(),
+        ),
+        (
+            "hard-three",
+            b"abc   \r\nnext".as_slice(),
+            b"abc\nnext\n\n\n".as_slice(),
+            b"abc   \nnext\n\n\n".as_slice(),
+        ),
+        (
+            "terminal-one",
+            b"abc ".as_slice(),
+            b"abc\n\n\n\n".as_slice(),
+            b"abc \n\n\n\n".as_slice(),
+        ),
+        (
+            "terminal-three",
+            b"abc   ".as_slice(),
+            b"abc\n\n\n\n".as_slice(),
+            b"abc   \n\n\n\n".as_slice(),
+        ),
+        (
+            "terminal-full-width",
+            b"abc def ".as_slice(),
+            b"abc def\n\n\n\n".as_slice(),
+            b"abc def \n\n\n\n".as_slice(),
+        ),
+        (
+            "blank-two",
+            b"  \r\nnext".as_slice(),
+            b"\nnext\n\n\n".as_slice(),
+            b"  \nnext\n\n\n".as_slice(),
+        ),
+    ];
 
-    let terminal = screen(8, 4, 20, b"abc def ");
-    assert_eq!(raw_capture(&terminal), b"abc def\n\n\n\n");
-    assert_eq!(joined_capture(&terminal), b"abc def\n\n\n\n");
+    for (label, payload, expected_raw, expected_joined) in cases {
+        let screen = screen(8, 4, 20, payload);
+        assert_eq!(raw_capture(&screen), expected_raw, "{label}: raw capture");
+        assert_eq!(
+            joined_capture(&screen),
+            expected_joined,
+            "{label}: joined capture"
+        );
+    }
 }
 
 #[test]
