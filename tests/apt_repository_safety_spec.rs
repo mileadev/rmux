@@ -446,6 +446,102 @@ fn inventory_transport_ignores_tmpdir_and_rejects_sorted_record_loss() {
 }
 
 #[test]
+fn inventory_transport_rejects_cardinality_preserving_sort_corruption() {
+    let root = fixture_root("inventory-sort-corruption");
+    let inventory = repo_root().join("scripts/apt-repository-inventory.sh");
+    let entries = root.join("entries");
+    let tools = root.join("tools");
+    install_tools(&tools);
+    fs::create_dir_all(&entries).expect("create sort input");
+    fs::write(entries.join("alpha"), b"alpha").expect("write alpha input");
+    fs::write(entries.join("beta"), b"beta").expect("write beta input");
+
+    let sort = tools.join("sort");
+    fs::write(
+        &sort,
+        r#"#!/bin/bash
+set -euo pipefail
+alpha=
+beta=
+while IFS= read -r -d '' entry; do
+  case "$entry" in
+    */alpha) alpha="$entry" ;;
+    */beta) beta="$entry" ;;
+    *) exit 65 ;;
+  esac
+done
+[ -n "$alpha" ] && [ -n "$beta" ]
+case "${RMUX_TEST_SORT_MODE:-}" in
+  duplicate)
+    printf '%s\0%s\0' "$alpha" "$alpha"
+    ;;
+  reverse)
+    printf '%s\0%s\0' "$beta" "$alpha"
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+"#,
+    )
+    .expect("write corrupting sort");
+    make_executable(&sort);
+
+    let path = std::env::join_paths([
+        tools.as_path(),
+        Path::new("/usr/bin"),
+        Path::new("/bin"),
+        Path::new("/usr/sbin"),
+        Path::new("/sbin"),
+    ])
+    .expect("compose corrupting sort PATH");
+    let run = |mode: &str| {
+        Command::new("/bin/bash")
+            .args([
+                "-euo",
+                "pipefail",
+                "-c",
+                concat!(
+                    "die(){ printf 'error: %s\\n' \"$*\" >&2; exit 1; }; ",
+                    "source \"$1\"; ",
+                    "collect_sorted_find_entries test -P \"$2\" -maxdepth 1 -type f"
+                ),
+                "bash",
+            ])
+            .arg(&inventory)
+            .arg(&entries)
+            .env("PATH", &path)
+            .env("RMUX_TEST_SORT_MODE", mode)
+            .current_dir(repo_root())
+            .output()
+            .expect("run corrupting sort probe")
+    };
+
+    let duplicate = run("duplicate");
+    assert!(
+        !duplicate.status.success(),
+        "duplicate-plus-loss sort output was accepted"
+    );
+    assert!(
+        stderr(&duplicate).contains("without preserving every record"),
+        "{}",
+        stderr(&duplicate)
+    );
+
+    let reverse = run("reverse");
+    fs::remove_dir_all(&root).expect("remove inventory-sort-corruption fixture");
+    assert!(
+        !reverse.status.success(),
+        "cardinality-preserving reverse sort output was accepted"
+    );
+    assert!(
+        stderr(&reverse).contains("cannot sort test in C byte order"),
+        "{}",
+        stderr(&reverse)
+    );
+}
+
+#[test]
 fn refuses_unreadable_output_inventory_without_mutating_tree_bytes() {
     let root = fixture_root("unreadable-inventory");
     let input = root.join("input");

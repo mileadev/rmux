@@ -54,6 +54,11 @@ paths_overlap() {
   return 1
 }
 
+c_string_greater_than() {
+  local LC_ALL=C
+  [[ "$1" > "$2" ]]
+}
+
 collect_find_entries() {
   local label entry complete
   label="$1"
@@ -73,13 +78,15 @@ collect_find_entries() {
 }
 
 collect_sorted_find_entries() {
-  local label entry complete expected_count
-  local unsorted=()
+  local label entry complete expected_count matched_index index
+  local previous_entry= have_previous=0
+  local unsorted=() remaining=()
   label="$1"
   shift
   collect_find_entries "$label" "$@"
   [ "${#inventory_collected_entries[@]}" -gt 0 ] || return 0
   unsorted=("${inventory_collected_entries[@]}")
+  remaining=("${inventory_collected_entries[@]}")
   inventory_collected_entries=()
   expected_count="${#unsorted[@]}"
   complete=0
@@ -90,10 +97,29 @@ collect_sorted_find_entries() {
       continue
     fi
     [ "$complete" -eq 0 ] || die "cannot sort $label"
+    matched_index=
+    if [ "${#remaining[@]}" -gt 0 ]; then
+      for index in "${!remaining[@]}"; do
+        if [ "${remaining[$index]}" = "$entry" ]; then
+          matched_index="$index"
+          break
+        fi
+      done
+    fi
+    [ -n "$matched_index" ] ||
+      die "cannot sort $label without preserving every record"
+    unset "remaining[$matched_index]"
+    if [ "$have_previous" -eq 1 ] &&
+      c_string_greater_than "$previous_entry" "$entry"; then
+      die "cannot sort $label in C byte order"
+    fi
+    previous_entry="$entry"
+    have_previous=1
     inventory_collected_entries+=("$entry")
   done < <(printf '%s\0' "${unsorted[@]}" | LC_ALL=C sort -z && printf '\0')
   [ "$complete" -eq 1 ] &&
-    [ "${#inventory_collected_entries[@]}" -eq "$expected_count" ] ||
+    [ "${#inventory_collected_entries[@]}" -eq "$expected_count" ] &&
+    [ "${#remaining[@]}" -eq 0 ] ||
     die "cannot sort $label without record loss"
 }
 
