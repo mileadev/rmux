@@ -8,6 +8,7 @@ use rmux_proto::{OptionName, PaneTarget, RmuxError, Target};
 use rmux_pty::WindowsConsoleKeyEvent;
 
 use super::super::{
+    mode_tree_support::ModeTreeInputError,
     prompt_support::{decode_prompt_key, PromptInputEvent},
     RequestHandler,
 };
@@ -166,10 +167,32 @@ impl RequestHandler {
         }
 
         let _ = self
-            .handle_mode_tree_key_event_for_identity(identity, fallback_event)
-            .await
-            .map_err(io_other)?;
+            .handle_attached_mode_tree_key_event(identity, fallback_event)
+            .await?;
         Ok(())
+    }
+
+    async fn handle_attached_mode_tree_key_event(
+        &self,
+        identity: ActiveAttachIdentity,
+        event: PromptInputEvent,
+    ) -> io::Result<bool> {
+        match self
+            .handle_mode_tree_key_event_for_identity(identity, event)
+            .await
+        {
+            Ok(handled) => Ok(handled),
+            Err(ModeTreeInputError::Fatal(error)) => Err(io_other(error)),
+            Err(ModeTreeInputError::UserCommandAfterModeExit(error)) => {
+                let session_name = self
+                    .attached_session_name_for_identity(identity)
+                    .await
+                    .map_err(io_other)?;
+                self.report_attached_command_error(&session_name, identity.attach_pid(), &error)
+                    .await;
+                Ok(true)
+            }
+        }
     }
 
     async fn handle_attached_live_key(
@@ -444,9 +467,8 @@ impl RequestHandler {
                     };
                     offset += consumed;
                     let _ = self
-                        .handle_mode_tree_key_event_for_identity(identity, event)
-                        .await
-                        .map_err(io_other)?;
+                        .handle_attached_mode_tree_key_event(identity, event)
+                        .await?;
                 }
             }
             if self.prompt_active_for_identity(identity).await
