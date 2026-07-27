@@ -1,5 +1,5 @@
 use rmux_os::identity::UserIdentity;
-use rmux_proto::TerminalSize;
+use rmux_proto::{SessionId, TerminalSize};
 
 #[derive(Debug, Clone)]
 pub(in crate::handler) struct ListClientSnapshot {
@@ -7,6 +7,7 @@ pub(in crate::handler) struct ListClientSnapshot {
     pub(in crate::handler) pid: u32,
     pub(in crate::handler) tty: String,
     pub(in crate::handler) control: bool,
+    pub(in crate::handler) session_id: Option<SessionId>,
     pub(in crate::handler) session_name: Option<rmux_proto::SessionName>,
     pub(in crate::handler) order: u64,
     pub(in crate::handler) activity_at: i64,

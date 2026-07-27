@@ -281,7 +281,7 @@ impl RequestHandler {
         let mut delivered = false;
         for identity in identities {
             delivered |= self
-                .send_control_notification_to_queue(identity, line.clone())
+                .send_control_response_notification_to_queue(identity, line.clone())
                 .await;
         }
         delivered
@@ -532,7 +532,7 @@ impl RequestHandler {
                 }
                 render_runtime_template(template, &runtime, true)
             };
-            self.send_control_notification_to(
+            self.send_control_response_notification_to(
                 requester_pid,
                 format_control_message_line(&expanded),
             )
@@ -649,7 +649,7 @@ impl RequestHandler {
         };
 
         if requester_is_control && display_client.is_none() && !route_control_to_target_session {
-            self.send_control_notification_to(
+            self.send_control_response_notification_to(
                 requester_pid,
                 format_control_message_line(&expanded),
             )
@@ -693,7 +693,7 @@ impl RequestHandler {
                     .await
                 }
                 Some(DisplayMessageClient::Control(identity)) => {
-                    self.send_control_notification_to_queue(
+                    self.send_control_response_notification_to_queue(
                         identity,
                         format_control_message_line(&expanded),
                     )

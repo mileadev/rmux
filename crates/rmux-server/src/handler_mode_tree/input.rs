@@ -16,6 +16,7 @@ use super::mode_tree_selection::{
     expand_or_child, move_selection, repeat_search, select_edge, selected_items, tag_all,
     tagged_tree_kill_prompt, toggle_tag,
 };
+use super::ModeTreeInputError;
 
 impl RequestHandler {
     #[cfg_attr(not(test), allow(dead_code))]
@@ -26,13 +27,14 @@ impl RequestHandler {
     ) -> Result<bool, RmuxError> {
         self.handle_mode_tree_key_event_with_identity(attach_pid, None, event)
             .await
+            .map_err(ModeTreeInputError::into_rmux_error)
     }
 
     pub(in crate::handler) async fn handle_mode_tree_key_event_for_identity(
         &self,
         identity: super::super::attach_support::ActiveAttachIdentity,
         event: PromptInputEvent,
-    ) -> Result<bool, RmuxError> {
+    ) -> Result<bool, ModeTreeInputError> {
         self.handle_mode_tree_key_event_with_identity(identity.attach_pid(), Some(identity), event)
             .await
     }
@@ -42,7 +44,7 @@ impl RequestHandler {
         attach_pid: u32,
         identity: Option<super::super::attach_support::ActiveAttachIdentity>,
         event: PromptInputEvent,
-    ) -> Result<bool, RmuxError> {
+    ) -> Result<bool, ModeTreeInputError> {
         let (mut mode, action_identity) = {
             let active_attach = self.active_attach.lock().await;
             let active = active_attach

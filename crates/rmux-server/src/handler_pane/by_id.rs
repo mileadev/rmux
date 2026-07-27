@@ -312,15 +312,18 @@ impl RequestHandler {
                                 .map(|policy| (session_name.clone(), session_id, policy))
                         })
                         .collect::<Vec<_>>();
-                    let lifecycle_events =
-                        hook_batch.prepare_committed(&mut state, &destroyed_sessions);
                     let after_hook_target =
                         after_kill_pane_target(&state, &result.hook_context, &affected_sessions);
-                    let post_lifecycle_events = selection_before.prepare_kill_pane_changes(
-                        &mut state,
-                        WindowTarget::with_window(session_name.clone(), layout_window),
-                        result.response.window_destroyed,
-                    );
+                    let layout_target =
+                        WindowTarget::with_window(session_name.clone(), layout_window);
+                    let (lifecycle_events, post_lifecycle_events) = hook_batch
+                        .prepare_explicit_committed(
+                            &mut state,
+                            &destroyed_sessions,
+                            &selection_before,
+                            layout_target,
+                            result.response.window_destroyed,
+                        );
                     if !result.session_destroyed && !result.response.window_destroyed {
                         let _ = state.hooks.remove_pane(&target);
                     }

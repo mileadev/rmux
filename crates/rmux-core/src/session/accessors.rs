@@ -197,6 +197,10 @@ impl Session {
         cloned.id = session_id;
         cloned.name = name;
         cloned.group_name = Some(group_name);
+        cloned.group_initial_window_id = self
+            .windows
+            .first_key_value()
+            .map(|(_, window)| window.id());
         cloned.created_at = now;
         cloned.activity_at = now;
         cloned.last_attached_at = None;

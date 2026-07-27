@@ -10,7 +10,11 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-use common::{assert_clap_failure, assert_success, stderr, stdout, terminate_child, CliHarness};
+use common::{
+    assert_clap_failure, assert_success, stderr, stdout, terminate_child, CliHarness,
+    BINARY_OVERRIDE_ENV,
+};
+use rmux_client::wait_for_server_endpoint_cleanup;
 
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -870,6 +874,41 @@ fn unlink_window_missing_target_uses_tmux_window_lookup_error() -> Result<(), Bo
     );
 
     terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn unlink_window_k_last_session_exits_the_empty_daemon_after_reply() -> Result<(), Box<dyn Error>> {
+    let _guard = window_surface_guard();
+    let harness = CliHarness::new("unlink-window-last-exit-empty")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+
+    let created = harness.run_with(
+        &["new-session", "-d", "-s", "alpha", "sleep 60"],
+        |command| {
+            command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+        },
+    )?;
+    assert_success(&created);
+    assert!(harness.pid_path().exists());
+    assert!(harness.socket_path().exists());
+    // Let the setup client's already-delivered detached connection reach EOF
+    // so this regression isolates unlink teardown from the separate idle
+    // connection shutdown race.
+    std::thread::sleep(Duration::from_millis(250));
+
+    let unlinked = harness.run(&["unlink-window", "-k", "-t", "alpha:0"])?;
+    assert_success(&unlinked);
+    wait_for_server_endpoint_cleanup(harness.socket_path())?;
+
+    let list = harness.run(&["list-sessions"])?;
+    assert_eq!(list.status.code(), Some(1));
+    assert!(stdout(&list).is_empty());
+    assert!(
+        stderr(&list).contains("no server running"),
+        "stderr={:?}",
+        stderr(&list)
+    );
     Ok(())
 }
 

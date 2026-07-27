@@ -523,6 +523,7 @@ async fn serve_connection(
                 if let Err(error) = response_result {
                     if let Some((_, _, _, _, control_id)) = pending_control.as_ref() {
                         handler.finish_control(requester.pid, *control_id).await;
+                        let _ = handler.request_shutdown_if_server_empty().await;
                     }
                     drop(detached_request_guard.take());
                     #[cfg(windows)]
@@ -643,6 +644,7 @@ async fn serve_connection(
                     )
                     .await;
                     handler.finish_control(requester.pid, control_id).await;
+                    let _ = handler.request_shutdown_if_server_empty().await;
                     return result;
                 }
 

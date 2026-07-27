@@ -155,6 +155,61 @@ fn delayed_command_run_shell_follows_stable_session_identity_after_rename(
 }
 
 #[test]
+fn command_run_shell_continues_after_renaming_its_pinned_session() -> Result<(), Box<dyn Error>> {
+    // tmux 3.7b oracle, measured 2026-07-27: the rename and the following
+    // admitted mutation both run against the same session lifetime.
+    let (harness, _daemon) = current_target_harness("run-shell-command-queued-rename")?;
+    let output = harness.run(&[
+        "run-shell",
+        "-C",
+        "-t",
+        "beta:0.0",
+        "rename-session -t beta renamed ; new-window -d -n queued-after-rename sleep 30",
+    ])?;
+
+    let old_target = harness.run(&["has-session", "-t", "beta"])?;
+    assert_eq!(
+        old_target.status.code(),
+        Some(1),
+        "the first admitted command must rename beta: {old_target:?}"
+    );
+    assert_success(&harness.run(&["has-session", "-t", "renamed"])?);
+    assert_eq!(
+        window_names(&harness, "renamed")?,
+        vec!["sleep", "queued-after-rename"],
+        "the renamed session exists, but the second admitted mutation was not dispatched: \
+         stdout={:?} stderr={:?}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert_output_success(&output);
+    Ok(())
+}
+
+#[test]
+fn command_run_shell_keeps_the_renamed_identity_when_the_old_name_is_reused(
+) -> Result<(), Box<dyn Error>> {
+    let (harness, _daemon) = current_target_harness("run-shell-command-rename-reuse")?;
+    let output = harness.run(&[
+        "run-shell",
+        "-C",
+        "-t",
+        "beta:0.0",
+        "rename-session -t beta renamed ; \
+         new-session -d -s beta sleep 30 ; \
+         new-window -d -n queued-on-renamed sleep 30",
+    ])?;
+
+    assert_output_success(&output);
+    assert_eq!(window_names(&harness, "beta")?, vec!["sleep"]);
+    assert_eq!(
+        window_names(&harness, "renamed")?,
+        vec!["sleep", "queued-on-renamed"]
+    );
+    Ok(())
+}
+
+#[test]
 fn delayed_command_run_shell_rejects_replacement_session_product_divergence(
 ) -> Result<(), Box<dyn Error>> {
     // tmux 3.7b oracle, measured 2026-07-26: after the original target is

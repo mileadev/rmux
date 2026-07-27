@@ -170,6 +170,7 @@ impl RequestHandler {
         &self,
         identity: super::ActiveAttachIdentity,
         session_name: &rmux_proto::SessionName,
+        session_id: rmux_proto::SessionId,
         expected_key_table_generation: u64,
         key_table_name: Option<String>,
         key_table_set_at: Option<Instant>,
@@ -178,7 +179,7 @@ impl RequestHandler {
             AttachedKeyTableExpectation {
                 attach_pid: identity.attach_pid(),
                 attach_id: Some(identity.attach_id()),
-                session: Some((session_name, identity.session_id())),
+                session: Some((session_name, session_id)),
                 key_table_generation: Some(expected_key_table_generation),
                 reset_repeat: true,
             },

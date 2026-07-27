@@ -201,11 +201,11 @@ fn resize_main_pane_recalculates_existing_geometry() {
     );
     assert_eq!(
         window.pane(1).expect("pane 1 exists").geometry(),
-        PaneGeometry::new(35, 0, 165, 24)
+        PaneGeometry::new(35, 0, 165, 25)
     );
     assert_eq!(
         window.pane(2).expect("pane 2 exists").geometry(),
-        PaneGeometry::new(35, 25, 165, 25)
+        PaneGeometry::new(35, 26, 165, 24)
     );
 }
 

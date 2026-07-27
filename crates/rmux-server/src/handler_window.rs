@@ -105,6 +105,31 @@ fn changed_active_window_ids(
     changed
 }
 
+fn swap_selection_session_order(
+    state: &HandlerState,
+    request: &rmux_proto::SwapWindowRequest,
+) -> Vec<SessionName> {
+    let mut seen_session_ids = HashSet::new();
+    let mut ordered_sessions = Vec::new();
+    for target in [&request.target, &request.source] {
+        for session_name in
+            state.window_linked_session_family_list(target.session_name(), target.window_index())
+        {
+            let Some(session_id) = state
+                .sessions
+                .session(&session_name)
+                .map(rmux_core::Session::id)
+            else {
+                continue;
+            };
+            if seen_session_ids.insert(session_id) {
+                ordered_sessions.push(session_name);
+            }
+        }
+    }
+    ordered_sessions
+}
+
 impl RequestHandler {
     #[cfg(test)]
     pub(in crate::handler) fn install_kill_window_commit_pause(
@@ -1264,11 +1289,9 @@ impl RequestHandler {
                 return Some(Response::Error(ErrorResponse { error }));
             }
             let session = state.sessions.session(request.target.session_name())?;
-            if session.windows().len() != 1
-                || state
-                    .window_link_count(request.target.session_name(), request.target.window_index())
-                    <= 1
-            {
+            let link_count = state
+                .window_link_count(request.target.session_name(), request.target.window_index());
+            if session.windows().len() != 1 || (link_count <= 1 && !request.kill_if_last) {
                 return None;
             }
             let window = session.window_at(request.target.window_index())?;
@@ -1285,6 +1308,7 @@ impl RequestHandler {
                 },
                 session_id,
                 window_id,
+                request.kill_if_last,
             )
             .await?;
         Some(match response {
@@ -1297,10 +1321,18 @@ impl RequestHandler {
         &self,
         request: rmux_proto::SwapWindowRequest,
     ) -> Response {
-        let (response, mut refresh_sessions, resize_window_ids) = {
+        let (response, mut refresh_sessions, resize_window_ids, lifecycle_events) = {
             let mut state = self.state.lock().await;
             if let Err(error) = require_expected_swap_window_identity(&state, &request) {
                 return Response::Error(ErrorResponse { error });
+            }
+            if request.source.session_name() == request.target.session_name()
+                && request.source.window_index() == request.target.window_index()
+            {
+                return Response::SwapWindow(rmux_proto::SwapWindowResponse {
+                    source: request.source,
+                    target: request.target,
+                });
             }
             let subscription_keys = PaneOutputSubscriptionKeySnapshot::capture_related(
                 &state,
@@ -1309,6 +1341,8 @@ impl RequestHandler {
                     request.target.session_name().clone(),
                 ],
             );
+            let selection_before = SelectionTransitionSnapshot::capture(&state);
+            let preferred_selection_sessions = swap_selection_session_order(&state, &request);
             let active_window_ids_before = active_window_ids_by_session(&state);
             let mut resize_window_ids = [&request.source, &request.target]
                 .into_iter()
@@ -1365,14 +1399,18 @@ impl RequestHandler {
                     resize_window_ids.sort_by_key(|window_id| window_id.as_u32());
                     resize_window_ids.dedup();
                     self.rekey_pane_output_subscriptions(&subscription_keys.rekeys_after(&state));
+                    let lifecycle_events = selection_before
+                        .prepare_session_window_changes(&mut state, &preferred_selection_sessions);
                     (
                         Response::SwapWindow(response),
                         refresh_sessions,
                         resize_window_ids,
+                        lifecycle_events,
                     )
                 }
                 Err(error) => (
                     Response::Error(ErrorResponse { error }),
+                    Vec::new(),
                     Vec::new(),
                     Vec::new(),
                 ),
@@ -1380,6 +1418,12 @@ impl RequestHandler {
         };
 
         if matches!(response, Response::SwapWindow(_)) {
+            if !lifecycle_events.is_empty() {
+                self.pause_before_window_lifecycle_emit().await;
+                for event in lifecycle_events {
+                    self.emit_prepared(event).await;
+                }
+            }
             let resize_targets = {
                 let state = self.state.lock().await;
                 let resize_targets = surviving_attached_resize_targets(&state, resize_window_ids);

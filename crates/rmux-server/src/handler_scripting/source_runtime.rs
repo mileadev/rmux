@@ -6,7 +6,7 @@ use rmux_core::{
         lookup_command, CommandArgument, CommandParseErrorKind, CommandParser,
         EnvironmentAssignment, ParsedCommand, ParsedCommands, SOURCE_FILE_MAX_COMMAND_BYTES,
     },
-    parse_binding_command_tokens_with_parser,
+    parse_binding_command_tokens_with_parser, SessionStore,
 };
 use rmux_proto::{
     CommandOutput, ErrorResponse, PaneTarget, Request, Response, RmuxError, SourceFileRequest,
@@ -131,7 +131,7 @@ impl RequestHandler {
         let execution = self
             .execute_startup_source_file(
                 loaded,
-                QueueExecutionContext::new(command.caller_cwd.clone()),
+                QueueExecutionContext::new(command.caller_cwd.clone()).for_startup_config(),
                 guard,
             )
             .await;
@@ -484,7 +484,7 @@ impl RequestHandler {
         let mut execution_errors = Vec::new();
         let mut exit_status = None;
         for batch in loaded.commands {
-            let batch_context = context.for_sourced_commands(depth, batch.current_file);
+            let mut batch_context = context.for_sourced_commands(depth, batch.current_file);
             if let Err(error) = self
                 .validate_sourced_command_syntax(
                     requester_pid,
@@ -503,7 +503,7 @@ impl RequestHandler {
                 .execute_command_queue(
                     requester_pid,
                     batch.commands,
-                    batch_context,
+                    &mut batch_context,
                     QueueMode::Detached,
                     None,
                 )
@@ -518,8 +518,9 @@ impl RequestHandler {
             if let Some(error) = result.execution_error {
                 execution_errors.push(error);
             }
+            context = batch_context;
             if !context.uses_explicit_current_target() {
-                context = context.with_implicit_current_target(
+                context = context.refresh_implicit_current_target(
                     self.implicit_source_file_target(requester_pid)
                         .await
                         .map(Target::Pane),
@@ -874,7 +875,15 @@ impl RequestHandler {
     ) -> Result<(), RmuxError> {
         let attached_session = self.current_session_candidate(requester_pid).await;
         let socket_path = self.socket_path();
-        let requester_pane_id = context
+        let mut validation_context = context.clone();
+        let mut validation_sessions = self
+            .state
+            .lock()
+            .await
+            .sessions
+            .is_empty()
+            .then(SessionStore::new);
+        let requester_pane_id = validation_context
             .current_target
             .is_none()
             .then(|| requester_environment_pane_id(requester_pid, &socket_path))
@@ -889,41 +898,48 @@ impl RequestHandler {
             let result = {
                 let state = self.state.lock().await;
                 let marked_target = state.marked_pane_target();
+                let sessions = validation_sessions.as_ref().unwrap_or(&state.sessions);
                 let find_context = queue_target_find_context(QueueTargetFindContextInput {
-                    sessions: &state.sessions,
+                    sessions,
                     options: &state.options,
                     requester_pane_id,
                     attached_session: attached_session.as_ref(),
-                    current_target: context.current_target.as_ref(),
-                    missing_current_target_fallback: context.missing_current_target_fallback(),
-                    mouse_target: context.mouse_target.as_ref(),
+                    current_target: validation_context.current_target.as_ref(),
+                    missing_current_target_fallback: validation_context
+                        .missing_current_target_fallback(),
+                    mouse_target: validation_context.mouse_target.as_ref(),
                     marked_target: marked_target.as_ref(),
                 });
                 parse_queue_invocation(
                     command.clone(),
-                    context.caller_cwd.as_deref(),
-                    &state.sessions,
+                    validation_context.caller_cwd.as_deref(),
+                    sessions,
                     &state.options,
                     &find_context,
-                    context.canfail_fallback_target(),
-                    context.run_shell_canfail_fallback_target(),
+                    validation_context.canfail_fallback_target(),
+                    validation_context.run_shell_canfail_fallback_target(),
                 )
             };
+            if let Some(sessions) = validation_sessions.as_mut() {
+                advance_source_validation_session_state(&result, sessions, &mut validation_context);
+            }
 
             match result {
                 Ok(QueueInvocation::SourceFile(command)) if recursive && load_nested_sources => {
                     self.validate_nested_source_file_syntax(
                         requester_pid,
                         command,
-                        context,
+                        &validation_context,
                         &mut errors,
                     )
                     .await;
                 }
                 Ok(QueueInvocation::IfShell(if_shell)) if recursive => {
                     let nested_context = match if_shell.target.clone() {
-                        Some(target) => context.clone().with_current_target(Some(target)),
-                        None => context.clone(),
+                        Some(target) => {
+                            validation_context.clone().with_current_target(Some(target))
+                        }
+                        None => validation_context.clone(),
                     };
                     self.push_command_list_validation_error(
                         requester_pid,
@@ -951,7 +967,7 @@ impl RequestHandler {
                         self.push_command_list_validation_error(
                             requester_pid,
                             template,
-                            context,
+                            &validation_context,
                             command,
                             &mut errors,
                             settings,
@@ -963,7 +979,7 @@ impl RequestHandler {
                     self.push_command_list_validation_error(
                         requester_pid,
                         &confirm.command,
-                        context,
+                        &validation_context,
                         command,
                         &mut errors,
                         settings,
@@ -974,7 +990,7 @@ impl RequestHandler {
                     self.validate_request_embedded_command_syntax(
                         requester_pid,
                         &request,
-                        context,
+                        &validation_context,
                         command,
                         &mut errors,
                         settings,
@@ -985,7 +1001,7 @@ impl RequestHandler {
                     self.validate_request_embedded_command_syntax(
                         requester_pid,
                         &rmux_proto::Request::RunShell(Box::new(run_shell.request)),
-                        context,
+                        &validation_context,
                         command,
                         &mut errors,
                         settings,
@@ -995,7 +1011,11 @@ impl RequestHandler {
                 Ok(_) => {}
                 Err(error) if should_defer_source_validation_error(&error, command, recursive) => {}
                 Err(error) => {
-                    errors.push(super::source_file_context_error(error, command, context));
+                    errors.push(super::source_file_context_error(
+                        error,
+                        command,
+                        &validation_context,
+                    ));
                 }
             }
             if fail_fast && !errors.is_empty() {
@@ -1197,6 +1217,36 @@ impl RequestHandler {
                 errors.push(error.with_parent_context(parent_command, context));
             }
         }
+    }
+}
+
+fn advance_source_validation_session_state(
+    result: &Result<QueueInvocation, RmuxError>,
+    sessions: &mut SessionStore,
+    context: &mut QueueExecutionContext,
+) {
+    match result {
+        Ok(QueueInvocation::Request(Request::NewSession(request))) => {
+            let size = request.size.unwrap_or(super::super::DEFAULT_SESSION_SIZE);
+            let _ = sessions.create_session(request.session_name.clone(), size);
+        }
+        Ok(QueueInvocation::Request(Request::NewSessionExt(request)))
+            if request.group_target.is_none() =>
+        {
+            let Some(session_name) = request.session_name.clone() else {
+                return;
+            };
+            let size = request.size.unwrap_or(super::super::DEFAULT_SESSION_SIZE);
+            let _ = sessions.create_session(session_name, size);
+        }
+        Ok(QueueInvocation::Request(Request::RenameSession(request)))
+            if sessions
+                .rename_session(&request.target, request.new_name.clone())
+                .is_ok() =>
+        {
+            context.rebase_for_source_validation_session_rename(&request.target, &request.new_name);
+        }
+        _ => {}
     }
 }
 

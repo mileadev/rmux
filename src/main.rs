@@ -20,6 +20,8 @@ mod cli_response;
 mod client_terminal;
 mod command_alias_snapshot;
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
+mod empty_server_lifecycle;
+#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 mod os_string;
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 mod process_locale;

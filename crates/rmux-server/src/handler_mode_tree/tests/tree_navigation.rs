@@ -195,6 +195,37 @@ fn parse_choose_tree_with_template_and_flags() {
 }
 
 #[test]
+fn parse_choose_tree_preserves_single_argv_template_for_runtime_reparse() {
+    for template in [
+        "switch-client -t target",
+        "switch-client -t '%%'",
+        "switch-client -Zt '%%'",
+        "switch-client -t '#{?#{==:#{session_name},target},%%,missing}'",
+        "switch-client -t '%%' ; display-message -p selected",
+    ] {
+        let parsed = CommandParser::new()
+            .parse_arguments(["choose-tree", template])
+            .expect("parses");
+        let mode = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+            .expect("ok")
+            .expect("recognized");
+        assert_eq!(mode.template.as_deref(), Some(template));
+    }
+}
+
+#[test]
+fn parse_choose_tree_preserves_quoted_source_template_for_runtime_reparse() {
+    let template = "switch-client -t '%%' ; display-message -p selected";
+    let parsed = CommandParser::new()
+        .parse_one_group(&format!("choose-tree {template:?}"))
+        .expect("parses");
+    let mode = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+        .expect("ok")
+        .expect("recognized");
+    assert_eq!(mode.template.as_deref(), Some(template));
+}
+
+#[test]
 fn parse_choose_tree_zw_preserves_trailing_direct_command_arguments_from_argv() {
     let parsed = CommandParser::new()
         .parse_arguments(["choose-tree", "-Zw", "set-buffer", "-b", "chosen", "%%"])

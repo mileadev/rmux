@@ -4,7 +4,7 @@ use rmux_core::{SessionStore, TargetFindContext};
 use rmux_proto::{DeleteBufferRequest, ListBuffersRequest, LoadBufferRequest, Request, RmuxError};
 
 use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
-use super::values::{missing_argument, unsupported_flag};
+use super::values::{missing_argument, reject_unknown_option_before_positional, unsupported_flag};
 use super::{implicit_pane_target, parse_pane_target};
 
 pub(super) fn parse_set_buffer(mut args: CommandTokens) -> Result<Request, RmuxError> {
@@ -41,6 +41,7 @@ pub(super) fn parse_set_buffer(mut args: CommandTokens) -> Result<Request, RmuxE
             }
             _ => {
                 let Some(cluster) = parse_compact_flag_cluster(&token, "aw", "bnt") else {
+                    reject_unknown_option_before_positional("set-buffer", &token)?;
                     break;
                 };
                 let _ = args.optional();

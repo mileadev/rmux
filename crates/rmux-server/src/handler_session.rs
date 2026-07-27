@@ -51,6 +51,12 @@ enum KillSessionExecution {
     OnlyLinkedWindowChanged,
 }
 
+#[derive(Clone, Copy)]
+struct OnlyWindowPrecondition {
+    window_id: WindowId,
+    kill_if_last: bool,
+}
+
 impl KillSessionExecution {
     fn into_unconditional_response(self) -> Response {
         match self {
@@ -813,6 +819,10 @@ impl RequestHandler {
                 return Response::Error(ErrorResponse { error });
             }
         }
+        super::scripting_support::record_queued_new_session_transition(
+            created_session_id,
+            session_name.clone(),
+        );
         self.finish_new_session_lifecycle(
             requester_pid,
             &session_name,
@@ -1060,6 +1070,20 @@ impl RequestHandler {
                     crate::pane_terminals::DeferredInitialPaneInput::Bytes(bytes) => {
                         flush.input_writer.write_all(&bytes)?;
                     }
+                    crate::pane_terminals::DeferredInitialPaneInput::BracketedPaste(bytes) => {
+                        if flush.input_writer.preserves_verbatim_input() {
+                            flush.input_writer.write_all(&bytes)?;
+                        } else {
+                            std::str::from_utf8(&bytes).map_err(|_| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    super::pane_support::
+                                        LEGACY_CONPTY_NON_UTF8_BRACKETED_PASTE_ERROR,
+                                )
+                            })?;
+                            rmux_pty::write_windows_console_utf8(pane_pid, &bytes)?;
+                        }
+                    }
                     crate::pane_terminals::DeferredInitialPaneInput::Console { action, .. } => {
                         Self::write_deferred_initial_console_input(pane_pid, action)?;
                     }
@@ -1145,9 +1169,18 @@ impl RequestHandler {
         request: rmux_proto::KillSessionRequest,
         session_id: SessionId,
         window_id: WindowId,
+        kill_if_last: bool,
     ) -> Option<Response> {
         match self
-            .handle_kill_session_with_identity(request, Some(session_id), None, Some(window_id))
+            .handle_kill_session_with_identity(
+                request,
+                Some(session_id),
+                None,
+                Some(OnlyWindowPrecondition {
+                    window_id,
+                    kill_if_last,
+                }),
+            )
             .await
         {
             KillSessionExecution::Completed(response) => Some(response),
@@ -1171,7 +1204,7 @@ impl RequestHandler {
         request: rmux_proto::KillSessionRequest,
         expected_session_id: Option<SessionId>,
         expected_expired_lease_token: Option<u64>,
-        expected_only_linked_window_id: Option<WindowId>,
+        expected_only_window: Option<OnlyWindowPrecondition>,
     ) -> KillSessionExecution {
         let (session_name, selected_session_id) = {
             let state = self.state.lock().await;
@@ -1290,7 +1323,7 @@ impl RequestHandler {
                 })
                 .into();
             }
-            if let Some(expected_window_id) = expected_only_linked_window_id {
+            if let Some(expected_window) = expected_only_window {
                 let session = state
                     .sessions
                     .session(&session_name)
@@ -1300,8 +1333,9 @@ impl RequestHandler {
                 let only_window_is_still_linked =
                     only_window.is_some_and(|(window_index, window)| {
                         windows.next().is_none()
-                            && window.id() == expected_window_id
-                            && state.window_link_count(&session_name, *window_index) > 1
+                            && window.id() == expected_window.window_id
+                            && (expected_window.kill_if_last
+                                || state.window_link_count(&session_name, *window_index) > 1)
                     });
                 if !only_window_is_still_linked {
                     return KillSessionExecution::OnlyLinkedWindowChanged;
@@ -1400,26 +1434,35 @@ impl RequestHandler {
                             removed_session.id(),
                             detach_on_destroy,
                         ));
-                        queued_events.push(prepare_lifecycle_event(
-                            &mut state,
-                            &LifecycleEvent::SessionClosed {
-                                session_name: session_name.clone(),
-                                session_id: Some(removed_session.id().as_u32()),
-                            },
-                        ));
+                        let session_closed = LifecycleEvent::SessionClosed {
+                            session_name: session_name.clone(),
+                            session_id: Some(removed_session.id().as_u32()),
+                        };
+                        let implicit_unlink_teardown = expected_only_window.is_some();
+                        let mut removal_events =
+                            Vec::with_capacity(removed_session.windows().len() + 1);
+                        // Explicit kill-session closes the session first. An
+                        // implicit unlink teardown lets the window hook consume
+                        // its state before the session hook cleans that state up.
+                        if !implicit_unlink_teardown {
+                            removal_events.push(session_closed.clone());
+                        }
                         for (window_index, window) in removed_session.windows() {
-                            queued_events.push(prepare_lifecycle_event(
-                                &mut state,
-                                &LifecycleEvent::WindowUnlinked {
-                                    session_name: session_name.clone(),
-                                    target: Some(WindowTarget::with_window(
-                                        session_name.clone(),
-                                        *window_index,
-                                    )),
-                                    window_id: Some(window.id().as_u32()),
-                                    window_name: Some(window.name().unwrap_or_default().to_owned()),
-                                },
-                            ));
+                            removal_events.push(LifecycleEvent::WindowUnlinked {
+                                session_name: session_name.clone(),
+                                target: Some(WindowTarget::with_window(
+                                    session_name.clone(),
+                                    *window_index,
+                                )),
+                                window_id: Some(window.id().as_u32()),
+                                window_name: Some(window.name().unwrap_or_default().to_owned()),
+                            });
+                        }
+                        if implicit_unlink_teardown {
+                            removal_events.push(session_closed);
+                        }
+                        for event in removal_events {
+                            queued_events.push(prepare_lifecycle_event(&mut state, &event));
                         }
                         let _ = state.options.remove_session(session_name);
                         let _ = state.environment.remove_session(session_name);
@@ -1745,7 +1788,7 @@ impl RequestHandler {
         })
     }
 
-    pub(in crate::handler) async fn request_shutdown_if_server_empty(&self) -> bool {
+    pub(crate) async fn request_shutdown_if_server_empty(&self) -> bool {
         if !self.queue_shutdown_if_server_empty().await {
             return false;
         }

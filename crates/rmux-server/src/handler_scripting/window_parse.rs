@@ -11,7 +11,7 @@ use rmux_proto::{
 use crate::pane_terminals::session_not_found;
 
 use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
-use super::values::unsupported_flag;
+use super::values::{reject_unknown_option_before_positional, unsupported_flag};
 use super::{
     implicit_session_name, implicit_window_target, parse_new_window_target_argument,
     parse_window_target,
@@ -388,7 +388,10 @@ pub(super) fn parse_rename_window(
                     args.required("-t target")?,
                 )?);
             }
-            _ => break,
+            token => {
+                reject_unknown_option_before_positional("rename-window", token)?;
+                break;
+            }
         }
     }
 

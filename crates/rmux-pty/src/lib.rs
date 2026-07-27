@@ -61,7 +61,7 @@ pub use size::{TerminalGeometry, TerminalPixels, TerminalSize};
 pub use windows_console_input::{
     send_windows_console_interrupt, write_windows_console_key, write_windows_console_key_batch,
     write_windows_console_key_reporting_processed_input, write_windows_console_mouse_drag,
-    WindowsConsoleKeyEvent,
+    write_windows_console_utf8, WindowsConsoleKeyEvent,
 };
 
 /// A crate-local result type for PTY operations.

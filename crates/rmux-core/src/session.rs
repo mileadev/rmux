@@ -46,6 +46,8 @@ pub struct Session {
     winlink_alert_flags: BTreeMap<u32, AlertFlags>,
     active_window: u32,
     last_window: Option<u32>,
+    /// First grouped-peer winlink by stable identity, retained until real local navigation.
+    group_initial_window_id: Option<WindowId>,
     next_pane_id: u32,
     next_window_id: WindowIdAllocator,
     created_at: i64,
@@ -83,6 +85,7 @@ impl Session {
             winlink_alert_flags: BTreeMap::from([(window_index, AlertFlags::empty())]),
             active_window: window_index,
             last_window: None,
+            group_initial_window_id: None,
             next_pane_id: pane_id.as_u32().saturating_add(1),
             next_window_id: WindowIdAllocator::new(window_id.as_u32().saturating_add(1)),
             created_at: now,
@@ -562,14 +565,15 @@ impl Session {
             }
         }
 
-        if let Some((window_index, _)) = self.windows.range(..removed_index).next_back() {
-            return *window_index;
+        if let Some(group_initial_window_id) = self.group_initial_window_id {
+            if let Some((window_index, _)) = self.windows.iter().find(|(window_index, window)| {
+                **window_index != removed_index && window.id() == group_initial_window_id
+            }) {
+                return *window_index;
+            }
         }
 
-        self.windows
-            .range((Excluded(removed_index), Unbounded))
-            .next()
-            .map(|(window_index, _)| *window_index)
+        cyclic_previous_window_index(&self.windows, removed_index)
             .expect("a non-empty session must have a replacement window")
     }
 
@@ -626,16 +630,23 @@ fn synchronized_active_window(
         }
     }
 
-    if let Some((window_index, _)) = windows.range(..previous_active).next_back() {
-        return *window_index;
-    }
-
-    windows
-        .range((Excluded(previous_active), Unbounded))
-        .next()
-        .map(|(window_index, _)| *window_index)
-        .or_else(|| windows.keys().next().copied())
+    cyclic_previous_window_index(windows, previous_active)
         .expect("group synchronization requires at least one window")
+}
+
+fn cyclic_previous_window_index(
+    windows: &BTreeMap<u32, Window>,
+    removed_index: u32,
+) -> Option<u32> {
+    windows
+        .range(..removed_index)
+        .next_back()
+        .or_else(|| {
+            windows
+                .range((Excluded(removed_index), Unbounded))
+                .next_back()
+        })
+        .map(|(window_index, _)| *window_index)
 }
 
 fn current_unix_timestamp() -> i64 {

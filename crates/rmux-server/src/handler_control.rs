@@ -16,7 +16,9 @@ use super::{
     RequestHandler, SelectionTargetTransitionSnapshot,
 };
 use crate::client_names::control_client_name;
-use crate::control::{ControlClientFlags, ControlModeUpgrade, ControlServerEvent};
+use crate::control::{
+    ControlClientFlags, ControlCommandResponseEvent, ControlModeUpgrade, ControlServerEvent,
+};
 use crate::control_notifications::{collect_control_notifications, ControlClientSnapshot};
 use crate::handler_support::{ambiguous_attached_client, attached_client_required};
 use crate::outer_terminal::OuterTerminalContext;
@@ -119,6 +121,13 @@ pub(super) enum ManagedClient {
 pub(crate) struct ControlClientIdentity {
     requester_pid: u32,
     control_id: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ControlCommandResponseSink {
+    identity: ControlClientIdentity,
+    sender: mpsc::Sender<ControlCommandResponseEvent>,
+    closing: Arc<AtomicBool>,
 }
 
 pub(super) struct ControlClientDetachOutcome {
@@ -234,9 +243,36 @@ impl ControlClientIdentity {
     }
 }
 
+impl ControlCommandResponseSink {
+    pub(crate) fn new(
+        identity: ControlClientIdentity,
+        sender: mpsc::Sender<ControlCommandResponseEvent>,
+        closing: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            identity,
+            sender,
+            closing,
+        }
+    }
+
+    fn try_send(&self, event: ControlCommandResponseEvent) -> bool {
+        if self.closing.load(Ordering::SeqCst) {
+            return false;
+        }
+        if self.sender.try_send(event).is_ok() {
+            return true;
+        }
+        self.closing.store(true, Ordering::SeqCst);
+        false
+    }
+}
+
 tokio::task_local! {
     static CONTROL_QUEUE_IDENTITY: ControlClientIdentity;
     static CONTROL_QUEUE_EOF_CANCELLATION: ControlQueueEofCancellation;
+    static CONTROL_COMMAND_RESPONSE_SINK: ControlCommandResponseSink;
+    static CONTROL_COMMAND_RESPONSE_CAPTURE: ();
 }
 
 #[derive(Debug, Clone)]
@@ -311,6 +347,45 @@ where
     CONTROL_QUEUE_EOF_CANCELLATION
         .scope(cancellation, future)
         .await
+}
+
+pub(crate) async fn with_control_command_response_sink<T, F>(
+    sink: ControlCommandResponseSink,
+    future: F,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    CONTROL_COMMAND_RESPONSE_SINK.scope(sink, future).await
+}
+
+pub(in crate::handler) async fn with_control_command_response_capture<T, F>(future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    CONTROL_COMMAND_RESPONSE_CAPTURE.scope((), future).await
+}
+
+fn current_control_command_response_sink() -> Option<ControlCommandResponseSink> {
+    CONTROL_COMMAND_RESPONSE_CAPTURE.try_with(|()| ()).ok()?;
+    CONTROL_COMMAND_RESPONSE_SINK.try_with(Clone::clone).ok()
+}
+
+pub(crate) fn control_command_response_stream_is_active(identity: ControlClientIdentity) -> bool {
+    CONTROL_COMMAND_RESPONSE_SINK
+        .try_with(|sink| sink.identity == identity && !sink.closing.load(Ordering::SeqCst))
+        .unwrap_or(false)
+}
+
+pub(crate) fn send_control_command_response_event(
+    identity: ControlClientIdentity,
+    event: ControlCommandResponseEvent,
+) -> bool {
+    CONTROL_COMMAND_RESPONSE_SINK
+        .try_with(|sink| (sink.identity == identity).then(|| sink.try_send(event)))
+        .ok()
+        .flatten()
+        .unwrap_or(false)
 }
 
 pub(in crate::handler) fn current_control_queue_identity(
@@ -1648,7 +1723,16 @@ impl RequestHandler {
         deliver_control_notification(&mut active_control, requester_pid, line);
     }
 
-    pub(in crate::handler) async fn send_control_notification_to_queue(
+    pub(in crate::handler) async fn send_control_response_notification_to(
+        &self,
+        requester_pid: u32,
+        line: String,
+    ) {
+        let mut active_control = self.active_control.lock().await;
+        deliver_control_response_notification(&mut active_control, requester_pid, line);
+    }
+
+    pub(in crate::handler) async fn send_control_response_notification_to_queue(
         &self,
         identity: ControlClientIdentity,
         line: String,
@@ -1661,7 +1745,7 @@ impl RequestHandler {
                 active.id == identity.control_id() && !active.closing.load(Ordering::SeqCst)
             })
         {
-            return deliver_control_notification(
+            return deliver_control_response_notification(
                 &mut active_control,
                 identity.requester_pid(),
                 line,
@@ -2027,6 +2111,30 @@ fn deliver_control_notification(
     let Some(active) = active_control.by_pid.get_mut(&requester_pid) else {
         return false;
     };
+    try_send_control_event(active, ControlServerEvent::Notification(line))
+}
+
+fn deliver_control_response_notification(
+    active_control: &mut ActiveControlState,
+    requester_pid: u32,
+    line: String,
+) -> bool {
+    let Some(active) = active_control.by_pid.get_mut(&requester_pid) else {
+        return false;
+    };
+    let target_identity = ControlClientIdentity::new(requester_pid, active.id);
+    if let Some(sink) =
+        current_control_command_response_sink().filter(|sink| sink.identity == target_identity)
+    {
+        if active.closing.load(Ordering::SeqCst) {
+            return false;
+        }
+        if sink.try_send(ControlCommandResponseEvent::Notification(line)) {
+            return true;
+        }
+        active.closing.store(true, Ordering::SeqCst);
+        return false;
+    }
     try_send_control_event(active, ControlServerEvent::Notification(line))
 }
 

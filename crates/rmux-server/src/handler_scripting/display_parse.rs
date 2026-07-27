@@ -12,7 +12,7 @@ use rmux_proto::{
 
 use super::targets::implicit_pane_target;
 use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
-use super::values::unsupported_flag;
+use super::values::{reject_unknown_option_before_positional, unsupported_flag};
 use super::{parse_pane_target, parse_target_arg};
 
 pub(super) fn parse_capture_pane(
@@ -344,7 +344,10 @@ fn parse_display_message_args(
                 let _ = args.optional();
                 target = Some(args.required("-t target")?)
             }
-            _ => break,
+            token => {
+                reject_unknown_option_before_positional("display-message", token)?;
+                break;
+            }
         }
     }
 

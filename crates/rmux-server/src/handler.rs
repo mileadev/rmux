@@ -163,7 +163,8 @@ use control_support::ActiveControlState;
 #[cfg(all(test, unix))]
 pub(crate) use control_support::ControlRegistrationError;
 pub(crate) use control_support::{
-    with_control_queue_eof_cancellation, with_control_queue_identity, ControlClientIdentity,
+    with_control_command_response_sink, with_control_queue_eof_cancellation,
+    with_control_queue_identity, ControlClientIdentity, ControlCommandResponseSink,
     ControlQueueDrainLease, ControlQueueEofCancellation, ControlRegistration,
 };
 use exited_output_support::RetainedExitedPaneOutputs;
@@ -174,6 +175,9 @@ pub(in crate::handler) use hook_identity_support::{
 use lifecycle_dispatch_queue::LifecycleDispatchOutbox;
 #[cfg(test)]
 pub(in crate::handler) use lifecycle_support::after_hook_format_values;
+#[cfg(test)]
+pub(crate) const TEST_CONTROL_QUEUE_INSERTED_COMMAND_LIMIT: usize =
+    scripting_support::CONTROL_QUEUE_INSERTED_COMMAND_LIMIT;
 pub(in crate::handler) use lifecycle_support::UnsequencedLifecycleEvent;
 pub(in crate::handler) use lifecycle_support::{
     defer_lifecycle_event, prepare_deferred_lifecycle_event, prepare_lifecycle_event,
@@ -323,7 +327,7 @@ pub(crate) struct RequestHandler {
     unix_socket_access: Arc<StdMutex<Option<UnixSocketAccessController>>>,
     shutdown_requested: Arc<AtomicBool>,
     shutdown_reason: Arc<StdMutex<Option<PendingShutdownReason>>>,
-    shutdown_retry_scheduled: Arc<AtomicBool>,
+    shutdown_retry_state: Arc<StdMutex<shutdown_support::ShutdownRetryState>>,
     active_detached_connections: Arc<StdMutex<HashSet<u64>>>,
     active_detached_requester_access: Arc<StdMutex<HashMap<u32, DetachedRequesterAccess>>>,
     active_detached_requests: Arc<AtomicUsize>,
@@ -424,7 +428,7 @@ impl Clone for RequestHandler {
             unix_socket_access: self.unix_socket_access.clone(),
             shutdown_requested: self.shutdown_requested.clone(),
             shutdown_reason: self.shutdown_reason.clone(),
-            shutdown_retry_scheduled: self.shutdown_retry_scheduled.clone(),
+            shutdown_retry_state: self.shutdown_retry_state.clone(),
             active_detached_connections: self.active_detached_connections.clone(),
             active_detached_requester_access: self.active_detached_requester_access.clone(),
             active_detached_requests: self.active_detached_requests.clone(),
@@ -514,7 +518,7 @@ pub(crate) struct WeakRequestHandler {
     unix_socket_access: Weak<StdMutex<Option<UnixSocketAccessController>>>,
     shutdown_requested: Weak<AtomicBool>,
     shutdown_reason: Weak<StdMutex<Option<PendingShutdownReason>>>,
-    shutdown_retry_scheduled: Weak<AtomicBool>,
+    shutdown_retry_state: Weak<StdMutex<shutdown_support::ShutdownRetryState>>,
     active_detached_connections: Weak<StdMutex<HashSet<u64>>>,
     active_detached_requester_access: Weak<StdMutex<HashMap<u32, DetachedRequesterAccess>>>,
     active_detached_requests: Weak<AtomicUsize>,
@@ -576,7 +580,7 @@ impl WeakRequestHandler {
             unix_socket_access: self.unix_socket_access.upgrade()?,
             shutdown_requested: self.shutdown_requested.upgrade()?,
             shutdown_reason: self.shutdown_reason.upgrade()?,
-            shutdown_retry_scheduled: self.shutdown_retry_scheduled.upgrade()?,
+            shutdown_retry_state: self.shutdown_retry_state.upgrade()?,
             active_detached_connections: self.active_detached_connections.upgrade()?,
             active_detached_requester_access: self.active_detached_requester_access.upgrade()?,
             active_detached_requests: self.active_detached_requests.upgrade()?,
@@ -879,7 +883,9 @@ impl RequestHandler {
             unix_socket_access: Arc::new(StdMutex::new(None)),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             shutdown_reason: Arc::new(StdMutex::new(None)),
-            shutdown_retry_scheduled: Arc::new(AtomicBool::new(false)),
+            shutdown_retry_state: Arc::new(StdMutex::new(
+                shutdown_support::ShutdownRetryState::new(),
+            )),
             active_detached_connections: Arc::new(StdMutex::new(HashSet::new())),
             active_detached_requester_access: Arc::new(StdMutex::new(HashMap::new())),
             active_detached_requests: Arc::new(AtomicUsize::new(0)),
@@ -979,7 +985,7 @@ impl RequestHandler {
             unix_socket_access: Arc::downgrade(&self.unix_socket_access),
             shutdown_requested: Arc::downgrade(&self.shutdown_requested),
             shutdown_reason: Arc::downgrade(&self.shutdown_reason),
-            shutdown_retry_scheduled: Arc::downgrade(&self.shutdown_retry_scheduled),
+            shutdown_retry_state: Arc::downgrade(&self.shutdown_retry_state),
             active_detached_connections: Arc::downgrade(&self.active_detached_connections),
             active_detached_requester_access: Arc::downgrade(
                 &self.active_detached_requester_access,
@@ -1543,6 +1549,10 @@ mod control_notification_tests;
 #[cfg(test)]
 #[path = "handler_selection_control_notification_tests.rs"]
 mod selection_control_notification_tests;
+
+#[cfg(test)]
+#[path = "handler_explicit_kill_selection_tests.rs"]
+mod explicit_kill_selection_tests;
 
 #[cfg(test)]
 #[path = "handler_switch_selection_notification_tests.rs"]

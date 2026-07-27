@@ -223,7 +223,7 @@ mod tests {
         assert!(!window.is_zoomed());
         assert_eq!(
             window.pane(1).expect("pane 1 exists").geometry(),
-            PaneGeometry::new(40, 0, 40, 24)
+            PaneGeometry::new(41, 0, 39, 24)
         );
     }
 

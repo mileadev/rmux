@@ -205,6 +205,7 @@ pub(crate) enum DeferredInitialPaneConsoleInputAction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DeferredInitialPaneInput {
     Bytes(Vec<u8>),
+    BracketedPaste(Vec<u8>),
     Console {
         action: DeferredInitialPaneConsoleInputAction,
         byte_len: usize,
@@ -215,7 +216,7 @@ pub(crate) enum DeferredInitialPaneInput {
 impl DeferredInitialPaneInput {
     fn byte_len(&self) -> usize {
         match self {
-            Self::Bytes(bytes) => bytes.len(),
+            Self::Bytes(bytes) | Self::BracketedPaste(bytes) => bytes.len(),
             Self::Console { byte_len, .. } => *byte_len,
         }
     }

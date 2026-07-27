@@ -166,6 +166,10 @@ impl RequestHandler {
         self.web_shares.mark_listener_unavailable(reason);
     }
 
+    pub(in crate::handler) fn has_persistent_web_listener(&self) -> bool {
+        self.web_shares.listener_available()
+    }
+
     pub(crate) async fn ensure_web_share_listener_running(&self) -> Result<(), RmuxError> {
         if self.web_shares.listener_available() {
             return Ok(());

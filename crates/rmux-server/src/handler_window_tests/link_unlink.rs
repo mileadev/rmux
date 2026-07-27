@@ -32,6 +32,116 @@ async fn assert_pane_output_observes(
 }
 
 #[tokio::test]
+async fn grouped_unlink_k_preserves_each_session_local_fallback_identity() {
+    for target_index in [2, 3] {
+        for renumber in [false, true] {
+            for peer_target_active in [false, true] {
+                let handler = RequestHandler::new();
+                let owner = session_name(&format!(
+                    "unlink-local-owner-{target_index}-{renumber}-{peer_target_active}"
+                ));
+                let peer = session_name(&format!(
+                    "unlink-local-peer-{target_index}-{renumber}-{peer_target_active}"
+                ));
+                let base_index = handler
+                    .handle(Request::SetOption(SetOptionRequest {
+                        scope: ScopeSelector::Global,
+                        option: OptionName::BaseIndex,
+                        value: target_index.to_string(),
+                        mode: SetOptionMode::Replace,
+                    }))
+                    .await;
+                assert!(
+                    matches!(base_index, Response::SetOption(_)),
+                    "{base_index:?}"
+                );
+                create_session(&handler, owner.as_str()).await;
+                for window_index in 0..target_index {
+                    create_window_at(&handler, &owner, window_index).await;
+                }
+                create_grouped_session(&handler, peer.as_str(), &owner).await;
+                if peer_target_active {
+                    // tmux starts the peer on index 0, so this single command
+                    // records 0 as its local last window. On the regression
+                    // base RMUX has already copied the owner's target, making
+                    // the same command a no-op with no fallback history.
+                    let selected = handler
+                        .handle(Request::SelectWindow(SelectWindowRequest {
+                            target: WindowTarget::with_window(peer.clone(), target_index),
+                        }))
+                        .await;
+                    assert!(
+                        matches!(selected, Response::SelectWindow(_)),
+                        "{selected:?}"
+                    );
+                }
+
+                for session_name in [&owner, &peer] {
+                    let response = handler
+                        .handle(Request::SetOption(SetOptionRequest {
+                            scope: ScopeSelector::Session(session_name.clone()),
+                            option: OptionName::RenumberWindows,
+                            value: if renumber { "on" } else { "off" }.to_owned(),
+                            mode: SetOptionMode::Replace,
+                        }))
+                        .await;
+                    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+                }
+
+                let (owner_expected, peer_expected) = {
+                    let state = handler.state.lock().await;
+                    let owner_session = state.sessions.session(&owner).expect("owner exists");
+                    let owner_expected = owner_session
+                        .window_at(target_index - 1)
+                        .expect("owner cyclic predecessor exists")
+                        .id();
+                    let peer_expected = state
+                        .sessions
+                        .session(&peer)
+                        .and_then(|session| session.window_at(0))
+                        .expect("peer local fallback exists")
+                        .id();
+                    (owner_expected, peer_expected)
+                };
+
+                let response = handler
+                    .handle(Request::UnlinkWindow(UnlinkWindowRequest {
+                        target: WindowTarget::with_window(owner.clone(), target_index),
+                        kill_if_last: true,
+                    }))
+                    .await;
+                assert!(
+                    matches!(response, Response::UnlinkWindow(_)),
+                    "{response:?}"
+                );
+
+                let state = handler.state.lock().await;
+                assert_eq!(
+                    state
+                        .sessions
+                        .session(&owner)
+                        .expect("owner survives")
+                        .window()
+                        .id(),
+                    owner_expected,
+                    "owner target={target_index}, renumber={renumber}, peer active={peer_target_active}"
+                );
+                assert_eq!(
+                    state
+                        .sessions
+                        .session(&peer)
+                        .expect("peer survives")
+                        .window()
+                        .id(),
+                    peer_expected,
+                    "peer target={target_index}, renumber={renumber}, active={peer_target_active}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn link_window_refreshes_attached_non_syntactic_group_peer_output_receiver() {
     let handler = RequestHandler::new();
     let owner = session_name("linked-refresh-owner");
@@ -1465,7 +1575,7 @@ async fn unlink_window_kill_if_last_rekeys_renumbered_silence_timers_without_del
         }))
         .await;
     assert!(
-        matches!(&response, Response::UnlinkWindow(result) if result.target == WindowTarget::with_window(alpha.clone(), 0)),
+        matches!(&response, Response::UnlinkWindow(result) if result.target == WindowTarget::with_window(alpha.clone(), 1)),
         "expected unlink-window -k success with renumbering, got {response:?}"
     );
 

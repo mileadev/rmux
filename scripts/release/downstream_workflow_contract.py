@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from workflow_run_input_boundary import validate_no_direct_input_expressions
+
 
 def _workflow_paths(root: Path) -> tuple[Path, Path, Path]:
     workflows = root / ".github/workflows"
@@ -247,7 +249,11 @@ def _validate_retry(path: Path) -> None:
     workflow_id = "316439352" if channel == "chocolatey" else "316439354"
     required = (
         "uses: ./.github/actions/release-channel-retry-prepare",
-        "scripts/release/prepare-channel-retry.py verify-prepared",
+        (
+            "scripts/release/prepare-channel-retry.py "
+            "validate-identity-inputs --from-env"
+        ),
+        "scripts/release/prepare-channel-retry.py verify-prepared --from-env",
         "scripts/release/assert-release-capability.py downstream_channels",
         "uses: ./.github/actions/release-channel-result",
         f'producer-workflow-id: "{workflow_id}"',
@@ -289,7 +295,8 @@ def _validate_retry_prepare(path: Path) -> None:
         'test "$RMUX_RECEIPT_RUN_ID" = "$RMUX_PRIOR_RESULT_RUN_ID"',
         "verify-receipt-attestation.py",
         "verify-channel-result-attestation.py",
-        "prepare-channel-retry.py prepare",
+        "prepare-channel-retry.py validate-prepare-inputs --from-env",
+        "prepare-channel-retry.py prepare --from-env",
         "artifact-ids: ${{ steps.payload.outputs.artifact_id }}",
     )
     if any(text.count(value) != 1 for value in required):
@@ -608,6 +615,9 @@ def _validate_channel_orchestration(main: str) -> None:
 
 def validate_downstream_workflows(root: Path) -> None:
     paths = _workflow_paths(root)
+    validate_no_direct_input_expressions(
+        (_retry_dispatch_path(root), *paths[1:], _retry_prepare_path(root))
+    )
     for path in paths:
         _validate_reusable_workflow(
             path, require_repository_guard=path.name == "release-downstream.yml"

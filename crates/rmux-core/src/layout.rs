@@ -225,10 +225,14 @@ fn split_axis(total: u32, count: usize) -> Vec<u32> {
     let usable = total.saturating_sub((count as u32).saturating_sub(1) * PANE_BORDER_CELLS);
     let each = usable / count as u32;
     let remainder = usable - each * count as u32;
+    let can_satisfy_minimums = usable >= count as u32;
     let mut sizes = Vec::with_capacity(count);
     for index in 0..count {
         let mut size = each;
-        if index + 1 == count {
+        if can_satisfy_minimums && (index as u32) < remainder {
+            size += 1;
+        } else if !can_satisfy_minimums && index + 1 == count {
+            // Preserve the fail-soft geometry used for undersized windows.
             size += remainder;
         }
         sizes.push(size);

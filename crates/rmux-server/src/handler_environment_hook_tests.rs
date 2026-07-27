@@ -1137,6 +1137,108 @@ async fn kill_session_emits_window_unlinked_for_removed_windows() {
 }
 
 #[tokio::test]
+async fn unlink_only_linked_window_runs_window_hook_before_session_cleanup() {
+    let handler = RequestHandler::new();
+    let owner = session_name("unlink-order-owner");
+    let alias = session_name("unlink-order-alias");
+    create_session(&handler, owner.as_str()).await;
+    create_session(&handler, alias.as_str()).await;
+
+    assert!(matches!(
+        handler
+            .handle(Request::LinkWindow(rmux_proto::LinkWindowRequest {
+                source: WindowTarget::with_window(owner.clone(), 0),
+                target: WindowTarget::with_window(alias.clone(), 9),
+                after: false,
+                before: false,
+                kill_destination: false,
+                detached: true,
+            }))
+            .await,
+        Response::LinkWindow(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::KillWindow(rmux_proto::KillWindowRequest {
+                target: WindowTarget::with_window(alias.clone(), 0),
+                kill_all_others: false,
+            }))
+            .await,
+        Response::KillWindow(_)
+    ));
+    assert_eq!(
+        handler
+            .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
+                scope: ScopeSelector::Global,
+                name: "RMUX_UNLINK_HOOK_DEPENDENCY".to_owned(),
+                value: "alive".to_owned(),
+                mode: None,
+                hidden: false,
+                format: false,
+            })))
+            .await,
+        Response::SetEnvironment(rmux_proto::SetEnvironmentResponse {
+            scope: ScopeSelector::Global,
+            name: "RMUX_UNLINK_HOOK_DEPENDENCY".to_owned(),
+        })
+    );
+    set_global_hook(
+        &handler,
+        HookName::WindowUnlinked,
+        "if-shell -F '#{==:#{RMUX_UNLINK_HOOK_DEPENDENCY},alive}' \
+         'set-buffer -a -b unlink-hook-order window-saw-alive,' \
+         'set-buffer -a -b unlink-hook-order window-saw-missing,'",
+    )
+    .await;
+    set_global_hook(
+        &handler,
+        HookName::SessionClosed,
+        "run-shell -C 'set-buffer -a -b unlink-hook-order session-cleanup, ; \
+         set-environment -gu RMUX_UNLINK_HOOK_DEPENDENCY'",
+    )
+    .await;
+
+    let response = handler
+        .handle(Request::UnlinkWindow(rmux_proto::UnlinkWindowRequest {
+            target: WindowTarget::with_window(alias.clone(), 9),
+            kill_if_last: false,
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::UnlinkWindow(_)),
+        "{response:?}"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let observed = loop {
+        let actual = buffer_text(&handler, "unlink-hook-order").await;
+        if actual
+            .as_deref()
+            .is_some_and(|value| value.matches(',').count() == 2)
+        {
+            break actual.expect("hook buffer exists");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for both unlink hooks, got {actual:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(
+        observed, "window-saw-alive,session-cleanup,",
+        "window-unlinked must consume shared hook state before session-closed tears it down"
+    );
+
+    let state = handler.state.lock().await;
+    assert!(state.sessions.session(&alias).is_none());
+    assert!(state
+        .sessions
+        .session(&owner)
+        .and_then(|session| session.window_at(0))
+        .is_some());
+}
+
+#[tokio::test]
 async fn kill_session_emits_session_closed_before_window_unlinked() {
     let handler = RequestHandler::new();
     create_session(&handler, "alpha").await;

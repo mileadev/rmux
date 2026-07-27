@@ -85,7 +85,7 @@ use pane::{
 pub(crate) use pane::{
     BreakPaneArgs, ClockModeArgs, CopyModeArgs, DisplayPanesArgs, JoinPaneArgs, LastPaneArgs,
     ListPanesArgs, PaneTargetArgs, PipePaneArgs, ResizePaneArgs, ResizePaneSize, RespawnPaneArgs,
-    SelectLayoutArgs, SelectPaneArgs, SplitWindowArgs, SwapPaneArgs,
+    SelectLayoutArgs, SelectLayoutMode, SelectPaneArgs, SplitWindowArgs, SwapPaneArgs,
 };
 #[path = "cli_args/session.rs"]
 mod session;

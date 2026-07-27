@@ -286,6 +286,36 @@ fn join_pane_cross_window_removes_empty_source_window() {
 }
 
 #[test]
+fn detached_join_from_active_window_uses_tmux_cyclic_previous_fallback() {
+    // This is the direct sibling of Session::remove_window: an intra-session
+    // join temporarily removes the empty source and calls the same fallback
+    // helper. tmux 3.7b selects window 2, not destination window 1.
+    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });
+    session
+        .insert_window_with_initial_pane(1, TerminalSize { cols: 80, rows: 24 })
+        .expect("insert window 1 succeeds");
+    session
+        .insert_window_with_initial_pane(2, TerminalSize { cols: 80, rows: 24 })
+        .expect("insert window 2 succeeds");
+    let expected_window_id = session
+        .window_at(2)
+        .expect("oracle-selected window exists before join")
+        .id();
+
+    session
+        .join_pane(
+            SessionPaneTarget::new(0, 0),
+            SessionPaneTarget::new(1, 0),
+            PaneJoinOptions::new(SplitDirection::Vertical, true, false, false, None),
+        )
+        .expect("detached join succeeds");
+
+    assert!(session.window_at(0).is_none());
+    assert_eq!(session.active_window_index(), 2);
+    assert_eq!(session.window().id(), expected_window_id);
+}
+
+#[test]
 fn break_pane_after_flag_shifts_windows_correctly() {
     let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });
     session.split_active_pane().expect("split succeeds");

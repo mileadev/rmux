@@ -964,6 +964,9 @@ impl Screen {
 #[path = "screen/capture_ascii_space_tests.rs"]
 mod capture_ascii_space_tests;
 #[cfg(test)]
+#[path = "screen/capture_mutation_tests.rs"]
+mod capture_mutation_tests;
+#[cfg(test)]
 #[path = "screen/erase_tests.rs"]
 mod erase_tests;
 #[cfg(test)]

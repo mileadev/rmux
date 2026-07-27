@@ -1,7 +1,7 @@
 use std::io;
 use std::time::Instant;
 
-use rmux_core::{key_code_lookup_bits, KeyCode};
+use rmux_core::{key_code_lookup_bits, KeyCode, KEYC_ANY};
 use rmux_proto::{OptionName, Response};
 
 use super::super::bracketed_paste::{
@@ -12,22 +12,57 @@ use super::super::retain_partial_attached_control_input;
 use super::super::retained::MAX_RETAINED_ATTACHED_CONTROL_INPUT;
 use super::{decode_live_attached_key, AttachedKeyDecode};
 use crate::handler::attach_support::ActiveAttachIdentity;
+use crate::handler::scripting_support::{read_only_client_action, ReadOnlyClientAction};
 use crate::handler::RequestHandler;
 use crate::key_table::{
-    lookup_attached_key_table_binding, matches_prefix_key, session_option_key, PREFIX_TABLE,
+    effective_client_key_table_name, lookup_attached_key_table_binding, matches_prefix_key,
+    session_option_key, PREFIX_TABLE,
 };
 
-struct ReadOnlyDetachSnapshot {
+struct ReadOnlyClientBinding {
+    key: KeyCode,
+    action: Option<ReadOnlyClientAction>,
+}
+
+struct ReadOnlyClientTable {
+    name: String,
+    bindings: Vec<ReadOnlyClientBinding>,
+}
+
+struct ReadOnlyClientActionSnapshot {
     session_name: rmux_proto::SessionName,
+    session_id: rmux_proto::SessionId,
+    default_table_name: String,
     key_table_name: Option<String>,
     key_table_generation: u64,
     prefix: Option<KeyCode>,
     prefix2: Option<KeyCode>,
-    detach_keys: Vec<KeyCode>,
+    tables: Vec<ReadOnlyClientTable>,
+}
+
+impl ReadOnlyClientActionSnapshot {
+    fn binding_action(
+        &self,
+        table_name: &str,
+        key: KeyCode,
+    ) -> Option<&Option<ReadOnlyClientAction>> {
+        let table = self.tables.iter().find(|table| table.name == table_name)?;
+        table
+            .bindings
+            .iter()
+            .find(|binding| binding.key == key)
+            .or_else(|| {
+                table
+                    .bindings
+                    .iter()
+                    .find(|binding| binding.key == KEYC_ANY)
+            })
+            .map(|binding| &binding.action)
+    }
 }
 
 impl RequestHandler {
-    pub(super) async fn handle_read_only_detach_input(
+    pub(super) async fn handle_read_only_client_action_input(
         &self,
         identity: ActiveAttachIdentity,
         pending_input: &mut Vec<u8>,
@@ -35,23 +70,24 @@ impl RequestHandler {
         backspace: Option<u8>,
         mut key_override: Option<KeyCode>,
     ) -> io::Result<()> {
-        let Some(snapshot) = self.read_only_detach_snapshot(identity).await? else {
+        let Some(snapshot) = self.read_only_client_action_snapshot(identity).await? else {
             pending_input.clear();
             return Ok(());
         };
         let initial_table_name = snapshot.key_table_name.clone();
-        let mut prefix_pending = initial_table_name.as_deref() == Some(PREFIX_TABLE);
+        let mut next_table_name = initial_table_name.clone();
         let new_input_at = pending_input.len();
         pending_input.extend_from_slice(bytes);
         let mut offset = 0;
-        let mut detach = false;
+        let mut matched_binding = false;
+        let mut action = None;
 
         while offset < pending_input.len() {
             let slice = &pending_input[offset..];
             let slice_new_input_at = new_input_at.saturating_sub(offset);
             match decode_bracketed_paste_after_append(slice, slice_new_input_at) {
                 BracketedPasteDecode::Matched { size, .. } => {
-                    prefix_pending = false;
+                    next_table_name = None;
                     offset += size;
                     continue;
                 }
@@ -62,14 +98,14 @@ impl RequestHandler {
                         MAX_RETAINED_ATTACHED_CONTROL_INPUT,
                     );
                     retain_partial_attached_control_input(
-                        "read-only live bracketed paste",
+                        "read-only client action bracketed paste",
                         pending_input,
                     )?;
-                    self.commit_read_only_prefix_state(
+                    self.commit_read_only_key_table_state(
                         identity,
                         &snapshot,
                         &initial_table_name,
-                        prefix_pending,
+                        next_table_name,
                         false,
                     )
                     .await?;
@@ -82,12 +118,15 @@ impl RequestHandler {
                 AttachedKeyDecode::Matched { size, key } => (size, key),
                 AttachedKeyDecode::Partial => {
                     pending_input.drain(..offset);
-                    retain_partial_attached_control_input("read-only live key", pending_input)?;
-                    self.commit_read_only_prefix_state(
+                    retain_partial_attached_control_input(
+                        "read-only client action key",
+                        pending_input,
+                    )?;
+                    self.commit_read_only_key_table_state(
                         identity,
                         &snapshot,
                         &initial_table_name,
-                        prefix_pending,
+                        next_table_name,
                         false,
                     )
                     .await?;
@@ -95,12 +134,11 @@ impl RequestHandler {
                 }
                 AttachedKeyDecode::Invalid => {
                     pending_input.clear();
-                    prefix_pending = false;
-                    self.commit_read_only_prefix_state(
+                    self.commit_read_only_key_table_state(
                         identity,
                         &snapshot,
                         &initial_table_name,
-                        prefix_pending,
+                        None,
                         false,
                     )
                     .await?;
@@ -109,62 +147,62 @@ impl RequestHandler {
             };
             if size == 0 {
                 pending_input.clear();
-                prefix_pending = false;
+                next_table_name = None;
                 break;
             }
             offset += size;
             let key = key_override.take().unwrap_or(key);
             let lookup_key = key_code_lookup_bits(key);
-            if prefix_pending {
-                prefix_pending = false;
-                if snapshot.detach_keys.contains(&lookup_key) {
-                    detach = true;
+            if next_table_name.as_deref() == Some(PREFIX_TABLE) {
+                next_table_name = None;
+                if let Some(binding_action) = snapshot.binding_action(PREFIX_TABLE, lookup_key) {
+                    matched_binding = true;
+                    action = binding_action.clone();
                     break;
                 }
             } else if matches_prefix_key(lookup_key, snapshot.prefix, snapshot.prefix2) {
-                prefix_pending = true;
+                next_table_name = Some(PREFIX_TABLE.to_owned());
+            } else {
+                let table_name = next_table_name
+                    .as_deref()
+                    .unwrap_or(&snapshot.default_table_name);
+                if let Some(binding_action) = snapshot.binding_action(table_name, lookup_key) {
+                    matched_binding = true;
+                    action = binding_action.clone();
+                    next_table_name = None;
+                    break;
+                }
+                if next_table_name.is_some() {
+                    next_table_name = None;
+                }
             }
         }
 
         pending_input.clear();
-        if detach {
-            if !self
-                .commit_read_only_prefix_state(
-                    identity,
-                    &snapshot,
-                    &initial_table_name,
-                    false,
-                    true,
-                )
-                .await?
-            {
-                return Ok(());
-            }
-            if !self.current_live_attach_input(identity).await {
-                return Ok(());
-            }
-            if let Response::Error(error) = self.handle_detach_client_for_identity(identity).await {
-                return Err(io::Error::other(error.error.to_string()));
-            }
-            return Ok(());
-        }
-
-        let _ = self
-            .commit_read_only_prefix_state(
+        if !self
+            .commit_read_only_key_table_state(
                 identity,
                 &snapshot,
                 &initial_table_name,
-                prefix_pending,
-                false,
+                next_table_name,
+                matched_binding,
             )
-            .await?;
+            .await?
+        {
+            return Ok(());
+        }
+
+        if let Some(action) = action {
+            self.execute_read_only_client_action(identity, &snapshot.session_name, action)
+                .await?;
+        }
         Ok(())
     }
 
-    async fn read_only_detach_snapshot(
+    async fn read_only_client_action_snapshot(
         &self,
         identity: ActiveAttachIdentity,
-    ) -> io::Result<Option<ReadOnlyDetachSnapshot>> {
+    ) -> io::Result<Option<ReadOnlyClientActionSnapshot>> {
         let state = self.state.lock().await;
         let active_attach = self.active_attach.lock().await;
         let active = active_attach
@@ -182,54 +220,64 @@ impl RequestHandler {
             return Ok(None);
         }
 
-        let bound_keys = state
-            .key_bindings
-            .table(PREFIX_TABLE)
+        let default_table_name = effective_client_key_table_name(&state, session, None);
+        let current_table_name =
+            effective_client_key_table_name(&state, session, active.key_table_name.as_deref());
+        let mut table_names = vec![current_table_name];
+        if !table_names.iter().any(|name| name == PREFIX_TABLE) {
+            table_names.push(PREFIX_TABLE.to_owned());
+        }
+        let tables = table_names
             .into_iter()
-            .flat_map(|table| table.active().keys())
-            .copied()
-            .collect::<Vec<_>>();
-        let detach_keys = bound_keys
-            .into_iter()
-            .filter_map(|key| {
-                lookup_attached_key_table_binding(&state, PREFIX_TABLE, key_code_lookup_bits(key))
-                    .is_some_and(|binding| {
-                        let commands = binding.commands().commands();
-                        commands.len() == 1
-                            && commands[0].name() == "detach-client"
-                            && commands[0].arguments().is_empty()
+            .map(|name| {
+                let bindings = state
+                    .key_bindings
+                    .table(&name)
+                    .into_iter()
+                    .flat_map(|table| table.active().keys())
+                    .filter_map(|key| {
+                        let key = key_code_lookup_bits(*key);
+                        lookup_attached_key_table_binding(&state, &name, key).map(|binding| {
+                            ReadOnlyClientBinding {
+                                key,
+                                action: read_only_client_action(binding.commands()),
+                            }
+                        })
                     })
-                    .then_some(key_code_lookup_bits(key))
+                    .collect();
+                ReadOnlyClientTable { name, bindings }
             })
             .collect();
 
-        Ok(Some(ReadOnlyDetachSnapshot {
+        Ok(Some(ReadOnlyClientActionSnapshot {
             session_name: active.session_name.clone(),
+            session_id: active.session_id,
+            default_table_name,
             key_table_name: active.key_table_name.clone(),
             key_table_generation: active.key_table_generation,
             prefix: session_option_key(&state, &active.session_name, OptionName::Prefix),
             prefix2: session_option_key(&state, &active.session_name, OptionName::Prefix2),
-            detach_keys,
+            tables,
         }))
     }
 
-    async fn commit_read_only_prefix_state(
+    async fn commit_read_only_key_table_state(
         &self,
         identity: ActiveAttachIdentity,
-        snapshot: &ReadOnlyDetachSnapshot,
+        snapshot: &ReadOnlyClientActionSnapshot,
         initial_table_name: &Option<String>,
-        prefix_pending: bool,
+        next_table_name: Option<String>,
         force_generation_check: bool,
     ) -> io::Result<bool> {
-        let next_table_name = prefix_pending.then(|| PREFIX_TABLE.to_owned());
         if !force_generation_check && initial_table_name == &next_table_name {
             return Ok(true);
         }
-        let set_at = prefix_pending.then(Instant::now);
+        let set_at = (next_table_name.as_deref() == Some(PREFIX_TABLE)).then(Instant::now);
         let commit = self
             .set_attached_key_table_for_read_only_input(
                 identity,
                 &snapshot.session_name,
+                snapshot.session_id,
                 snapshot.key_table_generation,
                 next_table_name,
                 set_at,
@@ -250,6 +298,37 @@ impl RequestHandler {
             }
         }
         Ok(true)
+    }
+
+    async fn execute_read_only_client_action(
+        &self,
+        identity: ActiveAttachIdentity,
+        session_name: &rmux_proto::SessionName,
+        action: ReadOnlyClientAction,
+    ) -> io::Result<()> {
+        if !self.current_live_attach_input(identity).await {
+            return Ok(());
+        }
+        let response = match action {
+            ReadOnlyClientAction::DetachSelf => {
+                self.handle_detach_client_for_identity(identity).await
+            }
+            ReadOnlyClientAction::SwitchSelf(request) => {
+                self.handle_switch_client_ext3_for_attach_identity(identity, request)
+                    .await
+            }
+        };
+        if let Response::Error(error) = response {
+            if self.current_live_attach_input(identity).await {
+                self.report_attached_command_error(
+                    session_name,
+                    identity.attach_pid(),
+                    &error.error,
+                )
+                .await;
+            }
+        }
+        Ok(())
     }
 
     pub(super) async fn dispatch_immediate_prefix_detach(

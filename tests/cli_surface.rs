@@ -20,13 +20,13 @@ use common::{
     stderr, stdout, terminate_child, wait_for_socket, AttachedSession, CliHarness,
     BINARY_OVERRIDE_ENV, BINARY_OVERRIDE_TEST_OPT_IN_ENV,
 };
-use rmux_client::INTERNAL_DAEMON_FLAG;
+use rmux_client::{connect, INTERNAL_DAEMON_FLAG};
 use rmux_core::command_parser::COMMAND_TABLE;
 use rmux_proto::{
     encode_frame, CommandOutput, ErrorResponse, FrameDecoder, HandshakeResponse,
-    ListSessionsResponse, OptionScopeSelector, Request, Response, RmuxError, ShowOptionsResponse,
-    SourceFileResponse, CONTROL_CONTROL_END, CONTROL_CONTROL_START, RMUX_FRAME_MAGIC,
-    RMUX_WIRE_VERSION,
+    KillSessionRequest, ListSessionsRequest, ListSessionsResponse, OptionScopeSelector, Request,
+    Response, RmuxError, SessionName, ShowOptionsResponse, SourceFileResponse, CONTROL_CONTROL_END,
+    CONTROL_CONTROL_START, RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION,
 };
 #[cfg(all(feature = "tiny-cli", not(debug_assertions)))]
 use rmux_proto::{
@@ -1595,8 +1595,8 @@ fn no_start_server_suppresses_start_server_auto_start() -> Result<(), Box<dyn Er
 }
 
 #[test]
-fn start_server_is_a_start_server_command() -> Result<(), Box<dyn Error>> {
-    let harness = CliHarness::new("start-server-command")?;
+fn start_server_exits_the_default_empty_daemon_after_reply() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("start-server-exit-empty")?;
     let _cleanup = harness.auto_start_cleanup()?;
 
     let output = harness.run_with(&["start-server"], |command| {
@@ -1604,8 +1604,221 @@ fn start_server_is_a_start_server_command() -> Result<(), Box<dyn Error>> {
     })?;
 
     assert_success(&output);
-    assert!(harness.pid_path().exists());
+    assert!(
+        harness.pid_path().exists(),
+        "the successful command must have launched a daemon before it exited"
+    );
+    wait_for_socket_cleanup(harness.socket_path())?;
+    let list = harness.run(&["list-sessions"])?;
+    assert_eq!(list.status.code(), Some(1));
+    assert_absent_server_error(&list, &harness, "list-sessions");
+    Ok(())
+}
+
+#[test]
+fn control_start_server_exits_the_default_empty_daemon_after_protocol_exit(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("control-start-server-exit-empty")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+
+    let output = harness.run_with(&["-C", "start-server"], |command| {
+        command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+    })?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr(&output).is_empty(), "stderr={:?}", stderr(&output));
+    let rendered = stdout(&output);
+    assert!(rendered.contains("%end "), "rendered={rendered:?}");
+    assert!(rendered.contains("%exit\n"), "rendered={rendered:?}");
+    assert!(
+        harness.pid_path().exists(),
+        "control-mode must have launched the daemon before reporting %exit"
+    );
+    wait_for_socket_cleanup(harness.socket_path())?;
+    Ok(())
+}
+
+#[test]
+fn queued_start_server_with_observational_tail_exits_the_empty_daemon() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("start-server-observational-tail")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+
+    let output = harness.run_with(
+        &["start-server", ";", "display-message", "-p", "#{pid}"],
+        |command| {
+            command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+        },
+    )?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr(&output).is_empty(), "stderr={:?}", stderr(&output));
+    assert!(
+        stdout(&output).trim().parse::<u32>().is_ok(),
+        "the tail response must expose the daemon PID: {:?}",
+        stdout(&output)
+    );
+    wait_for_socket_cleanup(harness.socket_path())?;
+    Ok(())
+}
+
+#[test]
+fn control_start_server_with_observational_tail_exits_after_protocol_exit(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("control-start-server-observational-tail")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+
+    let output = harness.run_with(
+        &["-C", "start-server", ";", "display-message", "-p", "#{pid}"],
+        |command| {
+            command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+        },
+    )?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr(&output).is_empty(), "stderr={:?}", stderr(&output));
+    let rendered = stdout(&output);
+    assert!(rendered.contains("%end "), "rendered={rendered:?}");
+    assert!(rendered.contains("%exit\n"), "rendered={rendered:?}");
+    assert!(
+        rendered.lines().any(|line| line.parse::<u32>().is_ok()),
+        "the tail response must expose the daemon PID: {rendered:?}"
+    );
+    wait_for_socket_cleanup(harness.socket_path())?;
+    Ok(())
+}
+
+#[test]
+fn control_start_server_keeps_a_session_created_by_the_initial_queue() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("control-start-server-new-session")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+
+    let output = harness.run_with(
+        &[
+            "-C",
+            "start-server",
+            ";",
+            "new-session",
+            "-d",
+            "-s",
+            "alpha",
+        ],
+        |command| {
+            command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+        },
+    )?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr(&output).is_empty(), "stderr={:?}", stderr(&output));
+    assert!(stdout(&output).contains("%exit\n"));
     assert!(harness.socket_path().exists());
+    assert_success(&harness.run(&["has-session", "-t", "alpha"])?);
+    assert_success(&harness.run(&["kill-session", "-t", "alpha"])?);
+    wait_for_socket_cleanup(harness.socket_path())?;
+    Ok(())
+}
+
+#[test]
+fn start_server_preserves_explicit_exit_empty_off() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("start-server-exit-empty-off")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+    let config_path = harness.tmpdir().join("rmux.conf");
+    fs::write(&config_path, "set-option -g exit-empty off\n")?;
+    let config_path = config_path.to_string_lossy().into_owned();
+
+    let output = harness.run_with(&["-f", &config_path, "start-server"], |command| {
+        command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+    })?;
+
+    assert_success(&output);
+    assert!(harness.socket_path().exists());
+    let policy = harness.run(&["show-options", "-gv", "exit-empty"])?;
+    assert_eq!(policy.status.code(), Some(0));
+    assert_eq!(stdout(&policy), "off\n");
+    assert!(stderr(&policy).is_empty());
+    assert_success(&harness.run(&["kill-server"])?);
+    wait_for_socket_cleanup(harness.socket_path())?;
+    Ok(())
+}
+
+#[test]
+fn start_server_preserves_a_preexisting_empty_daemon() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("start-server-existing-empty")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    let output = harness.run(&["start-server"])?;
+
+    assert_success(&output);
+    assert!(harness.socket_path().exists());
+    assert_eq!(daemon.child_mut().try_wait()?, None);
+    assert_success(&harness.run(&["kill-server"])?);
+    wait_for_socket_cleanup(harness.socket_path())?;
+    let _ = daemon.child_mut().wait();
+    Ok(())
+}
+
+#[test]
+fn queued_start_server_keeps_the_daemon_for_a_following_session() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("queued-start-server-new-session")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+
+    let output = harness.run_with(
+        &["start-server", ";", "new-session", "-d", "-s", "alpha"],
+        |command| {
+            command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+        },
+    )?;
+
+    assert_success(&output);
+    assert!(harness.socket_path().exists());
+    assert_success(&harness.run(&["has-session", "-t", "alpha"])?);
+    assert_success(&harness.run(&["kill-session", "-t", "alpha"])?);
+    wait_for_socket_cleanup(harness.socket_path())?;
+    Ok(())
+}
+
+#[test]
+fn queued_start_server_preserves_deferred_session_creation() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("start-server-deferred-session")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+
+    let output = harness.run_with(
+        &[
+            "start-server",
+            ";",
+            "run-shell",
+            "-d",
+            "0.2",
+            "-C",
+            "new-session -d -s late /bin/sleep 60",
+        ],
+        |command| {
+            command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+        },
+    )?;
+
+    assert_success(&output);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let has_session = harness.run(&["has-session", "-t", "late"])?;
+        if has_session.status.success() {
+            break;
+        }
+        assert!(
+            harness.socket_path().exists(),
+            "exit-empty stopped the admitted deferred producer before it created the session"
+        );
+        if Instant::now() >= deadline {
+            panic!(
+                "the admitted deferred producer did not create its session: {}",
+                stderr(&has_session)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_success(&harness.run(&["kill-session", "-t", "late"])?);
+    wait_for_socket_cleanup(harness.socket_path())?;
     Ok(())
 }
 
@@ -1623,14 +1836,10 @@ fn hidden_daemon_binary_override_is_ignored_without_test_opt_in() -> Result<(), 
 
     assert_success(&output);
     assert!(
-        harness.socket_path().exists(),
-        "rmux should still auto-start its own daemon"
-    );
-    assert!(
         !marker_path.exists(),
         "the undocumented override must be ignored without the test-only opt-in"
     );
-    assert_success(&harness.run(&["kill-server"])?);
+    wait_for_socket_cleanup(harness.socket_path())?;
     Ok(())
 }
 
@@ -4176,6 +4385,60 @@ fn detach_client_can_control_the_sole_active_attach_from_another_process(
     let status = attach.wait_for_exit(ATTACH_TIMEOUT)?;
     assert_eq!(status.code(), Some(0));
     attach.assert_restored()?;
+    Ok(())
+}
+
+#[test]
+fn exit_empty_retries_after_a_replied_detached_client_drains_an_attached_exit(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("exit-empty-replied-client")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+
+    let created = harness.run_with(
+        &["new-session", "-d", "-s", "alpha", "sleep 60"],
+        |command| {
+            command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+        },
+    )?;
+    assert_success(&created);
+    std::thread::sleep(Duration::from_millis(250));
+
+    let mut attach = AttachedSession::spawn(&harness, "alpha", TerminalSize::new(80, 24))?;
+    attach.wait_for_raw_mode(NONBLOCKING_ATTACH_TIMEOUT)?;
+    let mut killer = connect(harness.socket_path())?;
+    let response = killer.kill_session(KillSessionRequest {
+        target: SessionName::new("alpha")?,
+        kill_all_except_target: false,
+        clear_alerts: false,
+        kill_group: false,
+    })?;
+    assert!(matches!(response, Response::KillSession(_)));
+
+    let (status, attached_output) = attach.wait_for_exit_with_output(ATTACH_TIMEOUT)?;
+    assert_eq!(status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&attached_output).contains("[exited]"),
+        "attached output={attached_output:?}"
+    );
+    attach.assert_restored()?;
+
+    let response = killer.list_sessions(ListSessionsRequest {
+        format: None,
+        filter: None,
+        sort_order: None,
+        reversed: false,
+    })?;
+    let Response::ListSessions(response) = response else {
+        panic!("expected empty list-sessions response, got {response:?}");
+    };
+    assert!(response.command_output().stdout().is_empty());
+    assert!(
+        harness.socket_path().exists(),
+        "the daemon must not close a client that is still receiving replies"
+    );
+
+    drop(killer);
+    wait_for_socket_cleanup(harness.socket_path())?;
     Ok(())
 }
 
