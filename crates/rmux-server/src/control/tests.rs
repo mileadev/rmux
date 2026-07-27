@@ -845,6 +845,25 @@ async fn run_registered_initial_control_batch(
     String::from_utf8(rendered).expect("control transcript is utf-8")
 }
 
+fn control_message_test_config(label: &str, contents: &str) -> std::path::PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+    let root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .expect("test current directory")
+                .join("target")
+        })
+        .join("rmux-control-message-tests");
+    std::fs::create_dir_all(&root).expect("control message test directory");
+    let path = root.join(format!("{label}-{}-{nonce}.conf", std::process::id()));
+    std::fs::write(&path, contents).expect("control message test config");
+    path
+}
+
 #[tokio::test]
 async fn admitted_display_messages_are_owned_by_their_exact_control_guards() {
     let handler = Arc::new(RequestHandler::new());
@@ -930,6 +949,305 @@ async fn queued_display_messages_stay_once_inside_the_admitted_control_guard() {
     assert_eq!(
         transcript.frames[0].payload,
         ["QUEUE-PRINT"],
+        "{rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn sourced_and_conditional_display_messages_get_distinct_child_guards() {
+    // Fresh tmux 3.7b oracle:
+    // source-file: parent end, then one flags-preserving guard per sourced command.
+    // if-shell -F: parent end, then one guard for the selected branch.
+    let source = control_message_test_config(
+        "source-child-ownership",
+        "display-message -- SOURCE-CHILD-A\n\
+         display-message -- SOURCE-CHILD-B\n",
+    );
+    let handler = Arc::new(RequestHandler::new());
+    let commands = [
+        format!("source-file {}", source.display()),
+        "if-shell -F 1 'display-message -- IF-TRUE-CHILD' \
+         'display-message -- IF-TRUE-UNSELECTED'"
+            .to_owned(),
+        "if -F 0 'display-message -- IF-FALSE-UNSELECTED' \
+         'display-message -- IF-FALSE-CHILD'"
+            .to_owned(),
+        "display-message -d 0 -- DIRECT-AFTER-CHILDREN".to_owned(),
+    ];
+    let input = format!("{}\n", commands.join("\n")).into_bytes();
+    let rendered =
+        run_registered_initial_control_batch(Arc::clone(&handler), 42_433, input, commands.len())
+            .await;
+    let transcript = parse_strict_control_transcript(&rendered);
+
+    assert_eq!(transcript.frames.len(), 8, "{rendered:?}");
+    assert!(
+        transcript.frames[0].notifications.is_empty(),
+        "{rendered:?}"
+    );
+    assert_message_owned_once(&transcript, 1, "SOURCE-CHILD-A");
+    assert_message_owned_once(&transcript, 2, "SOURCE-CHILD-B");
+    assert!(
+        transcript.frames[3].notifications.is_empty(),
+        "{rendered:?}"
+    );
+    assert_message_owned_once(&transcript, 4, "IF-TRUE-CHILD");
+    assert!(
+        transcript.frames[5].notifications.is_empty(),
+        "{rendered:?}"
+    );
+    assert_message_owned_once(&transcript, 6, "IF-FALSE-CHILD");
+    assert_message_owned_once(&transcript, 7, "DIRECT-AFTER-CHILDREN");
+    assert!(
+        transcript.frames.iter().all(|frame| frame.guard.flags == 0),
+        "initial parent and synchronous children retain flag 0: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("IF-TRUE-UNSELECTED") && !rendered.contains("IF-FALSE-UNSELECTED"),
+        "{rendered:?}"
+    );
+
+    std::fs::remove_file(source).expect("remove source child config");
+}
+
+#[tokio::test]
+async fn sourced_command_alias_keeps_the_sourced_child_owner() {
+    let source = control_message_test_config(
+        "source-child-command-alias",
+        "announce SOURCE-ALIAS-CHILD\n",
+    );
+    let handler = Arc::new(RequestHandler::new());
+    let commands = [
+        "set-option -s 'command-alias[100]' 'announce=display-message --'".to_owned(),
+        format!("source-file {}", source.display()),
+    ];
+    let input = format!("{}\n", commands.join("\n")).into_bytes();
+    let rendered =
+        run_registered_initial_control_batch(Arc::clone(&handler), 42_436, input, commands.len())
+            .await;
+    let transcript = parse_strict_control_transcript(&rendered);
+
+    assert_eq!(transcript.frames.len(), 3, "{rendered:?}");
+    assert!(
+        transcript.frames[1].notifications.is_empty(),
+        "{rendered:?}"
+    );
+    assert_message_owned_once(&transcript, 2, "SOURCE-ALIAS-CHILD");
+
+    std::fs::remove_file(source).expect("remove source command-alias config");
+}
+
+#[tokio::test]
+async fn command_alias_to_if_shell_keeps_the_selected_child_owner() {
+    let handler = Arc::new(RequestHandler::new());
+    let commands = [
+        "set-option -s 'command-alias[101]' 'choose=if-shell -F 1'".to_owned(),
+        "choose 'display-message -- IF-COMMAND-ALIAS-CHILD'".to_owned(),
+    ];
+    let input = format!("{}\n", commands.join("\n")).into_bytes();
+    let rendered =
+        run_registered_initial_control_batch(Arc::clone(&handler), 42_437, input, commands.len())
+            .await;
+    let transcript = parse_strict_control_transcript(&rendered);
+
+    assert_eq!(transcript.frames.len(), 3, "{rendered:?}");
+    assert!(
+        transcript.frames[1].notifications.is_empty(),
+        "{rendered:?}"
+    );
+    assert_message_owned_once(&transcript, 2, "IF-COMMAND-ALIAS-CHILD");
+}
+
+#[tokio::test]
+async fn sourced_runtime_error_stays_in_its_child_guard_after_prior_message() {
+    // The invalid target is a runtime command failure, not a parse error: tmux
+    // first closes source-file, then ends the display child and errors the
+    // following child.
+    let source = control_message_test_config(
+        "source-child-error",
+        "display-message -- SOURCE-BEFORE-ERROR\n\
+         kill-pane -t missing-source-session:0.0\n",
+    );
+    let handler = Arc::new(RequestHandler::new());
+    let input = format!("source-file {}\n", source.display()).into_bytes();
+    let rendered =
+        run_registered_initial_control_batch(Arc::clone(&handler), 42_434, input, 1).await;
+    let transcript = parse_strict_control_transcript(&rendered);
+
+    assert_eq!(transcript.frames.len(), 3, "{rendered:?}");
+    assert_eq!(
+        transcript.frames[0].terminal,
+        TestGuardTerminal::End,
+        "{rendered:?}"
+    );
+    assert!(
+        transcript.frames[0].notifications.is_empty(),
+        "{rendered:?}"
+    );
+    assert_message_owned_once(&transcript, 1, "SOURCE-BEFORE-ERROR");
+    assert_eq!(
+        transcript.frames[2].terminal,
+        TestGuardTerminal::Error,
+        "{rendered:?}"
+    );
+    assert!(
+        transcript.frames[2]
+            .payload
+            .iter()
+            .any(|line| line.contains("missing-source-session")),
+        "{rendered:?}"
+    );
+
+    std::fs::remove_file(source).expect("remove source error config");
+}
+
+#[tokio::test]
+async fn conditional_runtime_error_stays_in_its_child_guard_after_prior_message() {
+    let handler = Arc::new(RequestHandler::new());
+    let input = b"if-shell -F 1 'display-message -- IF-BEFORE-ERROR ; \
+                  kill-pane -t missing-if-session:0.0'\n"
+        .to_vec();
+    let rendered =
+        run_registered_initial_control_batch(Arc::clone(&handler), 42_438, input, 1).await;
+    let transcript = parse_strict_control_transcript(&rendered);
+
+    assert_eq!(transcript.frames.len(), 3, "{rendered:?}");
+    assert_eq!(
+        transcript.frames[0].terminal,
+        TestGuardTerminal::End,
+        "{rendered:?}"
+    );
+    assert_message_owned_once(&transcript, 1, "IF-BEFORE-ERROR");
+    assert_eq!(
+        transcript.frames[2].terminal,
+        TestGuardTerminal::Error,
+        "{rendered:?}"
+    );
+    assert!(
+        transcript.frames[2]
+            .payload
+            .iter()
+            .any(|line| line.contains("missing-if-session")),
+        "{rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn inserted_child_frames_exceed_channel_capacity_without_fifo_loss() {
+    const CHILD_COUNT: usize = CONTROL_SERVER_EVENT_CAPACITY / 2;
+
+    let contents = (0..CHILD_COUNT)
+        .map(|index| format!("display-message -- SOURCE-FIFO-{index:03}\n"))
+        .collect::<String>();
+    let source = control_message_test_config("source-child-fifo", &contents);
+    let handler = Arc::new(RequestHandler::new());
+    let input = format!("source-file {}\n", source.display()).into_bytes();
+    let rendered =
+        run_registered_initial_control_batch(Arc::clone(&handler), 42_439, input, 1).await;
+    let transcript = parse_strict_control_transcript(&rendered);
+
+    assert_eq!(transcript.frames.len(), CHILD_COUNT + 1, "{rendered:?}");
+    assert!(
+        transcript.frames[0].notifications.is_empty(),
+        "{rendered:?}"
+    );
+    for (index, frame) in transcript.frames.iter().skip(1).enumerate() {
+        assert_eq!(
+            frame.notifications,
+            [format!("%message SOURCE-FIFO-{index:03}")],
+            "child {index} lost, duplicated, or reordered: {rendered:?}"
+        );
+    }
+    assert!(
+        transcript
+            .asynchronous_notifications
+            .iter()
+            .all(|line| !line.starts_with("%message ")),
+        "{rendered:?}"
+    );
+
+    std::fs::remove_file(source).expect("remove source FIFO config");
+}
+
+#[tokio::test]
+async fn rejected_synchronous_insertion_errors_the_parent_without_an_orphan_guard() {
+    let inserted =
+        "start-server ;".repeat(crate::handler::TEST_CONTROL_QUEUE_INSERTED_COMMAND_LIMIT + 1);
+    let handler = Arc::new(RequestHandler::new());
+    let input = format!("if-shell -F 1 '{inserted}'\n").into_bytes();
+    let rendered =
+        run_registered_initial_control_batch(Arc::clone(&handler), 42_440, input, 1).await;
+    let transcript = parse_strict_control_transcript(&rendered);
+
+    assert_eq!(transcript.frames.len(), 1, "{rendered:?}");
+    assert_eq!(
+        transcript.frames[0].terminal,
+        TestGuardTerminal::Error,
+        "{rendered:?}"
+    );
+    assert!(
+        transcript.frames[0]
+            .payload
+            .iter()
+            .any(|line| line.contains("inserted too many commands")),
+        "{rendered:?}"
+    );
+    assert!(
+        transcript
+            .asynchronous_notifications
+            .iter()
+            .all(|line| !line.starts_with("%message ")),
+        "{rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn direct_display_forms_remain_in_their_admitted_guards() {
+    let handler = Arc::new(RequestHandler::new());
+    let commands = [
+        "display -- DIRECT-ALIAS",
+        "display-mes -- DIRECT-PREFIX",
+        "display-message -d 0 -- DIRECT-EXT-DURATION",
+        "display-message -F 'DIRECT-EXT-FORMAT'",
+        "display-message -- DIRECT-REPEAT",
+        "display-message -- DIRECT-REPEAT",
+    ];
+    let input = format!("{}\n", commands.join("\n")).into_bytes();
+    let rendered =
+        run_registered_initial_control_batch(Arc::clone(&handler), 42_435, input, commands.len())
+            .await;
+    let transcript = parse_strict_control_transcript(&rendered);
+
+    assert_eq!(transcript.frames.len(), commands.len(), "{rendered:?}");
+    for (index, token) in [
+        "DIRECT-ALIAS",
+        "DIRECT-PREFIX",
+        "DIRECT-EXT-DURATION",
+        "DIRECT-EXT-FORMAT",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_message_owned_once(&transcript, index, token);
+    }
+    assert_eq!(
+        transcript.frames[4].notifications,
+        ["%message DIRECT-REPEAT"],
+        "{rendered:?}"
+    );
+    assert_eq!(
+        transcript.frames[5].notifications,
+        ["%message DIRECT-REPEAT"],
+        "{rendered:?}"
+    );
+    assert_eq!(
+        transcript
+            .frames
+            .iter()
+            .flat_map(|frame| frame.notifications.iter())
+            .filter(|line| line.as_str() == "%message DIRECT-REPEAT")
+            .count(),
+        2,
         "{rendered:?}"
     );
 }

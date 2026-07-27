@@ -175,6 +175,9 @@ pub(in crate::handler) use hook_identity_support::{
 use lifecycle_dispatch_queue::LifecycleDispatchOutbox;
 #[cfg(test)]
 pub(in crate::handler) use lifecycle_support::after_hook_format_values;
+#[cfg(test)]
+pub(crate) const TEST_CONTROL_QUEUE_INSERTED_COMMAND_LIMIT: usize =
+    scripting_support::CONTROL_QUEUE_INSERTED_COMMAND_LIMIT;
 pub(in crate::handler) use lifecycle_support::UnsequencedLifecycleEvent;
 pub(in crate::handler) use lifecycle_support::{
     defer_lifecycle_event, prepare_deferred_lifecycle_event, prepare_lifecycle_event,

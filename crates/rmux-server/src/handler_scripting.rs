@@ -14,7 +14,8 @@ use std::future::Future;
 use super::attach_support::ActiveAttachIdentity;
 use super::client_support::capture_switch_client_target_identity;
 use super::control_support::{
-    control_queue_eof_action, current_control_queue_identity,
+    control_command_response_stream_is_active, control_queue_eof_action,
+    current_control_queue_identity, send_control_command_response_event,
     with_control_command_response_capture, with_control_queue_identity, ControlClientIdentity,
     ControlQueueEofAction, ManagedClient,
 };
@@ -25,7 +26,9 @@ use super::{
     rebase_expected_attach_session_after_switch, validate_expected_attach_identity, RequestHandler,
 };
 use crate::client_names::control_client_name;
-use crate::control::ControlCommandResult;
+use crate::control::{
+    ControlCommandResponseEvent, ControlCommandResult, ControlQueueCommandOrigin,
+};
 use crate::hook_runtime::capture_inline_hooks;
 use crate::mouse::{AttachedMouseEvent, MouseLocation};
 
@@ -562,6 +565,8 @@ impl RequestHandler {
         }
         let control_identity = expected_control_id
             .map(|control_id| ControlClientIdentity::new(requester_pid, control_id));
+        let response_stream_is_active =
+            control_identity.is_some_and(control_command_response_stream_is_active);
         if control_queue_eof_action(control_identity) == ControlQueueEofAction::StopFrame {
             return ControlCommandResult {
                 stdout: Vec::new(),
@@ -594,6 +599,7 @@ impl RequestHandler {
         let mut exit_status = None;
         let mut inserted_command_count = 0_usize;
         let mut server_shutdown_started = false;
+        let mut child_guard_stream_started = false;
 
         'command_queue: loop {
             if queue.is_empty() {
@@ -647,6 +653,17 @@ impl RequestHandler {
             let item_context = contexts
                 .pop_front()
                 .expect("queue item context must stay aligned");
+            if response_stream_is_active && child_guard_stream_started {
+                let origin = item_context
+                    .control_queue_origin()
+                    .unwrap_or(ControlQueueCommandOrigin::QueueContinuation);
+                if !send_control_command_response_event(
+                    control_identity.expect("response streams have a control identity"),
+                    ControlCommandResponseEvent::FrameStarted { origin },
+                ) {
+                    break 'command_queue;
+                }
+            }
             let command_execution = self.execute_queued_command(
                 requester_pid,
                 item.command().clone(),
@@ -680,6 +697,32 @@ impl RequestHandler {
                 }
                 execution.action
             });
+            let starts_child_guard_stream = response_stream_is_active
+                && !child_guard_stream_started
+                && command_action.as_ref().is_ok_and(|action| {
+                    let QueueCommandAction::InsertAfter { batches, .. } = action else {
+                        return false;
+                    };
+                    let inserted = batches.iter().fold(0_usize, |count, (commands, _)| {
+                        count.saturating_add(parsed_command_count(commands))
+                    });
+                    let insertion_fits = inserted_command_count.saturating_add(inserted)
+                        <= CONTROL_QUEUE_INSERTED_COMMAND_LIMIT;
+                    insertion_fits
+                        && batches
+                            .iter()
+                            .any(|(_, context)| context.control_queue_origin().is_some())
+                });
+            if child_guard_stream_started || starts_child_guard_stream {
+                let (stdout, error) = control_command_frame_outcome(&command_action);
+                if !send_control_command_response_event(
+                    control_identity.expect("response streams have a control identity"),
+                    ControlCommandResponseEvent::FrameCompleted { stdout, error },
+                ) {
+                    break 'command_queue;
+                }
+                child_guard_stream_started = true;
+            }
             match command_action {
                 Ok(QueueCommandAction::Normal {
                     output: Some(output),
@@ -1694,6 +1737,37 @@ fn append_queue_stdout(
     }
     stdout.extend_from_slice(bytes);
     Ok(())
+}
+
+fn control_command_frame_outcome(
+    action: &Result<QueueCommandAction, RmuxError>,
+) -> (Vec<u8>, Option<RmuxError>) {
+    match action {
+        Ok(QueueCommandAction::Normal {
+            output,
+            error,
+            source_file_error,
+            ..
+        })
+        | Ok(QueueCommandAction::InsertAfter {
+            output,
+            error,
+            source_file_error,
+            ..
+        }) => (
+            output
+                .as_ref()
+                .map(|output| output.stdout().to_vec())
+                .unwrap_or_default(),
+            aggregate_rmux_errors(
+                [error.clone(), source_file_error.clone()]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+            ),
+        ),
+        Err(error) => (Vec::new(), Some(error.clone())),
+    }
 }
 
 fn parsed_command_count(commands: &ParsedCommands) -> usize {

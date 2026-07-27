@@ -16,7 +16,9 @@ use super::{
     RequestHandler, SelectionTargetTransitionSnapshot,
 };
 use crate::client_names::control_client_name;
-use crate::control::{ControlClientFlags, ControlModeUpgrade, ControlServerEvent};
+use crate::control::{
+    ControlClientFlags, ControlCommandResponseEvent, ControlModeUpgrade, ControlServerEvent,
+};
 use crate::control_notifications::{collect_control_notifications, ControlClientSnapshot};
 use crate::handler_support::{ambiguous_attached_client, attached_client_required};
 use crate::outer_terminal::OuterTerminalContext;
@@ -124,7 +126,8 @@ pub(crate) struct ControlClientIdentity {
 #[derive(Debug, Clone)]
 pub(crate) struct ControlCommandResponseSink {
     identity: ControlClientIdentity,
-    sender: mpsc::Sender<String>,
+    sender: mpsc::Sender<ControlCommandResponseEvent>,
+    closing: Arc<AtomicBool>,
 }
 
 pub(super) struct ControlClientDetachOutcome {
@@ -241,8 +244,27 @@ impl ControlClientIdentity {
 }
 
 impl ControlCommandResponseSink {
-    pub(crate) fn new(identity: ControlClientIdentity, sender: mpsc::Sender<String>) -> Self {
-        Self { identity, sender }
+    pub(crate) fn new(
+        identity: ControlClientIdentity,
+        sender: mpsc::Sender<ControlCommandResponseEvent>,
+        closing: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            identity,
+            sender,
+            closing,
+        }
+    }
+
+    fn try_send(&self, event: ControlCommandResponseEvent) -> bool {
+        if self.closing.load(Ordering::SeqCst) {
+            return false;
+        }
+        if self.sender.try_send(event).is_ok() {
+            return true;
+        }
+        self.closing.store(true, Ordering::SeqCst);
+        false
     }
 }
 
@@ -347,6 +369,23 @@ where
 fn current_control_command_response_sink() -> Option<ControlCommandResponseSink> {
     CONTROL_COMMAND_RESPONSE_CAPTURE.try_with(|()| ()).ok()?;
     CONTROL_COMMAND_RESPONSE_SINK.try_with(Clone::clone).ok()
+}
+
+pub(crate) fn control_command_response_stream_is_active(identity: ControlClientIdentity) -> bool {
+    CONTROL_COMMAND_RESPONSE_SINK
+        .try_with(|sink| sink.identity == identity && !sink.closing.load(Ordering::SeqCst))
+        .unwrap_or(false)
+}
+
+pub(crate) fn send_control_command_response_event(
+    identity: ControlClientIdentity,
+    event: ControlCommandResponseEvent,
+) -> bool {
+    CONTROL_COMMAND_RESPONSE_SINK
+        .try_with(|sink| (sink.identity == identity).then(|| sink.try_send(event)))
+        .ok()
+        .flatten()
+        .unwrap_or(false)
 }
 
 pub(in crate::handler) fn current_control_queue_identity(
@@ -2090,7 +2129,7 @@ fn deliver_control_response_notification(
         if active.closing.load(Ordering::SeqCst) {
             return false;
         }
-        if sink.sender.try_send(line).is_ok() {
+        if sink.try_send(ControlCommandResponseEvent::Notification(line)) {
             return true;
         }
         active.closing.store(true, Ordering::SeqCst);

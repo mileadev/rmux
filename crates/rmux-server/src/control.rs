@@ -163,6 +163,25 @@ pub(crate) enum ControlServerEvent {
     Exit(Option<String>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControlQueueCommandOrigin {
+    SourceFile { depth: usize },
+    IfShell,
+    QueueContinuation,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ControlCommandResponseEvent {
+    FrameStarted {
+        origin: ControlQueueCommandOrigin,
+    },
+    Notification(String),
+    FrameCompleted {
+        stdout: Vec<u8>,
+        error: Option<RmuxError>,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ControlCommandResult {
     pub(crate) stdout: Vec<u8>,
@@ -320,7 +339,9 @@ async fn forward_control_inner(
         .await
         .unwrap_or_default();
     let mut current_command: Option<ActiveControlCommand> = None;
-    let mut current_response_notifications: Option<mpsc::Receiver<String>> = None;
+    let mut current_response_frame: Option<ActiveControlResponseFrame> = None;
+    let mut current_response_notifications: Option<mpsc::Receiver<ControlCommandResponseEvent>> =
+        None;
     let mut initial_command_completion_pending = false;
     let mut command_numbering = if initial_command_count == 0 {
         let initial_timestamp = unix_epoch_seconds();
@@ -533,9 +554,13 @@ async fn forward_control_inner(
                     }
                     let task_eof_cancellation = eof_cancellation.clone();
                     let (response_tx, response_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-                    let response_sink =
-                        ControlCommandResponseSink::new(control_identity, response_tx);
+                    let response_sink = ControlCommandResponseSink::new(
+                        control_identity,
+                        response_tx,
+                        Arc::clone(&lifecycle.closing),
+                    );
                     current_response_notifications = Some(response_rx);
+                    current_response_frame = Some(ActiveControlResponseFrame::owner());
                     current_command = Some(ActiveControlCommand {
                         timestamp,
                         command_number: command_frame.number,
@@ -678,7 +703,7 @@ async fn forward_control_inner(
                     }
                 }
             }
-            Some(line) = async {
+            Some(event) = async {
                 match current_response_notifications.as_mut() {
                     Some(notifications) => notifications.recv().await,
                     None => std::future::pending().await,
@@ -698,7 +723,21 @@ async fn forward_control_inner(
                     flags: &mut flags,
                     deferred: &mut deferred_server_events,
                 };
-                if write_control_notification(line, &mut event_context).await? {
+                let command = current_command
+                    .as_mut()
+                    .expect("response events belong to an active command");
+                let response_frame = current_response_frame
+                    .as_mut()
+                    .expect("active commands own response frame state");
+                if handle_control_command_response_event(
+                    event,
+                    &mut command_numbering,
+                    command,
+                    response_frame,
+                    &mut event_context,
+                )
+                .await?
+                {
                     return Ok(());
                 }
             }
@@ -714,38 +753,15 @@ async fn forward_control_inner(
                 let Some(task_result) = result else {
                     continue;
                 };
-                let Some(command) = current_command.take() else {
-                    continue;
-                };
                 let result = task_result
                     .map_err(|error| io::Error::other(format!("control command task failed: {error}")))?;
-                if !result.stdout.is_empty() {
-                    output_queue.enqueue_stdout(result.stdout);
-                }
-                if drain_ready_pane_events(
-                    &mut pane_event_rx,
-                    &mut output_queue,
-                    &mut paused_panes,
-                    flags,
-                )? {
-                    flush_output_queue(
-                        &mut output_queue,
-                        &mut write_half,
-                        flags,
-                        &mut paused_panes,
-                    )
-                    .await?;
-                    return Ok(());
-                }
-                // The per-command response sender is dropped before the task
-                // joins, and its channel has the same finite capacity as the
-                // server-event channel. Drain it without waiting so the exact
-                // synchronous response closes inside this guard while unrelated
-                // server events retain their existing deferred path.
                 let mut response_notifications = current_response_notifications
                     .take()
                     .expect("active control command owns a response channel");
-                while let Ok(line) = response_notifications.try_recv() {
+                // The typed response sender is dropped before the task joins.
+                // Drain its finite FIFO without waiting so the last child
+                // boundary is applied before command completion.
+                while let Ok(event) = response_notifications.try_recv() {
                     let mut event_context = ServerEventContext {
                         handler: &handler,
                         control_identity,
@@ -760,37 +776,51 @@ async fn forward_control_inner(
                         flags: &mut flags,
                         deferred: &mut deferred_server_events,
                     };
-                    if write_control_notification(line, &mut event_context).await? {
+                    let command = current_command
+                        .as_mut()
+                        .expect("drained responses belong to an active command");
+                    let response_frame = current_response_frame
+                        .as_mut()
+                        .expect("active commands own response frame state");
+                    if handle_control_command_response_event(
+                        event,
+                        &mut command_numbering,
+                        command,
+                        response_frame,
+                        &mut event_context,
+                    )
+                    .await?
+                    {
                         return Ok(());
                     }
                 }
+                let Some(command) = current_command.take() else {
+                    continue;
+                };
+                let response_frame = current_response_frame
+                    .take()
+                    .expect("completed commands own response frame state");
                 let server_shutdown_started = result.server_shutdown_started;
-                match result.error {
-                    Some(error) => {
-                        output_queue.enqueue_stdout(error.to_string().into_bytes());
-                        output_queue.enqueue_line(
-                            format_guard_line(
-                                ControlGuardKind::Error,
-                                command.timestamp,
-                                command.command_number,
-                                command.guard_flag,
-                            )
-                            .into_bytes(),
-                            false,
-                        );
+                if response_frame.open {
+                    if !result.stdout.is_empty() {
+                        output_queue.enqueue_stdout(result.stdout);
                     }
-                    None => {
-                        output_queue.enqueue_line(
-                            format_guard_line(
-                                ControlGuardKind::End,
-                                command.timestamp,
-                                command.command_number,
-                                command.guard_flag,
-                            )
-                            .into_bytes(),
-                            false,
-                        );
+                    if drain_ready_pane_events(
+                        &mut pane_event_rx,
+                        &mut output_queue,
+                        &mut paused_panes,
+                        flags,
+                    )? {
+                        flush_output_queue(
+                            &mut output_queue,
+                            &mut write_half,
+                            flags,
+                            &mut paused_panes,
+                        )
+                        .await?;
+                        return Ok(());
                     }
+                    enqueue_control_frame_terminal(&mut output_queue, &command, result.error);
                 }
                 flush_output_queue(&mut output_queue, &mut write_half, flags, &mut paused_panes).await?;
                 if command.origin.completes_initial_batch() {
@@ -841,6 +871,7 @@ async fn forward_control_inner(
                     || lifecycle.closing.load(Ordering::SeqCst);
                 let closed = close_active_control_command_on_eof(
                     &mut current_command,
+                    &mut current_response_frame,
                     &mut output_queue,
                     &mut write_half,
                     flags,
@@ -1041,6 +1072,7 @@ struct ClosedControlCommand {
 #[cfg(any(unix, windows))]
 async fn close_active_control_command_on_eof(
     current_command: &mut Option<ActiveControlCommand>,
+    current_response_frame: &mut Option<ActiveControlResponseFrame>,
     output_queue: &mut ControlOutputQueue,
     write_half: &mut WriteHalf<LocalStream>,
     flags: ControlClientFlags,
@@ -1048,21 +1080,27 @@ async fn close_active_control_command_on_eof(
     exit_reason: Option<&str>,
 ) -> ClosedControlCommand {
     let Some(mut command) = current_command.take() else {
+        *current_response_frame = None;
         return ClosedControlCommand {
             task: None,
             transport_result: Ok(()),
         };
     };
-    output_queue.enqueue_line(
-        format_guard_line(
-            ControlGuardKind::End,
-            command.timestamp,
-            command.command_number,
-            command.guard_flag,
-        )
-        .into_bytes(),
-        false,
-    );
+    let response_frame = current_response_frame
+        .take()
+        .expect("active commands own response frame state");
+    if response_frame.open {
+        output_queue.enqueue_line(
+            format_guard_line(
+                ControlGuardKind::End,
+                command.timestamp,
+                command.command_number,
+                command.guard_flag,
+            )
+            .into_bytes(),
+            false,
+        );
+    }
     output_queue.enqueue_line(format_exit_line(exit_reason).into_bytes(), false);
     command.eof_cancellation.cancel_for_eof();
     let task = command.task.take();
@@ -1340,6 +1378,121 @@ async fn write_control_notification(
 }
 
 #[cfg(any(unix, windows))]
+async fn handle_control_command_response_event(
+    event: ControlCommandResponseEvent,
+    numbering: &mut ControlCommandNumbering,
+    command: &mut ActiveControlCommand,
+    response_frame: &mut ActiveControlResponseFrame,
+    context: &mut ServerEventContext<'_>,
+) -> io::Result<bool> {
+    match event {
+        ControlCommandResponseEvent::Notification(line) => {
+            if !response_frame.open {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "control response notification has no open owner guard",
+                ));
+            }
+            write_control_notification(line, context).await
+        }
+        ControlCommandResponseEvent::FrameStarted { origin } => {
+            if response_frame.open {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "synchronous {origin:?} child started before its owner guard completed"
+                    ),
+                ));
+            }
+            command.timestamp = unix_epoch_seconds();
+            command.command_number = numbering.next_synchronous_child_number();
+            response_frame.open = true;
+            response_frame.origin = Some(origin);
+            context.output_queue.enqueue_line(
+                format_guard_line(
+                    ControlGuardKind::Begin,
+                    command.timestamp,
+                    command.command_number,
+                    command.guard_flag,
+                )
+                .into_bytes(),
+                false,
+            );
+            flush_output_queue(
+                context.output_queue,
+                context.write_half,
+                *context.flags,
+                context.paused_panes,
+            )
+            .await?;
+            Ok(false)
+        }
+        ControlCommandResponseEvent::FrameCompleted { stdout, error } => {
+            if !response_frame.open {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "control response completed without an open owner guard",
+                ));
+            }
+            if !stdout.is_empty() {
+                context.output_queue.enqueue_stdout(stdout);
+            }
+            if drain_ready_pane_events(
+                context.pane_event_rx,
+                context.output_queue,
+                context.paused_panes,
+                *context.flags,
+            )? {
+                flush_output_queue(
+                    context.output_queue,
+                    context.write_half,
+                    *context.flags,
+                    context.paused_panes,
+                )
+                .await?;
+                return Ok(true);
+            }
+            enqueue_control_frame_terminal(context.output_queue, command, error);
+            response_frame.open = false;
+            let _completed_origin = response_frame.origin.take();
+            flush_output_queue(
+                context.output_queue,
+                context.write_half,
+                *context.flags,
+                context.paused_panes,
+            )
+            .await?;
+            Ok(false)
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn enqueue_control_frame_terminal(
+    output_queue: &mut ControlOutputQueue,
+    command: &ActiveControlCommand,
+    error: Option<RmuxError>,
+) {
+    let terminal = match error {
+        Some(error) => {
+            output_queue.enqueue_stdout(error.to_string().into_bytes());
+            ControlGuardKind::Error
+        }
+        None => ControlGuardKind::End,
+    };
+    output_queue.enqueue_line(
+        format_guard_line(
+            terminal,
+            command.timestamp,
+            command.command_number,
+            command.guard_flag,
+        )
+        .into_bytes(),
+        false,
+    );
+}
+
+#[cfg(any(unix, windows))]
 async fn flush_deferred_server_events(context: &mut ServerEventContext<'_>) -> io::Result<bool> {
     while let Some(line) = context.deferred.pop_notification() {
         if handle_server_event(ControlServerEvent::Notification(line), context, false).await? {
@@ -1441,6 +1594,23 @@ impl DeferredServerEvents {
             session_name: next_session,
             pane_sequences,
         });
+    }
+}
+
+#[derive(Debug)]
+#[cfg(any(unix, windows))]
+struct ActiveControlResponseFrame {
+    open: bool,
+    origin: Option<ControlQueueCommandOrigin>,
+}
+
+#[cfg(any(unix, windows))]
+impl ActiveControlResponseFrame {
+    const fn owner() -> Self {
+        Self {
+            open: true,
+            origin: None,
+        }
     }
 }
 

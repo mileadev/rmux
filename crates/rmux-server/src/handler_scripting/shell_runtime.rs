@@ -1019,7 +1019,8 @@ impl RequestHandler {
             context.clone().with_current_target(branch_target)
         } else {
             context.clone()
-        };
+        }
+        .for_if_shell_commands();
 
         Ok(QueueCommandAction::InsertAfter {
             batches: vec![(

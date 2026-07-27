@@ -71,6 +71,12 @@ impl ControlCommandNumbering {
             origin,
         }
     }
+
+    pub(super) fn next_synchronous_child_number(&mut self) -> u64 {
+        let number = self.next_number;
+        self.next_number = self.next_number.saturating_add(1);
+        number
+    }
 }
 
 #[cfg(test)]

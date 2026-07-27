@@ -12,6 +12,7 @@ use rmux_proto::{
     WindowTarget,
 };
 
+use crate::control::ControlQueueCommandOrigin;
 use crate::mouse::AttachedMouseEvent;
 
 use super::super::lifecycle_support::{LeaseResolution, LifecycleTargetLease};
@@ -43,6 +44,7 @@ pub(in crate::handler) struct QueueExecutionContext {
     pinned_current_target_identity: Option<Arc<StableTargetIdentity>>,
     pinned_pane_output_identity: Option<Arc<StablePaneOutputIdentity>>,
     run_shell_command_depth: usize,
+    control_queue_origin: Option<ControlQueueCommandOrigin>,
 }
 
 impl QueueExecutionContext {
@@ -63,6 +65,7 @@ impl QueueExecutionContext {
             pinned_current_target_identity: None,
             pinned_pane_output_identity: None,
             run_shell_command_depth: 0,
+            control_queue_origin: None,
         }
     }
 
@@ -83,6 +86,7 @@ impl QueueExecutionContext {
             pinned_current_target_identity: None,
             pinned_pane_output_identity: None,
             run_shell_command_depth: 0,
+            control_queue_origin: None,
         }
     }
 
@@ -107,7 +111,15 @@ impl QueueExecutionContext {
             pinned_current_target_identity: self.pinned_current_target_identity.clone(),
             pinned_pane_output_identity: self.pinned_pane_output_identity.clone(),
             run_shell_command_depth: self.run_shell_command_depth,
+            control_queue_origin: Some(ControlQueueCommandOrigin::SourceFile {
+                depth: source_file_depth,
+            }),
         }
+    }
+
+    pub(in crate::handler) fn for_if_shell_commands(mut self) -> Self {
+        self.control_queue_origin = Some(ControlQueueCommandOrigin::IfShell);
+        self
     }
 
     pub(in crate::handler) fn with_caller_cwd(mut self, caller_cwd: Option<PathBuf>) -> Self {
@@ -117,6 +129,12 @@ impl QueueExecutionContext {
 
     pub(in crate::handler) const fn run_shell_command_depth(&self) -> usize {
         self.run_shell_command_depth
+    }
+
+    pub(in crate::handler) const fn control_queue_origin(
+        &self,
+    ) -> Option<ControlQueueCommandOrigin> {
+        self.control_queue_origin
     }
 
     pub(in crate::handler) fn for_run_shell_commands(
