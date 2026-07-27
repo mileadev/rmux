@@ -390,6 +390,227 @@ if contexts != ("inputs",):
 }
 
 #[test]
+fn retry_public_validator_preserves_r4_yaml_expression_boundaries() {
+    assert_python(
+        r###"
+import pathlib
+import sys
+import tempfile
+
+sys.path.insert(0, "scripts/release")
+from workflow_run_input_boundary import validate_no_direct_input_expressions
+
+governed = (
+    (
+        "quoted_terminator",
+        """steps:
+  - run: echo "${{ format('display }} only: {0}', inputs.release_ref) }}"
+""",
+        True,
+    ),
+    (
+        "quoted_both_markers",
+        """steps:
+  - run: echo "${{ format('text ${{ and }} only', github['event'].inputs.channel) }}"
+""",
+        True,
+    ),
+    (
+        "indexed_event_dotted_inputs",
+        """steps:
+  - run: echo "${{ github['event'].inputs.release_id }}"
+""",
+        True,
+    ),
+    (
+        "dotted_event_indexed_inputs",
+        """steps:
+  - run: "echo ${{ github.event['inputs'].release_id }}"
+""",
+        True,
+    ),
+    (
+        "all_indexed",
+        """steps:
+  - run: |-
+      echo "${{ github['event']['inputs']['release_id'] }}"
+""",
+        True,
+    ),
+    (
+        "spaced_mixed",
+        """steps:
+  - run: >+
+      echo "${{ github [ 'event' ] . inputs [ 'release_id' ] }}"
+""",
+        True,
+    ),
+)
+
+protected = (
+    (
+        "block_single_active",
+        """steps:
+  - run: 'Write-Output "${{ github[''event''].inputs.release_id }}"'
+""",
+        True,
+    ),
+    (
+        "flow_single_active",
+        """steps:
+  - {name: emit, run: 'printf "%s" "${{ github[''event''].inputs.artifact_id }}"', shell: bash}
+""",
+        True,
+    ),
+    (
+        "block_single_inert",
+        """steps:
+  - run: 'echo "${{ ''inputs.release_ref is documentation'' }}"'
+""",
+        False,
+    ),
+    (
+        "flow_single_inert",
+        """steps:
+  - {shell: bash, run: 'echo "${{ ''github.event.inputs.not_an_access'' }}"'}
+""",
+        False,
+    ),
+    (
+        "unclosed_block_single",
+        """steps:
+  - run: 'echo bounded
+    env:
+      DOCUMENT_ONLY: ${{ inputs.outside_run }}
+""",
+        False,
+    ),
+    (
+        "unclosed_block_double",
+        """steps:
+  - run: "Write-Output bounded
+    name: ${{ github.event.inputs.outside_run }}
+""",
+        False,
+    ),
+    (
+        "unclosed_flow_single",
+        """steps:
+  - {run: 'echo bounded, name: ${{ inputs.outside_run }} }
+""",
+        False,
+    ),
+)
+
+failures = []
+passed = {"governed": 0, "protected": 0}
+with tempfile.TemporaryDirectory(
+    prefix=".rmux-r4-boundary-",
+    dir=pathlib.Path.cwd(),
+) as temporary:
+    fixture = pathlib.Path(temporary) / "workflow.yml"
+    for group, cases in (("governed", governed), ("protected", protected)):
+        for name, source, expected_rejection in cases:
+            fixture.write_text(source, encoding="utf-8", newline="")
+            try:
+                validate_no_direct_input_expressions((fixture,))
+            except ValueError:
+                actual_rejection = True
+            else:
+                actual_rejection = False
+            if actual_rejection == expected_rejection:
+                passed[group] += 1
+            else:
+                failures.append(
+                    f"{group}/{name}: expected rejection={expected_rejection}, "
+                    f"actual={actual_rejection}"
+                )
+
+if failures:
+    raise SystemExit(
+        f"governed={passed['governed']}/{len(governed)}, "
+        f"protected={passed['protected']}/{len(protected)}: "
+        + " | ".join(failures)
+    )
+"###,
+    );
+}
+
+#[test]
+fn retry_public_validator_bounds_quotes_without_narrowing_multiline_yaml() {
+    assert_python(
+        r###"
+import pathlib
+import sys
+import tempfile
+
+sys.path.insert(0, "scripts/release")
+from workflow_run_input_boundary import validate_no_direct_input_expressions
+
+cases = (
+    (
+        "minimally_indented_multiline_single",
+        """steps:
+  - run: 'echo first
+    ${{ inputs.multiline_single }}'
+""",
+        True,
+    ),
+    (
+        "minimally_indented_multiline_double",
+        """steps:
+  - run: "echo first
+    ${{ github.event.inputs.multiline_double }}"
+""",
+        True,
+    ),
+    (
+        "unclosed_flow_single_cannot_borrow_next_step_quote",
+        """steps:
+  - {run: 'echo bounded, name: ${{ inputs.outside_run }} }
+  - name: 'later quote'
+    run: echo safe
+""",
+        False,
+    ),
+    (
+        "unclosed_flow_double_cannot_borrow_next_step_quote",
+        """steps:
+  - {run: "echo bounded, name: ${{ github.event.inputs.outside_run }} }
+  - name: "later quote"
+    run: echo safe
+""",
+        False,
+    ),
+)
+
+failures = []
+with tempfile.TemporaryDirectory(
+    prefix=".rmux-r4-quote-boundary-",
+    dir=pathlib.Path.cwd(),
+) as temporary:
+    fixture = pathlib.Path(temporary) / "workflow.yml"
+    for name, source, expected_rejection in cases:
+        fixture.write_text(source, encoding="utf-8", newline="")
+        try:
+            validate_no_direct_input_expressions((fixture,))
+        except ValueError:
+            actual_rejection = True
+        else:
+            actual_rejection = False
+        if actual_rejection != expected_rejection:
+            failures.append(
+                f"{name}: expected rejection={expected_rejection}, "
+                f"actual={actual_rejection}"
+            )
+
+if failures:
+    raise SystemExit("quote-boundary regressions: " + " | ".join(failures))
+"###,
+    );
+}
+
+#[test]
 fn retry_boundary_scanner_covers_valid_expression_neighborhood() {
     assert_python(
         r###"

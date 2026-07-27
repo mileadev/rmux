@@ -28,6 +28,16 @@ class RunScalar:
     start: int
     end: int
 
+    def expression_source(self) -> str:
+        """Return the scalar text GitHub inspects for expression spans."""
+
+        if self.style in (
+            ScalarStyle.SINGLE_QUOTED,
+            ScalarStyle.FLOW_SINGLE_QUOTED,
+        ):
+            return self.value[1:-1].replace("''", "'")
+        return self.value
+
 
 @dataclass(frozen=True)
 class _SourceLine:
@@ -52,6 +62,12 @@ class _BlockEntry:
     value: str
 
 
+@dataclass(frozen=True)
+class _QuotedSpan:
+    end: int
+    closed: bool
+
+
 def _source_lines(text: str) -> tuple[_SourceLine, ...]:
     lines: list[_SourceLine] = []
     offset = 0
@@ -70,25 +86,28 @@ def _source_lines(text: str) -> tuple[_SourceLine, ...]:
     return tuple(lines)
 
 
-def _quoted_end(text: str, start: int, quote: str) -> int:
+def _quoted_span(
+    text: str, start: int, quote: str, limit: int | None = None
+) -> _QuotedSpan:
+    boundary = len(text) if limit is None else min(len(text), limit)
     index = start + 1
-    while index < len(text):
+    while index < boundary:
         character = text[index]
         if quote == "'":
             if character != "'":
                 index += 1
                 continue
-            if index + 1 < len(text) and text[index + 1] == "'":
+            if index + 1 < boundary and text[index + 1] == "'":
                 index += 2
                 continue
-            return index + 1
+            return _QuotedSpan(index + 1, True)
         if character == "\\":
-            index += 2
+            index = min(boundary, index + 2)
             continue
         if character == '"':
-            return index + 1
+            return _QuotedSpan(index + 1, True)
         index += 1
-    return len(text)
+    return _QuotedSpan(boundary, False)
 
 
 def _decode_key(raw: str) -> str:
@@ -117,11 +136,11 @@ def _block_entry(line: _SourceLine, text: str) -> _BlockEntry | None:
     if content[cursor] in "'\"":
         quote = content[cursor]
         key_start = line.start + cursor
-        key_end = _quoted_end(text, key_start, quote)
-        if key_end > line.end:
+        key_span = _quoted_span(text, key_start, quote, line.end)
+        if not key_span.closed:
             return None
-        raw_key = text[key_start:key_end]
-        cursor = key_end - line.start
+        raw_key = text[key_start : key_span.end]
+        cursor = key_span.end - line.start
     else:
         key_start = cursor
         while cursor < len(content):
@@ -225,9 +244,17 @@ def _block_run_scalars(
 
         if entry.value.startswith(("'", '"')):
             quote = entry.value[0]
-            scalar_end = _quoted_end(text, entry.value_start, quote)
-            excluded.append((entry.value_start, scalar_end))
-            if entry.key == "run":
+            end_index = _indented_end(lines, index + 1, line.indent)
+            scalar_limit = (
+                lines[end_index - 1].end
+                if end_index > index + 1
+                else line.end
+            )
+            scalar_span = _quoted_span(
+                text, entry.value_start, quote, scalar_limit
+            )
+            excluded.append((entry.value_start, scalar_span.end))
+            if entry.key == "run" and scalar_span.closed:
                 style = (
                     ScalarStyle.SINGLE_QUOTED
                     if quote == "'"
@@ -236,13 +263,13 @@ def _block_run_scalars(
                 nodes.append(
                     RunScalar(
                         line=line.number,
-                        value=text[entry.value_start:scalar_end],
+                        value=text[entry.value_start : scalar_span.end],
                         style=style,
                         start=entry.value_start,
-                        end=scalar_end,
+                        end=scalar_span.end,
                     )
                 )
-            index = _line_index_for_offset(lines, scalar_end) + 1
+            index = _line_index_for_offset(lines, scalar_span.end) + 1
             continue
 
         if entry.key != "run":
@@ -278,6 +305,7 @@ class _FlowScanner:
         excluded: list[tuple[int, int]],
     ) -> None:
         self.text = text
+        self.lines = lines
         self.line_starts = [line.start for line in lines]
         self.excluded = sorted(excluded)
         self.nodes: list[RunScalar] = []
@@ -294,6 +322,16 @@ class _FlowScanner:
             if start > offset:
                 return None
         return None
+
+    def _flow_limit(self, offset: int) -> int:
+        line_index = _line_index_for_offset(self.lines, offset)
+        line = self.lines[line_index]
+        end_index = _indented_end(self.lines, line_index + 1, line.indent)
+        return (
+            self.lines[end_index - 1].end
+            if end_index > line_index + 1
+            else line.end
+        )
 
     def _skip_expression(self, index: int) -> int:
         scanned = scan_actions_expression(self.text, index)
@@ -320,9 +358,11 @@ class _FlowScanner:
         if index >= len(self.text):
             return None, index
         if self.text[index] in "'\"":
-            end = _quoted_end(self.text, index, self.text[index])
-            key = _decode_key(self.text[index:end])
-            index = self._skip_trivia(end)
+            span = _quoted_span(self.text, index, self.text[index])
+            if not span.closed:
+                return None, span.end
+            key = _decode_key(self.text[index : span.end])
+            index = self._skip_trivia(span.end)
         else:
             start = index
             while index < len(self.text) and self.text[index] not in ":,}":
@@ -345,6 +385,7 @@ class _FlowScanner:
         return index
 
     def _mapping(self, index: int) -> int:
+        flow_limit = self._flow_limit(index)
         index += 1
         while index < len(self.text):
             index = self._skip_trivia(index)
@@ -355,8 +396,23 @@ class _FlowScanner:
             if key is None:
                 return index + 1
             value_start = self._skip_trivia(value_start)
+            quoted_span = (
+                _quoted_span(
+                    self.text,
+                    value_start,
+                    self.text[value_start],
+                    flow_limit,
+                )
+                if value_start < len(self.text)
+                and self.text[value_start] in "'\""
+                else None
+            )
+            if quoted_span is not None and not quoted_span.closed:
+                return quoted_span.end
             value_end = self._value_end(value_start, ",}")
-            if key == "run":
+            if key == "run" and (
+                quoted_span is None or quoted_span.closed
+            ):
                 if value_start < len(self.text) and self.text[value_start] == "'":
                     style = ScalarStyle.FLOW_SINGLE_QUOTED
                 elif value_start < len(self.text) and self.text[value_start] == '"':
@@ -389,7 +445,7 @@ class _FlowScanner:
                 continue
             character = self.text[index]
             if character in "'\"":
-                index = _quoted_end(self.text, index, character)
+                index = _quoted_span(self.text, index, character).end
                 continue
             if character == "{":
                 index = self._mapping(index)
@@ -419,7 +475,7 @@ class _FlowScanner:
                 continue
             character = self.text[index]
             if character in "'\"":
-                index = _quoted_end(self.text, index, character)
+                index = _quoted_span(self.text, index, character).end
                 continue
             if character == "#":
                 newline = self.text.find("\n", index + 1)

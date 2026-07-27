@@ -23,7 +23,7 @@ def iter_run_scalars(text: str) -> Iterator[tuple[int, str]]:
     """Yield line number and value from structured YAML scalar nodes."""
 
     for scalar in parse_run_scalars(text):
-        yield scalar.line, scalar.value
+        yield scalar.line, scalar.expression_source()
 
 
 def find_direct_input_expressions(text: str) -> tuple[DirectInputExpression, ...]:
