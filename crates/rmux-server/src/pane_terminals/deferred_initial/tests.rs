@@ -3,7 +3,8 @@ use std::path::Path;
 use rmux_proto::{SessionName, TerminalSize};
 
 use super::{
-    DeferredInitialPaneInputDrain, DeferredInitialPaneSpawn, HandlerState, InitialPaneSpawnOptions,
+    DeferredInitialPaneInput, DeferredInitialPaneInputDrain, DeferredInitialPaneSpawn,
+    HandlerState, InitialPaneSpawnOptions,
 };
 
 fn session_name(value: &str) -> SessionName {
@@ -111,5 +112,29 @@ fn deferred_identity_ignores_reused_name_and_stale_generation() {
         state.active_pane_is_starting(&original),
         "a stale generation must not remove a newer pane incarnation"
     );
+    state.shutdown_terminals_for_test();
+}
+
+#[test]
+fn starting_pane_keeps_bracketed_paste_distinct_from_plain_bytes() {
+    let mut state = HandlerState::default();
+    let session = session_name("deferred-bracketed-paste");
+    let job = prepare_deferred_session(&mut state, &session);
+    let payload = b"\x1b[200~alpha\nbeta\x1b[201~";
+
+    assert!(state
+        .queue_starting_pane_bracketed_paste_input(&session, 0, 0, payload)
+        .expect("bracketed paste queues while the pane starts"));
+
+    let starting = state
+        .starting_panes
+        .get(&job.runtime_session_name)
+        .and_then(|panes| panes.get(&job.identity.pane_id()))
+        .expect("starting pane remains registered");
+    assert_eq!(
+        starting.queued_input.front(),
+        Some(&DeferredInitialPaneInput::BracketedPaste(payload.to_vec()))
+    );
+    assert_eq!(starting.queued_input_bytes, payload.len());
     state.shutdown_terminals_for_test();
 }

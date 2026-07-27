@@ -1,6 +1,7 @@
 use std::io;
 use std::os::windows::io::RawHandle;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use rmux_proto::AttachedWindowsConsoleKey;
 use windows_sys::Win32::Foundation::HANDLE;
@@ -28,6 +29,17 @@ const ATTACH_INPUT_CHUNK_LIMIT: usize = 4096;
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 const CONSOLE_INPUT_RECORD_BATCH: usize = 32;
+// ConPTY removes the outer bracketed-paste delimiters before record-mode
+// clients can observe them. A drained Ctrl+Enter-shaped LF is therefore
+// indistinguishable from an interactive key until a following record arrives.
+// Defer only that dangerous singleton, long enough to bridge the delayed chunk
+// observed through Windows OpenSSH without holding the attach input-read lease.
+// ConPTY emits the same key-up for a synthesized paste LF as for a fully
+// buffered physical Ctrl+Enter, so only a following paste record or recent
+// paste evidence may turn the ambiguous record into paste. A lone record stays
+// live when the deadline expires.
+const SYNTHESIZED_LF_LOOKAHEAD_TIMEOUT: Duration = Duration::from_millis(350);
+const RECENT_PASTE_EVIDENCE_WINDOW: Duration = SYNTHESIZED_LF_LOOKAHEAD_TIMEOUT;
 const HIGH_SURROGATE_START: u16 = 0xd800;
 const HIGH_SURROGATE_END: u16 = 0xdbff;
 const LOW_SURROGATE_START: u16 = 0xdc00;
@@ -102,6 +114,18 @@ pub(super) struct ConsoleInputReader {
     /// hostile `\x1b[201~` spanning two batches cannot slip through per-batch
     /// stripping. Only ever populated while `paste_open` is true.
     paste_carryover: Vec<u8>,
+    /// Last batch known to belong to a detected paste. This preserves a
+    /// trailing LF that ConPTY isolates after the rest of a paste while still
+    /// leaving a lone physical Ctrl+Enter live once the bounded window expires.
+    last_paste_batch_at: Option<Instant>,
+    /// One drained, Ctrl+Enter-shaped LF whose origin cannot yet be known.
+    /// Keeping it in decoder state lets the input loop release its read lease
+    /// while waiting for either a paste continuation or the deadline.
+    pending_synthesized_lf: Option<PendingSynthesizedLf>,
+    /// Physical Control modifier state observed across console reads. ConPTY
+    /// brackets a synthesized paste LF with Control down/up in the same group;
+    /// a held physical chord remains down across repeated Enter records.
+    ctrl_modifier_down: bool,
     /// Whether a real outer tmux may deliver SGR mouse frames as Win32 key
     /// records. This exception is intentionally unavailable outside tmux.
     tmux_parent_sgr_mouse: bool,
@@ -124,6 +148,9 @@ impl ConsoleInputReader {
             last_mouse_button_state: 0,
             paste_open: false,
             paste_carryover: Vec::new(),
+            last_paste_batch_at: None,
+            pending_synthesized_lf: None,
+            ctrl_modifier_down: false,
             tmux_parent_sgr_mouse: parent_allows_sgr_mouse_key_batches(detect_parent()),
         })
     }
@@ -137,6 +164,9 @@ impl ConsoleInputReader {
         self.last_mouse_button_state = 0;
         self.paste_open = false;
         self.paste_carryover.clear();
+        self.last_paste_batch_at = None;
+        self.pending_synthesized_lf = None;
+        self.ctrl_modifier_down = false;
     }
 
     fn read_key_inputs_with<Api>(
@@ -147,6 +177,11 @@ impl ConsoleInputReader {
     where
         Api: ConsoleInputApi,
     {
+        let pending = self.pending_synthesized_lf.take();
+        let pending_observed_at = pending.as_ref().map(|pending| pending.observed_at);
+        let mut events = pending
+            .map(|pending| pending.events)
+            .unwrap_or_else(|| Vec::with_capacity(CONSOLE_INPUT_RECORD_BATCH * 2));
         let mut records = [INPUT_RECORD::default(); CONSOLE_INPUT_RECORD_BATCH];
         let ConsoleInputRead::Records {
             records_read,
@@ -156,47 +191,144 @@ impl ConsoleInputReader {
             // Teardown may flush an input which was readable immediately
             // before the attach input-read lease was acquired. Preserve all
             // decoder and paste state until a real record batch is available.
+            if let Some(observed_at) = pending_observed_at {
+                self.pending_synthesized_lf = Some(PendingSynthesizedLf {
+                    events,
+                    observed_at,
+                });
+            }
             return Ok(Vec::new());
         };
 
-        let mut events = Vec::with_capacity(records_read.saturating_mul(2));
+        let new_events_start = events.len();
         append_batch_events(&records[..records_read], &mut events);
+        self.ctrl_modifier_down =
+            ctrl_modifier_down_after(&events[new_events_start..], self.ctrl_modifier_down);
 
-        let ambiguous_body_before_lookahead =
-            ambiguous_paste_lookahead_body_count(&events, drained, self.paste_open);
-        if ambiguous_body_before_lookahead.is_some() {
-            // `drained == false` guarantees that another console record was
-            // queued at the end of the first read. Resolve the ambiguity under
-            // the same outer input-read lease, so a lock/suspend cannot retain
-            // a pre-action prefix in decoder state. If this one bounded
-            // lookahead still contains only irrelevant key-ups/modifiers while
-            // more records remain queued, fail closed as an open paste rather
-            // than holding the lease indefinitely or leaking the prefix as
-            // live input. The envelope remains open while the console is still
-            // non-drained so a short continuation cannot escape live.
-            match read_console_input_batch_with(coordinator, api, self.handle, &mut records)? {
-                ConsoleInputRead::NoEvents => drained = true,
-                ConsoleInputRead::Records {
-                    records_read,
-                    drained: lookahead_drained,
-                } => {
-                    append_batch_events(&records[..records_read], &mut events);
-                    drained = lookahead_drained;
-                }
+        let paste_lookahead = paste_lookahead(&events, drained, self.paste_open);
+        let ambiguous_body_before_lookahead = paste_lookahead.map(|lookahead| lookahead.body_count);
+        let mut force_ambiguous_lookahead_paste = false;
+        match paste_lookahead {
+            Some(PasteLookahead {
+                wait_for_continuation: true,
+                ..
+            }) if self.has_recent_paste_evidence() => {
+                force_ambiguous_lookahead_paste = true;
             }
+            Some(PasteLookahead {
+                wait_for_continuation: true,
+                ..
+            }) if pending_observed_at
+                .is_some_and(|observed| observed.elapsed() >= SYNTHESIZED_LF_LOOKAHEAD_TIMEOUT) =>
+            {
+                // No continuation arrived before the deadline. The exact
+                // record shape is also a fully buffered Ctrl+Enter, so release
+                // it through the live-key path.
+            }
+            Some(PasteLookahead {
+                wait_for_continuation: true,
+                ..
+            }) => {
+                self.pending_synthesized_lf = Some(PendingSynthesizedLf {
+                    events,
+                    observed_at: pending_observed_at.unwrap_or_else(Instant::now),
+                });
+                return Ok(Vec::new());
+            }
+            Some(PasteLookahead {
+                wait_for_continuation: false,
+                ..
+            }) => {
+                let lookahead_events_start = events.len();
+                // A non-drained prefix guarantees a queued record, so this
+                // second read is nonblocking and can safely remain under the
+                // same outer input-read lease.
+                match read_console_input_batch_with(coordinator, api, self.handle, &mut records)? {
+                    ConsoleInputRead::NoEvents => drained = true,
+                    ConsoleInputRead::Records {
+                        records_read,
+                        drained: lookahead_drained,
+                    } => {
+                        append_batch_events(&records[..records_read], &mut events);
+                        self.ctrl_modifier_down = ctrl_modifier_down_after(
+                            &events[lookahead_events_start..],
+                            self.ctrl_modifier_down,
+                        );
+                        drained = lookahead_drained;
+                    }
+                }
+                let ambiguous_body_after_lookahead = ambiguous_paste_body_count(&events);
+                let gained_body = ambiguous_body_before_lookahead
+                    .zip(ambiguous_body_after_lookahead)
+                    .is_some_and(|(before, after)| after > before);
+                if drained && !gained_body && is_single_synthesized_lf_prefix(&events) {
+                    // ReadConsoleInputW can split the exact ConPTY LF group
+                    // after its key-down. If the bounded immediate lookahead
+                    // sees only key-up/modifier noise, the actual clipboard
+                    // body may still arrive in a later network segment. Keep
+                    // the ambiguous LF pending just like a drained singleton;
+                    // releasing it here would submit the preceding line.
+                    self.pending_synthesized_lf = Some(PendingSynthesizedLf {
+                        events,
+                        observed_at: pending_observed_at.unwrap_or_else(Instant::now),
+                    });
+                    return Ok(Vec::new());
+                }
+                force_ambiguous_lookahead_paste =
+                    ambiguous_body_after_lookahead.is_some_and(|_| !drained || gained_body);
+            }
+            None => {}
         }
-        let force_ambiguous_lookahead_paste = ambiguous_body_before_lookahead
-            .zip(ambiguous_paste_body_count(&events))
-            .is_some_and(|(before, after)| !drained || after > before);
 
+        Ok(self.encode_console_events(
+            &events,
+            drained,
+            PasteEncodingHint {
+                force_ambiguous_lookahead_paste,
+                suppress_fresh_paste: self.ctrl_modifier_down
+                    && is_held_physical_ctrl_lf_batch(&events),
+            },
+        ))
+    }
+
+    pub(super) fn pending_input_deadline_expired(&self) -> bool {
+        self.pending_synthesized_lf.as_ref().is_some_and(|pending| {
+            pending.observed_at.elapsed() >= SYNTHESIZED_LF_LOOKAHEAD_TIMEOUT
+        })
+    }
+
+    pub(super) fn flush_expired_pending_input(&mut self) -> Vec<AttachInput> {
+        if !self.pending_input_deadline_expired() {
+            return Vec::new();
+        }
+        let Some(pending) = self.pending_synthesized_lf.take() else {
+            return Vec::new();
+        };
+        self.encode_console_events(
+            &pending.events,
+            true,
+            PasteEncodingHint {
+                force_ambiguous_lookahead_paste: false,
+                suppress_fresh_paste: self.ctrl_modifier_down
+                    && is_held_physical_ctrl_lf_batch(&pending.events),
+            },
+        )
+    }
+
+    fn encode_console_events(
+        &mut self,
+        events: &[BatchEvent],
+        drained: bool,
+        hint: PasteEncodingHint,
+    ) -> Vec<AttachInput> {
         if self.tmux_parent_sgr_mouse {
             if let Some(inputs) = encode_drained_tmux_sgr_mouse_batch(
-                &events,
+                events,
                 drained,
                 self.paste_open,
                 &mut self.pending_high_surrogate,
             ) {
-                return Ok(inputs);
+                return inputs;
             }
         }
 
@@ -208,15 +340,43 @@ impl ConsoleInputReader {
         // "a") and a pasted newline arrives as VK_RETURN just like a typed Enter,
         // so there is no per-record "injected" flag. If the buffer still holds
         // events after this batch the paste continues into the next one.
-        Ok(encode_input_batch_with_hint(
-            &events,
+        let paste_was_open = self.paste_open;
+        let paste_body_count = paste_body_text_count(events);
+        let inputs = encode_input_batch_with_hint(
+            events,
             drained,
-            force_ambiguous_lookahead_paste,
+            hint,
             &mut self.paste_open,
             &mut self.paste_carryover,
             &mut self.pending_high_surrogate,
             &mut self.last_mouse_button_state,
-        ))
+        );
+        let opened_paste = inputs
+            .iter()
+            .any(|input| input.payload().starts_with(BRACKETED_PASTE_START));
+        let strong_fresh_paste = !paste_was_open && paste_body_count >= 2 && opened_paste;
+        let continued_paste = paste_was_open
+            && paste_body_count >= 1
+            && !inputs.is_empty()
+            && inputs
+                .iter()
+                .all(|input| input.windows_console_key().is_none());
+        if strong_fresh_paste || continued_paste {
+            // Do not refresh this evidence from a singleton which was itself
+            // bracketed only because the previous timestamp was recent.
+            self.last_paste_batch_at = Some(Instant::now());
+        }
+        inputs
+    }
+
+    fn has_recent_paste_evidence(&mut self) -> bool {
+        let recent = self
+            .last_paste_batch_at
+            .is_some_and(|observed| observed.elapsed() <= RECENT_PASTE_EVIDENCE_WINDOW);
+        if !recent {
+            self.last_paste_batch_at = None;
+        }
+        recent
     }
 }
 
@@ -358,9 +518,10 @@ fn append_batch_events(records: &[INPUT_RECORD], events: &mut Vec<BatchEvent>) {
 }
 
 /// A pasted printable character — or a pasted carriage return, which reaches
-/// the console as `VK_RETURN` — is normally an unmodified key-down. Conhost can
-/// synthesize a clipboard line feed as Ctrl+J, so that exact Unicode LF is the
-/// one Ctrl-modified exception. Other Control and Alt chords force the normal
+/// the console as `VK_RETURN` — is normally an unmodified key-down. Console
+/// transports synthesize a clipboard line feed as either Ctrl+J or, for Windows
+/// OpenSSH/ConPTY, Ctrl+Enter. Those exact Unicode LF shapes are the only
+/// Ctrl-modified exceptions. Other Control and Alt chords force the normal
 /// per-key path, except for AltGr on European layouts
 /// (`LEFT_CTRL|RIGHT_ALT`), which is legitimate paste text. Records with
 /// `unicode_char == 0` (pure modifier key-downs synthesized around shifted
@@ -383,33 +544,132 @@ fn is_paste_body_text(event: &ConsoleKeyEvent) -> bool {
 
 fn is_synthesized_paste_lf(event: &ConsoleKeyEvent) -> bool {
     let alt_gr = alt_gr_pressed(event.control_key_state);
+    let known_virtual_key =
+        event.virtual_key_code == u16::from(b'J') || event.virtual_key_code == VK_RETURN;
     event.key_down
         && ctrl_pressed(event.control_key_state)
         && !alt_gr
         && !meta_pressed(event.control_key_state)
         && event.unicode_char == b'\n' as u16
-        && !virtual_key_requires_modifier_mapping(*event)
+        && known_virtual_key
         && !shift_pressed(event.control_key_state)
 }
 
-/// Returns the text count of an ambiguous, non-drained body-only prefix. Two
-/// body records already prove a fresh paste without lookahead; fewer may need
-/// the next console batch to distinguish an interactive key from a split
-/// clipboard burst. A synthesized LF, Tab, or Backspace is body text here: two
-/// records are still a burst, while each key remains live when it is the only
-/// drained record. Once an envelope is open, the continuation path owns the
-/// state and must not be deferred.
-fn ambiguous_paste_lookahead_body_count(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PasteLookahead {
+    body_count: usize,
+    wait_for_continuation: bool,
+}
+
+struct PendingSynthesizedLf {
+    events: Vec<BatchEvent>,
+    observed_at: Instant,
+}
+
+/// Returns the evidence for one bounded paste lookahead. A queued, non-drained
+/// body-only prefix can be read immediately. Once the queue has drained, only a
+/// singleton synthesized LF waits: releasing that record before a following
+/// paste record can submit a partial command, while delaying ordinary
+/// interactive text would damage responsiveness. ConPTY synthesizes the same
+/// modifier/key-up group for clipboard LF as for a physical Ctrl+Enter, so
+/// key-up shape is not evidence. A continuation or recent detected paste keeps
+/// the LF bracketed; a lone LF remains a live Ctrl+Enter.
+fn paste_lookahead(
     events: &[BatchEvent],
     drained: bool,
     paste_open: bool,
-) -> Option<usize> {
-    if drained || paste_open {
+) -> Option<PasteLookahead> {
+    if paste_open {
         return None;
     }
 
     let text_downs = ambiguous_paste_body_count(events)?;
-    (text_downs < 2).then_some(text_downs)
+    if text_downs >= 2 {
+        return None;
+    }
+    if !drained {
+        return Some(PasteLookahead {
+            body_count: text_downs,
+            wait_for_continuation: false,
+        });
+    }
+    is_single_synthesized_lf_prefix(events).then_some(PasteLookahead {
+        body_count: text_downs,
+        wait_for_continuation: true,
+    })
+}
+
+fn is_single_synthesized_lf_prefix(events: &[BatchEvent]) -> bool {
+    let mut saw_lf = false;
+    for event in events {
+        let BatchEvent::Key(key) = event else {
+            return false;
+        };
+        if !key.key_down || is_pure_modifier_key_down(key) {
+            continue;
+        }
+        if saw_lf || key.repeat_count != 1 || !is_conpty_synthesized_paste_lf(key) {
+            return false;
+        }
+        saw_lf = true;
+    }
+    saw_lf
+}
+
+fn is_conpty_synthesized_paste_lf(event: &ConsoleKeyEvent) -> bool {
+    is_synthesized_paste_lf(event)
+        && event.virtual_key_code == VK_RETURN
+        && event.virtual_scan_code == 0x1c
+}
+
+fn ctrl_modifier_down_after(events: &[BatchEvent], mut ctrl_down: bool) -> bool {
+    for event in events {
+        let BatchEvent::Key(key) = event else {
+            continue;
+        };
+        if matches!(key.virtual_key_code, VK_CONTROL | VK_LCONTROL | VK_RCONTROL) {
+            ctrl_down = key.key_down;
+        } else if !ctrl_pressed(key.control_key_state) {
+            // A focus transition can lose the dedicated Control key-up record.
+            // Every subsequent key record still carries the current modifier
+            // snapshot, so reconcile the latch as soon as that snapshot says
+            // Control is no longer held.
+            ctrl_down = false;
+        }
+    }
+    ctrl_down
+}
+
+fn contains_only_synthesized_lf_text(events: &[BatchEvent]) -> bool {
+    let mut saw_lf = false;
+    for event in events {
+        let BatchEvent::Key(key) = event else {
+            return false;
+        };
+        if !key.key_down || is_pure_modifier_key_down(key) {
+            continue;
+        }
+        if !is_synthesized_paste_lf(key) {
+            return false;
+        }
+        saw_lf = true;
+    }
+    saw_lf
+}
+
+fn is_held_physical_ctrl_lf_batch(events: &[BatchEvent]) -> bool {
+    contains_only_synthesized_lf_text(events)
+        && !events.iter().any(|event| {
+            matches!(
+                event,
+                BatchEvent::Key(key)
+                    if !key.key_down
+                        && matches!(
+                            key.virtual_key_code,
+                            VK_CONTROL | VK_LCONTROL | VK_RCONTROL
+                        )
+            )
+        })
 }
 
 /// Validates a prefix containing only single-repeat paste body records plus
@@ -431,6 +691,15 @@ fn ambiguous_paste_body_count(events: &[BatchEvent]) -> Option<usize> {
         text_downs += 1;
     }
     (text_downs >= 1).then_some(text_downs)
+}
+
+fn paste_body_text_count(events: &[BatchEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(event, BatchEvent::Key(key) if key.key_down && is_paste_body_text(key))
+        })
+        .count()
 }
 
 /// A pure-modifier key-down (`unicode_char == 0`) — the shift/ctrl/alt records
@@ -541,7 +810,7 @@ fn encode_input_batch(
     encode_input_batch_with_hint(
         events,
         drained,
-        false,
+        PasteEncodingHint::default(),
         paste_open,
         paste_carryover,
         pending_high_surrogate,
@@ -549,10 +818,16 @@ fn encode_input_batch(
     )
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PasteEncodingHint {
+    force_ambiguous_lookahead_paste: bool,
+    suppress_fresh_paste: bool,
+}
+
 fn encode_input_batch_with_hint(
     events: &[BatchEvent],
     drained: bool,
-    force_ambiguous_lookahead_paste: bool,
+    hint: PasteEncodingHint,
     paste_open: &mut bool,
     paste_carryover: &mut Vec<u8>,
     pending_high_surrogate: &mut Option<u16>,
@@ -604,10 +879,10 @@ fn encode_input_batch_with_hint(
     }
 
     let paste_text_only = !has_other_key;
-    let is_paste = paste_text_only
-        && (text_downs >= 2
-            || (*paste_open && text_downs >= 1)
-            || (force_ambiguous_lookahead_paste && text_downs >= 1));
+    let continuing_paste = *paste_open && text_downs >= 1;
+    let fresh_paste = !hint.suppress_fresh_paste
+        && (text_downs >= 2 || (hint.force_ambiguous_lookahead_paste && text_downs >= 1));
+    let is_paste = paste_text_only && (continuing_paste || fresh_paste);
 
     let mut inputs = Vec::new();
     if is_paste {
@@ -625,7 +900,7 @@ fn encode_input_batch_with_hint(
         let mut text = std::mem::take(paste_carryover);
         for event in events {
             if let BatchEvent::Key(key) = event {
-                text.extend_from_slice(&encode_key_event(*key, pending_high_surrogate));
+                text.extend_from_slice(&encode_paste_body_key_event(*key, pending_high_surrogate));
             }
         }
         // Mouse records coalesced with clipboard text are suppressed so they
@@ -906,6 +1181,21 @@ fn trace_windows_console_key(key: AttachedWindowsConsoleKey, bytes: &[u8]) {
         ?bytes,
         "read Windows attach console key"
     );
+}
+
+fn encode_paste_body_key_event(
+    event: ConsoleKeyEvent,
+    pending_high_surrogate: &mut Option<u16>,
+) -> Vec<u8> {
+    if is_synthesized_paste_lf(&event) {
+        // Live Ctrl+Enter remains a modified console key, but inside a burst
+        // independently identified as paste this record represents the literal
+        // U+000A clipboard byte. Encoding it through VK_RETURN would turn it
+        // into CSI 13;5u and corrupt the paste body.
+        pending_high_surrogate.take();
+        return vec![b'\n'; usize::from(event.repeat_count.max(1))];
+    }
+    encode_key_event(event, pending_high_surrogate)
 }
 
 fn encode_key_event(event: ConsoleKeyEvent, pending_high_surrogate: &mut Option<u16>) -> Vec<u8> {
@@ -1249,6 +1539,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::io;
     use std::sync::Mutex;
+    use std::time::{Duration, Instant};
 
     use super::super::console_coordination::ConsoleIoCoordinator;
     use super::super::console_input_read::ConsoleInputApi;
@@ -1258,6 +1549,7 @@ mod tests {
         parent_allows_sgr_mouse_key_batches, strip_embedded_paste_markers,
         windows_console_key_for_event, AttachInput, BatchEvent, ConsoleInputReader,
         ConsoleKeyEvent, ATTACH_INPUT_CHUNK_LIMIT, BRACKETED_PASTE_END, BRACKETED_PASTE_START,
+        RECENT_PASTE_EVIDENCE_WINDOW,
     };
     use crate::nested::ClientContextParent;
     use windows_sys::Win32::Foundation::HANDLE;
@@ -1268,8 +1560,8 @@ mod tests {
         RIGHTMOST_BUTTON_PRESSED, RIGHT_ALT_PRESSED, SHIFT_PRESSED,
     };
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F5, VK_HOME, VK_LEFT, VK_RETURN,
-        VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+        VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F5, VK_HOME, VK_LEFT,
+        VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
     };
 
     #[test]
@@ -1355,6 +1647,8 @@ mod tests {
 
     struct FakeConsoleState {
         records: VecDeque<INPUT_RECORD>,
+        deferred_records: VecDeque<INPUT_RECORD>,
+        read_caps: VecDeque<usize>,
         calls: Vec<FakeConsoleCall>,
     }
 
@@ -1367,6 +1661,51 @@ mod tests {
             Self {
                 state: Mutex::new(FakeConsoleState {
                     records: records.into_iter().collect(),
+                    deferred_records: VecDeque::new(),
+                    read_caps: VecDeque::new(),
+                    calls: Vec::new(),
+                }),
+            }
+        }
+
+        fn with_deferred(
+            records: impl IntoIterator<Item = INPUT_RECORD>,
+            deferred_records: impl IntoIterator<Item = INPUT_RECORD>,
+        ) -> Self {
+            Self {
+                state: Mutex::new(FakeConsoleState {
+                    records: records.into_iter().collect(),
+                    deferred_records: deferred_records.into_iter().collect(),
+                    read_caps: VecDeque::new(),
+                    calls: Vec::new(),
+                }),
+            }
+        }
+
+        fn with_read_caps(
+            records: impl IntoIterator<Item = INPUT_RECORD>,
+            read_caps: impl IntoIterator<Item = usize>,
+        ) -> Self {
+            Self {
+                state: Mutex::new(FakeConsoleState {
+                    records: records.into_iter().collect(),
+                    deferred_records: VecDeque::new(),
+                    read_caps: read_caps.into_iter().collect(),
+                    calls: Vec::new(),
+                }),
+            }
+        }
+
+        fn with_deferred_and_read_caps(
+            records: impl IntoIterator<Item = INPUT_RECORD>,
+            deferred_records: impl IntoIterator<Item = INPUT_RECORD>,
+            read_caps: impl IntoIterator<Item = usize>,
+        ) -> Self {
+            Self {
+                state: Mutex::new(FakeConsoleState {
+                    records: records.into_iter().collect(),
+                    deferred_records: deferred_records.into_iter().collect(),
+                    read_caps: read_caps.into_iter().collect(),
                     calls: Vec::new(),
                 }),
             }
@@ -1376,6 +1715,12 @@ mod tests {
             let mut state = self.state.lock().expect("fake console remains usable");
             state.calls.push(FakeConsoleCall::Flush);
             state.records.clear();
+        }
+
+        fn release_deferred(&self) {
+            let mut state = self.state.lock().expect("fake console remains usable");
+            let deferred = std::mem::take(&mut state.deferred_records);
+            state.records.extend(deferred);
         }
 
         fn calls(&self) -> Vec<FakeConsoleCall> {
@@ -1398,7 +1743,8 @@ mod tests {
         fn read_records(&self, _handle: HANDLE, records: &mut [INPUT_RECORD]) -> io::Result<usize> {
             let mut state = self.state.lock().expect("fake console remains usable");
             state.calls.push(FakeConsoleCall::Read);
-            let records_read = records.len().min(state.records.len());
+            let read_cap = state.read_caps.pop_front().unwrap_or(records.len());
+            let records_read = records.len().min(read_cap).min(state.records.len());
             for record in records.iter_mut().take(records_read) {
                 *record = state
                     .records
@@ -1416,7 +1762,9 @@ mod tests {
     fn console_paste_input_record(byte: u8) -> INPUT_RECORD {
         let event = match byte {
             b'\r' => key_event(VK_RETURN, b'\r' as u16, 0),
-            b'\n' => key_event(b'J' as u16, b'\n' as u16, LEFT_CTRL_PRESSED),
+            // Windows OpenSSH/ConPTY synthesizes a raw LF as Ctrl+Enter, not
+            // Ctrl+J: VK_RETURN, scan 0x1c, U+000A, LEFT_CTRL_PRESSED.
+            b'\n' => conpty_lf_event(LEFT_CTRL_PRESSED),
             _ => key_event(u16::from(byte), u16::from(byte), 0),
         };
         console_key_input_record_from_event(event)
@@ -1454,8 +1802,20 @@ mod tests {
             last_mouse_button_state: 0,
             paste_open: false,
             paste_carryover: Vec::new(),
+            last_paste_batch_at: None,
+            pending_synthesized_lf: None,
+            ctrl_modifier_down: false,
             tmux_parent_sgr_mouse: false,
         }
+    }
+
+    fn expire_pending_synthesized_lf(reader: &mut ConsoleInputReader) {
+        reader
+            .pending_synthesized_lf
+            .as_mut()
+            .expect("the ambiguous LF is pending")
+            .observed_at =
+            Instant::now() - super::SYNTHESIZED_LF_LOOKAHEAD_TIMEOUT - Duration::from_millis(1);
     }
 
     #[test]
@@ -1465,6 +1825,12 @@ mod tests {
         reader.last_mouse_button_state = FROM_LEFT_1ST_BUTTON_PRESSED;
         reader.paste_open = true;
         reader.paste_carryover = b"\x1b[20".to_vec();
+        reader.last_paste_batch_at = Some(Instant::now());
+        reader.pending_synthesized_lf = Some(super::PendingSynthesizedLf {
+            events: vec![BatchEvent::Key(conpty_lf_event(LEFT_CTRL_PRESSED))],
+            observed_at: Instant::now(),
+        });
+        reader.ctrl_modifier_down = true;
 
         reader.reset_after_exclusive_action();
 
@@ -1472,6 +1838,9 @@ mod tests {
         assert_eq!(reader.last_mouse_button_state, 0);
         assert!(!reader.paste_open);
         assert!(reader.paste_carryover.is_empty());
+        assert!(reader.last_paste_batch_at.is_none());
+        assert!(reader.pending_synthesized_lf.is_none());
+        assert!(!reader.ctrl_modifier_down);
     }
 
     #[test]
@@ -1677,6 +2046,506 @@ mod tests {
             }
             assert!(!reader.paste_open);
         }
+    }
+
+    #[test]
+    fn drained_conpty_lf_waits_for_a_delayed_paste_continuation() {
+        let api = FakeConsoleInput::with_deferred(
+            [console_key_input_record_from_event(conpty_lf_event(
+                LEFT_CTRL_PRESSED,
+            ))],
+            [console_key_input_record(b'b')],
+        );
+        let coordinator = ConsoleIoCoordinator::new();
+        let mut reader = fake_console_reader();
+
+        let initial = reader
+            .read_key_inputs_with(&coordinator, &api)
+            .expect("the ambiguous LF is retained without blocking");
+        assert!(initial.is_empty());
+        assert!(reader.pending_synthesized_lf.is_some());
+
+        api.release_deferred();
+        let inputs = reader
+            .read_key_inputs_with(&coordinator, &api)
+            .expect("the delayed paste continuation resolves the pending LF");
+        assert_eq!(batch_bytes(&inputs), bracketed_text(b"\nb"));
+        assert!(reader.pending_synthesized_lf.is_none());
+        assert!(!reader.paste_open);
+    }
+
+    #[test]
+    fn drained_conpty_lf_without_a_continuation_stays_live() {
+        let api = FakeConsoleInput::new([console_key_input_record_from_event(conpty_lf_event(
+            LEFT_CTRL_PRESSED,
+        ))]);
+        let coordinator = ConsoleIoCoordinator::new();
+        let mut reader = fake_console_reader();
+
+        let initial = reader
+            .read_key_inputs_with(&coordinator, &api)
+            .expect("an unmatched synthesized LF is retained without blocking");
+        assert!(initial.is_empty());
+
+        expire_pending_synthesized_lf(&mut reader);
+        let inputs = reader.flush_expired_pending_input();
+        assert_eq!(batch_bytes(&inputs), b"\x1b[13;5u");
+        assert!(!batch_bytes(&inputs).starts_with(BRACKETED_PASTE_START));
+        assert!(reader.pending_synthesized_lf.is_none());
+        assert!(!reader.paste_open);
+    }
+
+    #[test]
+    fn conpty_lf_group_waits_for_a_delayed_paste_continuation() {
+        let mut ctrl_down = key_event(VK_CONTROL, 0, LEFT_CTRL_PRESSED);
+        ctrl_down.virtual_scan_code = 0x1d;
+        let mut ctrl_up = ctrl_down;
+        ctrl_up.key_down = false;
+        ctrl_up.control_key_state = 0;
+        let down = conpty_lf_event(LEFT_CTRL_PRESSED);
+        let mut up = down;
+        up.key_down = false;
+        let api = FakeConsoleInput::with_deferred(
+            [ctrl_down, down, up, ctrl_up]
+                .into_iter()
+                .map(console_key_input_record_from_event),
+            [console_key_input_record(b'b')],
+        );
+        let coordinator = ConsoleIoCoordinator::new();
+        let mut reader = fake_console_reader();
+
+        let initial = reader
+            .read_key_inputs_with(&coordinator, &api)
+            .expect("the captured ConPTY LF group is retained without blocking");
+        assert!(initial.is_empty());
+
+        api.release_deferred();
+        let inputs = reader
+            .read_key_inputs_with(&coordinator, &api)
+            .expect("the following paste text resolves the captured LF group");
+        assert_eq!(batch_bytes(&inputs), bracketed_text(b"\nb"));
+        assert!(!reader.paste_open);
+    }
+
+    #[test]
+    fn conpty_lf_split_after_the_next_control_down_remains_paste() {
+        let mut ctrl_down = key_event(VK_CONTROL, 0, LEFT_CTRL_PRESSED);
+        ctrl_down.virtual_scan_code = 0x1d;
+        let mut ctrl_up = ctrl_down;
+        ctrl_up.key_down = false;
+        ctrl_up.control_key_state = 0;
+        let down = conpty_lf_event(LEFT_CTRL_PRESSED);
+        let mut up = down;
+        up.key_down = false;
+        let first = [ctrl_down, down, up, ctrl_up, ctrl_down]
+            .into_iter()
+            .map(console_key_input_record_from_event);
+        let second = [down, up, ctrl_up]
+            .into_iter()
+            .map(console_key_input_record_from_event);
+        let api = FakeConsoleInput::with_deferred(first, second);
+        let coordinator = ConsoleIoCoordinator::new();
+        let mut reader = fake_console_reader();
+
+        let initial = reader
+            .read_key_inputs_with(&coordinator, &api)
+            .expect("a completed LF before another Control-down remains ambiguous");
+        assert!(initial.is_empty());
+        assert!(reader.pending_synthesized_lf.is_some());
+
+        api.release_deferred();
+        let inputs = reader
+            .read_key_inputs_with(&coordinator, &api)
+            .expect("the second LF resolves both groups as paste");
+        assert_eq!(batch_bytes(&inputs), bracketed_text(b"\n\n"));
+        assert!(!reader.paste_open);
+    }
+
+    #[test]
+    fn recent_paste_evidence_keeps_a_trailing_isolated_lf_bracketed() {
+        let coordinator = ConsoleIoCoordinator::new();
+        let mut reader = fake_console_reader();
+        let prefix = FakeConsoleInput::new([
+            console_key_input_record(b'a'),
+            console_key_input_record(b'b'),
+        ]);
+        let prefix_inputs = reader
+            .read_key_inputs_with(&coordinator, &prefix)
+            .expect("the prefix establishes paste evidence");
+        assert_eq!(batch_bytes(&prefix_inputs), bracketed_text(b"ab"));
+
+        let mut ctrl_down = key_event(VK_CONTROL, 0, LEFT_CTRL_PRESSED);
+        ctrl_down.virtual_scan_code = 0x1d;
+        let mut ctrl_up = ctrl_down;
+        ctrl_up.key_down = false;
+        ctrl_up.control_key_state = 0;
+        let down = conpty_lf_event(LEFT_CTRL_PRESSED);
+        let mut up = down;
+        up.key_down = false;
+        let trailing = FakeConsoleInput::new(
+            [ctrl_down, down, up, ctrl_up]
+                .into_iter()
+                .map(console_key_input_record_from_event),
+        );
+        let trailing_inputs = reader
+            .read_key_inputs_with(&coordinator, &trailing)
+            .expect("a trailing LF inside the bounded paste window remains bracketed");
+
+        assert_eq!(batch_bytes(&trailing_inputs), bracketed_text(b"\n"));
+        assert!(!reader.paste_open);
+    }
+
+    #[test]
+    fn recent_evidence_is_not_refreshed_by_a_forced_singleton() {
+        let coordinator = ConsoleIoCoordinator::new();
+        let mut reader = fake_console_reader();
+        let prefix = FakeConsoleInput::new([
+            console_key_input_record(b'a'),
+            console_key_input_record(b'b'),
+        ]);
+        let prefix_inputs = reader
+            .read_key_inputs_with(&coordinator, &prefix)
+            .expect("the prefix establishes strong paste evidence");
+        assert_eq!(batch_bytes(&prefix_inputs), bracketed_text(b"ab"));
+        let original_evidence = reader
+            .last_paste_batch_at
+            .expect("the strong paste records its timestamp");
+
+        let singleton = FakeConsoleInput::new([console_key_input_record_from_event(
+            conpty_lf_event(LEFT_CTRL_PRESSED),
+        )]);
+        let singleton_inputs = reader
+            .read_key_inputs_with(&coordinator, &singleton)
+            .expect("recent evidence brackets the isolated LF");
+        assert_eq!(batch_bytes(&singleton_inputs), bracketed_text(b"\n"));
+        assert_eq!(
+            reader.last_paste_batch_at,
+            Some(original_evidence),
+            "weak evidence must not extend its own lifetime"
+        );
+
+        reader.last_paste_batch_at =
+            Some(Instant::now() - RECENT_PASTE_EVIDENCE_WINDOW - Duration::from_millis(1));
+        let after_expiry = FakeConsoleInput::new([console_key_input_record_from_event(
+            conpty_lf_event(LEFT_CTRL_PRESSED),
+        )]);
+        let after_expiry_inputs = reader
+            .read_key_inputs_with(&coordinator, &after_expiry)
+            .expect("expired weak evidence no longer brackets another LF");
+        assert!(after_expiry_inputs.is_empty());
+        assert!(reader.pending_synthesized_lf.is_some());
+    }
+
+    #[test]
+    fn stale_control_latch_cannot_break_an_open_paste_continuation() {
+        let coordinator = ConsoleIoCoordinator::new();
+        let mut reader = fake_console_reader();
+        reader.paste_open = true;
+        reader.ctrl_modifier_down = true;
+        let mut records = b"abcdefghijklmnop"
+            .iter()
+            .copied()
+            .map(console_key_input_record)
+            .collect::<Vec<_>>();
+        records.push(console_key_input_record_from_event(conpty_lf_event(
+            LEFT_CTRL_PRESSED,
+        )));
+        let continuation = FakeConsoleInput::new(records);
+
+        let inputs = reader
+            .read_key_inputs_with(&coordinator, &continuation)
+            .expect("an open paste remains authoritative over stale modifier state");
+
+        let mut expected = b"abcdefghijklmnop\n".to_vec();
+        expected.extend_from_slice(BRACKETED_PASTE_END);
+        assert_eq!(batch_bytes(&inputs), expected);
+        assert!(!reader.ctrl_modifier_down);
+        assert!(!reader.paste_open);
+    }
+
+    #[test]
+    fn neutral_key_snapshot_reconciles_a_lost_control_keyup() {
+        let coordinator = ConsoleIoCoordinator::new();
+        let mut reader = fake_console_reader();
+        reader.ctrl_modifier_down = true;
+        let paste = FakeConsoleInput::new([
+            console_key_input_record(b'a'),
+            console_key_input_record(b'b'),
+        ]);
+
+        let inputs = reader
+            .read_key_inputs_with(&coordinator, &paste)
+            .expect("neutral key snapshots clear a stale Control latch");
+
+        assert_eq!(batch_bytes(&inputs), bracketed_text(b"ab"));
+        assert!(!reader.ctrl_modifier_down);
+    }
+
+    #[test]
+    fn stale_control_latch_cannot_suppress_a_looked_ahead_paste() {
+        let coordinator = ConsoleIoCoordinator::new();
+        let mut reader = fake_console_reader();
+        reader.ctrl_modifier_down = true;
+        let records = std::iter::once(console_key_input_record_from_event(conpty_lf_event(
+            LEFT_CTRL_PRESSED,
+        )))
+        .chain(b"KLMNO".iter().copied().map(console_key_input_record));
+        let paste = FakeConsoleInput::with_read_caps(records, [1]);
+
+        let inputs = reader
+            .read_key_inputs_with(&coordinator, &paste)
+            .expect("the lookahead reconciles stale Control state before classification");
+
+        assert_eq!(batch_bytes(&inputs), bracketed_text(b"\nKLMNO"));
+        assert!(!reader.ctrl_modifier_down);
+        assert!(!reader.paste_open);
+    }
+
+    #[test]
+    fn stale_control_latch_cannot_release_a_delayed_paste_lf_live() {
+        for delay_ms in [150, 250] {
+            let coordinator = ConsoleIoCoordinator::new();
+            let mut reader = fake_console_reader();
+            reader.ctrl_modifier_down = true;
+            let paste = FakeConsoleInput::with_deferred(
+                [console_key_input_record_from_event(conpty_lf_event(
+                    LEFT_CTRL_PRESSED,
+                ))],
+                b"KLMNO".iter().copied().map(console_key_input_record),
+            );
+
+            let initial = reader
+                .read_key_inputs_with(&coordinator, &paste)
+                .expect("a stale Control latch cannot make an ambiguous LF live");
+            assert!(initial.is_empty());
+            reader
+                .pending_synthesized_lf
+                .as_mut()
+                .expect("the LF remains pending")
+                .observed_at = Instant::now() - Duration::from_millis(delay_ms);
+
+            paste.release_deferred();
+            let inputs = reader
+                .read_key_inputs_with(&coordinator, &paste)
+                .expect("the delayed body resolves the stale-latch LF as paste");
+
+            assert_eq!(batch_bytes(&inputs), bracketed_text(b"\nKLMNO"));
+            assert!(!reader.ctrl_modifier_down);
+            assert!(!reader.paste_open);
+        }
+    }
+
+    #[test]
+    fn noise_only_lookahead_cannot_release_a_delayed_paste_lf_live() {
+        for delay_ms in [150, 250] {
+            let mut ctrl_down = key_event(VK_CONTROL, 0, LEFT_CTRL_PRESSED);
+            ctrl_down.virtual_scan_code = 0x1d;
+            let mut ctrl_up = ctrl_down;
+            ctrl_up.key_down = false;
+            ctrl_up.control_key_state = 0;
+            let lf_down = conpty_lf_event(LEFT_CTRL_PRESSED);
+            let mut lf_up = lf_down;
+            lf_up.key_down = false;
+            let paste = FakeConsoleInput::with_deferred_and_read_caps(
+                [ctrl_down, lf_down, lf_up, ctrl_up]
+                    .into_iter()
+                    .map(console_key_input_record_from_event),
+                b"KLMNO".iter().copied().map(console_key_input_record),
+                [2, 2],
+            );
+            let coordinator = ConsoleIoCoordinator::new();
+            let mut reader = fake_console_reader();
+
+            let initial = reader
+                .read_key_inputs_with(&coordinator, &paste)
+                .expect("key-up noise cannot make the split LF live");
+            assert!(initial.is_empty());
+            reader
+                .pending_synthesized_lf
+                .as_mut()
+                .expect("the noise-drained LF remains pending")
+                .observed_at = Instant::now() - Duration::from_millis(delay_ms);
+
+            paste.release_deferred();
+            let inputs = reader
+                .read_key_inputs_with(&coordinator, &paste)
+                .expect("the delayed body resolves the split group as paste");
+
+            assert_eq!(batch_bytes(&inputs), bracketed_text(b"\nKLMNO"));
+            assert!(!reader.ctrl_modifier_down);
+            assert!(!reader.paste_open);
+        }
+    }
+
+    #[test]
+    fn expired_paste_evidence_leaves_a_lone_ctrl_enter_live() {
+        let mut reader = fake_console_reader();
+        reader.last_paste_batch_at =
+            Some(Instant::now() - RECENT_PASTE_EVIDENCE_WINDOW - Duration::from_millis(1));
+        let api = FakeConsoleInput::new([console_key_input_record_from_event(conpty_lf_event(
+            LEFT_CTRL_PRESSED,
+        ))]);
+        let coordinator = ConsoleIoCoordinator::new();
+
+        let initial = reader
+            .read_key_inputs_with(&coordinator, &api)
+            .expect("expired paste evidence cannot immediately consume a physical Ctrl+Enter");
+        assert!(initial.is_empty());
+
+        expire_pending_synthesized_lf(&mut reader);
+        let inputs = reader.flush_expired_pending_input();
+        assert_eq!(batch_bytes(&inputs), b"\x1b[13;5u");
+        assert!(!batch_bytes(&inputs).starts_with(BRACKETED_PASTE_START));
+        assert!(reader.last_paste_batch_at.is_none());
+    }
+
+    #[test]
+    fn drained_physical_ctrl_enter_keyup_keeps_the_key_live() {
+        let mut ctrl_down = key_event(VK_CONTROL, 0, LEFT_CTRL_PRESSED);
+        ctrl_down.virtual_scan_code = 0x1d;
+        let down = conpty_lf_event(LEFT_CTRL_PRESSED);
+        let mut up = down;
+        up.key_down = false;
+        let api = FakeConsoleInput::with_deferred(
+            [ctrl_down, down]
+                .into_iter()
+                .map(console_key_input_record_from_event),
+            [console_key_input_record_from_event(up)],
+        );
+        let coordinator = ConsoleIoCoordinator::new();
+        let mut reader = fake_console_reader();
+
+        let initial = reader
+            .read_key_inputs_with(&coordinator, &api)
+            .expect("a still-held physical Ctrl+Enter remains ambiguous");
+        assert!(initial.is_empty());
+
+        api.release_deferred();
+        let keyup = reader
+            .read_key_inputs_with(&coordinator, &api)
+            .expect("the matching key-up does not invent paste evidence");
+        assert!(keyup.is_empty());
+        expire_pending_synthesized_lf(&mut reader);
+        let inputs = reader.flush_expired_pending_input();
+        assert_eq!(inputs.len(), 1);
+        assert!(!inputs[0].payload().starts_with(BRACKETED_PASTE_START));
+        let key = inputs[0]
+            .windows_console_key()
+            .expect("physical Ctrl+Enter metadata survives the lookahead");
+        assert_eq!(key.virtual_key_code(), VK_RETURN);
+        assert_eq!(key.virtual_scan_code(), 0x1c);
+        assert_eq!(key.unicode_char(), b'\n' as u16);
+        assert_eq!(key.control_key_state(), LEFT_CTRL_PRESSED);
+        assert!(reader.pending_synthesized_lf.is_none());
+        assert!(!reader.paste_open);
+    }
+
+    #[test]
+    fn drained_physical_ctrl_enter_completed_in_one_batch_stays_live() {
+        let mut ctrl_down = key_event(VK_CONTROL, 0, LEFT_CTRL_PRESSED);
+        ctrl_down.virtual_scan_code = 0x1d;
+        let mut ctrl_up = ctrl_down;
+        ctrl_up.key_down = false;
+        ctrl_up.control_key_state = 0;
+        let down = conpty_lf_event(LEFT_CTRL_PRESSED);
+        let mut up = down;
+        up.key_down = false;
+        let api = FakeConsoleInput::new(
+            [ctrl_down, down, up, ctrl_up]
+                .into_iter()
+                .map(console_key_input_record_from_event),
+        );
+        let coordinator = ConsoleIoCoordinator::new();
+        let mut reader = fake_console_reader();
+
+        let initial = reader
+            .read_key_inputs_with(&coordinator, &api)
+            .expect("a fully buffered chord is retained because it matches a pasted LF exactly");
+        assert!(initial.is_empty());
+
+        expire_pending_synthesized_lf(&mut reader);
+        let inputs = reader.flush_expired_pending_input();
+        assert_eq!(batch_bytes(&inputs), b"\x1b[13;5u");
+        assert!(!batch_bytes(&inputs).starts_with(BRACKETED_PASTE_START));
+        assert_eq!(
+            inputs[0]
+                .windows_console_key()
+                .expect("physical Ctrl+Enter metadata survives")
+                .virtual_key_code(),
+            VK_RETURN
+        );
+        assert!(!reader.paste_open);
+    }
+
+    #[test]
+    fn held_physical_ctrl_enter_auto_repeat_stays_live() {
+        let mut ctrl_down = key_event(VK_CONTROL, 0, LEFT_CTRL_PRESSED);
+        ctrl_down.virtual_scan_code = 0x1d;
+        let coordinator = ConsoleIoCoordinator::new();
+        let mut reader = fake_console_reader();
+
+        let modifier = FakeConsoleInput::new([console_key_input_record_from_event(ctrl_down)]);
+        let modifier_inputs = reader
+            .read_key_inputs_with(&coordinator, &modifier)
+            .expect("the held modifier state is observed");
+        assert!(modifier_inputs.is_empty());
+        assert!(reader.ctrl_modifier_down);
+
+        let repeated = FakeConsoleInput::with_deferred(
+            [console_key_input_record_from_event(conpty_lf_event(
+                LEFT_CTRL_PRESSED,
+            ))],
+            [console_key_input_record_from_event(conpty_lf_event(
+                LEFT_CTRL_PRESSED,
+            ))],
+        );
+        let first_inputs = reader
+            .read_key_inputs_with(&coordinator, &repeated)
+            .expect("physical Enter auto-repeat remains live while Control is held");
+        repeated.release_deferred();
+        let second_inputs = reader
+            .read_key_inputs_with(&coordinator, &repeated)
+            .expect("the next physical Enter repeat remains live");
+        let inputs = first_inputs
+            .into_iter()
+            .chain(second_inputs)
+            .collect::<Vec<_>>();
+
+        assert_eq!(batch_bytes(&inputs), b"\x1b[13;5u\x1b[13;5u");
+        assert!(!batch_bytes(&inputs).starts_with(BRACKETED_PASTE_START));
+        assert!(reader.ctrl_modifier_down);
+        assert!(!reader.paste_open);
+    }
+
+    #[test]
+    fn repeated_conpty_paste_lf_groups_remain_bracketed() {
+        let mut records = Vec::new();
+        for _ in 0..2 {
+            let mut ctrl_down = key_event(VK_CONTROL, 0, LEFT_CTRL_PRESSED);
+            ctrl_down.virtual_scan_code = 0x1d;
+            let mut ctrl_up = ctrl_down;
+            ctrl_up.key_down = false;
+            ctrl_up.control_key_state = 0;
+            let down = conpty_lf_event(LEFT_CTRL_PRESSED);
+            let mut up = down;
+            up.key_down = false;
+            records.extend(
+                [ctrl_down, down, up, ctrl_up]
+                    .into_iter()
+                    .map(console_key_input_record_from_event),
+            );
+        }
+        let api = FakeConsoleInput::new(records);
+        let coordinator = ConsoleIoCoordinator::new();
+        let mut reader = fake_console_reader();
+
+        let inputs = reader
+            .read_key_inputs_with(&coordinator, &api)
+            .expect("complete ConPTY modifier groups remain paste evidence");
+
+        assert_eq!(batch_bytes(&inputs), bracketed_text(b"\n\n"));
+        assert!(!reader.ctrl_modifier_down);
+        assert!(!reader.paste_open);
     }
 
     #[test]
@@ -2488,7 +3357,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_synthesized_lf_stays_inside_a_paste_burst() {
+    fn supported_synthesized_lf_shapes_stay_inside_a_paste_burst() {
         let cases: &[(&[BatchEvent], &[u8])] = &[
             (
                 &[
@@ -2503,6 +3372,23 @@ mod tests {
                     BatchEvent::Key(key_event(b'a' as u16, b'a' as u16, 0)),
                     BatchEvent::Key(key_event(VK_RETURN, b'\r' as u16, 0)),
                     BatchEvent::Key(key_event(b'J' as u16, b'\n' as u16, LEFT_CTRL_PRESSED)),
+                    BatchEvent::Key(key_event(b'b' as u16, b'b' as u16, 0)),
+                ],
+                b"a\r\nb",
+            ),
+            (
+                &[
+                    BatchEvent::Key(key_event(b'a' as u16, b'a' as u16, 0)),
+                    BatchEvent::Key(conpty_lf_event(LEFT_CTRL_PRESSED)),
+                    BatchEvent::Key(key_event(b'b' as u16, b'b' as u16, 0)),
+                ],
+                b"a\nb",
+            ),
+            (
+                &[
+                    BatchEvent::Key(key_event(b'a' as u16, b'a' as u16, 0)),
+                    BatchEvent::Key(key_event(VK_RETURN, b'\r' as u16, 0)),
+                    BatchEvent::Key(conpty_lf_event(LEFT_CTRL_PRESSED)),
                     BatchEvent::Key(key_event(b'b' as u16, b'b' as u16, 0)),
                 ],
                 b"a\r\nb",
@@ -2525,15 +3411,18 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_j_chords_remain_live_outside_a_detected_paste() {
+    fn synthesized_lf_singletons_remain_live_outside_a_detected_paste() {
         let cases = [
             key_event(b'J' as u16, b'\n' as u16, LEFT_CTRL_PRESSED),
+            conpty_lf_event(LEFT_CTRL_PRESSED),
             key_event(b'J' as u16, b'\n' as u16, LEFT_CTRL_PRESSED | SHIFT_PRESSED),
+            conpty_lf_event(LEFT_CTRL_PRESSED | SHIFT_PRESSED),
             key_event(
                 b'J' as u16,
                 b'\n' as u16,
                 LEFT_CTRL_PRESSED | LEFT_ALT_PRESSED,
             ),
+            conpty_lf_event(LEFT_CTRL_PRESSED | LEFT_ALT_PRESSED),
         ];
 
         for event in cases {
@@ -2552,38 +3441,61 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_j_body_text_supplies_fresh_paste_evidence_in_a_burst() {
-        let ctrl_j = || BatchEvent::Key(key_event(b'J' as u16, b'\n' as u16, LEFT_CTRL_PRESSED));
-        let cases = [
-            (
-                [
-                    BatchEvent::Key(key_event(b'a' as u16, b'a' as u16, 0)),
-                    ctrl_j(),
-                ],
-                b"a\n".as_slice(),
-            ),
-            (
-                [
-                    ctrl_j(),
-                    BatchEvent::Key(key_event(b'a' as u16, b'a' as u16, 0)),
-                ],
-                b"\na".as_slice(),
-            ),
-            ([ctrl_j(), ctrl_j()], b"\n\n".as_slice()),
+    fn unrecognized_ctrl_lf_virtual_key_does_not_enter_paste() {
+        let events = [
+            BatchEvent::Key(key_event(b'a' as u16, b'a' as u16, 0)),
+            BatchEvent::Key(key_event(b'K' as u16, b'\n' as u16, LEFT_CTRL_PRESSED)),
+            BatchEvent::Key(key_event(b'b' as u16, b'b' as u16, 0)),
         ];
+        let mut paste_open = false;
+        let inputs = encode_input_batch(
+            &events,
+            true,
+            &mut paste_open,
+            &mut Vec::new(),
+            &mut None,
+            &mut 0,
+        );
 
-        for (events, expected) in cases {
-            let mut paste_open = false;
-            let inputs = encode_input_batch(
-                &events,
-                true,
-                &mut paste_open,
-                &mut Vec::new(),
-                &mut None,
-                &mut 0,
-            );
-            assert_eq!(batch_bytes(&inputs), bracketed_text(expected));
-            assert!(!paste_open);
+        assert!(!batch_bytes(&inputs).starts_with(BRACKETED_PASTE_START));
+        assert!(!paste_open);
+    }
+
+    #[test]
+    fn supported_synthesized_lf_shapes_supply_fresh_paste_evidence_in_a_burst() {
+        for virtual_key in [u16::from(b'J'), VK_RETURN] {
+            let lf = || BatchEvent::Key(key_event(virtual_key, b'\n' as u16, LEFT_CTRL_PRESSED));
+            let cases = [
+                (
+                    [
+                        BatchEvent::Key(key_event(b'a' as u16, b'a' as u16, 0)),
+                        lf(),
+                    ],
+                    b"a\n".as_slice(),
+                ),
+                (
+                    [
+                        lf(),
+                        BatchEvent::Key(key_event(b'a' as u16, b'a' as u16, 0)),
+                    ],
+                    b"\na".as_slice(),
+                ),
+                ([lf(), lf()], b"\n\n".as_slice()),
+            ];
+
+            for (events, expected) in cases {
+                let mut paste_open = false;
+                let inputs = encode_input_batch(
+                    &events,
+                    true,
+                    &mut paste_open,
+                    &mut Vec::new(),
+                    &mut None,
+                    &mut 0,
+                );
+                assert_eq!(batch_bytes(&inputs), bracketed_text(expected));
+                assert!(!paste_open);
+            }
         }
     }
 
@@ -2648,7 +3560,7 @@ mod tests {
             vec![
                 BatchEvent::Key(key_event(b'a' as u16, b'a' as u16, 0)),
                 BatchEvent::Key(key_event(VK_RETURN, b'\r' as u16, 0)),
-                BatchEvent::Key(key_event(b'J' as u16, b'\n' as u16, LEFT_CTRL_PRESSED)),
+                BatchEvent::Key(conpty_lf_event(LEFT_CTRL_PRESSED)),
             ],
         ];
 
@@ -2669,10 +3581,10 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_enter_unicode_lf_is_not_accepted_as_paste_body_text() {
+    fn conpty_ctrl_enter_unicode_lf_stays_inside_a_paste_burst() {
         let events = [
             BatchEvent::Key(key_event(b'a' as u16, b'a' as u16, 0)),
-            BatchEvent::Key(key_event(VK_RETURN, b'\n' as u16, LEFT_CTRL_PRESSED)),
+            BatchEvent::Key(conpty_lf_event(LEFT_CTRL_PRESSED)),
             BatchEvent::Key(key_event(b'b' as u16, b'b' as u16, 0)),
         ];
         let mut paste_open = false;
@@ -2685,20 +3597,41 @@ mod tests {
             &mut 0,
         );
 
-        assert!(!batch_bytes(&inputs).starts_with(BRACKETED_PASTE_START));
+        assert_eq!(batch_bytes(&inputs), bracketed_text(b"a\nb"));
         assert!(!paste_open);
     }
 
     #[test]
-    fn ctrl_synthesized_lf_keeps_an_existing_paste_envelope_open() {
+    fn conpty_ctrl_enter_lf_singleton_remains_a_live_console_key() {
+        let event = conpty_lf_event(LEFT_CTRL_PRESSED);
+        let mut paste_open = false;
+        let inputs = encode_input_batch(
+            &[BatchEvent::Key(event)],
+            true,
+            &mut paste_open,
+            &mut Vec::new(),
+            &mut None,
+            &mut 0,
+        );
+
+        assert_eq!(inputs.len(), 1);
+        assert!(!inputs[0].payload().starts_with(BRACKETED_PASTE_START));
+        let key = inputs[0]
+            .windows_console_key()
+            .expect("interactive Ctrl+Enter retains its Windows identity");
+        assert_eq!(key.virtual_key_code(), VK_RETURN);
+        assert_eq!(key.virtual_scan_code(), 0x1c);
+        assert_eq!(key.unicode_char(), b'\n' as u16);
+        assert_eq!(key.control_key_state(), LEFT_CTRL_PRESSED);
+        assert!(!paste_open);
+    }
+
+    #[test]
+    fn conpty_ctrl_enter_lf_keeps_an_existing_paste_envelope_open() {
         let mut paste_open = true;
         let mut carryover = Vec::new();
         let inputs = encode_input_batch(
-            &[BatchEvent::Key(key_event(
-                b'J' as u16,
-                b'\n' as u16,
-                LEFT_CTRL_PRESSED,
-            ))],
+            &[BatchEvent::Key(conpty_lf_event(LEFT_CTRL_PRESSED))],
             false,
             &mut paste_open,
             &mut carryover,
@@ -3204,6 +4137,12 @@ mod tests {
             unicode_char,
             control_key_state,
         }
+    }
+
+    fn conpty_lf_event(control_key_state: u32) -> ConsoleKeyEvent {
+        let mut event = key_event(VK_RETURN, b'\n' as u16, control_key_state);
+        event.virtual_scan_code = 0x1c;
+        event
     }
 
     fn mouse_event(

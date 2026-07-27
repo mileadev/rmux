@@ -372,6 +372,18 @@ impl PtyMaster {
         self.io.try_clone()
     }
 
+    /// Returns whether byte writes reach a Windows ConPTY child verbatim.
+    ///
+    /// Older Windows builds run ConPTY without passthrough mode and consume
+    /// bracketed-paste delimiters written through the input pipe. Callers that
+    /// must preserve those delimiters can inject Unicode console records
+    /// instead. Modern passthrough ConPTYs preserve the byte stream directly.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn preserves_verbatim_input(&self) -> bool {
+        self.io.pty.uses_passthrough()
+    }
+
     /// Consumes this master handle into its I/O endpoint.
     #[must_use]
     pub fn into_io(self) -> PtyIo {

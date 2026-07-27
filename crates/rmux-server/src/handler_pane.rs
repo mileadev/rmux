@@ -65,14 +65,16 @@ pub(in crate::handler) use pane_deferred_wait::format_references_pane_pid;
 pub(super) use pane_inspection::{
     attached_status_message_for_error, command_output_from_lines, display_time,
 };
+#[cfg(windows)]
+pub(super) use pane_io_encoding::LEGACY_CONPTY_NON_UTF8_BRACKETED_PASTE_ERROR;
 use pane_io_encoding::{
     encode_key_for_target, encode_mouse_for_target, encode_tokens_for_target,
     expand_send_key_tokens, pane_id_for_input_target, prepare_synchronized_pane_input_writes,
     write_bytes_to_target, write_bytes_to_targets, PaneInputWrite,
 };
 pub(super) use pane_io_encoding::{
-    prepare_pane_input_write, write_attached_bytes_to_target_io, write_bytes_to_target_io,
-    PaneInputLiveness,
+    prepare_pane_bracketed_paste_write, prepare_pane_input_write,
+    write_attached_bytes_to_target_io, write_bytes_to_target_io, PaneInputLiveness,
 };
 pub(in crate::handler) use pane_management::{SplitWindowParts, SplitWindowResponseMode};
 pub(super) use pane_prompt_input::decode_prompt_input_event;

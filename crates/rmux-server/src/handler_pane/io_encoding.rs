@@ -45,11 +45,25 @@ impl PaneInputWrite {
 
 enum PaneInputSink {
     Pty(PtyMaster),
+    #[cfg(windows)]
+    ConsoleUtf8(ProcessId),
     Disabled,
     #[cfg(windows)]
     QueuedStarting,
     #[cfg(test)]
     CapturedForTest,
+}
+
+#[cfg(windows)]
+pub(in crate::handler) const LEGACY_CONPTY_NON_UTF8_BRACKETED_PASTE_ERROR: &str =
+    "cannot preserve bracketed paste containing non-UTF-8 bytes on this Windows host";
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowsBracketedPasteSink {
+    Pty,
+    ConsoleUtf8,
+    RejectNonUtf8,
 }
 
 #[cfg(windows)]
@@ -113,6 +127,25 @@ pub(in crate::handler) fn prepare_pane_input_write(
     bytes: &[u8],
     liveness: PaneInputLiveness,
 ) -> Result<PaneInputWrite, RmuxError> {
+    prepare_pane_input_write_with_encoding(state, target, bytes, liveness, false)
+}
+
+pub(in crate::handler) fn prepare_pane_bracketed_paste_write(
+    state: &mut HandlerState,
+    target: &PaneTarget,
+    bytes: &[u8],
+    liveness: PaneInputLiveness,
+) -> Result<PaneInputWrite, RmuxError> {
+    prepare_pane_input_write_with_encoding(state, target, bytes, liveness, true)
+}
+
+fn prepare_pane_input_write_with_encoding(
+    state: &mut HandlerState,
+    target: &PaneTarget,
+    bytes: &[u8],
+    liveness: PaneInputLiveness,
+    preserve_bracketed_paste: bool,
+) -> Result<PaneInputWrite, RmuxError> {
     let session_name = target.session_name().clone();
     let window_index = target.window_index();
     let pane_index = target.pane_index();
@@ -137,7 +170,16 @@ pub(in crate::handler) fn prepare_pane_input_write(
         });
     }
     #[cfg(windows)]
-    if state.queue_starting_pane_input(&session_name, window_index, pane_index, bytes)? {
+    if if preserve_bracketed_paste {
+        state.queue_starting_pane_bracketed_paste_input(
+            &session_name,
+            window_index,
+            pane_index,
+            bytes,
+        )?
+    } else {
+        state.queue_starting_pane_input(&session_name, window_index, pane_index, bytes)?
+    } {
         return Ok(PaneInputWrite {
             session_name,
             window_index,
@@ -153,6 +195,30 @@ pub(in crate::handler) fn prepare_pane_input_write(
             state.clone_pane_master(&session_name, window_index, pane_index)?
         }
     };
+    #[cfg(windows)]
+    if preserve_bracketed_paste {
+        match windows_bracketed_paste_sink(master.preserves_verbatim_input(), bytes) {
+            WindowsBracketedPasteSink::Pty => {}
+            WindowsBracketedPasteSink::ConsoleUtf8 => {
+                let raw_pid = state.pane_pid_in_window(&session_name, window_index, pane_index)?;
+                let pid = ProcessId::new(raw_pid)
+                    .map_err(|error| RmuxError::Server(error.to_string()))?;
+                return Ok(PaneInputWrite {
+                    session_name,
+                    window_index,
+                    pane_index,
+                    sink: PaneInputSink::ConsoleUtf8(pid),
+                });
+            }
+            WindowsBracketedPasteSink::RejectNonUtf8 => {
+                return Err(RmuxError::Message(
+                    LEGACY_CONPTY_NON_UTF8_BRACKETED_PASTE_ERROR.to_owned(),
+                ));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = preserve_bracketed_paste;
     #[cfg(not(any(test, windows)))]
     let _ = bytes;
     Ok(PaneInputWrite {
@@ -161,6 +227,20 @@ pub(in crate::handler) fn prepare_pane_input_write(
         pane_index,
         sink: PaneInputSink::Pty(master),
     })
+}
+
+#[cfg(windows)]
+fn windows_bracketed_paste_sink(
+    preserves_verbatim_input: bool,
+    bytes: &[u8],
+) -> WindowsBracketedPasteSink {
+    if preserves_verbatim_input {
+        WindowsBracketedPasteSink::Pty
+    } else if std::str::from_utf8(bytes).is_ok() {
+        WindowsBracketedPasteSink::ConsoleUtf8
+    } else {
+        WindowsBracketedPasteSink::RejectNonUtf8
+    }
 }
 
 pub(super) fn prepare_attached_pane_input_writes(
@@ -812,6 +892,24 @@ async fn write_bytes_to_target_io_classified(
         PaneInputSink::Disabled => Ok(()),
         #[cfg(windows)]
         PaneInputSink::QueuedStarting => Ok(()),
+        #[cfg(windows)]
+        PaneInputSink::ConsoleUtf8(pid) => {
+            tokio::task::spawn_blocking(move || rmux_pty::write_windows_console_utf8(pid, &bytes))
+                .await
+                .map_err(|error| {
+                    PaneInputWriteFailure::other(RmuxError::Server(format!(
+                        "pane console text task failed: {error}"
+                    )))
+                })?
+                .map_err(|error| {
+                    PaneInputWriteFailure::from_console(
+                        &error,
+                        &session_name,
+                        window_index,
+                        pane_index,
+                    )
+                })
+        }
         PaneInputSink::Pty(master) => match write_pane_bytes(master, bytes).await {
             Ok(()) => Ok(()),
             Err(error) => Err(PaneInputWriteFailure::from_pty(
@@ -1540,6 +1638,26 @@ mod windows_tests {
         assert_eq!(
             super::windows_ctrl_d_console_key(true),
             WindowsConsoleKeyEvent::ctrl_d()
+        );
+    }
+
+    #[test]
+    fn legacy_conpty_routes_valid_utf8_and_rejects_unrepresentable_paste() {
+        let bracketed = b"\x1b[200~alpha\r\nbeta\x1b[201~";
+
+        assert_eq!(
+            super::windows_bracketed_paste_sink(false, bracketed),
+            super::WindowsBracketedPasteSink::ConsoleUtf8
+        );
+        assert_eq!(
+            super::windows_bracketed_paste_sink(true, bracketed),
+            super::WindowsBracketedPasteSink::Pty,
+            "passthrough ConPTY must retain the byte-oriented path"
+        );
+        assert_eq!(
+            super::windows_bracketed_paste_sink(false, b"\x1b[200~invalid \xff\x1b[201~"),
+            super::WindowsBracketedPasteSink::RejectNonUtf8,
+            "legacy ConPTY must not silently strip the paste delimiters"
         );
     }
 

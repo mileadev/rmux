@@ -1070,6 +1070,20 @@ impl RequestHandler {
                     crate::pane_terminals::DeferredInitialPaneInput::Bytes(bytes) => {
                         flush.input_writer.write_all(&bytes)?;
                     }
+                    crate::pane_terminals::DeferredInitialPaneInput::BracketedPaste(bytes) => {
+                        if flush.input_writer.preserves_verbatim_input() {
+                            flush.input_writer.write_all(&bytes)?;
+                        } else {
+                            std::str::from_utf8(&bytes).map_err(|_| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    super::pane_support::
+                                        LEGACY_CONPTY_NON_UTF8_BRACKETED_PASTE_ERROR,
+                                )
+                            })?;
+                            rmux_pty::write_windows_console_utf8(pane_pid, &bytes)?;
+                        }
+                    }
                     crate::pane_terminals::DeferredInitialPaneInput::Console { action, .. } => {
                         Self::write_deferred_initial_console_input(pane_pid, action)?;
                     }

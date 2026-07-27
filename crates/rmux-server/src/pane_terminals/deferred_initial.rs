@@ -481,6 +481,24 @@ impl HandlerState {
         )
     }
 
+    pub(crate) fn queue_starting_pane_bracketed_paste_input(
+        &mut self,
+        session_name: &SessionName,
+        window_index: u32,
+        pane_index: u32,
+        bytes: &[u8],
+    ) -> Result<bool, RmuxError> {
+        if bytes.is_empty() {
+            return Ok(false);
+        }
+        self.queue_starting_pane_input_entry(
+            session_name,
+            window_index,
+            pane_index,
+            DeferredInitialPaneInput::BracketedPaste(bytes.to_vec()),
+        )
+    }
+
     pub(crate) fn queue_starting_pane_console_input(
         &mut self,
         session_name: &SessionName,

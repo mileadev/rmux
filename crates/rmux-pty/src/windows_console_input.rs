@@ -20,6 +20,8 @@ use crate::ProcessId;
 
 static CONSOLE_ATTACH_LOCK: Mutex<()> = Mutex::new(());
 const LEFT_CTRL_PRESSED: u32 = 0x0008;
+const CONSOLE_TEXT_KEY_BATCH: usize = 2048;
+const VK_PACKET: u16 = 0x00e7;
 
 /// A Windows console keyboard event that can be injected into a ConPTY child.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -206,6 +208,69 @@ pub fn write_windows_console_key_batch(
         records.extend(key_event_records(*key));
     }
     write_windows_console_records_to_handle(handle, &records)
+}
+
+/// Injects UTF-8 text as Unicode console key records into a ConPTY child.
+///
+/// This preserves terminal control sequences on older ConPTY builds which
+/// parse and consume bracketed-paste delimiters written through the raw input
+/// pipe. The console attachment remains locked across all bounded record
+/// batches so concurrent key injection cannot interleave with the text.
+pub fn write_windows_console_utf8(process_id: ProcessId, bytes: &[u8]) -> io::Result<()> {
+    let text = std::str::from_utf8(bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Windows console text is not valid UTF-8: {error}"),
+        )
+    })?;
+    if text.is_empty() {
+        return Ok(());
+    }
+
+    let _guard = CONSOLE_ATTACH_LOCK
+        .lock()
+        .map_err(|_| io::Error::other("Windows console attach lock poisoned"))?;
+    let _attachment = attach_to_process_console(process_id)?;
+    let handle = open_console_input()?;
+    let handle = handle.as_raw_handle() as HANDLE;
+    let mut keys = Vec::with_capacity(CONSOLE_TEXT_KEY_BATCH);
+    for code_unit in text.encode_utf16() {
+        keys.push(literal_console_key(code_unit));
+        if keys.len() == CONSOLE_TEXT_KEY_BATCH {
+            write_console_key_batch_to_handle(handle, &keys)?;
+            keys.clear();
+        }
+    }
+    write_console_key_batch_to_handle(handle, &keys)
+}
+
+fn write_console_key_batch_to_handle(
+    handle: HANDLE,
+    keys: &[WindowsConsoleKeyEvent],
+) -> io::Result<()> {
+    let mut records = Vec::with_capacity(keys.len().saturating_mul(2));
+    for key in keys {
+        records.extend(key_event_records(*key));
+    }
+    write_windows_console_records_to_handle(handle, &records)
+}
+
+const fn literal_console_key(code_unit: u16) -> WindowsConsoleKeyEvent {
+    let (virtual_key_code, virtual_scan_code, control_key_state) = match code_unit {
+        0 => (b'@' as u16, 0, LEFT_CTRL_PRESSED),
+        0x08 => (0x08, 0x0e, 0),
+        0x09 => (0x09, 0x0f, 0),
+        0x0a | 0x0d => (0x0d, 0x1c, 0),
+        0x1b => (0x1b, 0x01, 0),
+        _ => (VK_PACKET, 0, 0),
+    };
+    WindowsConsoleKeyEvent::new(
+        virtual_key_code,
+        virtual_scan_code,
+        code_unit,
+        control_key_state,
+        1,
+    )
 }
 
 /// Writes a left-button mouse drag into a ConPTY child console.
@@ -662,6 +727,43 @@ fn last_os_error() -> io::Error {
 mod tests {
     use super::*;
     use windows_sys::Win32::System::Console::ENABLE_LINE_INPUT;
+
+    #[test]
+    fn literal_console_keys_preserve_bracketed_utf16_text() {
+        let text = "\u{1b}[200~alpha\r\nβ😀\u{1b}[201~";
+        let keys = text
+            .encode_utf16()
+            .map(literal_console_key)
+            .collect::<Vec<_>>();
+        let actual = keys
+            .iter()
+            .map(|key| key.unicode_char())
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, text.encode_utf16().collect::<Vec<_>>());
+        assert_eq!(keys[0].virtual_key_code(), 0x1b);
+        assert_eq!(keys[0].virtual_scan_code(), 0x01);
+        let lf = keys
+            .iter()
+            .find(|key| key.unicode_char() == b'\n' as u16)
+            .expect("LF key");
+        assert_eq!(lf.virtual_key_code(), 0x0d);
+        assert_eq!(lf.virtual_scan_code(), 0x1c);
+        assert_eq!(lf.control_key_state(), 0);
+
+        for literal in ['A', '-', '[', '~', 'é', '🦀'] {
+            let mut encoded = [0_u16; 2];
+            for code_unit in literal.encode_utf16(&mut encoded) {
+                let key = literal_console_key(*code_unit);
+                assert_eq!(
+                    key.virtual_key_code(),
+                    VK_PACKET,
+                    "U+{code_unit:04X} must not alias a navigation or modifier key"
+                );
+                assert_eq!(key.virtual_scan_code(), 0);
+            }
+        }
+    }
 
     #[test]
     fn ctrl_d_eot_is_suppressible_cooked_event_without_scan_code() {
