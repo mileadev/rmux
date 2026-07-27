@@ -43,6 +43,7 @@ pub(in crate::handler) struct QueueExecutionContext {
     retained_lifecycle_target: Option<Arc<LifecycleTargetLease>>,
     pinned_current_target_identity: Option<Arc<StableTargetIdentity>>,
     pinned_pane_output_identity: Option<Arc<StablePaneOutputIdentity>>,
+    rebased_current_session: Option<(SessionId, SessionName)>,
     run_shell_command_depth: usize,
     control_queue_origin: Option<ControlQueueCommandOrigin>,
 }
@@ -64,6 +65,7 @@ impl QueueExecutionContext {
             retained_lifecycle_target: None,
             pinned_current_target_identity: None,
             pinned_pane_output_identity: None,
+            rebased_current_session: None,
             run_shell_command_depth: 0,
             control_queue_origin: None,
         }
@@ -85,6 +87,7 @@ impl QueueExecutionContext {
             retained_lifecycle_target: None,
             pinned_current_target_identity: None,
             pinned_pane_output_identity: None,
+            rebased_current_session: None,
             run_shell_command_depth: 0,
             control_queue_origin: None,
         }
@@ -110,6 +113,7 @@ impl QueueExecutionContext {
             retained_lifecycle_target: self.retained_lifecycle_target.clone(),
             pinned_current_target_identity: self.pinned_current_target_identity.clone(),
             pinned_pane_output_identity: self.pinned_pane_output_identity.clone(),
+            rebased_current_session: self.rebased_current_session.clone(),
             run_shell_command_depth: self.run_shell_command_depth,
             control_queue_origin: Some(ControlQueueCommandOrigin::SourceFile {
                 depth: source_file_depth,
@@ -164,6 +168,7 @@ impl QueueExecutionContext {
         self.current_target = current_target;
         self.pinned_current_target_identity = None;
         self.pinned_pane_output_identity = None;
+        self.rebased_current_session = None;
         self
     }
 
@@ -175,6 +180,27 @@ impl QueueExecutionContext {
         self.current_target_allows_canfail_fallback = false;
         self.pinned_current_target_identity = None;
         self.pinned_pane_output_identity = None;
+        self.rebased_current_session = None;
+        self
+    }
+
+    pub(super) fn refresh_implicit_current_target(
+        mut self,
+        current_target: Option<Target>,
+    ) -> Self {
+        let Some((_, session_name)) = self.rebased_current_session.as_ref() else {
+            return self.with_implicit_current_target(current_target);
+        };
+        if self.pinned_current_target_identity.is_some() {
+            return self;
+        }
+        if current_target
+            .as_ref()
+            .is_some_and(|target| target.session_name() == session_name)
+        {
+            self.current_target = current_target;
+            self.pinned_pane_output_identity = None;
+        }
         self
     }
 
@@ -210,6 +236,7 @@ impl QueueExecutionContext {
         self.current_target = Some(current_target);
         self.pinned_current_target_identity = None;
         self.pinned_pane_output_identity = None;
+        self.rebased_current_session = None;
     }
 
     pub(in crate::handler) fn uses_explicit_current_target(&self) -> bool {
@@ -257,6 +284,7 @@ impl QueueExecutionContext {
         if let Some(identity) = identity {
             self.current_target = Some(identity.target().clone());
             self.pinned_current_target_identity = Some(Arc::new(identity));
+            self.rebased_current_session = None;
         }
         self
     }
@@ -287,6 +315,17 @@ impl QueueExecutionContext {
         }
         if let Some(identity) = self.pinned_pane_output_identity.as_ref() {
             identity.require(state, "queued pinned")?;
+        }
+        if let Some((session_id, session_name)) = self.rebased_current_session.as_ref() {
+            if state
+                .sessions
+                .session(session_name)
+                .is_none_or(|session| session.id() != *session_id)
+            {
+                return Err(RmuxError::Server(
+                    "queued renamed target was replaced before execution".to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -364,6 +403,28 @@ impl QueueExecutionContext {
         if let Some(identity) = self.pinned_pane_output_identity.as_mut() {
             Arc::make_mut(identity).rename_session(old_name, new_name);
         }
+        if self
+            .rebased_current_session
+            .as_ref()
+            .is_some_and(|(_, session_name)| session_name == old_name)
+        {
+            self.rebased_current_session = self
+                .rebased_current_session
+                .take()
+                .map(|(id, _)| (id, new_name.clone()));
+        }
+    }
+
+    pub(super) fn rebase_for_source_validation_session_rename(
+        &mut self,
+        old_name: &SessionName,
+        new_name: &SessionName,
+    ) {
+        if self.current_target.is_none() && self.source_file_depth > 0 {
+            self.current_target = Some(Target::Session(new_name.clone()));
+            return;
+        }
+        self.rename_session_targets(old_name, new_name);
     }
 
     pub(super) fn rebase_after_session_rename(
@@ -379,7 +440,19 @@ impl QueueExecutionContext {
         {
             return;
         }
+        if self.current_target.is_none() && self.source_file_depth > 0 {
+            self.current_target = Some(Target::Session(new_name.clone()));
+            self.rebased_current_session = Some((session_id, new_name.clone()));
+            return;
+        }
+        let rebases_current_target = self
+            .current_target
+            .as_ref()
+            .is_some_and(|target| target.session_name() == old_name);
         self.rename_session_targets(old_name, new_name);
+        if rebases_current_target {
+            self.rebased_current_session = Some((session_id, new_name.clone()));
+        }
     }
 }
 

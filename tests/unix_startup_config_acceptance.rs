@@ -169,6 +169,98 @@ fn startup_fallback_deduplicates_home_and_xdg_hardlinked_tmux_conf() -> Result<(
     Ok(())
 }
 
+#[test]
+fn startup_direct_group_continues_after_renaming_current_session() -> Result<(), Box<dyn Error>> {
+    let harness = StartupHarness::new("startup-direct-rename-context")?;
+    let config = harness.tmpdir().join("startup-direct-rename.conf");
+    fs::write(
+        &config,
+        "new-session -d -s alpha \"/usr/bin/sleep 30\"\n\
+         rename-session -t alpha beta ; new-window -d -n after-direct-rename \
+         \"/usr/bin/sleep 30\" ; set-option -g @tail U01\n",
+    )?;
+
+    harness.success([
+        "-f".into(),
+        config.into_os_string(),
+        "new-session".into(),
+        "-d".into(),
+        "-s".into(),
+        "keeper".into(),
+        "/usr/bin/sleep 30".into(),
+    ])?;
+
+    assert_startup_rename_continuation(&harness, "after-direct-rename", "U01")
+}
+
+#[test]
+fn startup_non_nested_group_continues_after_renaming_current_session() -> Result<(), Box<dyn Error>>
+{
+    let harness = StartupHarness::new("startup-non-nested-rename-context")?;
+    let config = harness.tmpdir().join("startup-non-nested-rename.conf");
+    fs::write(
+        &config,
+        "new-session -d -s alpha \"/usr/bin/sleep 30\"\n\
+         rename-session -t alpha beta\n\
+         display-message -p \"#{session_id}|#{session_name}\"\n\
+         new-window -d -n after-non-nested-rename \"/usr/bin/sleep 30\" ; \
+         set-option -g @tail U03\n",
+    )?;
+
+    harness.success([
+        "-f".into(),
+        config.into_os_string(),
+        "new-session".into(),
+        "-d".into(),
+        "-s".into(),
+        "keeper".into(),
+        "/usr/bin/sleep 30".into(),
+    ])?;
+
+    assert_startup_rename_continuation(&harness, "after-non-nested-rename", "U03")
+}
+
+fn assert_startup_rename_continuation(
+    harness: &StartupHarness,
+    expected_window: &str,
+    expected_tail: &str,
+) -> Result<(), Box<dyn Error>> {
+    let sessions = harness.stdout([
+        "list-sessions",
+        "-F",
+        "#{session_id}|#{session_name}|#{session_windows}|#{@tail}",
+    ])?;
+    assert!(
+        sessions
+            .lines()
+            .any(|line| { line == format!("$0|beta|2|{expected_tail}") }),
+        "renamed stable session identity or final marker was lost: {sessions:?}"
+    );
+    assert!(
+        sessions
+            .lines()
+            .any(|line| line == format!("$1|keeper|1|{expected_tail}")),
+        "startup command session or global final marker was lost: {sessions:?}"
+    );
+
+    let windows = harness.stdout(["list-windows", "-t", "beta", "-F", "#{window_name}"])?;
+    assert_eq!(
+        windows
+            .lines()
+            .filter(|window| *window == expected_window)
+            .count(),
+        1,
+        "the post-rename command must execute exactly once: {windows:?}"
+    );
+
+    let messages = harness.stdout(["show-messages"])?;
+    assert!(
+        !messages.contains("requires -t target"),
+        "startup queue lost its current target after rename: {messages:?}"
+    );
+    Ok(())
+}
+
 struct StartupHarness {
     label: String,
     tmpdir: PathBuf,
@@ -179,7 +271,7 @@ struct StartupHarness {
 impl StartupHarness {
     fn new(label: &str) -> Result<Self, Box<dyn Error>> {
         let unique = unique_id(label);
-        let tmpdir = PathBuf::from("/tmp").join(&unique);
+        let tmpdir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(&unique);
         let _ = fs::remove_dir_all(&tmpdir);
         let home = tmpdir.join("home");
         let xdg = tmpdir.join("xdg");

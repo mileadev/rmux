@@ -338,10 +338,16 @@ impl RequestHandler {
         &self,
         requester_pid: u32,
         commands: ParsedCommands,
-        context: QueueExecutionContext,
+        mut context: QueueExecutionContext,
     ) -> Result<CommandOutput, RmuxError> {
         let result = self
-            .execute_command_queue(requester_pid, commands, context, QueueMode::Detached, None)
+            .execute_command_queue(
+                requester_pid,
+                commands,
+                &mut context,
+                QueueMode::Detached,
+                None,
+            )
             .await;
         match result.error {
             Some(error) => Err(error),
@@ -355,10 +361,11 @@ impl RequestHandler {
         expected_control_id: u64,
         commands: ParsedCommands,
     ) -> ControlCommandResult {
+        let mut context = QueueExecutionContext::without_caller_cwd();
         self.execute_command_queue(
             requester_pid,
             commands,
-            QueueExecutionContext::without_caller_cwd(),
+            &mut context,
             QueueMode::Control,
             Some(expected_control_id),
         )
@@ -553,7 +560,7 @@ impl RequestHandler {
         &self,
         requester_pid: u32,
         commands: ParsedCommands,
-        context: QueueExecutionContext,
+        context: &mut QueueExecutionContext,
         mode: QueueMode,
         expected_control_id: Option<u64>,
     ) -> ControlCommandResult {
@@ -595,7 +602,7 @@ impl RequestHandler {
             };
         }
         let mut queue = CommandQueue::from_parsed(commands);
-        let mut contexts = VecDeque::from(vec![context; queue.len()]);
+        let mut contexts = VecDeque::from(vec![context.clone(); queue.len()]);
         let mut stdout = Vec::new();
         let mut errors = Vec::new();
         let mut source_file_errors = Vec::new();
@@ -700,6 +707,7 @@ impl RequestHandler {
                     }
                 }
                 if let Some(rename) = execution.session_rename {
+                    rename.apply(context);
                     for context in &mut contexts {
                         rename.apply(context);
                     }
@@ -871,7 +879,7 @@ impl RequestHandler {
                     {
                         *context = context
                             .clone()
-                            .with_implicit_current_target(updated_target.clone());
+                            .refresh_implicit_current_target(updated_target.clone());
                     }
                 }
             }
