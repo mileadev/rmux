@@ -27,6 +27,10 @@ pub(super) struct ControlOutputQueue {
 }
 
 impl ControlOutputQueue {
+    pub(super) fn is_transport_closed(&self) -> bool {
+        self.transport_closed
+    }
+
     pub(super) fn enqueue_line(&mut self, bytes: Vec<u8>, output: bool) {
         if self.transport_closed {
             return;

@@ -456,6 +456,32 @@ async fn forward_control_inner(
             attachment.is_attached(),
             current_command.is_some() || !queued_lines.is_empty(),
         );
+        if output_queue.is_transport_closed() {
+            if !input_closed {
+                // A terminal write failure means the peer transport is gone,
+                // even if the read half has not observed EOF yet. Stop
+                // admission, retain the already-complete queue, and apply the
+                // same cancellation and ownership rules as a read-side EOF.
+                // Clean stdin EOF remains persistent for attached `-CC`;
+                // broken output transport does not.
+                input_closed = true;
+                input_buffer.clear();
+                acquire_control_eof_queue_lease(&mut eof_queue_lease, &handler, control_identity)
+                    .await;
+                if let Some(command) = current_command.as_ref() {
+                    command.eof_cancellation.cancel_for_eof();
+                }
+                #[cfg(windows)]
+                eof_completion.observe_transport_eof(
+                    attachment.is_attached(),
+                    current_command.is_some() || !queued_lines.is_empty(),
+                );
+                arm_control_eof_transition(&mut eof_transition);
+            }
+            if current_command.is_none() && queued_lines.is_empty() {
+                return Ok(());
+            }
+        }
         if shutdown_draining && current_command.is_none() {
             output_queue.enqueue_line(
                 format_exit_line(Some("server shutting down")).into_bytes(),

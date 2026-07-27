@@ -291,6 +291,51 @@ fn raw_control_transport_eof_after_attach_finishes_admitted_mutation() -> Result
 }
 
 #[test]
+fn control_control_stdin_eof_persists_until_transport_dies_then_reaps() -> Result<(), Box<dyn Error>>
+{
+    let _serial_guard = windows_cli_serial::acquire("control-control-transport-reap")?;
+    let label = unique_label("control-control-transport-reap-windows")?;
+    let _server = ServerGuard::new(label.clone());
+    create_default_detached_session(&label, "alpha")?;
+
+    let mut child = rmux_command()
+        .args(["-L", &label, "-CC", "attach-session", "-t", "alpha"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    wait_for_attached_client(&label, "alpha", &mut child)?;
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        child.try_wait()?.is_none(),
+        "clean stdin EOF must keep an attached -CC client persistent"
+    );
+
+    child.kill()?;
+    let _ = child.wait()?;
+    for sequence in 0..8 {
+        assert_command_success(
+            rmux_command()
+                .args([
+                    "-L",
+                    &label,
+                    "send-keys",
+                    "-t",
+                    "alpha:0.0",
+                    &format!("echo CONTROL-REAP-{sequence}"),
+                    "Enter",
+                ])
+                .stdin(Stdio::null())
+                .output()?,
+            "trigger pane output after control transport loss",
+        )?;
+    }
+    wait_for_no_control_clients(&label, "alpha")?;
+
+    Ok(())
+}
+
+#[test]
 fn control_argv_attach_batch_finishes_before_success() -> Result<(), Box<dyn Error>> {
     let _serial_guard = windows_cli_serial::acquire("control-attach-argv")?;
     let label = unique_label("control-attach-argv-windows")?;
@@ -501,6 +546,24 @@ fn wait_for_attached_client(
         thread::sleep(Duration::from_millis(25));
     }
     Err(format!("timed out waiting for control client to attach to {session:?}").into())
+}
+
+fn wait_for_no_control_clients(label: &str, session: &str) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + CONTROL_TIMEOUT;
+    let mut last_listing = String::new();
+    while Instant::now() < deadline {
+        let output = rmux_command()
+            .args(["-L", label, "list-clients", "-t", session])
+            .stdin(Stdio::null())
+            .output()?;
+        assert_command_success(output.clone(), "list control clients after transport loss")?;
+        last_listing = String::from_utf8(output.stdout)?;
+        if last_listing.trim().is_empty() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err(format!("control client remained registered after transport loss: {last_listing:?}").into())
 }
 
 fn read_child_pipe<R>(pipe: Option<R>, name: &str) -> Result<String, Box<dyn Error>>
