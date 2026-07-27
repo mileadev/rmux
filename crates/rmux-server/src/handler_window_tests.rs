@@ -256,6 +256,24 @@ async fn insert_window(handler: &RequestHandler, session_name: &SessionName, win
         .expect("window terminal insert succeeds");
 }
 
+async fn create_window_at(handler: &RequestHandler, session_name: &SessionName, window_index: u32) {
+    let response = handler
+        .handle(Request::NewWindow(Box::new(NewWindowRequest {
+            target: session_name.clone(),
+            name: None,
+            detached: true,
+            start_directory: None,
+            environment: None,
+            command: Some(quiet_window_test_command()),
+            process_command: None,
+            target_window_index: Some(window_index),
+            insert_at_target: false,
+        })))
+        .await;
+    assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
+    handler.wait_for_initial_panes_for_test().await;
+}
+
 async fn link_duplicate_window(
     handler: &RequestHandler,
     session_name: &SessionName,

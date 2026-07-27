@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use super::{session_name, Session};
-use crate::{SessionId, WINLINK_ACTIVITY, WINLINK_BELL};
+use crate::{PaneId, SessionId, WindowId, WINLINK_ACTIVITY, WINLINK_BELL};
 use rmux_proto::TerminalSize;
 
 fn grouped_sessions() -> (Session, Session) {
@@ -14,6 +14,44 @@ fn grouped_sessions() -> (Session, Session) {
         SessionId::new(2),
     );
     (source, peer)
+}
+
+#[test]
+fn grouped_clone_removal_preserves_owner_and_peer_local_fallbacks() {
+    let size = TerminalSize { cols: 80, rows: 24 };
+    let mut owner = Session::new_with_initial_window(
+        session_name("owner-local-selection"),
+        size,
+        2,
+        PaneId::new(0),
+        WindowId::new(0),
+    );
+    owner
+        .insert_window_with_initial_pane(0, size)
+        .expect("window 0 insert succeeds");
+    owner
+        .insert_window_with_initial_pane(1, size)
+        .expect("window 1 insert succeeds");
+    let mut peer = owner.clone_as_group_member(
+        session_name("peer-local-selection"),
+        session_name("selection-group"),
+        SessionId::new(1),
+    );
+    let owner_expected_id = owner.window_at(1).expect("owner predecessor exists").id();
+    let peer_expected_id = peer.window_at(0).expect("peer initial winlink exists").id();
+
+    owner
+        .remove_window(2)
+        .expect("owner target removal succeeds");
+    peer.remove_window(2)
+        .expect("group peer target removal succeeds");
+
+    assert_eq!(owner.window().id(), owner_expected_id);
+    assert_eq!(owner.active_window_index(), 1);
+    assert_eq!(owner.last_window_index(), None);
+    assert_eq!(peer.window().id(), peer_expected_id);
+    assert_eq!(peer.active_window_index(), 0);
+    assert_eq!(peer.last_window_index(), None);
 }
 
 #[test]

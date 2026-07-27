@@ -46,6 +46,8 @@ pub struct Session {
     winlink_alert_flags: BTreeMap<u32, AlertFlags>,
     active_window: u32,
     last_window: Option<u32>,
+    /// First grouped-peer winlink by stable identity, retained until real local navigation.
+    group_initial_window_id: Option<WindowId>,
     next_pane_id: u32,
     next_window_id: WindowIdAllocator,
     created_at: i64,
@@ -83,6 +85,7 @@ impl Session {
             winlink_alert_flags: BTreeMap::from([(window_index, AlertFlags::empty())]),
             active_window: window_index,
             last_window: None,
+            group_initial_window_id: None,
             next_pane_id: pane_id.as_u32().saturating_add(1),
             next_window_id: WindowIdAllocator::new(window_id.as_u32().saturating_add(1)),
             created_at: now,
@@ -559,6 +562,14 @@ impl Session {
         if let Some(last_window) = self.last_window {
             if last_window != removed_index && self.windows.contains_key(&last_window) {
                 return last_window;
+            }
+        }
+
+        if let Some(group_initial_window_id) = self.group_initial_window_id {
+            if let Some((window_index, _)) = self.windows.iter().find(|(window_index, window)| {
+                **window_index != removed_index && window.id() == group_initial_window_id
+            }) {
+                return *window_index;
             }
         }
 

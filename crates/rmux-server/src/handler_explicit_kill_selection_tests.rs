@@ -6,8 +6,8 @@ use rmux_core::PaneId;
 use rmux_proto::{
     ControlMode, KillPaneRequest, LinkWindowRequest, NewSessionRequest, NewWindowRequest,
     OptionName, PaneKillRequest, PaneTarget, PaneTargetRef, Request, Response, ScopeSelector,
-    SessionName, SetOptionMode, SetOptionRequest, SplitDirection, SplitWindowRequest,
-    SplitWindowTarget, TerminalSize, WindowTarget,
+    SelectWindowRequest, SessionName, SetOptionMode, SetOptionRequest, SplitDirection,
+    SplitWindowRequest, SplitWindowTarget, TerminalSize, WindowTarget,
 };
 use tokio::sync::mpsc;
 
@@ -87,6 +87,14 @@ async fn new_session(handler: &RequestHandler, name: &SessionName) {
 }
 
 async fn new_window(handler: &RequestHandler, session: &SessionName) {
+    new_window_at(handler, session, None).await;
+}
+
+async fn new_window_at(
+    handler: &RequestHandler,
+    session: &SessionName,
+    target_window_index: Option<u32>,
+) {
     let response = handler
         .handle(Request::NewWindow(Box::new(NewWindowRequest {
             target: session.clone(),
@@ -96,7 +104,7 @@ async fn new_window(handler: &RequestHandler, session: &SessionName) {
             environment: None,
             command: None,
             process_command: None,
-            target_window_index: None,
+            target_window_index,
             insert_at_target: false,
         })))
         .await;
@@ -629,20 +637,43 @@ async fn linked_and_grouped_last_pane_kill_interleave_each_selection_before_its_
     let observer = session_name("grouped-observer");
     let owner = session_name("grouped-owner");
     new_session(&handler, &observer).await;
+    let base_index = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::BaseIndex,
+            value: "2".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(
+        matches!(base_index, Response::SetOption(_)),
+        "{base_index:?}"
+    );
     new_session(&handler, &owner).await;
-    new_window(&handler, &owner).await;
-    new_window(&handler, &owner).await;
+    new_window_at(&handler, &owner, Some(0)).await;
+    new_window_at(&handler, &owner, Some(1)).await;
     let peer = create_grouped_session(&handler, "grouped-peer", &owner).await;
-    // The grouped oracle has the same explicit cyclic predecessor for both
-    // sessions because both active identities are removed.
-    let (owner_session_id, owner_expected_id) = expected_selection(&handler, &owner, 2).await;
-    let (peer_session_id, peer_expected_id) = expected_selection(&handler, &peer, 2).await;
+    let peer_selection = handler
+        .handle(Request::SelectWindow(SelectWindowRequest {
+            target: WindowTarget::with_window(peer.clone(), 2),
+        }))
+        .await;
+    assert!(
+        matches!(peer_selection, Response::SelectWindow(_)),
+        "{peer_selection:?}"
+    );
+    // Fresh tmux 3.7b causal matrix: a group peer created while the
+    // no-history owner is on index 2 starts on its own index 0. Its single
+    // selection of index 2 therefore records 0 as the local last window.
+    // Removing index 2 sends the owner to 1 and the peer back to 0.
+    let (owner_session_id, owner_expected_id) = expected_selection(&handler, &owner, 1).await;
+    let (peer_session_id, peer_expected_id) = expected_selection(&handler, &peer, 0).await;
     let (killed_window_id, pane_index) = {
         let state = handler.state.lock().await;
         let window = state
             .sessions
             .session(&owner)
-            .and_then(|session| session.window_at(0))
+            .and_then(|session| session.window_at(2))
             .expect("grouped window exists");
         (
             window.id().to_string(),
@@ -653,7 +684,7 @@ async fn linked_and_grouped_last_pane_kill_interleave_each_selection_before_its_
     let _ = relevant_notifications(&mut events);
     let response = handler
         .handle(Request::KillPane(KillPaneRequest {
-            target: PaneTarget::with_window(owner, 0, pane_index),
+            target: PaneTarget::with_window(owner, 2, pane_index),
             kill_all_except: false,
         }))
         .await;
