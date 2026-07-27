@@ -8,7 +8,7 @@ use std::thread;
 
 use rmux_ipc::{LocalListener, LocalStream, MAX_NAMED_MUTEX_LEN};
 use rmux_proto::{
-    encode_frame, FrameDecoder, HasSessionResponse, Request, Response, RMUX_WIRE_VERSION,
+    encode_frame, FrameDecoder, HasSessionResponse, Request, Response, RmuxError, RMUX_WIRE_VERSION,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -254,7 +254,15 @@ async fn incompatible_wire_probe_is_reported_immediately() -> TestResult {
             operation, source, ..
         }) => {
             assert_eq!(operation, "decode probe response");
-            assert!(source.to_string().contains("unsupported wire version"));
+            assert!(
+                matches!(
+                    source
+                        .get_ref()
+                        .and_then(|error| error.downcast_ref::<RmuxError>()),
+                    Some(RmuxError::UnsupportedWireVersion { .. })
+                ),
+                "unexpected decode error: {source}"
+            );
         }
         other => panic!("expected incompatible probe error, got {other:?}"),
     }
