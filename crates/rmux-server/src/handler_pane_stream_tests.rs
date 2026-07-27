@@ -18,6 +18,8 @@ use super::{validate_raw_rebase_size, RequestHandler};
 
 #[path = "handler_pane_stream_tests/subscription_kind.rs"]
 mod subscription_kind;
+#[path = "handler_pane_stream_tests/surface_budget.rs"]
+mod surface_budget;
 
 const CONNECTION_ID: u64 = 41;
 

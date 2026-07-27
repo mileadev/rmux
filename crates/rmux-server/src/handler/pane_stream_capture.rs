@@ -361,11 +361,11 @@ mod tests {
     #[test]
     fn surface_projection_uses_its_encoded_frame_budget_not_the_raw_snapshot_budget() {
         let size = TerminalSize {
-            cols: 1024,
-            rows: 256,
+            cols: 512,
+            rows: 320,
         };
         let cells = usize::from(size.cols) * usize::from(size.rows);
-        assert_eq!(cells, rmux_proto::DEFAULT_MAX_DETACHED_FRAME_LENGTH / 32);
+        assert!(cells > super::MAX_RECOVERY_TYPED_SNAPSHOT_CELLS);
 
         let mut transcript = PaneTranscript::new(0, size);
         let bytes = vec![b'x'; cells];

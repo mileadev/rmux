@@ -561,6 +561,10 @@ impl RequestHandler {
         );
         subscriptions.note_pane_drain_progress(&current_key, Instant::now());
         drop(subscriptions);
+        if let Err(error) = validate_surface_frame_size(&frame) {
+            self.remove_reserved_stream(subscription_id);
+            return Response::Error(ErrorResponse { error });
+        }
         let response = subscribe_response(
             subscription_id,
             &source,
@@ -621,6 +625,10 @@ impl RequestHandler {
         );
         subscriptions.note_pane_drain_progress(&current_key, Instant::now());
         drop(subscriptions);
+        if let Err(error) = validate_surface_frame_size(&frame) {
+            self.remove_reserved_stream(subscription_id);
+            return Response::Error(ErrorResponse { error });
+        }
         let response = subscribe_response(
             subscription_id,
             &source,
