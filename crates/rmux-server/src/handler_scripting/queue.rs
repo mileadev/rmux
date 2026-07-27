@@ -140,6 +140,7 @@ impl QueueExecutionContext {
     pub(in crate::handler) fn for_run_shell_commands(
         mut self,
         parent_depth: usize,
+        synchronous: bool,
     ) -> Result<Self, RmuxError> {
         let depth = parent_depth.saturating_add(1);
         if depth > super::RUN_SHELL_COMMAND_NESTING_LIMIT {
@@ -149,6 +150,8 @@ impl QueueExecutionContext {
             )));
         }
         self.run_shell_command_depth = depth;
+        self.control_queue_origin =
+            synchronous.then_some(ControlQueueCommandOrigin::RunShell { depth });
         Ok(self)
     }
 

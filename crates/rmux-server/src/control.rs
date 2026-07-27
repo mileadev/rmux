@@ -167,6 +167,7 @@ pub(crate) enum ControlServerEvent {
 pub(crate) enum ControlQueueCommandOrigin {
     SourceFile { depth: usize },
     IfShell,
+    RunShell { depth: usize },
     QueueContinuation,
 }
 

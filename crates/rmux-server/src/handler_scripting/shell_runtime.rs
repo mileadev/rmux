@@ -647,11 +647,12 @@ impl RequestHandler {
                 .as_ref()
                 .and_then(|context| context.mouse_event.clone())
         }));
+        let synchronous = request.delay_seconds.is_none();
         let context = match request.source_depth {
             Some(depth) => context.for_sourced_commands(depth, None),
             None => context,
         }
-        .for_run_shell_commands(queue_state.parent_depth)?;
+        .for_run_shell_commands(queue_state.parent_depth, synchronous)?;
         Ok((parsed, context))
     }
 

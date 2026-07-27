@@ -1253,6 +1253,105 @@ async fn direct_display_forms_remain_in_their_admitted_guards() {
 }
 
 #[tokio::test]
+async fn immediate_run_shell_commands_get_one_child_guard_per_nesting_level() {
+    // Fresh tmux 3.7b oracle: each run-shell -C level closes its current
+    // guard before the inserted callback begins in a new guard.
+    let handler = Arc::new(RequestHandler::new());
+    let session_name =
+        SessionName::new("control-message-run-shell-nesting").expect("valid session name");
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name,
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+
+    let commands = [
+        "run-shell -C 'display-message -- RUN-C-NEST-1'",
+        "run-shell -C \"run-shell -C 'display-message -- RUN-C-NEST-2'\"",
+        "run-shell -C \"run-shell -C \\\"run-shell -C \
+         'display-message -- RUN-C-NEST-3'\\\"\"",
+    ];
+    let input = format!("{}\n", commands.join("\n")).into_bytes();
+    let rendered =
+        run_registered_initial_control_batch(Arc::clone(&handler), 42_441, input, commands.len())
+            .await;
+    let transcript = parse_strict_control_transcript(&rendered);
+
+    assert_eq!(transcript.frames.len(), 9, "{rendered:?}");
+    for parent in [0, 2, 3, 5, 6, 7] {
+        assert!(
+            transcript.frames[parent].notifications.is_empty(),
+            "run-shell parent/level {parent} captured its child: {rendered:?}"
+        );
+    }
+    assert_message_owned_once(&transcript, 1, "RUN-C-NEST-1");
+    assert_message_owned_once(&transcript, 4, "RUN-C-NEST-2");
+    assert_message_owned_once(&transcript, 8, "RUN-C-NEST-3");
+    assert!(
+        transcript.frames.iter().all(|frame| frame.guard.flags == 0),
+        "initial parents and synchronous callbacks retain flag 0: {rendered:?}"
+    );
+    assert!(
+        transcript
+            .asynchronous_notifications
+            .iter()
+            .all(|line| !line.starts_with("%message ")),
+        "{rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn immediate_run_shell_callback_error_gets_its_own_child_guard() {
+    let handler = Arc::new(RequestHandler::new());
+    let session_name =
+        SessionName::new("control-message-run-shell-error").expect("valid session name");
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name,
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+
+    let input = b"run-shell -C 'display-message -- RUN-C-BEFORE-ERROR ; \
+                  kill-pane -t missing-run-session:0.0'\n"
+        .to_vec();
+    let rendered =
+        run_registered_initial_control_batch(Arc::clone(&handler), 42_442, input, 1).await;
+    let transcript = parse_strict_control_transcript(&rendered);
+
+    assert_eq!(transcript.frames.len(), 3, "{rendered:?}");
+    assert_eq!(
+        transcript.frames[0].terminal,
+        TestGuardTerminal::End,
+        "{rendered:?}"
+    );
+    assert!(
+        transcript.frames[0].notifications.is_empty(),
+        "{rendered:?}"
+    );
+    assert_message_owned_once(&transcript, 1, "RUN-C-BEFORE-ERROR");
+    assert_eq!(
+        transcript.frames[2].terminal,
+        TestGuardTerminal::Error,
+        "{rendered:?}"
+    );
+    assert!(
+        transcript.frames[2]
+            .payload
+            .iter()
+            .any(|line| line.contains("missing-run-session")),
+        "{rendered:?}"
+    );
+}
+
+#[tokio::test]
 async fn delayed_run_shell_control_message_remains_asynchronous_product_divergence() {
     // Frozen tmux 3.7b gives the delayed `run-shell -C` callback its own
     // control guard. RMUX did not do so before W13-M30, and this fix must not

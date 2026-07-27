@@ -1124,7 +1124,8 @@ impl RequestHandler {
                 let request = apply_queue_context_to_request(request, context, false);
                 let request = crate::server_access::apply_access_policy(request, can_write)?;
                 let capture_control_response = mode == QueueMode::Control
-                    && context.run_shell_command_depth() == 0
+                    && (context.run_shell_command_depth() == 0
+                        || context.control_queue_origin().is_some())
                     && matches!(
                         &request,
                         Request::DisplayMessage(_) | Request::DisplayMessageExt(_)
