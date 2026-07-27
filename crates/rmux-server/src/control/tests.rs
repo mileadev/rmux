@@ -116,22 +116,14 @@ fn only_control_control_eof_waits_for_an_attached_session() {
     assert!(!control_control_waits_for_attached_session(
         ControlMode::Plain,
         &attached,
-        false,
     ));
     assert!(!control_control_waits_for_attached_session(
         ControlMode::ControlControl,
         &unattached,
-        false,
     ));
     assert!(control_control_waits_for_attached_session(
         ControlMode::ControlControl,
         &attached,
-        false,
-    ));
-    assert!(!control_control_waits_for_attached_session(
-        ControlMode::ControlControl,
-        &attached,
-        true,
     ));
 }
 
