@@ -278,6 +278,68 @@ fn startup_run_shell_follows_successful_new_session_after_rename() -> Result<(),
 }
 
 #[test]
+fn startup_group_attach_if_exists_reuse_keeps_renamed_identity() -> Result<(), Box<dyn Error>> {
+    let harness = StartupHarness::new("startup-existing-session-reuse-group")?;
+    let config = harness
+        .tmpdir()
+        .join("startup-existing-session-reuse-group.conf");
+    fs::write(
+        &config,
+        "new-session -d -s occupied \"/usr/bin/sleep 30\"\n\
+         new-session -d -s alpha \"/usr/bin/sleep 30\"\n\
+         rename-session -t alpha beta ; \
+         new-session -A -s occupied ; \
+         new-window -d -n reuse-first \"/usr/bin/sleep 30\" ; \
+         new-window -d -n reuse-repeat \"/usr/bin/sleep 30\"\n",
+    )?;
+
+    start_with_config_and_keeper(&harness, &config)?;
+    assert_existing_session_reuse_keeps_renamed_identity(&harness)
+}
+
+#[test]
+fn startup_lines_detached_attach_if_exists_reuse_keeps_renamed_identity(
+) -> Result<(), Box<dyn Error>> {
+    let harness = StartupHarness::new("startup-existing-session-reuse-lines")?;
+    let config = harness
+        .tmpdir()
+        .join("startup-existing-session-reuse-lines.conf");
+    fs::write(
+        &config,
+        "new-session -d -s occupied \"/usr/bin/sleep 30\"\n\
+         new-session -d -s alpha \"/usr/bin/sleep 30\"\n\
+         rename-session -t alpha beta\n\
+         new-session -Ad -s occupied\n\
+         new-window -d -n reuse-first \"/usr/bin/sleep 30\"\n\
+         new-window -d -n reuse-repeat \"/usr/bin/sleep 30\"\n",
+    )?;
+
+    start_with_config_and_keeper(&harness, &config)?;
+    assert_existing_session_reuse_keeps_renamed_identity(&harness)
+}
+
+#[test]
+fn startup_run_shell_detached_attach_if_exists_reuse_keeps_renamed_identity(
+) -> Result<(), Box<dyn Error>> {
+    let harness = StartupHarness::new("startup-existing-session-reuse-run-shell")?;
+    let config = harness
+        .tmpdir()
+        .join("startup-existing-session-reuse-run-shell.conf");
+    fs::write(
+        &config,
+        "new-session -d -s occupied \"/usr/bin/sleep 30\"\n\
+         new-session -d -s alpha \"/usr/bin/sleep 30\"\n\
+         run-shell -C \"rename-session -t alpha beta ; \
+         new-session -Ad -s occupied ; \
+         new-window -d -n reuse-first /usr/bin/sleep 30 ; \
+         new-window -d -n reuse-repeat /usr/bin/sleep 30\"\n",
+    )?;
+
+    start_with_config_and_keeper(&harness, &config)?;
+    assert_existing_session_reuse_keeps_renamed_identity(&harness)
+}
+
+#[test]
 fn startup_nested_source_keeps_renamed_identity_after_new_session() -> Result<(), Box<dyn Error>> {
     let harness = StartupHarness::new("startup-nested-source-transition-boundary")?;
     let nested = harness.tmpdir().join("nested-transition.conf");
@@ -387,6 +449,50 @@ fn assert_successful_new_session_transition(
             windows.lines().filter(|name| *name == window).count(),
             1,
             "{window} must execute once on the explicit new-session transition: {windows:?}"
+        );
+    }
+    Ok(())
+}
+
+fn assert_existing_session_reuse_keeps_renamed_identity(
+    harness: &StartupHarness,
+) -> Result<(), Box<dyn Error>> {
+    let sessions = harness.stdout([
+        "list-sessions",
+        "-F",
+        "#{session_id}|#{session_name}|#{session_windows}",
+    ])?;
+    assert!(
+        sessions.lines().any(|line| line == "$0|occupied|1"),
+        "reusing an existing session must not receive following windows: {sessions:?}"
+    );
+    assert!(
+        sessions.lines().any(|line| line == "$1|beta|3"),
+        "following windows must retain the exact renamed identity: {sessions:?}"
+    );
+    assert!(
+        sessions.lines().any(|line| line == "$2|keeper|1"),
+        "startup validation must not consume runtime allocators: {sessions:?}"
+    );
+    let occupied_windows =
+        harness.stdout(["list-windows", "-t", "occupied", "-F", "#{window_name}"])?;
+    let renamed_windows = harness.stdout(["list-windows", "-t", "beta", "-F", "#{window_name}"])?;
+    for window in ["reuse-first", "reuse-repeat"] {
+        assert_eq!(
+            occupied_windows
+                .lines()
+                .filter(|name| *name == window)
+                .count(),
+            0,
+            "{window} must not mutate the reused existing session: {occupied_windows:?}"
+        );
+        assert_eq!(
+            renamed_windows
+                .lines()
+                .filter(|name| *name == window)
+                .count(),
+            1,
+            "{window} must execute once on the renamed identity: {renamed_windows:?}"
         );
     }
     Ok(())

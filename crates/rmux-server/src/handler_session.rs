@@ -514,10 +514,6 @@ impl RequestHandler {
                         session_id,
                     )
                     .await;
-                    super::scripting_support::record_queued_new_session_transition(
-                        session_id,
-                        session_name.clone(),
-                    );
                     self.queue_suppressed_inline_hook(
                         HookName::AfterNewSession,
                         PendingInlineHookFormat::AfterCommand,
