@@ -5,7 +5,10 @@ use rmux_proto::{
 };
 
 use super::super::{
-    attach_support::{PreparedAttachedDestroySwitches, SessionDetachOnDestroy},
+    attach_support::{
+        prepare_applied_window_resize_events, PreparedAttachedDestroySwitches,
+        SessionDetachOnDestroy,
+    },
     defer_lifecycle_event, prepare_deferred_lifecycle_event, prepare_lifecycle_event,
     scripting_support::format_context_for_target,
     DeferredLifecycleEvent, PaneOutputSubscriptionKeySnapshot, QueuedLifecycleEvent,
@@ -36,6 +39,7 @@ struct PreparedPaneTransferEffects {
     unlinked_windows: Vec<QueuedLifecycleEvent>,
     pane_selection_events: Vec<QueuedLifecycleEvent>,
     layout_events: Vec<QueuedLifecycleEvent>,
+    resize_events: Vec<QueuedLifecycleEvent>,
     linked_event: Option<QueuedLifecycleEvent>,
     session_selection_events: Vec<QueuedLifecycleEvent>,
     closed_sessions: Vec<(
@@ -164,6 +168,7 @@ impl PaneTransferEffects {
         removed_sessions: &[SessionName],
         layout_targets: &[WindowTarget],
         linked_event: Option<LifecycleEvent>,
+        reserve_applied_resizes: bool,
         include_selection_changes: bool,
     ) -> PreparedPaneTransferEffects {
         let Self {
@@ -191,6 +196,14 @@ impl PaneTransferEffects {
                 prepare_lifecycle_event(state, &LifecycleEvent::WindowLayoutChanged { target })
             })
             .collect();
+        // Reserve the resize immediately after its layout events. This both
+        // claims the layout half of the pending pair and prevents an executing
+        // layout hook from draining the shared resize queue through a nested
+        // command. Reserving it before session-close tickets also keeps ticket
+        // order identical to the emission order below.
+        let resize_events = reserve_applied_resizes
+            .then(|| prepare_applied_window_resize_events(state))
+            .unwrap_or_default();
         let linked_event = linked_event
             .as_ref()
             .map(|event| prepare_lifecycle_event(state, event));
@@ -222,6 +235,7 @@ impl PaneTransferEffects {
             unlinked_windows,
             pane_selection_events,
             layout_events,
+            resize_events,
             linked_event,
             session_selection_events,
             closed_sessions,
@@ -351,7 +365,14 @@ impl RequestHandler {
                 })
                 .unwrap_or_default();
             let effects = matches!(response, Response::JoinPane(_)).then(|| {
-                effects.prepare_emitted(&mut state, &removed_sessions, &layout_targets, None, false)
+                effects.prepare_emitted(
+                    &mut state,
+                    &removed_sessions,
+                    &layout_targets,
+                    None,
+                    true,
+                    false,
+                )
             });
             (response, effects, removed_sessions)
         };
@@ -427,7 +448,14 @@ impl RequestHandler {
                 })
                 .unwrap_or_default();
             let effects = matches!(response, Response::MovePane(_)).then(|| {
-                effects.prepare_emitted(&mut state, &removed_sessions, &layout_targets, None, false)
+                effects.prepare_emitted(
+                    &mut state,
+                    &removed_sessions,
+                    &layout_targets,
+                    None,
+                    true,
+                    false,
+                )
             });
             (response, effects, removed_sessions)
         };
@@ -536,6 +564,7 @@ impl RequestHandler {
                     &removed_sessions,
                     &layout_targets,
                     linked_event,
+                    false,
                     true,
                 )
             });
@@ -607,6 +636,9 @@ impl RequestHandler {
             self.emit_prepared(event.clone()).await;
         }
         for event in &effects.layout_events {
+            self.emit_prepared(event.clone()).await;
+        }
+        for event in &effects.resize_events {
             self.emit_prepared(event.clone()).await;
         }
         if let Some(event) = &effects.linked_event {

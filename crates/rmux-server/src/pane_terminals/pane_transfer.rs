@@ -83,24 +83,37 @@ impl HandlerState {
                 "source and target panes must be different".to_owned(),
             ));
         }
-        if pane_targets_share_window_identity(&self.sessions, &request.source, &request.target) {
-            let mut normalized_request = request;
-            normalized_request.source = PaneTarget::with_window(
-                normalized_request.target.session_name().clone(),
-                normalized_request.target.window_index(),
-                normalized_request.source.pane_index(),
-            );
-            return self.join_pane_within_group(normalized_request);
-        }
-        if sessions_share_grouped_window_state(
-            &self.sessions,
-            request.source.session_name(),
-            request.target.session_name(),
-        ) {
-            return self.join_pane_within_group(request);
-        }
+        let tracked_windows = [
+            WindowTarget::with_window(
+                request.source.session_name().clone(),
+                request.source.window_index(),
+            ),
+            WindowTarget::with_window(
+                request.target.session_name().clone(),
+                request.target.window_index(),
+            ),
+        ];
+        self.mutate_and_record_window_geometry_changes(&tracked_windows, |state| {
+            if pane_targets_share_window_identity(&state.sessions, &request.source, &request.target)
+            {
+                let mut normalized_request = request;
+                normalized_request.source = PaneTarget::with_window(
+                    normalized_request.target.session_name().clone(),
+                    normalized_request.target.window_index(),
+                    normalized_request.source.pane_index(),
+                );
+                return state.join_pane_within_group(normalized_request);
+            }
+            if sessions_share_grouped_window_state(
+                &state.sessions,
+                request.source.session_name(),
+                request.target.session_name(),
+            ) {
+                return state.join_pane_within_group(request);
+            }
 
-        self.join_pane_across_sessions(request)
+            state.join_pane_across_sessions(request)
+        })
     }
 
     pub(crate) fn move_pane(

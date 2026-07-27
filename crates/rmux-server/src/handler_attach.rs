@@ -169,8 +169,9 @@ mod transient_message;
 pub(crate) use crate::client_flags::ClientFlags;
 pub(in crate::handler) use key_table::AttachedKeyTableCommit;
 pub(in crate::handler) use resize_policy::{
-    resize_control_session_for_client, surviving_attached_resize_targets,
-    switch_control_session_for_client, AttachedWindowSizePolicy, ControlResizeClient,
+    prepare_applied_window_resize_events, resize_control_session_for_client,
+    surviving_attached_resize_targets, switch_control_session_for_client, AttachedWindowSizePolicy,
+    ControlResizeClient,
 };
 pub(in crate::handler) use session_destroy::{
     PreparedAttachedDestroySwitches, SessionDetachOnDestroy,

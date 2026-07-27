@@ -260,10 +260,10 @@ pub(crate) struct HandlerState {
     ///
     /// tmux 3.7b concentrates both notifications in `resize_window()`, so every
     /// applied resize publishes them exactly once. RMUX applies window geometry
-    /// through one synchronous chokepoint
-    /// (`mutate_session_and_resize_window_terminal_with_family_if`) but has to
-    /// publish asynchronously, so the chokepoint records the applied resize here
-    /// and `RequestHandler::publish_applied_window_resizes` drains it.
+    /// through synchronous single-window mutation helpers and stable-identity
+    /// snapshots around multi-window transfers, but has to publish
+    /// asynchronously. Those paths record the applied resize here and
+    /// `RequestHandler::publish_applied_window_resizes` drains it.
     applied_window_resizes: AppliedWindowResizeQueue,
     lifecycle_commit_order: crate::lifecycle_commit_order::LifecycleCommitOrder,
     status_jobs: StatusJobRuntime,

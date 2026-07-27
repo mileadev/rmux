@@ -367,3 +367,14 @@ limitations = [
   "on its first application with three through six panes, tmux 3.7b expands a one-column window to three columns but leaves tiled row containers only one column wide; incomplete final rows also leave the final pane narrow",
   "tmux repairs the rows on a second identical select-layout command; RMUX reaches the coherent three-column tree on the first application and remains idempotent",
 ]
+
+[[entry]]
+id = "C-D84"
+summary = "Pane transfers reflow a width-deficient target instead of rejecting it"
+inventory = "bounded"
+evidence = ["tests/fixtures/tmux37/accepted_product_divergences.txt"]
+tests = ["crates/rmux-server/src/handler_layout_notification_tests.rs::join_and_move_reflow_minimum_target_and_publish_resize_product_divergence"]
+limitations = [
+  "tmux 3.7b rejects horizontal join-pane and move-pane into a one-column target, both within one session and across sessions, with size or position no space for a new pane",
+  "RMUX expands the target to the viable three-column minimum, completes the transfer, preserves the two existing layout notifications, and adds exactly one window-resized notification; a target already three columns wide receives no resize notification",
+]

@@ -5,9 +5,9 @@ use std::time::Duration;
 use rmux_core::LifecycleEvent;
 use rmux_proto::{
     ControlMode, PaneKillRequest, PaneResizeRequest, PaneTargetRef, Request, ResizePaneAdjustment,
-    Response, SessionName,
+    Response, SessionName, TerminalSize,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use super::RequestHandler;
 use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
@@ -169,6 +169,147 @@ async fn custom_layout_resize_has_one_layout_notification_not_two() {
         1,
         "deduplicating the layout producer must keep the resize hook"
     );
+}
+
+#[tokio::test]
+async fn join_and_move_reflow_minimum_target_and_publish_resize_product_divergence() {
+    // tmux 3.7b rejects every width-one case below with
+    // "size or position no space for a new pane". RMUX deliberately expands
+    // the target to the viable three-column minimum. Both engines accept the
+    // width-three neighborhood, where RMUX must not publish a spurious resize.
+    for operation in ["join-pane", "move-pane"] {
+        for route in ["same", "cross"] {
+            for (initial_width, expected_resize_events) in [(1, 1), (3, 0)] {
+                let label = format!("{operation}-{route}-{initial_width}");
+                let target = SessionName::new(format!("transfer-resize-target-{label}"))
+                    .expect("target session");
+                let source = SessionName::new(format!("transfer-resize-source-{label}"))
+                    .expect("source session");
+                let handler = RequestHandler::new();
+                let lifecycle_dispatch = handler
+                    .take_lifecycle_dispatch_receiver()
+                    .expect("test owns lifecycle dispatch");
+                let (hook_shutdown_tx, hook_shutdown_rx) = oneshot::channel();
+                let hook_handler = handler.clone();
+                let hook_task = tokio::spawn(async move {
+                    hook_handler
+                        .consume_lifecycle_hooks(lifecycle_dispatch, hook_shutdown_rx)
+                        .await;
+                });
+                create_session(&handler, &target).await;
+                run_detached_command(
+                    &handler,
+                    &format!("set-window-option -t {target}:0 window-size manual"),
+                )
+                .await;
+                run_detached_command(
+                    &handler,
+                    &format!("resize-window -t {target}:0 -x {initial_width} -y 1"),
+                )
+                .await;
+
+                let source_target = if route == "same" {
+                    run_detached_command(
+                        &handler,
+                        &format!("new-window -d -t {target}:9 'sleep 60'"),
+                    )
+                    .await;
+                    format!("{target}:9.0")
+                } else {
+                    create_session(&handler, &source).await;
+                    format!("{source}:0.0")
+                };
+                run_detached_command(&handler, "set-buffer -b transfer-events ''").await;
+                run_detached_command(
+                    &handler,
+                    "set-hook -g window-layout-changed 'set-buffer -a -b transfer-events L'",
+                )
+                .await;
+                run_detached_command(
+                    &handler,
+                    "set-hook -g window-resized 'set-buffer -a -b transfer-events R'",
+                )
+                .await;
+
+                let (control_pid, mut notifications) =
+                    register_control_client(&handler, &target).await;
+                let _ = settle_control_notifications(&mut notifications).await;
+                run_detached_command(&handler, "set-buffer -b transfer-events ''").await;
+                let mut lifecycle_events = handler.subscribe_lifecycle_events();
+
+                let command = format!("{} -h -d -s {source_target} -t {target}:0.0", operation);
+                run_control_command(&handler, control_pid, &command).await;
+                let control_lines = settle_control_notifications(&mut notifications).await;
+                let expected_hook_events = if expected_resize_events == 0 {
+                    "LL"
+                } else {
+                    "LLR"
+                };
+                let hook_events =
+                    wait_for_buffer_text(&handler, "transfer-events", expected_hook_events).await;
+                let mut events = Vec::new();
+                while let Ok(Ok(event)) =
+                    tokio::time::timeout(CONTROL_NOTIFICATION_POLL, lifecycle_events.recv()).await
+                {
+                    events.push(event.event);
+                }
+
+                let (target_size, target_panes) = {
+                    let state = handler.state.lock().await;
+                    let window = state
+                        .sessions
+                        .session(&target)
+                        .expect("target session")
+                        .window_at(0)
+                        .expect("target window");
+                    (window.size(), window.pane_count())
+                };
+                assert_eq!(
+                    (target_size, target_panes),
+                    (TerminalSize { cols: 3, rows: 1 }, 2),
+                    "{label}"
+                );
+                assert_eq!(
+                    control_lines
+                        .iter()
+                        .filter(|line| line.starts_with("%layout-change "))
+                        .count(),
+                    2,
+                    "{label}: resize publication must not duplicate control layout events"
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, LifecycleEvent::WindowLayoutChanged { .. }))
+                        .count(),
+                    2,
+                    "{label}"
+                );
+                assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        LifecycleEvent::WindowResized { target: resized }
+                            if resized.session_name() == &target && resized.window_index() == 0
+                    )
+                })
+                .count(),
+            expected_resize_events,
+            "{label}: hooks={hook_events:?}, lifecycle={events:?}"
+        );
+                assert_eq!(
+                    hook_events,
+                    Some(expected_hook_events.to_owned()),
+                    "{label}: lifecycle hooks must observe the same committed resize"
+                );
+
+                let _ = hook_shutdown_tx.send(());
+                hook_task.await.expect("lifecycle hook task");
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -350,6 +491,28 @@ async fn settle_control_notifications(
         }
     }
     lines
+}
+
+async fn wait_for_buffer_text(
+    handler: &RequestHandler,
+    name: &str,
+    expected: &str,
+) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    loop {
+        let content = {
+            let state = handler.state.lock().await;
+            state
+                .buffers
+                .show(Some(name))
+                .ok()
+                .map(|(_, content)| String::from_utf8_lossy(content).into_owned())
+        };
+        if content.as_deref() == Some(expected) || tokio::time::Instant::now() >= deadline {
+            return content;
+        }
+        tokio::time::sleep(CONTROL_NOTIFICATION_POLL).await;
+    }
 }
 
 fn render_command(command: &str, session: &SessionName) -> String {

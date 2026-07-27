@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
-use rmux_core::{EnvironmentStore, HookStore, OptionStore, PaneId, Session, SessionStore};
-use rmux_proto::{RmuxError, SessionName, TerminalPixels, WindowTarget};
+use rmux_core::{
+    EnvironmentStore, HookStore, OptionStore, PaneId, Session, SessionStore, WindowId,
+};
+use rmux_proto::{RmuxError, SessionName, TerminalPixels, TerminalSize, WindowTarget};
 
 use super::{
     session_not_found, AppliedWindowResizeQueue, HandlerState, PaneExitMetadata,
@@ -23,6 +25,16 @@ pub(crate) struct SessionTransferSnapshot {
     next_window_link_group_id: u64,
     next_window_link_occurrence_id: u64,
     applied_window_resizes: AppliedWindowResizeQueue,
+}
+
+struct WindowGeometryBefore {
+    window_id: WindowId,
+    preferred_target: WindowTarget,
+    size: TerminalSize,
+}
+
+struct WindowGeometrySnapshot {
+    windows: Vec<WindowGeometryBefore>,
 }
 
 impl SessionTransferSnapshot {
@@ -65,7 +77,111 @@ impl SessionTransferSnapshot {
     }
 }
 
+impl WindowGeometrySnapshot {
+    fn capture(state: &HandlerState, targets: &[WindowTarget]) -> Self {
+        let mut windows = Vec::with_capacity(targets.len());
+        for target in targets {
+            let Some(window) = state
+                .sessions
+                .session(target.session_name())
+                .and_then(|session| session.window_at(target.window_index()))
+            else {
+                continue;
+            };
+            if windows
+                .iter()
+                .any(|before: &WindowGeometryBefore| before.window_id == window.id())
+            {
+                continue;
+            }
+            windows.push(WindowGeometryBefore {
+                window_id: window.id(),
+                preferred_target: target.clone(),
+                size: window.size(),
+            });
+        }
+        Self { windows }
+    }
+
+    fn record_changes(self, state: &mut HandlerState) {
+        for before in self.windows {
+            let Some((target, size)) = before.resolve_current(state) else {
+                continue;
+            };
+            if size != before.size {
+                state.record_applied_window_resize(target);
+            }
+        }
+    }
+}
+
+impl WindowGeometryBefore {
+    fn resolve_current(&self, state: &HandlerState) -> Option<(WindowTarget, TerminalSize)> {
+        if let Some(session) = state.sessions.session(self.preferred_target.session_name()) {
+            if let Some(window) = session
+                .window_at(self.preferred_target.window_index())
+                .filter(|window| window.id() == self.window_id)
+            {
+                return Some((self.preferred_target.clone(), window.size()));
+            }
+            if let Some((&window_index, window)) = session
+                .windows()
+                .iter()
+                .find(|(_, window)| window.id() == self.window_id)
+            {
+                return Some((
+                    WindowTarget::with_window(
+                        self.preferred_target.session_name().clone(),
+                        window_index,
+                    ),
+                    window.size(),
+                ));
+            }
+        }
+
+        let mut fallback = None;
+        for (session_name, session) in state.sessions.iter() {
+            for (&window_index, window) in session.windows() {
+                if window.id() != self.window_id {
+                    continue;
+                }
+                let is_better = fallback.as_ref().is_none_or(
+                    |(best_session, best_index, _): &(SessionName, u32, TerminalSize)| {
+                        (session_name.as_str(), window_index) < (best_session.as_str(), *best_index)
+                    },
+                );
+                if is_better {
+                    fallback = Some((session_name.clone(), window_index, window.size()));
+                }
+            }
+        }
+        fallback.map(|(session_name, window_index, size)| {
+            (WindowTarget::with_window(session_name, window_index), size)
+        })
+    }
+}
+
 impl HandlerState {
+    /// Runs a mutation that can touch more than one stored window, then records
+    /// every surviving stable window identity whose content size changed.
+    ///
+    /// The comparison runs after both success and error returns. Transactional
+    /// errors restore their model snapshot and compare equal; a partially
+    /// committed error still owes the same notification as a successful write.
+    pub(crate) fn mutate_and_record_window_geometry_changes<T, F>(
+        &mut self,
+        targets: &[WindowTarget],
+        mutate: F,
+    ) -> T
+    where
+        F: FnOnce(&mut Self) -> T,
+    {
+        let geometry_before = WindowGeometrySnapshot::capture(self, targets);
+        let result = mutate(self);
+        geometry_before.record_changes(self);
+        result
+    }
+
     pub(crate) fn mutate_session_and_resize_active_window_geometry<T, F>(
         &mut self,
         session_name: &SessionName,
@@ -116,17 +232,16 @@ impl HandlerState {
         )
     }
 
-    /// The single chokepoint through which every stored window geometry change
-    /// is committed.
+    /// The primary chokepoint for mutations scoped to one stored window.
     ///
     /// tmux 3.7b keeps the equivalent invariant inside `resize_window()`: a
     /// window whose size actually changed always publishes
     /// `window-layout-changed` and then `window-resized`, and control clients see
     /// the former as `%layout-change`. Publication here is asynchronous, so a
     /// window whose size really moved is recorded on the state and drained by
-    /// `RequestHandler::publish_applied_window_resizes`. Recording at the write
-    /// itself is what makes a silent resize impossible, no matter which command
-    /// performed it.
+    /// `RequestHandler::publish_applied_window_resizes`. Multi-window mutations
+    /// use `mutate_and_record_window_geometry_changes` to preserve the same
+    /// invariant across stable window identities.
     pub(crate) fn mutate_session_and_resize_window_terminal_with_family_if<T, F, P>(
         &mut self,
         session_name: &SessionName,

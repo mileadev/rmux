@@ -944,8 +944,8 @@ impl RequestHandler {
 }
 
 /// Reserves the `window-layout-changed` / `window-resized` pair for every
-/// window the geometry chokepoint recorded, in tmux's order, under one state
-/// lock.
+/// window the geometry mutation paths recorded, in tmux's order, under one
+/// state lock.
 pub(in crate::handler) fn prepare_applied_window_resize_events(
     state: &mut crate::pane_terminals::HandlerState,
 ) -> Vec<crate::handler::QueuedLifecycleEvent> {
