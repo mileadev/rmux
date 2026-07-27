@@ -105,6 +105,31 @@ fn changed_active_window_ids(
     changed
 }
 
+fn swap_selection_session_order(
+    state: &HandlerState,
+    request: &rmux_proto::SwapWindowRequest,
+) -> Vec<SessionName> {
+    let mut seen_session_ids = HashSet::new();
+    let mut ordered_sessions = Vec::new();
+    for target in [&request.target, &request.source] {
+        for session_name in
+            state.window_linked_session_family_list(target.session_name(), target.window_index())
+        {
+            let Some(session_id) = state
+                .sessions
+                .session(&session_name)
+                .map(rmux_core::Session::id)
+            else {
+                continue;
+            };
+            if seen_session_ids.insert(session_id) {
+                ordered_sessions.push(session_name);
+            }
+        }
+    }
+    ordered_sessions
+}
+
 impl RequestHandler {
     #[cfg(test)]
     pub(in crate::handler) fn install_kill_window_commit_pause(
@@ -1318,10 +1343,7 @@ impl RequestHandler {
                 ],
             );
             let selection_before = SelectionTransitionSnapshot::capture(&state);
-            let preferred_selection_sessions = [
-                request.target.session_name().clone(),
-                request.source.session_name().clone(),
-            ];
+            let preferred_selection_sessions = swap_selection_session_order(&state, &request);
             let active_window_ids_before = active_window_ids_by_session(&state);
             let mut resize_window_ids = [&request.source, &request.target]
                 .into_iter()

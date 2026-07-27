@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -16,6 +16,13 @@ struct IntraSessionCase {
     target: u32,
     detached: bool,
     expected_identity_slot: u32,
+}
+
+#[derive(Debug)]
+struct StableSessionSelection {
+    session_name: SessionName,
+    session_id: String,
+    window_id: String,
 }
 
 async fn register_swap_control(
@@ -134,6 +141,59 @@ async fn active_window_model(
                 .session(session_name)
                 .expect("model session exists");
             (session.id().to_string(), session.window().id().to_string())
+        })
+        .collect()
+}
+
+async fn stable_selection_snapshot(
+    handler: &RequestHandler,
+    session_names: &[SessionName],
+) -> Vec<StableSessionSelection> {
+    let state = handler.state.lock().await;
+    session_names
+        .iter()
+        .map(|session_name| {
+            let session = state
+                .sessions
+                .session(session_name)
+                .expect("snapshot session exists");
+            StableSessionSelection {
+                session_name: session_name.clone(),
+                session_id: session.id().to_string(),
+                window_id: session.window().id().to_string(),
+            }
+        })
+        .collect()
+}
+
+fn semantic_notifications_from_snapshots(
+    before: &[StableSessionSelection],
+    after: &[StableSessionSelection],
+    target_then_source_family: &[SessionName],
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    target_then_source_family
+        .iter()
+        .filter_map(|session_name| {
+            let before = before
+                .iter()
+                .find(|selection| &selection.session_name == session_name)
+                .expect("ordered session exists in before snapshot");
+            let after = after
+                .iter()
+                .find(|selection| &selection.session_name == session_name)
+                .expect("ordered session exists in after snapshot");
+            assert_eq!(
+                before.session_id, after.session_id,
+                "session identity remains stable"
+            );
+            if before.window_id == after.window_id || !seen.insert(after.session_id.clone()) {
+                return None;
+            }
+            Some(format!(
+                "%session-window-changed {} {}",
+                after.session_id, after.window_id
+            ))
         })
         .collect()
 }
@@ -378,6 +438,85 @@ async fn cross_session_swap_orders_each_real_transition_target_then_source() {
     );
     apply_session_window_events(&mut model, &notifications);
     assert_eq!(model, active_window_model(&handler, &sessions).await);
+}
+
+#[tokio::test]
+async fn cross_session_swap_orders_complete_grouped_families_from_stable_snapshots() {
+    let handler = RequestHandler::new();
+    let alpha = create_indexed_windows(&handler, "family-alpha", 3).await;
+    let gamma = session_name("family-gamma");
+    create_grouped_session(&handler, gamma.as_str(), &alpha).await;
+    let beta = create_indexed_windows(&handler, "family-beta", 3).await;
+    let unchanged = create_indexed_windows(&handler, "family-unchanged", 1).await;
+    for session_name in [&alpha, &gamma, &beta, &unchanged] {
+        select_window(&handler, session_name, 0).await;
+    }
+
+    let (_alpha_id, alpha_windows) = session_window_ids(&handler, &alpha).await;
+    let (_beta_id, beta_windows) = session_window_ids(&handler, &beta).await;
+    let source_window_id = alpha_windows.get(&0).expect("source identity").clone();
+    let target_window_id = beta_windows.get(&0).expect("target identity").clone();
+    let session_names = [
+        alpha.clone(),
+        gamma.clone(),
+        beta.clone(),
+        unchanged.clone(),
+    ];
+    let requester_pid = 32_250;
+    let (control_id, mut rx) = register_swap_control(&handler, requester_pid, &alpha).await;
+    let _ = swap_notifications(&mut rx);
+
+    let family_orders = [
+        vec![
+            beta.clone(),
+            alpha.clone(),
+            gamma.clone(),
+            beta.clone(),
+            unchanged.clone(),
+        ],
+        vec![
+            alpha.clone(),
+            gamma.clone(),
+            beta.clone(),
+            alpha.clone(),
+            unchanged.clone(),
+        ],
+    ];
+    for (operation, family_order) in family_orders.into_iter().enumerate() {
+        let before = stable_selection_snapshot(&handler, &session_names).await;
+        run_swap_control(
+            &handler,
+            requester_pid,
+            control_id,
+            &format!("swap-window -s {source_window_id} -t {target_window_id}"),
+        )
+        .await;
+        let after = stable_selection_snapshot(&handler, &session_names).await;
+        let expected = semantic_notifications_from_snapshots(&before, &after, &family_order);
+        let notifications = swap_notifications(&mut rx);
+        assert_eq!(
+            notifications,
+            expected,
+            "operation {} publishes the whole target family before the source family",
+            operation + 1
+        );
+
+        let mut model = before
+            .iter()
+            .map(|selection| (selection.session_id.clone(), selection.window_id.clone()))
+            .collect::<HashMap<_, _>>();
+        apply_session_window_events(&mut model, &notifications);
+        let final_snapshot = after
+            .iter()
+            .map(|selection| (selection.session_id.clone(), selection.window_id.clone()))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            model,
+            final_snapshot,
+            "snapshot plus ordered events reconstructs operation {}",
+            operation + 1
+        );
+    }
 }
 
 #[tokio::test]
