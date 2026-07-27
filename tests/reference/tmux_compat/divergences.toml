@@ -313,3 +313,38 @@ id = "C-D76"
 summary = "Delayed command-mode jobs reject replaced stable session targets"
 inventory = "bounded"
 tests = ["tests/run_shell_context.rs::delayed_command_run_shell_rejects_replacement_session_product_divergence"]
+
+[[entry]]
+id = "C-D77"
+summary = "Impossible undersized multi-pane layouts fail soft inside the core"
+inventory = "bounded"
+evidence = ["tests/fixtures/tmux37/accepted_product_divergences.txt"]
+tests = [
+  "crates/rmux-core/src/layout/tests.rs::even_horizontal_degenerate_width_product_divergence",
+  "crates/rmux-core/src/layout/tests.rs::even_vertical_degenerate_height_product_divergence",
+]
+limitations = [
+  "tmux refuses a split that cannot fit and clamps an existing two-pane window to its three-cell minimum",
+  "RMUX runtime paths clamp viable windows; these tests preserve bounded behavior for otherwise unreachable core inputs",
+]
+
+[[entry]]
+id = "C-D78"
+summary = "Joined capture preserves main-screen soft wraps across alternate-screen cycles"
+inventory = "bounded"
+evidence = ["tests/fixtures/tmux37/accepted_product_divergences.txt"]
+tests = ["crates/rmux-core/src/screen/tests.rs::joined_capture_alt_cycles_preserve_main_wrap_product_divergence"]
+
+[[entry]]
+id = "C-D79"
+summary = "Delayed display callbacks remain asynchronous instead of creating phantom control commands"
+inventory = "bounded"
+evidence = ["tests/fixtures/tmux37/accepted_product_divergences.txt"]
+tests = ["crates/rmux-server/src/control/tests.rs::delayed_run_shell_control_message_remains_asynchronous_product_divergence"]
+
+[[entry]]
+id = "C-D80"
+summary = "Explicit empty initial window names preserve caller intent"
+inventory = "bounded"
+evidence = ["tests/fixtures/tmux37/accepted_product_divergences.txt"]
+tests = ["tests/automatic_rename_initial.rs::explicit_empty_initial_names_are_preserved_product_divergence"]
