@@ -1,14 +1,13 @@
 use rmux_core::command_parser::{CommandArgument, ParsedCommand, ParsedCommands};
 
-/// Tracks the Windows stdin EOF marker separately from a raw transport EOF.
+/// Tracks the bounded Windows completion barrier after either form of EOF.
 ///
 /// Once this stream has run `attach-session` and admitted work before the
-/// marker, its transcript must stay open until that bounded batch has
-/// completed. Other EOF paths retain the global grace period and detached
-/// finite drain.
+/// private stdin marker or raw transport close, its finite batch must complete.
+/// Other EOF paths retain the global grace period and detached finite drain.
 #[derive(Debug, Default)]
 pub(super) struct ControlEofCompletion {
-    stdin_eof_marker_seen: bool,
+    completion_eof_seen: bool,
     attach_session_seen: bool,
     active_command_attaches_session: bool,
     finish_admitted_attached_batch: bool,
@@ -24,12 +23,27 @@ impl ControlEofCompletion {
         self.active_command_attaches_session = false;
     }
 
+    #[cfg(any(windows, test))]
     pub(super) fn observe_stdin_eof_marker(
         &mut self,
         client_attached: bool,
         admitted_work_pending: bool,
     ) {
-        self.stdin_eof_marker_seen = true;
+        self.observe_completion_eof(client_attached, admitted_work_pending);
+    }
+
+    #[cfg(any(windows, test))]
+    pub(super) fn observe_transport_eof(
+        &mut self,
+        client_attached: bool,
+        admitted_work_pending: bool,
+    ) {
+        self.observe_completion_eof(client_attached, admitted_work_pending);
+    }
+
+    #[cfg(any(windows, test))]
+    fn observe_completion_eof(&mut self, client_attached: bool, admitted_work_pending: bool) {
+        self.completion_eof_seen = true;
         if self.attach_session_seen && client_attached && admitted_work_pending {
             self.finish_admitted_attached_batch = true;
         }
@@ -40,7 +54,7 @@ impl ControlEofCompletion {
         client_attached: bool,
         admitted_work_pending: bool,
     ) {
-        if self.stdin_eof_marker_seen
+        if self.completion_eof_seen
             && self.attach_session_seen
             && client_attached
             && admitted_work_pending
@@ -51,7 +65,7 @@ impl ControlEofCompletion {
 
     pub(super) fn allows_detached_drain_transition(&self) -> bool {
         !(self.finish_admitted_attached_batch
-            || (self.stdin_eof_marker_seen && self.active_command_attaches_session))
+            || (self.completion_eof_seen && self.active_command_attaches_session))
     }
 }
 
@@ -96,6 +110,20 @@ mod tests {
         let mut completion = ControlEofCompletion::default();
         completion.command_started(&parse("attach-session -t alpha"));
         completion.observe_stdin_eof_marker(false, true);
+
+        assert!(!completion.allows_detached_drain_transition());
+
+        completion.command_finished();
+        completion.observe_attachment(true, true);
+
+        assert!(!completion.allows_detached_drain_transition());
+    }
+
+    #[test]
+    fn raw_transport_eof_protects_follow_on_frames_admitted_behind_attach() {
+        let mut completion = ControlEofCompletion::default();
+        completion.command_started(&parse("attach-session -t alpha"));
+        completion.observe_transport_eof(false, true);
 
         assert!(!completion.allows_detached_drain_transition());
 

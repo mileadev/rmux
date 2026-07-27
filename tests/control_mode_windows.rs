@@ -7,7 +7,8 @@ use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rmux_proto::{CONTROL_CONTROL_END, CONTROL_CONTROL_START};
+use rmux_client::{connect, socket_path_for_label, ControlTransition};
+use rmux_proto::{ClientTerminalContext, ControlMode, CONTROL_CONTROL_END, CONTROL_CONTROL_START};
 
 #[path = "support/windows_cli_serial.rs"]
 mod windows_cli_serial;
@@ -254,6 +255,42 @@ fn control_pipe_eof_after_attach_finishes_admitted_mutation_before_success(
 }
 
 #[test]
+fn raw_control_transport_eof_after_attach_finishes_admitted_mutation() -> Result<(), Box<dyn Error>>
+{
+    let _serial_guard = windows_cli_serial::acquire("control-attach-raw-eof")?;
+    let label = unique_label("control-attach-raw-eof-windows")?;
+    let _server = ServerGuard::new(label.clone());
+    create_default_detached_session(&label, "alpha")?;
+
+    let connection = connect(&socket_path_for_label(&label)?)?;
+    let transition =
+        connection.begin_control_mode(ControlMode::Plain, ClientTerminalContext::default())?;
+    let mut stream = match transition {
+        ControlTransition::Upgraded(upgrade) => upgrade.into_stream(),
+        ControlTransition::Rejected(response) => {
+            return Err(format!("control upgrade was rejected: {response:?}").into());
+        }
+    };
+
+    const ADMITTED_MUTATIONS: usize = 512;
+    let buffer_name = "control-raw-eof-proof";
+    writeln!(stream, "attach-session -t alpha")?;
+    for sequence in 0..ADMITTED_MUTATIONS {
+        writeln!(stream, "set-buffer -b {buffer_name} VALUE-{sequence}")?;
+    }
+    stream.flush()?;
+    drop(stream);
+
+    wait_for_buffer_after_transport_close(
+        &label,
+        buffer_name,
+        &format!("VALUE-{}", ADMITTED_MUTATIONS - 1),
+    )?;
+
+    Ok(())
+}
+
+#[test]
 fn control_argv_attach_batch_finishes_before_success() -> Result<(), Box<dyn Error>> {
     let _serial_guard = windows_cli_serial::acquire("control-attach-argv")?;
     let label = unique_label("control-attach-argv-windows")?;
@@ -424,6 +461,24 @@ fn wait_for_buffer(
         thread::sleep(Duration::from_millis(25));
     }
     Err(format!("timed out waiting for buffer {buffer_name:?}={expected:?}").into())
+}
+
+fn wait_for_buffer_after_transport_close(
+    label: &str,
+    buffer_name: &str,
+    expected: &str,
+) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + CONTROL_TIMEOUT;
+    while Instant::now() < deadline {
+        if matches!(
+            show_buffer(label, buffer_name).as_deref(),
+            Ok(actual) if actual == expected
+        ) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err(format!("timed out waiting after raw control EOF for {buffer_name:?}={expected:?}").into())
 }
 
 fn wait_for_attached_client(

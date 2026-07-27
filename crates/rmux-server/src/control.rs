@@ -694,6 +694,11 @@ async fn forward_control_inner(
                     if let Some(command) = current_command.as_ref() {
                         command.eof_cancellation.cancel_for_eof();
                     }
+                    #[cfg(windows)]
+                    eof_completion.observe_transport_eof(
+                        attachment.is_attached(),
+                        current_command.is_some() || !queued_lines.is_empty(),
+                    );
                     arm_control_eof_transition(&mut eof_transition);
                 } else {
                     append_control_input(
