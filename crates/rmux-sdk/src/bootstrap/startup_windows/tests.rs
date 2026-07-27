@@ -254,7 +254,7 @@ async fn incompatible_wire_probe_is_reported_immediately() -> TestResult {
             operation, source, ..
         }) => {
             assert_eq!(operation, "decode probe response");
-            assert!(source.to_string().contains("unsupported wire version"));
+            assert!(source.to_string().contains("unsupported RMUX wire version"));
         }
         other => panic!("expected incompatible probe error, got {other:?}"),
     }
