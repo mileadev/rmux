@@ -1575,7 +1575,7 @@ async fn unlink_window_kill_if_last_rekeys_renumbered_silence_timers_without_del
         }))
         .await;
     assert!(
-        matches!(&response, Response::UnlinkWindow(result) if result.target == WindowTarget::with_window(alpha.clone(), 0)),
+        matches!(&response, Response::UnlinkWindow(result) if result.target == WindowTarget::with_window(alpha.clone(), 1)),
         "expected unlink-window -k success with renumbering, got {response:?}"
     );
 
