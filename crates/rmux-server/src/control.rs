@@ -414,7 +414,12 @@ async fn forward_control_inner(
         }
         if current_command.is_none() {
             let reconcile_ready_control_events = initial_command_completion_pending
-                || (input_closed && !control_control_waits_for_attached_session(mode, &attachment));
+                || (input_closed
+                    && !control_control_waits_for_attached_session(
+                        mode,
+                        &attachment,
+                        eof_completion.raw_transport_eof_seen(),
+                    ));
             let mut event_context = ServerEventContext {
                 handler: &handler,
                 control_identity,
@@ -511,7 +516,11 @@ async fn forward_control_inner(
             && input_closed
             && current_command.is_none()
             && queued_lines.is_empty()
-            && !control_control_waits_for_attached_session(mode, &attachment)
+            && !control_control_waits_for_attached_session(
+                mode,
+                &attachment,
+                eof_completion.raw_transport_eof_seen(),
+            )
         {
             // Any incomplete line remaining in input_buffer after EOF is
             // discarded, matching tmux's `evbuffer_readln` semantics. EOF
@@ -684,7 +693,11 @@ async fn forward_control_inner(
             && input_closed
             && current_command.is_none()
             && queued_lines.is_empty()
-            && !control_control_waits_for_attached_session(mode, &attachment)
+            && !control_control_waits_for_attached_session(
+                mode,
+                &attachment,
+                eof_completion.raw_transport_eof_seen(),
+            )
         {
             output_queue.enqueue_line(format_exit_line(None).into_bytes(), false);
             flush_output_queue(&mut output_queue, &mut write_half, flags, &mut paused_panes)
@@ -1002,8 +1015,9 @@ async fn forward_control_inner(
 fn control_control_waits_for_attached_session(
     mode: ControlMode,
     attachment: &ControlSessionAttachment,
+    raw_transport_eof_seen: bool,
 ) -> bool {
-    mode.is_control_control() && attachment.is_attached()
+    mode.is_control_control() && attachment.is_attached() && !raw_transport_eof_seen
 }
 
 #[cfg(any(unix, windows))]

@@ -8,6 +8,7 @@ use rmux_core::command_parser::{CommandArgument, ParsedCommand, ParsedCommands};
 #[derive(Debug, Default)]
 pub(super) struct ControlEofCompletion {
     completion_eof_seen: bool,
+    raw_transport_eof_seen: bool,
     attach_session_seen: bool,
     active_command_attaches_session: bool,
     finish_admitted_attached_batch: bool,
@@ -38,6 +39,7 @@ impl ControlEofCompletion {
         client_attached: bool,
         admitted_work_pending: bool,
     ) {
+        self.raw_transport_eof_seen = true;
         self.observe_completion_eof(client_attached, admitted_work_pending);
     }
 
@@ -66,6 +68,10 @@ impl ControlEofCompletion {
     pub(super) fn allows_detached_drain_transition(&self) -> bool {
         !(self.finish_admitted_attached_batch
             || (self.completion_eof_seen && self.active_command_attaches_session))
+    }
+
+    pub(super) fn raw_transport_eof_seen(&self) -> bool {
+        self.raw_transport_eof_seen
     }
 }
 
@@ -126,6 +132,7 @@ mod tests {
         completion.observe_transport_eof(false, true);
 
         assert!(!completion.allows_detached_drain_transition());
+        assert!(completion.raw_transport_eof_seen());
 
         completion.command_finished();
         completion.observe_attachment(true, true);
@@ -139,6 +146,7 @@ mod tests {
         completion.command_started(&parse("attach-session -t alpha"));
 
         assert!(completion.allows_detached_drain_transition());
+        assert!(!completion.raw_transport_eof_seen());
 
         completion.command_finished();
         completion.observe_attachment(true, true);
@@ -156,6 +164,7 @@ mod tests {
         completion.observe_stdin_eof_marker(true, true);
 
         assert!(!completion.allows_detached_drain_transition());
+        assert!(!completion.raw_transport_eof_seen());
     }
 
     #[test]
