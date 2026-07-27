@@ -294,6 +294,8 @@ impl Error for PaneSurfaceApplyError {}
 ///
 /// Construction goes through [`crate::Pane::surface_stream`]. Rendering is
 /// shared once per pane inside the daemon, independent of viewer count.
+/// A daemon projection or frame-size error is returned from the current poll
+/// without closing the stream; callers may retry after pane state changes.
 pub struct PaneSurfaceStream {
     inner: RecoverablePaneStream<PaneSurfaceEvent>,
 }
@@ -313,11 +315,17 @@ impl PaneSurfaceStream {
     }
 
     /// Returns the next surface event, waiting for pane activity when needed.
+    ///
+    /// A non-transport daemon projection error leaves the subscription open,
+    /// so calling `next` again retries the same stream.
     pub async fn next(&mut self) -> Result<Option<PaneSurfaceEvent>> {
         self.inner.next().await
     }
 
     /// Performs at most one daemon cursor round trip and returns ready events.
+    ///
+    /// A non-transport daemon projection error leaves the subscription open,
+    /// so a later `poll_once` can receive a transportable Surface frame.
     pub async fn poll_once(&mut self) -> Result<Vec<PaneSurfaceEvent>> {
         self.inner.poll_once().await
     }

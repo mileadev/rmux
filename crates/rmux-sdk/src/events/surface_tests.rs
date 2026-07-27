@@ -1,5 +1,13 @@
 use super::*;
-use crate::{PaneCursor, PaneSnapshot};
+use crate::transport::TransportClient;
+use crate::{PaneCursor, PaneId, PaneSnapshot};
+use rmux_proto::{
+    encode_frame, ErrorResponse, FrameDecoder, PaneOutputSubscriptionId, PaneStreamCursorRequest,
+    PaneStreamCursorResponse, PaneTarget, Request, Response, SessionName,
+    SubscribePaneStreamRequest, SubscribePaneStreamResponse, UnsubscribePaneStreamRequest,
+    UnsubscribePaneStreamResponse, DEFAULT_MAX_DETACHED_FRAME_LENGTH,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 fn frame(epoch: u64, revision: u64) -> PaneSurfaceFrame {
     frame_at(epoch, revision, revision)
@@ -73,6 +81,148 @@ fn linked_proto_snapshot(metadata_complete: bool) -> ProtoSnapshot {
         history_bytes: 0,
         revision: 1,
     }
+}
+
+fn stream_target() -> PaneTarget {
+    PaneTarget::with_window(
+        SessionName::new("surface-retry").expect("valid session name"),
+        0,
+        0,
+    )
+}
+
+fn stream_subscription_id() -> PaneOutputSubscriptionId {
+    PaneOutputSubscriptionId::new(91)
+}
+
+fn wire_frame(epoch: u64, revision: u64) -> ProtoFrame {
+    let mut snapshot = linked_proto_snapshot(true);
+    snapshot.revision = revision;
+    ProtoFrame {
+        epoch,
+        revision,
+        next_output_sequence: revision,
+        snapshot,
+    }
+}
+
+async fn read_request(stream: &mut DuplexStream) -> Request {
+    let mut decoder = FrameDecoder::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        if let Some(request) = decoder.next_frame().expect("request frame") {
+            return request;
+        }
+        let read = stream.read(&mut buffer).await.expect("read request");
+        assert_ne!(read, 0, "transport closed before request");
+        decoder.push_bytes(&buffer[..read]);
+    }
+}
+
+async fn write_response(stream: &mut DuplexStream, response: Response) {
+    stream
+        .write_all(&encode_frame(&response).expect("response frame"))
+        .await
+        .expect("write response");
+}
+
+#[tokio::test]
+async fn surface_projection_error_is_retryable_without_closing_the_sdk_stream() {
+    let (client, mut server) = tokio::io::duplex(64 * 1024);
+    let server_task = tokio::spawn(async move {
+        assert_eq!(
+            read_request(&mut server).await,
+            Request::SubscribePaneStream(SubscribePaneStreamRequest {
+                target: PaneTargetRef::slot(stream_target()),
+                mode: PaneStreamMode::Surface,
+                include_snapshot: false,
+            })
+        );
+        write_response(
+            &mut server,
+            Response::SubscribePaneStream(Box::new(SubscribePaneStreamResponse {
+                subscription_id: stream_subscription_id(),
+                target: stream_target(),
+                pane_id: PaneId::new(1),
+                event: ProtoEvent::SurfaceReset(Box::new(wire_frame(1, 1))),
+            })),
+        )
+        .await;
+
+        for response in [
+            Response::Error(ErrorResponse {
+                error: rmux_proto::RmuxError::FrameTooLarge {
+                    length: DEFAULT_MAX_DETACHED_FRAME_LENGTH + 1,
+                    maximum: DEFAULT_MAX_DETACHED_FRAME_LENGTH,
+                },
+            }),
+            Response::PaneStreamCursor(Box::new(PaneStreamCursorResponse {
+                subscription_id: stream_subscription_id(),
+                events: vec![ProtoEvent::SurfacePatch(Box::new(wire_frame(1, 2)))],
+                limited: false,
+            })),
+        ] {
+            assert!(matches!(
+                read_request(&mut server).await,
+                Request::PaneStreamCursor(PaneStreamCursorRequest {
+                    subscription_id,
+                    ..
+                }) if subscription_id == stream_subscription_id()
+            ));
+            write_response(&mut server, response).await;
+        }
+
+        assert_eq!(
+            read_request(&mut server).await,
+            Request::UnsubscribePaneStream(UnsubscribePaneStreamRequest {
+                subscription_id: stream_subscription_id(),
+            })
+        );
+        write_response(
+            &mut server,
+            Response::UnsubscribePaneStream(UnsubscribePaneStreamResponse {
+                subscription_id: stream_subscription_id(),
+                removed: true,
+            }),
+        )
+        .await;
+    });
+
+    let mut stream = PaneSurfaceStream::open(
+        TransportClient::spawn(client),
+        PaneTargetRef::slot(stream_target()),
+    )
+    .await
+    .expect("open Surface stream");
+    assert!(matches!(
+        stream.next().await.expect("initial Surface event"),
+        Some(PaneSurfaceEvent::Reset(frame)) if frame.revision == 1
+    ));
+
+    let error = stream
+        .poll_once()
+        .await
+        .expect_err("oversized Surface projection must reach the SDK as an error");
+    assert!(matches!(
+        error,
+        crate::RmuxError::Protocol {
+            source: rmux_proto::RmuxError::FrameTooLarge {
+                length,
+                maximum,
+            },
+        } if length == DEFAULT_MAX_DETACHED_FRAME_LENGTH + 1
+            && maximum == DEFAULT_MAX_DETACHED_FRAME_LENGTH
+    ));
+
+    assert!(matches!(
+        stream.poll_once().await.expect("retry Surface cursor"),
+        events if matches!(
+            events.as_slice(),
+            [PaneSurfaceEvent::Patch(frame)] if frame.revision == 2
+        )
+    ));
+    drop(stream);
+    server_task.await.expect("Surface server task");
 }
 
 #[test]

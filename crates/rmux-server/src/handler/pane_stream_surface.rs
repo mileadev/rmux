@@ -4,7 +4,7 @@ use std::time::Instant;
 use rmux_core::events::{OutputCursorItem, DEFAULT_SUBSCRIPTION_BATCH_EVENTS};
 use rmux_proto::{
     ErrorResponse, PaneStreamCursorRequest, PaneStreamEndReason, PaneStreamEvent,
-    PaneStreamLifecycleEvent, PaneStreamMode, Response, RmuxError,
+    PaneStreamLifecycleEvent, Response, RmuxError,
 };
 
 use crate::pane_io::PaneObservationItem;
@@ -17,6 +17,12 @@ use super::{
 };
 
 impl RequestHandler {
+    #[cfg(test)]
+    pub(in crate::handler) fn surface_poll_materialization_count(&self) -> usize {
+        self.surface_poll_materializations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(super) async fn poll_surface_stream(
         &self,
         connection_id: u64,
@@ -123,6 +129,13 @@ impl RequestHandler {
                 reset,
                 frame_lifecycle_revision,
             };
+            let admission_cache = driver.admission_cache();
+            let reuse_rejected_fingerprint = admission_cache.validation().is_err();
+            let previous_fingerprint = if reuse_rejected_fingerprint {
+                admission_cache.fingerprint().clone()
+            } else {
+                driver.fingerprint.clone()
+            };
             let refresh = (
                 key.clone(),
                 token,
@@ -131,7 +144,9 @@ impl RequestHandler {
                 driver.revision.saturating_add(1),
                 driver.latest.snapshot.revision.saturating_add(1),
                 reset,
-                driver.fingerprint.clone(),
+                previous_fingerprint,
+                admission_cache,
+                reset && !reuse_rejected_fingerprint,
                 driver.receiver.observed_invalidation_revision(),
                 driver.receiver.observed_process_exit_revision(),
                 frame_lifecycle_revision,
@@ -153,6 +168,8 @@ impl RequestHandler {
             minimum_snapshot_revision,
             reset,
             previous_fingerprint,
+            admission_cache,
+            force_projection,
             observed_invalidation_revision,
             observed_process_exit_revision,
             frame_lifecycle_revision,
@@ -177,30 +194,25 @@ impl RequestHandler {
                     );
                 }
             };
-            let candidate =
-                match capture_surface_source(&source, Some(&previous_fingerprint), reset) {
-                    Ok(candidate) => candidate,
-                    Err(_) => {
-                        self.finish_stream_after_end(request.subscription_id);
-                        return stream_cursor_response(
-                            request.subscription_id,
-                            vec![PaneStreamEvent::End(PaneStreamEndReason::ProjectionFailed)],
-                            false,
-                        );
-                    }
-                };
+            let candidate = match capture_surface_source(
+                &source,
+                Some(&previous_fingerprint),
+                force_projection,
+            ) {
+                Ok(candidate) => candidate,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            };
             if candidate.boundary.generation == source.generation {
                 captured = Some(candidate);
                 break;
             }
         }
         let Some(mut captured) = captured else {
-            self.finish_stream_after_end(request.subscription_id);
-            return stream_cursor_response(
-                request.subscription_id,
-                vec![PaneStreamEvent::End(PaneStreamEndReason::ProjectionFailed)],
-                false,
-            );
+            return Response::Error(ErrorResponse {
+                error: RmuxError::Server(
+                    "pane generation changed repeatedly while refreshing surface stream".to_owned(),
+                ),
+            });
         };
         if captured.boundary.invalidation_revision > observed_invalidation_revision {
             let response = {
@@ -221,6 +233,15 @@ impl RequestHandler {
             .receiver
             .preserve_process_exits_since(observed_process_exit_revision);
         let Some(seed) = captured.seed.as_ref() else {
+            if captured.fingerprint == *admission_cache.fingerprint() {
+                if let Err(error) = admission_cache.validation() {
+                    // A Surface frame is authoritative rather than
+                    // sequence-bearing. Keep the refresh pending and let the
+                    // caller retry after the fingerprint changes; Raw rebases
+                    // cannot make this choice without losing byte continuity.
+                    return Response::Error(ErrorResponse { error });
+                }
+            }
             let mut subscriptions = self
                 .subscriptions
                 .lock()
@@ -247,6 +268,9 @@ impl RequestHandler {
                 source_batch_limited,
             );
         };
+        #[cfg(test)]
+        self.surface_poll_materializations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let frame = match materialize_surface_frame(
             self,
             key.pane_id(),
@@ -257,30 +281,23 @@ impl RequestHandler {
             seed,
         ) {
             Ok(frame) => frame,
-            Err(_error) => {
-                let mut subscriptions = self
-                    .subscriptions
-                    .lock()
-                    .expect("subscription registry mutex must not be poisoned");
-                if let Some(current_key) =
-                    subscriptions.surface_driver_key_for_pane_id(key.pane_id())
-                {
-                    subscriptions.end_pane_streams(
-                        &current_key,
-                        PaneStreamMode::Surface,
-                        PaneStreamEndReason::ProjectionFailed,
-                        Instant::now(),
-                    );
-                    subscriptions.ended_streams.remove(&request.subscription_id);
-                }
-                return stream_cursor_response(
-                    request.subscription_id,
-                    vec![PaneStreamEvent::End(PaneStreamEndReason::ProjectionFailed)],
-                    false,
+            Err(error) => {
+                let _ = self.cache_surface_admission_if_revision(
+                    key.pane_id(),
+                    admission_cache.revision(),
+                    captured.fingerprint.clone(),
+                    Err(error.clone()),
                 );
+                return Response::Error(ErrorResponse { error });
             }
         };
         if let Err(error) = validate_surface_frame_size(&frame) {
+            let _ = self.cache_surface_admission_if_revision(
+                key.pane_id(),
+                admission_cache.revision(),
+                captured.fingerprint.clone(),
+                Err(error.clone()),
+            );
             return Response::Error(ErrorResponse { error });
         }
 

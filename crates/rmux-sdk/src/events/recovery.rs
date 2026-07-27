@@ -394,7 +394,10 @@ impl Error for PaneRecoveryApplyError {}
 ///
 /// Construction goes through [`crate::Pane::recover_output`]. A lag, resize,
 /// clear, parser expiry, or process-generation change produces an in-band
-/// [`PaneRecoveryEvent::Rebase`] on the same subscription.
+/// [`PaneRecoveryEvent::Rebase`] on the same subscription. If a required Raw
+/// rebase cannot fit the detached transport, the stream ends with
+/// [`PaneStreamEndReason::SlowConsumer`]: skipping that rebase would break byte
+/// sequence continuity.
 pub struct PaneRecoveryStream {
     inner: RecoverablePaneStream<PaneRecoveryEvent>,
 }

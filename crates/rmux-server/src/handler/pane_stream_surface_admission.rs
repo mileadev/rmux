@@ -62,22 +62,26 @@ impl RequestHandler {
             .ok_or_else(|| RmuxError::Server("pane surface driver not found".to_owned()))
     }
 
-    fn cache_surface_admission(
+    pub(super) fn cache_surface_admission_if_revision(
         &self,
         pane_id: rmux_core::PaneId,
+        expected_revision: u64,
         fingerprint: PaneSurfaceFingerprint,
         validation: Result<(), RmuxError>,
-    ) {
+    ) -> bool {
         let mut subscriptions = self
             .subscriptions
             .lock()
             .expect("subscription registry mutex must not be poisoned");
         let Some(key) = subscriptions.surface_driver_key_for_pane_id(pane_id) else {
-            return;
+            return false;
         };
-        if let Some(driver) = subscriptions.surface_drivers.get_mut(&key) {
-            driver.cache_admission(fingerprint, validation);
-        }
+        subscriptions
+            .surface_drivers
+            .get_mut(&key)
+            .is_some_and(|driver| {
+                driver.cache_admission_if_revision(expected_revision, fingerprint, validation)
+            })
     }
 
     fn validate_surface_admission_capture(
@@ -126,11 +130,14 @@ impl RequestHandler {
                 continue;
             }
             let validation = self.validate_surface_admission_capture(&source, &captured, &cache);
-            self.cache_surface_admission(
-                source.key.pane_id(),
-                captured.fingerprint.clone(),
-                validation.clone(),
-            );
+            if captured.fingerprint != *cache.fingerprint() {
+                let _ = self.cache_surface_admission_if_revision(
+                    source.key.pane_id(),
+                    cache.revision(),
+                    captured.fingerprint.clone(),
+                    validation.clone(),
+                );
+            }
             self.pause_after_surface_admission_validation().await;
             if source.output.is_current_boundary(captured.boundary) {
                 validation?;
@@ -150,13 +157,18 @@ impl RequestHandler {
                 validation
             } else {
                 let current_cache = self.current_surface_admission_cache(source.key.pane_id())?;
-                self.validate_surface_admission_capture(&source, &current, &current_cache)
+                let validation =
+                    self.validate_surface_admission_capture(&source, &current, &current_cache);
+                if current.fingerprint != *current_cache.fingerprint() {
+                    let _ = self.cache_surface_admission_if_revision(
+                        source.key.pane_id(),
+                        current_cache.revision(),
+                        current.fingerprint.clone(),
+                        validation.clone(),
+                    );
+                }
+                validation
             };
-            self.cache_surface_admission(
-                source.key.pane_id(),
-                current.fingerprint,
-                current_validation.clone(),
-            );
             if source.output.current_generation() != source.generation {
                 source = self
                     .resolve_stream_source_for_pane(

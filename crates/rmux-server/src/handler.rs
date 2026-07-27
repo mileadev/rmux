@@ -376,6 +376,8 @@ pub(crate) struct RequestHandler {
     #[cfg(test)]
     surface_admission_materializations: Arc<AtomicUsize>,
     #[cfg(test)]
+    surface_poll_materializations: Arc<AtomicUsize>,
+    #[cfg(test)]
     alert_plan_effect_pause: Arc<StdMutex<Option<Arc<AlertPlanEffectPause>>>>,
     #[cfg(test)]
     pane_alert_apply_pause: Arc<StdMutex<Option<Arc<PaneAlertApplyPause>>>>,
@@ -472,6 +474,8 @@ impl Clone for RequestHandler {
             surface_admission_pause: self.surface_admission_pause.clone(),
             #[cfg(test)]
             surface_admission_materializations: self.surface_admission_materializations.clone(),
+            #[cfg(test)]
+            surface_poll_materializations: self.surface_poll_materializations.clone(),
             #[cfg(test)]
             alert_plan_effect_pause: self.alert_plan_effect_pause.clone(),
             #[cfg(test)]
@@ -622,6 +626,8 @@ impl WeakRequestHandler {
             surface_admission_pause: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             surface_admission_materializations: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            surface_poll_materializations: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             alert_plan_effect_pause: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
@@ -934,6 +940,8 @@ impl RequestHandler {
             surface_admission_pause: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             surface_admission_materializations: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            surface_poll_materializations: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             alert_plan_effect_pause: Arc::new(StdMutex::new(None)),
             #[cfg(test)]

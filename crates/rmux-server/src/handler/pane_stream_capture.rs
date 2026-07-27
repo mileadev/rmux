@@ -15,7 +15,7 @@ use crate::pane_recovery::{
 };
 
 use super::super::pane_support::{
-    collect_cells, compute_snapshot_fingerprint, cursor_coord_to_u16,
+    collect_cells, compute_snapshot_fingerprint, cursor_coord_to_u16, CellCollectionBudget,
 };
 use super::super::RequestHandler;
 use super::types::{PaneStreamSource, PaneSurfaceFingerprint};
@@ -127,7 +127,13 @@ pub(in crate::handler) fn materialize_surface_frame(
     let size = screen.size();
     let history_size = seed.history_size();
     let history_bytes = seed.history_bytes();
-    let cells = collect_cells(screen, size.cols, size.rows, history_size)?;
+    let cells = collect_cells(
+        screen,
+        size.cols,
+        size.rows,
+        history_size,
+        CellCollectionBudget::Surface,
+    )?;
     let (hyperlinks, hyperlinks_complete) = collect_surface_hyperlinks(screen, &cells);
     let (cursor_x, cursor_y) = screen.cursor_position();
     let (scroll_top, scroll_bottom) = screen.scroll_region();
@@ -216,7 +222,13 @@ fn materialize_typed_snapshot(
     validate_recovery_snapshot_geometry(size.cols, size.rows)?;
     let history_size = seed.history_size();
     let history_bytes = seed.history_bytes();
-    let cells = collect_cells(screen, size.cols, size.rows, history_size)?;
+    let cells = collect_cells(
+        screen,
+        size.cols,
+        size.rows,
+        history_size,
+        CellCollectionBudget::PaneSnapshot,
+    )?;
     let (cursor_x, cursor_y) = screen.cursor_position();
     let cursor = PaneSnapshotCursor {
         row: cursor_coord_to_u16(cursor_y),

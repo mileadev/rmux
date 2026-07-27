@@ -140,7 +140,8 @@ async fn stale_surface_refresh_cannot_cancel_a_recreated_driver() {
         original.receiver,
         Arc::clone(&original.latest),
         original.fingerprint,
-    );
+    )
+    .expect("replacement frame is already validated");
     let current = replacement.begin_refresh().expect("replacement refresh");
     let pending = super::PendingSurfaceRefresh {
         reset: true,

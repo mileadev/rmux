@@ -196,16 +196,22 @@ impl PaneSurfaceFingerprint {
 
 #[derive(Debug, Clone)]
 pub(in crate::handler) struct SurfaceAdmissionCache {
+    revision: u64,
     fingerprint: PaneSurfaceFingerprint,
     validation: Result<(), RmuxError>,
 }
 
 impl SurfaceAdmissionCache {
-    fn valid(fingerprint: PaneSurfaceFingerprint) -> Self {
+    fn valid(revision: u64, fingerprint: PaneSurfaceFingerprint) -> Self {
         Self {
+            revision,
             fingerprint,
             validation: Ok(()),
         }
+    }
+
+    pub(in crate::handler) const fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub(in crate::handler) const fn fingerprint(&self) -> &PaneSurfaceFingerprint {
@@ -250,9 +256,10 @@ impl SurfaceDriver {
         receiver: PaneOutputReceiver,
         latest: Arc<PaneSurfaceFrame>,
         fingerprint: PaneSurfaceFingerprint,
-    ) -> Self {
-        let admission_cache = SurfaceAdmissionCache::valid(fingerprint.clone());
-        Self {
+    ) -> Result<Self, RmuxError> {
+        super::validate_surface_frame_size(&latest)?;
+        let admission_cache = SurfaceAdmissionCache::valid(0, fingerprint.clone());
+        Ok(Self {
             generation,
             receiver,
             revision: latest.revision,
@@ -264,19 +271,33 @@ impl SurfaceDriver {
             refresh_token: 0,
             pending_refresh: None,
             admission_cache,
-        }
+        })
     }
 
     pub(in crate::handler) fn admission_cache(&self) -> SurfaceAdmissionCache {
         self.admission_cache.clone()
     }
 
-    pub(in crate::handler) fn cache_admission(
+    pub(in crate::handler) fn cache_admission_if_revision(
+        &mut self,
+        expected_revision: u64,
+        fingerprint: PaneSurfaceFingerprint,
+        validation: Result<(), RmuxError>,
+    ) -> bool {
+        if self.admission_cache.revision != expected_revision {
+            return false;
+        }
+        self.replace_admission_cache(fingerprint, validation);
+        true
+    }
+
+    fn replace_admission_cache(
         &mut self,
         fingerprint: PaneSurfaceFingerprint,
         validation: Result<(), RmuxError>,
     ) {
         self.admission_cache = SurfaceAdmissionCache {
+            revision: self.admission_cache.revision.saturating_add(1),
             fingerprint,
             validation,
         };
@@ -313,7 +334,7 @@ impl SurfaceDriver {
         self.receiver = receiver;
         self.revision = latest.revision;
         self.latest = latest;
-        self.admission_cache = SurfaceAdmissionCache::valid(fingerprint.clone());
+        self.replace_admission_cache(fingerprint.clone(), Ok(()));
         self.fingerprint = fingerprint;
         self.frame_lifecycle_revision = frame_lifecycle_revision;
         self.refreshing = false;
@@ -330,7 +351,7 @@ impl SurfaceDriver {
             return false;
         }
         self.receiver = receiver;
-        self.admission_cache = SurfaceAdmissionCache::valid(fingerprint.clone());
+        self.replace_admission_cache(fingerprint.clone(), Ok(()));
         self.fingerprint = fingerprint;
         self.refreshing = false;
         true

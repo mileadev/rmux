@@ -356,6 +356,57 @@ async fn cancelled_next_reuses_the_inflight_cursor_and_drop_unsubscribes_once() 
 }
 
 #[tokio::test]
+async fn raw_slow_consumer_end_is_terminal_in_the_sdk_stream() {
+    let (client, mut server) = tokio::io::duplex(64 * 1024);
+    let server_task = tokio::spawn(async move {
+        serve_subscribe(&mut server).await;
+        assert!(matches!(
+            read_request(&mut server).await,
+            Request::PaneStreamCursor(PaneStreamCursorRequest {
+                subscription_id: id,
+                ..
+            }) if id == subscription_id()
+        ));
+        write_response(
+            &mut server,
+            Response::PaneStreamCursor(Box::new(PaneStreamCursorResponse {
+                subscription_id: subscription_id(),
+                events: vec![PaneStreamEvent::End(PaneStreamEndReason::SlowConsumer)],
+                limited: false,
+            })),
+        )
+        .await;
+        assert_eq!(
+            read_request(&mut server).await,
+            Request::UnsubscribePaneStream(UnsubscribePaneStreamRequest {
+                subscription_id: subscription_id(),
+            })
+        );
+        write_response(
+            &mut server,
+            Response::UnsubscribePaneStream(UnsubscribePaneStreamResponse {
+                subscription_id: subscription_id(),
+                removed: true,
+            }),
+        )
+        .await;
+    });
+
+    let mut stream = open_stream(client).await;
+    assert!(matches!(
+        stream.next().await.expect("initial event"),
+        Some(PaneRecoveryEvent::Rebase(_))
+    ));
+    assert_eq!(
+        stream.poll_once().await.expect("typed Raw end"),
+        vec![PaneRecoveryEvent::End(SdkEndReason::SlowConsumer)]
+    );
+    assert_eq!(stream.next().await.expect("closed Raw stream"), None);
+    drop(stream);
+    server_task.await.expect("Raw server task");
+}
+
+#[tokio::test]
 async fn in_band_rebase_and_typed_end_are_delivered_before_stream_closes() {
     let (client, mut server) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {

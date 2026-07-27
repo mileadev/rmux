@@ -505,6 +505,10 @@ impl RequestHandler {
         };
         receiver.preserve_process_exits_since(observed_process_exit_revision);
         if let Err(error) = validate_raw_rebase_size(&rebase) {
+            // Raw output is sequence-bearing: a required rebase cannot be
+            // skipped and retried after later bytes without creating a gap.
+            // Surface frames are authoritative snapshots and deliberately
+            // keep their subscription open for this corresponding error.
             self.finish_stream_after_end(request.subscription_id);
             return match error {
                 RmuxError::FrameTooLarge { .. } => slow_consumer_response(request.subscription_id),

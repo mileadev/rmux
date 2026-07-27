@@ -369,7 +369,7 @@ impl RequestHandler {
                         return Response::Error(ErrorResponse { error });
                     }
                 };
-                let driver = SurfaceDriver::new(
+                let driver = match SurfaceDriver::new(
                     surface_initialization
                         .as_ref()
                         .expect("a new surface driver owns an initialization generation")
@@ -377,7 +377,13 @@ impl RequestHandler {
                     captured.receiver,
                     frame,
                     captured.fingerprint,
-                );
+                ) {
+                    Ok(driver) => driver,
+                    Err(error) => {
+                        self.remove_reserved_stream(subscription_id);
+                        return Response::Error(ErrorResponse { error });
+                    }
+                };
                 self.finish_new_surface_subscription(connection_id, subscription_id, source, driver)
             }
             _ => {

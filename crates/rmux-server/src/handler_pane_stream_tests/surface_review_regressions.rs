@@ -21,14 +21,152 @@ async fn surface_prefilter_rejects_only_a_grid_impossible_with_empty_cells() {
     install_blank_screen(&transcript, TerminalSize { cols, rows });
 
     let response = subscribe_response(&handler, CONNECTION_ID, &target).await;
-    assert!(
-        matches!(
-            response,
-            Response::Error(ref error) if matches!(error.error, RmuxError::Server(_))
-        ),
-        "a grid that cannot fit even with empty cells must fail structurally: {response:?}"
+    let expected =
+        format!("surface grid has {cells} cells, exceeding the {MAX_RECOVERY_SURFACE_CELLS}-cell transport cap");
+    assert_eq!(
+        response,
+        Response::Error(rmux_proto::ErrorResponse {
+            error: RmuxError::Server(expected),
+        }),
+        "the production prefilter, rather than a later collector, must reject the grid"
     );
     assert_surface_state(&handler, 0, 0);
+}
+
+#[tokio::test]
+async fn blank_surface_inside_the_previous_dead_band_reaches_exact_validation() {
+    const EXPECTED_FRAME_BYTES: u64 = 8_077_422;
+    let handler = super::RequestHandler::new();
+    let (target, _, transcript) = test_pane(&handler).await;
+    let size = TerminalSize {
+        cols: 1024,
+        rows: 272,
+    };
+    install_blank_screen(&transcript, size);
+
+    let frame = materialize_frame(&handler, &transcript);
+    assert_eq!(
+        bincode::serialized_size(frame.as_ref()).expect("blank Surface frame size"),
+        EXPECTED_FRAME_BYTES
+    );
+    assert!(EXPECTED_FRAME_BYTES <= MAX_SURFACE_FRAME_BYTES as u64);
+
+    let subscription =
+        expect_surface_subscription(subscribe_response(&handler, CONNECTION_ID, &target).await);
+    assert_surface_state(&handler, 1, 1);
+    unsubscribe(&handler, CONNECTION_ID, subscription).await;
+}
+
+#[tokio::test]
+async fn real_resize_into_the_previous_dead_band_preserves_every_surface_peer() {
+    let handler = super::RequestHandler::new();
+    let (target, _, _) = test_pane(&handler).await;
+    resize_window(&handler, &target, 1024, 256).await;
+    let first =
+        expect_surface_subscription(subscribe_response(&handler, CONNECTION_ID, &target).await);
+    let second = expect_surface_subscription(
+        subscribe_response(&handler, SECOND_CONNECTION_ID, &target).await,
+    );
+    assert_surface_state(&handler, 2, 1);
+
+    resize_window(&handler, &target, 1024, 272).await;
+    for (connection_id, subscription_id) in [(CONNECTION_ID, first), (SECOND_CONNECTION_ID, second)]
+    {
+        let events = cursor_for_connection(&handler, connection_id, subscription_id).await;
+        let frame = events
+            .iter()
+            .find_map(super::surface_frame)
+            .expect("peer receives the transportable 1024x272 Surface frame");
+        assert_eq!((frame.snapshot.cols, frame.snapshot.rows), (1024, 272));
+        let encoded = bincode::serialized_size(frame).expect("dead-band frame size");
+        assert!(
+            encoded <= MAX_SURFACE_FRAME_BYTES as u64,
+            "real resize frame {encoded} exceeds the Surface budget"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, PaneStreamEvent::End(_))),
+            "transportable resize must not end peer {subscription_id:?}: {events:?}"
+        );
+    }
+    assert_surface_state(&handler, 2, 1);
+
+    resize_window(&handler, &target, 1024, 256).await;
+    for (connection_id, subscription_id) in [(CONNECTION_ID, first), (SECOND_CONNECTION_ID, second)]
+    {
+        let events = cursor_for_connection(&handler, connection_id, subscription_id).await;
+        assert!(
+            events.iter().any(|event| {
+                super::surface_frame(event)
+                    .is_some_and(|frame| (frame.snapshot.cols, frame.snapshot.rows) == (1024, 256))
+            }),
+            "peer must recover the resize back from 1024x272: {events:?}"
+        );
+    }
+
+    unsubscribe(&handler, SECOND_CONNECTION_ID, second).await;
+    unsubscribe(&handler, CONNECTION_ID, first).await;
+    assert_surface_state(&handler, 0, 0);
+}
+
+#[tokio::test]
+async fn prefilter_rejection_after_resize_is_nonterminal_and_recoverable() {
+    let handler = super::RequestHandler::new();
+    let (target, _, _) = test_pane(&handler).await;
+    resize_window(&handler, &target, 1024, 256).await;
+    let first =
+        expect_surface_subscription(subscribe_response(&handler, CONNECTION_ID, &target).await);
+    let second = expect_surface_subscription(
+        subscribe_response(&handler, SECOND_CONNECTION_ID, &target).await,
+    );
+
+    resize_window(&handler, &target, 1024, 291).await;
+    let cells = 1024 * 291;
+    let expected =
+        format!("surface grid has {cells} cells, exceeding the {MAX_RECOVERY_SURFACE_CELLS}-cell transport cap");
+    for (connection_id, subscription_id) in [(CONNECTION_ID, first), (SECOND_CONNECTION_ID, second)]
+    {
+        assert_eq!(
+            cursor_response_for_connection(&handler, connection_id, subscription_id).await,
+            Response::Error(rmux_proto::ErrorResponse {
+                error: RmuxError::Server(expected.clone()),
+            })
+        );
+        assert_surface_state(&handler, 2, 1);
+    }
+    {
+        let subscriptions = handler
+            .subscriptions
+            .lock()
+            .expect("subscription registry mutex");
+        for subscription_id in [first, second] {
+            assert_eq!(
+                subscriptions
+                    .streams
+                    .get(&subscription_id)
+                    .and_then(super::super::PaneStreamSubscription::end_reason),
+                None,
+                "prefilter rejection must not mark peer {subscription_id:?} as ending"
+            );
+        }
+    }
+
+    resize_window(&handler, &target, 1024, 256).await;
+    for (connection_id, subscription_id) in [(CONNECTION_ID, first), (SECOND_CONNECTION_ID, second)]
+    {
+        let events = cursor_for_connection(&handler, connection_id, subscription_id).await;
+        assert!(
+            events.iter().any(|event| {
+                super::surface_frame(event)
+                    .is_some_and(|frame| (frame.snapshot.cols, frame.snapshot.rows) == (1024, 256))
+            }),
+            "peer must receive the first transportable frame after rejection: {events:?}"
+        );
+    }
+
+    unsubscribe(&handler, SECOND_CONNECTION_ID, second).await;
+    unsubscribe(&handler, CONNECTION_ID, first).await;
 }
 
 #[tokio::test]
@@ -191,6 +329,48 @@ async fn ready_admission_reuses_cached_exact_validation() {
 }
 
 #[tokio::test]
+async fn stale_surface_admission_cache_writer_cannot_replace_a_newer_result() {
+    let handler = super::RequestHandler::new();
+    let (target, _, _) = test_pane(&handler).await;
+    let active =
+        expect_surface_subscription(subscribe_response(&handler, CONNECTION_ID, &target).await);
+
+    {
+        let mut subscriptions = handler
+            .subscriptions
+            .lock()
+            .expect("subscription registry mutex");
+        let driver = subscriptions
+            .surface_drivers
+            .values_mut()
+            .next()
+            .expect("surface driver");
+        let stale = driver.admission_cache();
+        let fingerprint = stale.fingerprint().clone();
+        let newer_error = RmuxError::Server("newer validation result".to_owned());
+        assert!(driver.cache_admission_if_revision(
+            stale.revision(),
+            fingerprint.clone(),
+            Err(newer_error.clone()),
+        ));
+        assert!(
+            !driver.cache_admission_if_revision(stale.revision(), fingerprint.clone(), Ok(())),
+            "a writer carrying the old cache revision must be refused"
+        );
+        assert_eq!(
+            driver.admission_cache().validation(),
+            Err(newer_error),
+            "the stale writer must not overwrite the newer validation"
+        );
+
+        let current = driver.admission_cache();
+        assert!(driver.cache_admission_if_revision(current.revision(), fingerprint, Ok(()),));
+    }
+
+    unsubscribe(&handler, CONNECTION_ID, active).await;
+}
+
+#[tokio::test]
 async fn oversized_surface_poll_is_recoverable_for_all_active_peers() {
     let handler = super::RequestHandler::new();
     let (target, output, transcript) = test_pane(&handler).await;
@@ -205,8 +385,25 @@ async fn oversized_surface_poll_is_recoverable_for_all_active_peers() {
     publish_title(&transcript, &output, title_length + 1, b'd');
     let first_error = cursor_response_for_connection(&handler, CONNECTION_ID, first).await;
     assert_surface_budget_error(&first_error);
+    assert_eq!(handler.surface_poll_materialization_count(), 1);
     let second_error = cursor_response_for_connection(&handler, SECOND_CONNECTION_ID, second).await;
     assert_surface_budget_error(&second_error);
+    assert_eq!(
+        handler.surface_poll_materialization_count(),
+        1,
+        "the unchanged rejected fingerprint must reuse its exact cached error"
+    );
+    for (connection_id, subscription_id) in [(CONNECTION_ID, first), (SECOND_CONNECTION_ID, second)]
+    {
+        let repeated =
+            cursor_response_for_connection(&handler, connection_id, subscription_id).await;
+        assert_surface_budget_error(&repeated);
+    }
+    assert_eq!(
+        handler.surface_poll_materialization_count(),
+        1,
+        "repeated P+1 polls must not rematerialize the same eight-megabyte frame"
+    );
     assert_surface_state(&handler, 2, 1);
     {
         let subscriptions = handler
@@ -244,6 +441,11 @@ async fn oversized_surface_poll_is_recoverable_for_all_active_peers() {
             "peer must recover without End: {events:?}"
         );
     }
+    assert_eq!(
+        handler.surface_poll_materialization_count(),
+        2,
+        "the first changed transportable fingerprint is materialized once for both peers"
+    );
 
     unsubscribe(&handler, SECOND_CONNECTION_ID, second).await;
     unsubscribe(&handler, CONNECTION_ID, first).await;

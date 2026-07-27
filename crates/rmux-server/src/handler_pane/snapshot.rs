@@ -10,6 +10,7 @@ use rmux_proto::{
 };
 
 use super::super::RequestHandler;
+use crate::pane_recovery::MAX_RECOVERY_SURFACE_CELLS;
 use crate::pane_terminal_lookup::pane_id_for_target;
 use crate::pane_terminals::HandlerState;
 use crate::pane_transcript::SharedPaneTranscript;
@@ -20,6 +21,12 @@ use crate::pane_transcript::SharedPaneTranscript;
 // representation before allocation. Variable-length glyph text is still
 // protected by the encoder's exact byte limit.
 const MAX_PANE_SNAPSHOT_CELLS: usize = DEFAULT_MAX_DETACHED_FRAME_LENGTH / 32;
+
+#[derive(Clone, Copy)]
+pub(in crate::handler) enum CellCollectionBudget {
+    PaneSnapshot,
+    Surface,
+}
 
 pub(in crate::handler) struct PaneSnapshotInputs {
     pane_id: PaneId,
@@ -103,7 +110,13 @@ impl RequestHandler {
             };
             let output_sequence = transcript.output_sequence();
 
-            let cells = match collect_cells(screen, cols, rows, history_size) {
+            let cells = match collect_cells(
+                screen,
+                cols,
+                rows,
+                history_size,
+                CellCollectionBudget::PaneSnapshot,
+            ) {
                 Ok(cells) => cells,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
@@ -243,10 +256,11 @@ pub(in crate::handler) fn collect_cells(
     cols: u16,
     rows: u16,
     _history_size: usize,
+    budget: CellCollectionBudget,
 ) -> Result<Vec<PaneSnapshotCell>, RmuxError> {
     let cols_usize = usize::from(cols);
     let rows_usize = usize::from(rows);
-    let total = snapshot_cell_count(cols, rows)?;
+    let total = snapshot_cell_count(cols, rows, budget)?;
     let mut cells = Vec::with_capacity(total);
     if cols_usize == 0 || rows_usize == 0 {
         return Ok(cells);
@@ -278,13 +292,25 @@ pub(in crate::handler) fn collect_cells(
     Ok(cells)
 }
 
-fn snapshot_cell_count(cols: u16, rows: u16) -> Result<usize, RmuxError> {
+fn snapshot_cell_count(
+    cols: u16,
+    rows: u16,
+    budget: CellCollectionBudget,
+) -> Result<usize, RmuxError> {
     let total = usize::from(cols)
         .checked_mul(usize::from(rows))
         .ok_or_else(|| RmuxError::Server("pane snapshot dimensions overflow".to_owned()))?;
-    if total > MAX_PANE_SNAPSHOT_CELLS {
+    let maximum = match budget {
+        CellCollectionBudget::PaneSnapshot => MAX_PANE_SNAPSHOT_CELLS,
+        CellCollectionBudget::Surface => MAX_RECOVERY_SURFACE_CELLS,
+    };
+    if total > maximum {
+        let subject = match budget {
+            CellCollectionBudget::PaneSnapshot => "pane snapshot",
+            CellCollectionBudget::Surface => "surface materialization",
+        };
         return Err(RmuxError::Server(format!(
-            "pane snapshot grid has {total} cells, exceeding the {MAX_PANE_SNAPSHOT_CELLS}-cell limit"
+            "{subject} grid has {total} cells, exceeding the {maximum}-cell limit"
         )));
     }
     Ok(total)
@@ -436,22 +462,26 @@ mod tests {
     #[test]
     fn collect_cells_returns_empty_vec_when_either_dim_is_zero() {
         let screen = screen_with_size(0, 4);
-        let cells = collect_cells(&screen, 0, 4, 0).expect("zero cols ok");
+        let cells = collect_cells(&screen, 0, 4, 0, CellCollectionBudget::PaneSnapshot)
+            .expect("zero cols ok");
         assert!(cells.is_empty());
 
         let screen = screen_with_size(4, 0);
-        let cells = collect_cells(&screen, 4, 0, 0).expect("zero rows ok");
+        let cells = collect_cells(&screen, 4, 0, 0, CellCollectionBudget::PaneSnapshot)
+            .expect("zero rows ok");
         assert!(cells.is_empty());
     }
 
     #[test]
     fn snapshot_cell_count_rejects_oversized_grids_before_allocation() {
         assert_eq!(
-            snapshot_cell_count(512, 512).expect("limit-sized snapshot is allowed"),
+            snapshot_cell_count(512, 512, CellCollectionBudget::PaneSnapshot)
+                .expect("limit-sized snapshot is allowed"),
             MAX_PANE_SNAPSHOT_CELLS
         );
 
-        let error = snapshot_cell_count(513, 512).expect_err("oversized snapshot must fail");
+        let error = snapshot_cell_count(513, 512, CellCollectionBudget::PaneSnapshot)
+            .expect_err("oversized snapshot must fail");
         assert!(
             error
                 .to_string()
@@ -459,7 +489,9 @@ mod tests {
             "unexpected error: {error}"
         );
 
-        assert!(snapshot_cell_count(u16::MAX, u16::MAX).is_err());
+        assert!(
+            snapshot_cell_count(u16::MAX, u16::MAX, CellCollectionBudget::PaneSnapshot).is_err()
+        );
     }
 
     #[test]
@@ -469,7 +501,8 @@ mod tests {
         // for any future grid backend that could hand us short rows. The
         // captured row count must always equal `rows * cols`.
         let screen = screen_with_size(4, 2);
-        let cells = collect_cells(&screen, 4, 2, 0).expect("collect ok");
+        let cells = collect_cells(&screen, 4, 2, 0, CellCollectionBudget::PaneSnapshot)
+            .expect("collect ok");
         assert_eq!(cells.len(), 8);
         for cell in &cells {
             // Default cells are blank single-width spaces with default colors.
@@ -484,7 +517,8 @@ mod tests {
         let mut terminal = TerminalScreen::new(TerminalSize { cols: 4, rows: 1 }, 0);
         terminal.feed("界x".as_bytes());
         let screen = terminal.screen().clone();
-        let cells = collect_cells(&screen, 4, 1, 0).expect("collect ok");
+        let cells = collect_cells(&screen, 4, 1, 0, CellCollectionBudget::PaneSnapshot)
+            .expect("collect ok");
         assert_eq!(cells.len(), 4);
         assert!(!cells[0].padding);
         assert_eq!(cells[0].text, "界");
@@ -506,7 +540,8 @@ mod tests {
         let mut terminal = TerminalScreen::new(TerminalSize { cols: 4, rows: 2 }, 0);
         terminal.feed(b"abcd\r\nefgh");
         let screen = terminal.screen().clone();
-        let cells = collect_cells(&screen, 4, 2, 0).expect("collect ok");
+        let cells = collect_cells(&screen, 4, 2, 0, CellCollectionBudget::PaneSnapshot)
+            .expect("collect ok");
         assert_eq!(cells.len(), 8);
         let row0_text: String = cells[0..4].iter().map(|c| c.text.as_str()).collect();
         let row1_text: String = cells[4..8].iter().map(|c| c.text.as_str()).collect();

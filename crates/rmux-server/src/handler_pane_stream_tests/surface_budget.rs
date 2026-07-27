@@ -127,6 +127,31 @@ async fn new_surface_driver_boundary_is_stable_on_first_application_and_repetiti
 }
 
 #[tokio::test]
+async fn surface_driver_constructor_rejects_an_unvalidated_p_plus_one_frame() {
+    let handler = super::RequestHandler::new();
+    let (target, _, transcript) = test_pane(&handler).await;
+    let (frame, _) = install_frame_at_size(&handler, &transcript, SURFACE_POLL_FRAME_LIMIT + 1);
+    let source = {
+        let state = handler.state.lock().await;
+        super::super::stream_source_for_target(&state, target).expect("surface source")
+    };
+    let (_, captured) = handler
+        .capture_current_surface_stream_source(source)
+        .await
+        .expect("capture current Surface source");
+
+    let error = super::super::SurfaceDriver::new(1, captured.receiver, frame, captured.fingerprint)
+        .expect_err("a driver must not cache an oversized initial frame as valid");
+    assert_eq!(
+        error,
+        rmux_proto::RmuxError::FrameTooLarge {
+            length: rmux_proto::DEFAULT_MAX_DETACHED_FRAME_LENGTH + 1,
+            maximum: rmux_proto::DEFAULT_MAX_DETACHED_FRAME_LENGTH,
+        }
+    );
+}
+
+#[tokio::test]
 async fn shared_surface_admission_rejects_current_p_plus_one_without_ending_active_stream() {
     let handler = super::RequestHandler::new();
     let (target, output, transcript) = test_pane(&handler).await;
@@ -370,7 +395,8 @@ async fn waiting_surface_peer_rechecks_p_plus_one_after_driver_becomes_ready() {
         )
         .expect("materialize active Surface frame"),
         captured.fingerprint,
-    );
+    )
+    .expect("active Surface frame fits its transport budget");
     let response =
         handler.finish_new_surface_subscription(CONNECTION_ID, active_id, source, driver);
     assert_eq!(expect_surface_subscription(response), active_id);

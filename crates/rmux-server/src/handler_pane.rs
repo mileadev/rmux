@@ -77,7 +77,8 @@ pub(super) use pane_io_encoding::{
 pub(in crate::handler) use pane_management::{SplitWindowParts, SplitWindowResponseMode};
 pub(super) use pane_prompt_input::decode_prompt_input_event;
 pub(in crate::handler) use pane_snapshot::{
-    collect_cells, compute_snapshot_fingerprint, cursor_coord_to_u16, PaneSnapshotRevisionRegistry,
+    collect_cells, compute_snapshot_fingerprint, cursor_coord_to_u16, CellCollectionBudget,
+    PaneSnapshotRevisionRegistry,
 };
 
 use rmux_proto::{PaneTarget, RmuxError, Target};
