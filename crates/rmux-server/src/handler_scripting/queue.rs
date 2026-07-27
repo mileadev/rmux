@@ -27,6 +27,12 @@ use super::queue_parse::{ParsedIfShellCommand, ParsedNewWindowCommand};
 use super::shell_parse::ParsedRunShellCommand;
 use super::source_files::ParsedSourceFileCommand;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CurrentSessionTransitionPolicy {
+    Stable,
+    StartupRoot,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::handler) struct QueueExecutionContext {
     pub(super) caller_cwd: Option<PathBuf>,
@@ -44,6 +50,7 @@ pub(in crate::handler) struct QueueExecutionContext {
     pinned_current_target_identity: Option<Arc<StableTargetIdentity>>,
     pinned_pane_output_identity: Option<Arc<StablePaneOutputIdentity>>,
     rebased_current_session: Option<(SessionId, SessionName)>,
+    current_session_transition_policy: CurrentSessionTransitionPolicy,
     run_shell_command_depth: usize,
     control_queue_origin: Option<ControlQueueCommandOrigin>,
 }
@@ -66,6 +73,7 @@ impl QueueExecutionContext {
             pinned_current_target_identity: None,
             pinned_pane_output_identity: None,
             rebased_current_session: None,
+            current_session_transition_policy: CurrentSessionTransitionPolicy::Stable,
             run_shell_command_depth: 0,
             control_queue_origin: None,
         }
@@ -88,6 +96,7 @@ impl QueueExecutionContext {
             pinned_current_target_identity: None,
             pinned_pane_output_identity: None,
             rebased_current_session: None,
+            current_session_transition_policy: CurrentSessionTransitionPolicy::Stable,
             run_shell_command_depth: 0,
             control_queue_origin: None,
         }
@@ -114,6 +123,15 @@ impl QueueExecutionContext {
             pinned_current_target_identity: self.pinned_current_target_identity.clone(),
             pinned_pane_output_identity: self.pinned_pane_output_identity.clone(),
             rebased_current_session: self.rebased_current_session.clone(),
+            current_session_transition_policy: match (
+                self.current_session_transition_policy,
+                source_file_depth,
+            ) {
+                (CurrentSessionTransitionPolicy::StartupRoot, 1) => {
+                    CurrentSessionTransitionPolicy::StartupRoot
+                }
+                _ => CurrentSessionTransitionPolicy::Stable,
+            },
             run_shell_command_depth: self.run_shell_command_depth,
             control_queue_origin: Some(ControlQueueCommandOrigin::SourceFile {
                 depth: source_file_depth,
@@ -123,6 +141,11 @@ impl QueueExecutionContext {
 
     pub(in crate::handler) fn for_if_shell_commands(mut self) -> Self {
         self.control_queue_origin = Some(ControlQueueCommandOrigin::IfShell);
+        self
+    }
+
+    pub(super) fn for_startup_config(mut self) -> Self {
+        self.current_session_transition_policy = CurrentSessionTransitionPolicy::StartupRoot;
         self
     }
 
@@ -202,6 +225,28 @@ impl QueueExecutionContext {
             self.pinned_pane_output_identity = None;
         }
         self
+    }
+
+    pub(super) fn accepts_explicit_current_session_transition(&self) -> bool {
+        self.current_session_transition_policy == CurrentSessionTransitionPolicy::StartupRoot
+            && self.source_file_depth == 1
+            && self.rebased_current_session.is_some()
+    }
+
+    pub(super) fn rebase_after_explicit_current_session_transition(
+        &mut self,
+        session_id: SessionId,
+        session_name: &SessionName,
+    ) {
+        if !self.accepts_explicit_current_session_transition() {
+            return;
+        }
+        self.current_target = Some(Target::Session(session_name.clone()));
+        self.current_target_allows_canfail_fallback = false;
+        self.follows_attached_session = false;
+        self.pinned_current_target_identity = None;
+        self.pinned_pane_output_identity = None;
+        self.rebased_current_session = Some((session_id, session_name.clone()));
     }
 
     pub(in crate::handler) fn forbid_missing_current_target_fallback(mut self) -> Self {

@@ -81,6 +81,8 @@ mod prompt_parse;
 mod prompt_runtime;
 #[path = "handler_scripting/queue.rs"]
 mod queue;
+#[path = "handler_scripting/queue_current_session_transition.rs"]
+mod queue_current_session_transition;
 #[path = "handler_scripting/queue_exact_target.rs"]
 mod queue_exact_target;
 #[path = "handler_scripting/queue_lifecycle_target.rs"]
@@ -140,6 +142,8 @@ pub(in crate::handler) use self::queue::{
     rename_pane_target_session, rename_target_session, rename_window_target_session,
 };
 pub(super) use self::queue::{QueueCommandAction, QueueExecutionContext};
+pub(in crate::handler) use self::queue_current_session_transition::record_queued_new_session_transition;
+use self::queue_current_session_transition::QueuedCurrentSessionTransition;
 use self::queue_exact_target::QueueExactTargetCapture;
 #[cfg(test)]
 pub(crate) use self::queue_exact_target::{
@@ -269,6 +273,7 @@ pub(in crate::handler) fn queued_command_context() -> Option<QueueExecutionConte
 struct QueuedCommandExecution {
     action: QueueCommandAction,
     attached_switch_target: Option<Target>,
+    current_session_transition: Option<QueuedCurrentSessionTransition>,
     session_rename: Option<QueuedSessionRename>,
 }
 
@@ -712,6 +717,12 @@ impl RequestHandler {
                         rename.apply(context);
                     }
                 }
+                if let Some(transition) = execution.current_session_transition {
+                    transition.apply(context);
+                    for context in &mut contexts {
+                        transition.apply(context);
+                    }
+                }
                 execution.action
             });
             let starts_child_guard_stream = response_stream_is_active
@@ -1122,6 +1133,7 @@ impl RequestHandler {
             .or_else(|| context.current_target.clone());
 
         let mut attached_switch_target = None;
+        let mut committed_current_session_transition = None;
         let mut committed_session_rename = None;
         let result = match invocation {
             QueueInvocation::NoOp => Ok(QueueCommandAction::Normal {
@@ -1170,12 +1182,16 @@ impl RequestHandler {
                         ),
                     ),
                 ));
-                let ((outcome, inline_hooks), switch_client_capture) = if captures_client_transition
-                {
-                    capture_switch_client_target_identity(dispatch).await
-                } else {
-                    (dispatch.await, Default::default())
-                };
+                let dispatch =
+                    QueuedCurrentSessionTransition::capture(context, &request_for_hooks, dispatch);
+                let (((outcome, inline_hooks), current_session_transition), switch_client_capture) =
+                    if captures_client_transition {
+                        capture_switch_client_target_identity(dispatch).await
+                    } else {
+                        (dispatch.await, Default::default())
+                    };
+                committed_current_session_transition = current_session_transition
+                    .and_then(|transition| transition.commit(&outcome.response));
                 committed_session_rename =
                     session_rename.and_then(|rename| rename.commit(&outcome.response));
                 if captures_client_transition {
@@ -1424,6 +1440,7 @@ impl RequestHandler {
             .map(|action| QueuedCommandExecution {
                 action,
                 attached_switch_target,
+                current_session_transition: committed_current_session_transition,
                 session_rename: committed_session_rename,
             })
             .map_err(|error| source_file_context_error(error, &command_for_hooks, context))

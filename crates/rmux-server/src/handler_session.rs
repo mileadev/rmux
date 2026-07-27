@@ -514,6 +514,10 @@ impl RequestHandler {
                         session_id,
                     )
                     .await;
+                    super::scripting_support::record_queued_new_session_transition(
+                        session_id,
+                        session_name.clone(),
+                    );
                     self.queue_suppressed_inline_hook(
                         HookName::AfterNewSession,
                         PendingInlineHookFormat::AfterCommand,
@@ -813,6 +817,10 @@ impl RequestHandler {
                 return Response::Error(ErrorResponse { error });
             }
         }
+        super::scripting_support::record_queued_new_session_transition(
+            created_session_id,
+            session_name.clone(),
+        );
         self.finish_new_session_lifecycle(
             requester_pid,
             &session_name,

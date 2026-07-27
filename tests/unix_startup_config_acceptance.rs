@@ -220,6 +220,203 @@ fn startup_non_nested_group_continues_after_renaming_current_session() -> Result
     assert_startup_rename_continuation(&harness, "after-non-nested-rename", "U03")
 }
 
+#[test]
+fn startup_group_follows_successful_new_session_after_rename() -> Result<(), Box<dyn Error>> {
+    let harness = StartupHarness::new("startup-new-session-transition-group")?;
+    let config = harness
+        .tmpdir()
+        .join("startup-new-session-transition-group.conf");
+    fs::write(
+        &config,
+        "new-session -d -s alpha \"/usr/bin/sleep 30\"\n\
+         rename-session -t alpha beta ; \
+         new-session -d -s newcomer \"/usr/bin/sleep 30\" ; \
+         new-window -d -n transition-first \"/usr/bin/sleep 30\" ; \
+         new-window -d -n transition-repeat \"/usr/bin/sleep 30\"\n",
+    )?;
+
+    start_with_config_and_keeper(&harness, &config)?;
+    assert_successful_new_session_transition(&harness)
+}
+
+#[test]
+fn startup_lines_follow_successful_new_session_after_rename() -> Result<(), Box<dyn Error>> {
+    let harness = StartupHarness::new("startup-new-session-transition-lines")?;
+    let config = harness
+        .tmpdir()
+        .join("startup-new-session-transition-lines.conf");
+    fs::write(
+        &config,
+        "new-session -d -s alpha \"/usr/bin/sleep 30\"\n\
+         rename-session -t alpha beta\n\
+         new-session -d -s newcomer \"/usr/bin/sleep 30\"\n\
+         new-window -d -n transition-first \"/usr/bin/sleep 30\"\n\
+         new-window -d -n transition-repeat \"/usr/bin/sleep 30\"\n",
+    )?;
+
+    start_with_config_and_keeper(&harness, &config)?;
+    assert_successful_new_session_transition(&harness)
+}
+
+#[test]
+fn startup_run_shell_follows_successful_new_session_after_rename() -> Result<(), Box<dyn Error>> {
+    let harness = StartupHarness::new("startup-new-session-transition-run-shell")?;
+    let config = harness
+        .tmpdir()
+        .join("startup-new-session-transition-run-shell.conf");
+    fs::write(
+        &config,
+        "new-session -d -s alpha \"/usr/bin/sleep 30\"\n\
+         run-shell -C \"rename-session -t alpha beta ; \
+         new-session -d -s newcomer /usr/bin/sleep 30 ; \
+         new-window -d -n transition-first /usr/bin/sleep 30 ; \
+         new-window -d -n transition-repeat /usr/bin/sleep 30\"\n",
+    )?;
+
+    start_with_config_and_keeper(&harness, &config)?;
+    assert_successful_new_session_transition(&harness)
+}
+
+#[test]
+fn startup_nested_source_keeps_renamed_identity_after_new_session() -> Result<(), Box<dyn Error>> {
+    let harness = StartupHarness::new("startup-nested-source-transition-boundary")?;
+    let nested = harness.tmpdir().join("nested-transition.conf");
+    fs::write(
+        &nested,
+        "rename-session -t alpha beta ; \
+         new-session -d -s newcomer \"/usr/bin/sleep 30\" ; \
+         new-window -d -n transition-first \"/usr/bin/sleep 30\" ; \
+         new-window -d -n transition-repeat \"/usr/bin/sleep 30\"\n",
+    )?;
+    let config = harness.tmpdir().join("startup-nested-source.conf");
+    fs::write(
+        &config,
+        format!(
+            "new-session -d -s alpha \"/usr/bin/sleep 30\"\n\
+             source-file '{}'\n",
+            shell_single_quote(&nested)
+        ),
+    )?;
+
+    start_with_config_and_keeper(&harness, &config)?;
+    assert_source_keeps_renamed_identity(&harness, true)
+}
+
+#[test]
+fn ordinary_source_keeps_renamed_identity_after_new_session() -> Result<(), Box<dyn Error>> {
+    let harness = StartupHarness::new("ordinary-source-transition-boundary")?;
+    harness.success(["new-session", "-d", "-s", "alpha", "/usr/bin/sleep 30"])?;
+    let config = harness.tmpdir().join("ordinary-source-transition.conf");
+    fs::write(
+        &config,
+        "rename-session -t alpha beta ; \
+         new-session -d -s newcomer \"/usr/bin/sleep 30\" ; \
+         new-window -d -n transition-first \"/usr/bin/sleep 30\" ; \
+         new-window -d -n transition-repeat \"/usr/bin/sleep 30\"\n",
+    )?;
+
+    harness.success(["source-file".into(), config.into_os_string()])?;
+    assert_source_keeps_renamed_identity(&harness, false)
+}
+
+#[test]
+fn failed_startup_new_session_does_not_supersede_rename_marker() -> Result<(), Box<dyn Error>> {
+    let harness = StartupHarness::new("startup-failed-new-session-transition")?;
+    let config = harness
+        .tmpdir()
+        .join("startup-failed-new-session-transition.conf");
+    fs::write(
+        &config,
+        "new-session -d -s alpha \"/usr/bin/sleep 30\"\n\
+         rename-session -t alpha beta\n\
+         new-session -d -s beta \"/usr/bin/sleep 30\"\n\
+         new-window -d -n after-failed-transition \"/usr/bin/sleep 30\"\n",
+    )?;
+
+    start_with_config_and_keeper(&harness, &config)?;
+    let beta_windows = harness.stdout(["list-windows", "-t", "beta", "-F", "#{window_name}"])?;
+    assert_eq!(
+        beta_windows
+            .lines()
+            .filter(|name| *name == "after-failed-transition")
+            .count(),
+        1,
+        "a failed new-session must leave the rename marker current: {beta_windows:?}"
+    );
+    Ok(())
+}
+
+fn start_with_config_and_keeper(
+    harness: &StartupHarness,
+    config: &Path,
+) -> Result<(), Box<dyn Error>> {
+    harness.success([
+        "-f".into(),
+        config.as_os_str().to_owned(),
+        "new-session".into(),
+        "-d".into(),
+        "-s".into(),
+        "keeper".into(),
+        "/usr/bin/sleep 30".into(),
+    ])
+}
+
+fn assert_successful_new_session_transition(
+    harness: &StartupHarness,
+) -> Result<(), Box<dyn Error>> {
+    let sessions = harness.stdout([
+        "list-sessions",
+        "-F",
+        "#{session_id}|#{session_name}|#{session_windows}",
+    ])?;
+    assert!(
+        sessions.lines().any(|line| line == "$0|beta|1"),
+        "the renamed source identity must remain unchanged: {sessions:?}"
+    );
+    assert!(
+        sessions.lines().any(|line| line == "$1|newcomer|3"),
+        "the successful new-session must become current for both following windows: {sessions:?}"
+    );
+    assert!(
+        sessions.lines().any(|line| line == "$2|keeper|1"),
+        "startup validation must not consume runtime allocators: {sessions:?}"
+    );
+    for window in ["transition-first", "transition-repeat"] {
+        let windows = harness.stdout(["list-windows", "-t", "newcomer", "-F", "#{window_name}"])?;
+        assert_eq!(
+            windows.lines().filter(|name| *name == window).count(),
+            1,
+            "{window} must execute once on the explicit new-session transition: {windows:?}"
+        );
+    }
+    Ok(())
+}
+
+fn assert_source_keeps_renamed_identity(
+    harness: &StartupHarness,
+    expect_keeper: bool,
+) -> Result<(), Box<dyn Error>> {
+    let sessions = harness.stdout([
+        "list-sessions",
+        "-F",
+        "#{session_id}|#{session_name}|#{session_windows}",
+    ])?;
+    assert!(
+        sessions.lines().any(|line| line == "$0|beta|3"),
+        "source-owned work must remain on the renamed identity: {sessions:?}"
+    );
+    assert!(
+        sessions.lines().any(|line| line == "$1|newcomer|1"),
+        "source new-session must still be created exactly once: {sessions:?}"
+    );
+    assert_eq!(
+        sessions.lines().any(|line| line == "$2|keeper|1"),
+        expect_keeper,
+        "unexpected startup keeper inventory: {sessions:?}"
+    );
+    Ok(())
+}
+
 fn assert_startup_rename_continuation(
     harness: &StartupHarness,
     expected_window: &str,

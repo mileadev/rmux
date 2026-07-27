@@ -131,7 +131,7 @@ impl RequestHandler {
         let execution = self
             .execute_startup_source_file(
                 loaded,
-                QueueExecutionContext::new(command.caller_cwd.clone()),
+                QueueExecutionContext::new(command.caller_cwd.clone()).for_startup_config(),
                 guard,
             )
             .await;
