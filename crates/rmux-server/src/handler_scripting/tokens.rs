@@ -298,6 +298,28 @@ pub(super) fn parse_compact_flag_cluster(
     Some(cluster)
 }
 
+pub(super) fn first_unsupported_compact_flag(
+    token: &str,
+    bare_flags: &str,
+    value_flags: &str,
+) -> Option<char> {
+    if !token.starts_with('-') || token == "-" || token == "--" {
+        return None;
+    }
+
+    for flag in token.strip_prefix('-')?.chars() {
+        if bare_flags.contains(flag) {
+            continue;
+        }
+        if value_flags.contains(flag) {
+            return None;
+        }
+        return Some(flag);
+    }
+
+    None
+}
+
 pub(super) struct CommandTokens {
     tokens: VecDeque<String>,
 }

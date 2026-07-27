@@ -122,6 +122,47 @@ mod tests {
     }
 
     #[test]
+    fn set_size_while_zoomed_reconciles_and_updates_the_saved_layout() {
+        let mut window = Window::new(TerminalSize { cols: 3, rows: 10 });
+        window.split_after_position(0);
+        assert!(window.toggle_zoom(0));
+
+        window.set_size(TerminalSize { cols: 2, rows: 10 });
+
+        assert_eq!(window.size(), TerminalSize { cols: 3, rows: 10 });
+        assert_eq!(
+            window.pane(0).expect("pane 0 exists").geometry(),
+            PaneGeometry::new(0, 0, 3, 10)
+        );
+        assert_eq!(
+            window.pane(1).expect("pane 1 exists").geometry(),
+            PaneGeometry::new(2, 0, 1, 10)
+        );
+
+        window.set_size(TerminalSize { cols: 5, rows: 12 });
+
+        assert_eq!(window.size(), TerminalSize { cols: 5, rows: 12 });
+        assert_eq!(
+            window.pane(0).expect("pane 0 exists").geometry(),
+            PaneGeometry::new(0, 0, 5, 12)
+        );
+        assert_eq!(
+            window.pane(1).expect("pane 1 exists").geometry(),
+            PaneGeometry::new(3, 0, 2, 12)
+        );
+
+        assert!(window.auto_unzoom());
+        assert_eq!(
+            window.pane(0).expect("pane 0 exists").geometry(),
+            PaneGeometry::new(0, 0, 2, 12)
+        );
+        assert_eq!(
+            window.pane(1).expect("pane 1 exists").geometry(),
+            PaneGeometry::new(3, 0, 2, 12)
+        );
+    }
+
+    #[test]
     fn single_pane_zoom_toggle_is_a_noop() {
         let mut window = Window::new(TerminalSize { cols: 80, rows: 24 });
         let geometry = window.pane(0).expect("pane 0 exists").geometry();

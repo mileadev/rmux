@@ -289,6 +289,7 @@ impl Window {
             return;
         }
         let tree = LayoutTree::named(layout, self.panes.len(), self.size, self.layout_options());
+        self.size = tree.size();
         self.layout_tree = Some(tree);
         self.custom_layout = false;
         self.apply_layout_tree();

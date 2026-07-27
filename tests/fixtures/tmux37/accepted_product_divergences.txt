@@ -14,49 +14,6 @@ Observed:
   tmux 3.7b
 
 
-C-D77: impossible undersized multi-pane layouts
-------------------------------------------------
-
-Exact command:
-
-  TMUX_BIN=/Users/pingudelfuego/.local/bin/tmux
-  SOCKET=rmux-oracle-degenerate-layout-resize-$$
-  "$TMUX_BIN" -L "$SOCKET" -f /dev/null new-session -d -x 3 -y 10 -s horizontal 'sleep 30'
-  "$TMUX_BIN" -L "$SOCKET" set-option -t horizontal status off
-  "$TMUX_BIN" -L "$SOCKET" split-window -h -d -t horizontal:0 'sleep 30'
-  printf 'horizontal_before_resize='
-  "$TMUX_BIN" -L "$SOCKET" display-message -p -t horizontal '#{window_width}x#{window_height}|#{window_layout}'
-  "$TMUX_BIN" -L "$SOCKET" resize-window -t horizontal -x 2 -y 10
-  printf 'horizontal_after_resize_2='
-  "$TMUX_BIN" -L "$SOCKET" display-message -p -t horizontal '#{window_width}x#{window_height}|#{window_layout}'
-  "$TMUX_BIN" -L "$SOCKET" list-panes -t horizontal:0 -F '#{pane_index}|#{pane_left},#{pane_top}|#{pane_width}x#{pane_height}'
-  "$TMUX_BIN" -L "$SOCKET" new-session -d -x 10 -y 3 -s vertical 'sleep 30'
-  "$TMUX_BIN" -L "$SOCKET" set-option -t vertical status off
-  "$TMUX_BIN" -L "$SOCKET" split-window -v -d -t vertical:0 'sleep 30'
-  printf 'vertical_before_resize='
-  "$TMUX_BIN" -L "$SOCKET" display-message -p -t vertical '#{window_width}x#{window_height}|#{window_layout}'
-  "$TMUX_BIN" -L "$SOCKET" resize-window -t vertical -x 10 -y 2
-  printf 'vertical_after_resize_2='
-  "$TMUX_BIN" -L "$SOCKET" display-message -p -t vertical '#{window_width}x#{window_height}|#{window_layout}'
-  "$TMUX_BIN" -L "$SOCKET" list-panes -t vertical:0 -F '#{pane_index}|#{pane_left},#{pane_top}|#{pane_width}x#{pane_height}'
-  "$TMUX_BIN" -L "$SOCKET" kill-server
-
-Observed:
-
-  horizontal_before_resize=3x10|35e4,3x10,0,0{1x10,0,0,0,1x10,2,0,1}
-  horizontal_after_resize_2=3x10|35e4,3x10,0,0{1x10,0,0,0,1x10,2,0,1}
-  0|0,0|1x10
-  1|2,0|1x10
-  vertical_before_resize=10x3|ad71,10x3,0,0[10x1,0,0,2,10x1,0,2,3]
-  vertical_after_resize_2=10x3|ad71,10x3,0,0[10x1,0,0,2,10x1,0,2,3]
-  0|0,0|10x1
-  1|0,2|10x1
-
-tmux keeps the viable three-cell window in both axes. RMUX's runtime does the
-same; the cited unit tests cover bounded fail-soft behavior if an invalid
-two-cell multi-pane size reaches the core directly.
-
-
 C-D78: joined capture after alternate-screen cycles
 ---------------------------------------------------
 
@@ -176,4 +133,153 @@ Observed:
 tmux replaces explicit empty names for `new-session` and `new-window`, even
 when automatic rename is disabled, but preserves the same explicit empty value
 for `break-pane -n ""`. RMUX consistently preserves the caller's explicit
-value on all three paths.
+value on all three paths and disables automatic rename for those explicitly
+named windows. The `automatic-on` block is contextual; the decisive
+`automatic-off` block shows `#{automatic-rename}=0` while tmux still replaces
+the explicit empty values for `new-session` and `new-window`.
+
+
+C-D81: cursor anchor across width reflow
+----------------------------------------
+
+Exact command:
+
+  TMUX_BIN=/Users/pingudelfuego/.local/bin/tmux
+  RMUX_BIN=.rmux-audit/target-1.96.1/debug/rmux
+  probe_engine() {
+    engine="$1"
+    binary="$2"
+    socket="reflow-write-${engine}-$$"
+    "$binary" -L "$socket" -f /dev/null new-session -d -x 10 -y 4 -s probe \
+      "'$binary' -L '$socket' wait-for start;
+       printf 'abcdef\\033[1;3H';
+       '$binary' -L '$socket' wait-for -S initial;
+       '$binary' -L '$socket' wait-for continue;
+       printf X;
+       sleep 0.1;
+       '$binary' -L '$socket' wait-for -S wrote;
+       sleep 30"
+    "$binary" -L "$socket" set-option -t probe status off
+    "$binary" -L "$socket" resize-window -t probe -x 10 -y 4
+    "$binary" -L "$socket" wait-for -S start
+    "$binary" -L "$socket" wait-for initial
+    printf '%s_before=' "$engine"
+    "$binary" -L "$socket" display-message -p -t probe:0.0 \
+      '#{window_width}x#{window_height}|cursor=#{cursor_x},#{cursor_y}|history=#{history_size}'
+    "$binary" -L "$socket" resize-window -t probe -x 5 -y 4
+    printf '%s_after_resize=' "$engine"
+    "$binary" -L "$socket" display-message -p -t probe:0.0 \
+      '#{window_width}x#{window_height}|cursor=#{cursor_x},#{cursor_y}|history=#{history_size}'
+    "$binary" -L "$socket" wait-for -S continue
+    "$binary" -L "$socket" wait-for wrote
+    printf '%s_after_write=' "$engine"
+    "$binary" -L "$socket" display-message -p -t probe:0.0 \
+      '#{window_width}x#{window_height}|cursor=#{cursor_x},#{cursor_y}|history=#{history_size}'
+    printf '%s_capture_hex=' "$engine"
+    "$binary" -L "$socket" capture-pane -p -S - -E - -t probe:0.0 |
+      od -An -tx1 -v | tr -d ' \n'
+    printf '\n'
+    "$binary" -L "$socket" kill-server
+  }
+  "$TMUX_BIN" -V
+  probe_engine tmux "$TMUX_BIN"
+  probe_engine rmux "$RMUX_BIN"
+
+Observed:
+
+  tmux 3.7b
+  tmux_before=10x4|cursor=2,0|history=0
+  tmux_after_resize=5x4|cursor=0,0|history=1
+  tmux_after_write=5x4|cursor=1,0|history=1
+  tmux_capture_hex=61626364650a580a0a0a0a
+  rmux_before=10x4|cursor=2,0|history=0
+  rmux_after_resize=5x4|cursor=2,0|history=0
+  rmux_after_write=5x4|cursor=3,0|history=0
+  rmux_capture_hex=61625864650a660a0a0a
+
+Before the resize, both engines place the cursor on logical column two of
+`abcdef`. tmux's reflow moves it onto the continuation's first cell, pushes
+`abcde` into history, and the next `X` destroys `f`. RMUX keeps the cursor on
+logical column two, so `X` replaces `c` as requested while preserving `f`.
+
+
+C-D82: minimum tiled layout hang
+--------------------------------
+
+Exact command, run from the repository root:
+
+  TMUX_BIN=/Users/pingudelfuego/.local/bin/tmux
+  RMUX_BIN=.rmux-audit/target-1.96.1/debug/rmux
+  run_with_two_second_timeout() {
+    "$@" >/dev/null 2>&1 &
+    command_pid="$!"
+    iteration=0
+    while kill -0 "$command_pid" >/dev/null 2>&1 && [ "$iteration" -lt 20 ]; do
+      sleep 0.1
+      iteration=$((iteration + 1))
+    done
+    if kill -0 "$command_pid" >/dev/null 2>&1; then
+      kill -TERM "$command_pid" >/dev/null 2>&1 || true
+      sleep 0.1
+      kill -KILL "$command_pid" >/dev/null 2>&1 || true
+      wait "$command_pid" >/dev/null 2>&1 || true
+      return 124
+    fi
+    wait "$command_pid"
+  }
+  probe_engine() {
+    engine="$1"
+    binary="$2"
+    pane_count="$3"
+    width=$((pane_count * 2 - 1))
+    socket_name="c-d82-${engine}-${pane_count}-$$"
+    "$binary" -L "$socket_name" -f /dev/null new-session -d -x 80 -y 24 \
+      -s probe 'sleep 60'
+    "$binary" -L "$socket_name" set-option -t probe status off
+    index=1
+    while [ "$index" -lt "$pane_count" ]; do
+      "$binary" -L "$socket_name" split-window -h -d -t probe:0.0 'sleep 60'
+      index=$((index + 1))
+    done
+    "$binary" -L "$socket_name" select-layout -t probe:0 even-horizontal >/dev/null
+    "$binary" -L "$socket_name" resize-window -t probe:0 -x "$width" -y 1
+    server_pid="$("$binary" -L "$socket_name" display-message -p '#{pid}')"
+    set +e
+    run_with_two_second_timeout \
+      "$binary" -L "$socket_name" select-layout -t probe:0 tiled
+    status="$?"
+    set -e
+    if [ "$status" -eq 124 ]; then
+      printf '%s_%s=status:timeout-2s\n' "$engine" "$pane_count"
+      kill -KILL "$server_pid" >/dev/null 2>&1 || true
+      return
+    fi
+    window_size="$("$binary" -L "$socket_name" display-message -p -t probe \
+      '#{window_width}x#{window_height}')"
+    pane_geometries="$("$binary" -L "$socket_name" list-panes -t probe:0 \
+      -F '#{pane_index}:#{pane_left},#{pane_top}:#{pane_width}x#{pane_height}' |
+      paste -sd ';' -)"
+    printf '%s_%s=status:%s|window:%s|panes:%s\n' \
+      "$engine" "$pane_count" "$status" "$window_size" "$pane_geometries"
+    "$binary" -L "$socket_name" kill-server >/dev/null 2>&1 || true
+  }
+  "$TMUX_BIN" -V
+  "$RMUX_BIN" -V
+  for pane_count in 5 6; do
+    probe_engine tmux "$TMUX_BIN" "$pane_count"
+    probe_engine rmux "$RMUX_BIN" "$pane_count"
+  done
+
+Observed:
+
+  tmux 3.7b
+  rmux 0.10.0
+  tmux_5=status:timeout-2s
+  rmux_5=status:0|window:9x5|panes:0:0,0:4x1;1:5,0:4x1;2:0,2:4x1;3:5,2:4x1;4:0,4:9x1
+  tmux_6=status:timeout-2s
+  rmux_6=status:0|window:11x5|panes:0:0,0:5x1;1:6,0:5x1;2:0,2:5x1;3:6,2:5x1;4:0,4:5x1;5:6,4:5x1
+
+tmux 3.7b pegs its server and does not return from `select-layout tiled` for
+five or six panes at the viable one-row horizontal minimum. RMUX expands only
+the deficient height to five rows, returns immediately, and keeps every pane
+at least one cell wide and high. Repeating the RMUX command is idempotent.

@@ -159,7 +159,9 @@ fn tmux_ledger_gate_reads_authoritative_inventories_and_named_divergence_tests()
     }
     for exhaustive_guard in [
         "PRODUCT_DIVERGENCE_TEST",
+        "PRODUCT_DIVERGENCE_SUFFIX",
         "git\", \"ls-files\"",
+        "path.stem.endswith(PRODUCT_DIVERGENCE_SUFFIX)",
         "has no allowlist entry",
         "stale product-divergence references",
         "reference points to an untracked path",

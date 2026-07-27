@@ -111,3 +111,47 @@ fn tiled_partial_final_row_absorbs_remaining_width_in_the_last_pane() {
         ],
     );
 }
+
+#[test]
+fn tiled_five_and_six_pane_minimum_avoids_tmux_hang_product_divergence() {
+    for (pane_count, size, expected) in [
+        (
+            5,
+            TerminalSize { cols: 9, rows: 1 },
+            vec![
+                PaneGeometry::new(0, 0, 4, 1),
+                PaneGeometry::new(5, 0, 4, 1),
+                PaneGeometry::new(0, 2, 4, 1),
+                PaneGeometry::new(5, 2, 4, 1),
+                PaneGeometry::new(0, 4, 9, 1),
+            ],
+        ),
+        (
+            6,
+            TerminalSize { cols: 11, rows: 1 },
+            vec![
+                PaneGeometry::new(0, 0, 5, 1),
+                PaneGeometry::new(6, 0, 5, 1),
+                PaneGeometry::new(0, 2, 5, 1),
+                PaneGeometry::new(6, 2, 5, 1),
+                PaneGeometry::new(0, 4, 5, 1),
+                PaneGeometry::new(6, 4, 5, 1),
+            ],
+        ),
+    ] {
+        let mut panes = (0..pane_count).map(pane).collect::<Vec<_>>();
+        let tree = apply_layout(&mut panes, LayoutName::Tiled, size, None);
+
+        assert_eq!(
+            tree.size(),
+            TerminalSize {
+                cols: size.cols,
+                rows: 5,
+            }
+        );
+        assert_eq!(
+            panes.iter().map(|pane| pane.geometry()).collect::<Vec<_>>(),
+            expected
+        );
+    }
+}

@@ -320,10 +320,9 @@ impl Window {
 
     pub(crate) fn set_size(&mut self, size: TerminalSize) {
         self.size = size;
+        self.recalculate_geometry();
         if self.zoomed {
             self.apply_zoom_geometry();
-        } else {
-            self.recalculate_geometry();
         }
     }
 

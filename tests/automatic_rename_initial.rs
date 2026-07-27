@@ -311,8 +311,11 @@ fn explicit_empty_initial_names_are_preserved_product_divergence() -> Result<(),
 
     assert_success(&harness.run(&["new-session", "-d", "-s", "empty-on", "-n", "", "sleep 60"])?);
     assert_success(&harness.run(&["new-window", "-d", "-t", "empty-on", "-n", "", "sleep 60"])?);
-    assert_eq!(snapshot(&harness, "empty-on:0")?.name, "");
-    assert_eq!(snapshot(&harness, "empty-on:1")?.name, "");
+    for target in ["empty-on:0", "empty-on:1"] {
+        let snapshot = snapshot(&harness, target)?;
+        assert_eq!(snapshot.name, "", "target={target}");
+        assert_eq!(snapshot.automatic_rename, "0", "target={target}");
+    }
 
     set_global_automatic_rename(&harness, false)?;
     assert_success(&harness.run(&[
@@ -329,7 +332,9 @@ fn explicit_empty_initial_names_are_preserved_product_divergence() -> Result<(),
     assert_success(&harness.run(&["break-pane", "-d", "-s", "empty-off:0.1", "-n", ""])?);
 
     for target in ["empty-off:0", "empty-off:1", "empty-off:2"] {
-        assert_eq!(snapshot(&harness, target)?.name, "", "target={target}");
+        let snapshot = snapshot(&harness, target)?;
+        assert_eq!(snapshot.name, "", "target={target}");
+        assert_eq!(snapshot.automatic_rename, "0", "target={target}");
     }
     Ok(())
 }

@@ -1,4 +1,4 @@
-use super::{apply_layout, layout_checksum, LayoutTree};
+use super::{apply_layout, layout_checksum, LayoutOptions, LayoutTree};
 use crate::{Pane, PaneGeometry};
 use rmux_proto::{LayoutName, TerminalSize};
 
@@ -508,32 +508,62 @@ fn even_vertical_two_panes_minimum_viable_height_gives_each_pane_one_row() {
 }
 
 #[test]
-fn even_horizontal_degenerate_width_product_divergence() {
-    // tmux clamps a two-pane window to the viable three-column minimum. RMUX's
-    // core can represent this otherwise unreachable undersized geometry and
-    // preserves its existing fail-soft allocation to the final pane.
+fn even_horizontal_undersized_width_clamps_to_the_viable_minimum() {
     assert_layout(
         LayoutName::EvenHorizontal,
         TerminalSize { cols: 2, rows: 10 },
         None,
         vec![
-            PaneGeometry::new(0, 0, 0, 10),
-            PaneGeometry::new(1, 0, 1, 10),
+            PaneGeometry::new(0, 0, 1, 10),
+            PaneGeometry::new(2, 0, 1, 10),
         ],
     );
 }
 
 #[test]
-fn even_vertical_degenerate_height_product_divergence() {
+fn even_vertical_undersized_height_clamps_to_the_viable_minimum() {
     assert_layout(
         LayoutName::EvenVertical,
         TerminalSize { cols: 10, rows: 2 },
         None,
         vec![
-            PaneGeometry::new(0, 0, 10, 0),
-            PaneGeometry::new(0, 1, 10, 1),
+            PaneGeometry::new(0, 0, 10, 1),
+            PaneGeometry::new(0, 2, 10, 1),
         ],
     );
+}
+
+#[test]
+fn all_named_layouts_clamp_impossible_geometry_to_nonzero_valid_trees() {
+    for layout in [
+        LayoutName::EvenHorizontal,
+        LayoutName::EvenVertical,
+        LayoutName::MainHorizontal,
+        LayoutName::MainHorizontalMirrored,
+        LayoutName::MainVertical,
+        LayoutName::MainVerticalMirrored,
+        LayoutName::Tiled,
+    ] {
+        for pane_count in 2..=6 {
+            let tree = LayoutTree::named(
+                layout,
+                pane_count,
+                TerminalSize { cols: 1, rows: 1 },
+                LayoutOptions::default(),
+            );
+            let mut panes = (0..pane_count as u32).map(pane).collect::<Vec<_>>();
+            tree.apply_to_panes(&mut panes);
+
+            assert!(tree.root.check(), "layout={layout} pane_count={pane_count}");
+            assert!(
+                panes.iter().all(|pane| {
+                    let geometry = pane.geometry();
+                    geometry.cols() >= 1 && geometry.rows() >= 1
+                }),
+                "layout={layout} pane_count={pane_count} panes={panes:?}"
+            );
+        }
+    }
 }
 
 #[test]

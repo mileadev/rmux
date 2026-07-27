@@ -63,6 +63,7 @@ impl Window {
     pub(crate) fn recalculate_geometry(&mut self) {
         if let Some(tree) = &mut self.layout_tree {
             tree.resize(self.size);
+            self.size = tree.size();
             tree.apply_to_panes(&mut self.panes);
         }
     }
@@ -112,6 +113,70 @@ mod tests {
         let mut window = Window::new(TerminalSize { cols: 80, rows: 24 });
         window.split_after_position(0);
         window
+    }
+
+    #[test]
+    fn set_size_reconciles_undersized_horizontal_tree_and_is_idempotent() {
+        let mut window = Window::new(TerminalSize { cols: 3, rows: 10 });
+        window.split_after_position(0);
+
+        for _ in 0..2 {
+            window.set_size(TerminalSize { cols: 2, rows: 1 });
+
+            assert_eq!(window.size(), TerminalSize { cols: 3, rows: 1 });
+            assert_eq!(
+                window.pane(0).expect("pane 0 exists").geometry(),
+                PaneGeometry::new(0, 0, 1, 1)
+            );
+            assert_eq!(
+                window.pane(1).expect("pane 1 exists").geometry(),
+                PaneGeometry::new(2, 0, 1, 1)
+            );
+        }
+    }
+
+    #[test]
+    fn set_size_reconciles_undersized_vertical_tree_and_is_idempotent() {
+        let mut window = Window::new(TerminalSize { cols: 10, rows: 3 });
+        window.split_after_position_with_id_and_direction(
+            0,
+            PaneId::new(1),
+            SplitDirection::Horizontal,
+        );
+
+        for _ in 0..2 {
+            window.set_size(TerminalSize { cols: 1, rows: 2 });
+
+            assert_eq!(window.size(), TerminalSize { cols: 1, rows: 3 });
+            assert_eq!(
+                window.pane(0).expect("pane 0 exists").geometry(),
+                PaneGeometry::new(0, 0, 1, 1)
+            );
+            assert_eq!(
+                window.pane(1).expect("pane 1 exists").geometry(),
+                PaneGeometry::new(0, 2, 1, 1)
+            );
+        }
+    }
+
+    #[test]
+    fn named_layout_expands_the_deficient_axis_and_is_idempotent() {
+        let mut window = Window::new(TerminalSize { cols: 3, rows: 1 });
+        window.split_after_position(0);
+
+        for _ in 0..2 {
+            window.set_layout(LayoutName::EvenVertical);
+
+            assert_eq!(window.size(), TerminalSize { cols: 3, rows: 3 });
+            assert_eq!(
+                window.pane(0).expect("pane 0 exists").geometry(),
+                PaneGeometry::new(0, 0, 3, 1)
+            );
+            assert_eq!(
+                window.pane(1).expect("pane 1 exists").geometry(),
+                PaneGeometry::new(0, 2, 3, 1)
+            );
+        }
     }
 
     #[test]

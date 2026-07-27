@@ -315,20 +315,6 @@ inventory = "bounded"
 tests = ["tests/run_shell_context.rs::delayed_command_run_shell_rejects_replacement_session_product_divergence"]
 
 [[entry]]
-id = "C-D77"
-summary = "Impossible undersized multi-pane layouts fail soft inside the core"
-inventory = "bounded"
-evidence = ["tests/fixtures/tmux37/accepted_product_divergences.txt"]
-tests = [
-  "crates/rmux-core/src/layout/tests.rs::even_horizontal_degenerate_width_product_divergence",
-  "crates/rmux-core/src/layout/tests.rs::even_vertical_degenerate_height_product_divergence",
-]
-limitations = [
-  "tmux refuses a split that cannot fit and clamps an existing two-pane window to its three-cell minimum",
-  "RMUX runtime paths clamp viable windows; these tests preserve bounded behavior for otherwise unreachable core inputs",
-]
-
-[[entry]]
 id = "C-D78"
 summary = "Joined capture preserves main-screen soft wraps across alternate-screen cycles"
 inventory = "bounded"
@@ -348,3 +334,25 @@ summary = "Explicit empty initial window names preserve caller intent"
 inventory = "bounded"
 evidence = ["tests/fixtures/tmux37/accepted_product_divergences.txt"]
 tests = ["tests/automatic_rename_initial.rs::explicit_empty_initial_names_are_preserved_product_divergence"]
+
+[[entry]]
+id = "C-D81"
+summary = "Width reflow preserves the cursor's logical-cell anchor"
+inventory = "bounded"
+evidence = ["tests/fixtures/tmux37/accepted_product_divergences.txt"]
+tests = ["crates/rmux-core/tests/parser_traces/ascii_reflow_cursor_history_anchor_product_divergence.trace"]
+limitations = [
+  "tmux 3.7b moves the cursor from logical column two to the first cell of the reflow continuation and pushes the original row into history",
+  "RMUX preserves the logical cursor anchor, so the next byte overwrites the intended cell instead of destroying the continuation",
+]
+
+[[entry]]
+id = "C-D82"
+summary = "Minimum tiled layouts return a viable grid instead of hanging"
+inventory = "bounded"
+evidence = ["tests/fixtures/tmux37/accepted_product_divergences.txt"]
+tests = ["crates/rmux-core/src/layout/tiled_tests.rs::tiled_five_and_six_pane_minimum_avoids_tmux_hang_product_divergence"]
+limitations = [
+  "tmux 3.7b does not return from select-layout tiled with five or six panes at the one-row horizontal minimum",
+  "RMUX expands the deficient height to five rows and returns a nonzero tiled grid immediately",
+]

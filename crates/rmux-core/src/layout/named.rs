@@ -18,7 +18,32 @@ impl LayoutTree {
         }
 
         let geometry = LayoutGeometry::new(u32::from(size.cols), u32::from(size.rows), 0, 0);
-        let mut tree = match layout {
+        let mut tree = Self::build_named(layout, pane_count, geometry, options);
+        let (minimum_width, minimum_height) = tree.root.minimum_size();
+        if geometry.width < minimum_width || geometry.height < minimum_height {
+            let clamped_geometry = LayoutGeometry::new(
+                geometry.width.max(minimum_width),
+                geometry.height.max(minimum_height),
+                0,
+                0,
+            );
+            tree = Self::build_named(layout, pane_count, clamped_geometry, options);
+        }
+        tree.root.fix_offsets(0, 0);
+        debug_assert!(
+            tree.root.check(),
+            "named layout must satisfy its recursive geometry"
+        );
+        tree
+    }
+
+    fn build_named(
+        layout: LayoutName,
+        pane_count: usize,
+        geometry: LayoutGeometry,
+        options: LayoutOptions,
+    ) -> Self {
+        match layout {
             LayoutName::EvenHorizontal => {
                 Self::build_even(LayoutDirection::LeftRight, pane_count, geometry)
             }
@@ -38,9 +63,7 @@ impl LayoutTree {
                 Self::build_main_vertical(pane_count, geometry, options, true)
             }
             LayoutName::Tiled => Self::build_tiled(pane_count, geometry, options),
-        };
-        tree.root.fix_offsets(0, 0);
-        tree
+        }
     }
 
     fn build_even(direction: LayoutDirection, pane_count: usize, geometry: LayoutGeometry) -> Self {

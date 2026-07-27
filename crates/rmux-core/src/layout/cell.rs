@@ -63,6 +63,38 @@ impl LayoutCell {
         }
     }
 
+    #[must_use]
+    pub(super) fn minimum_size(&self) -> (u32, u32) {
+        let LayoutKind::Split(direction, children) = &self.kind else {
+            return (PANE_MINIMUM, PANE_MINIMUM);
+        };
+
+        let border_count = u32::try_from(children.len().saturating_sub(1)).unwrap_or(u32::MAX);
+        let borders = PANE_BORDER_CELLS.saturating_mul(border_count);
+        let mut summed_axis = borders;
+        let mut widest = PANE_MINIMUM;
+        let mut tallest = PANE_MINIMUM;
+
+        for child in children {
+            let (width, height) = child.minimum_size();
+            match direction {
+                LayoutDirection::LeftRight => {
+                    summed_axis = summed_axis.saturating_add(width);
+                    tallest = tallest.max(height);
+                }
+                LayoutDirection::TopBottom => {
+                    summed_axis = summed_axis.saturating_add(height);
+                    widest = widest.max(width);
+                }
+            }
+        }
+
+        match direction {
+            LayoutDirection::LeftRight => (summed_axis.max(PANE_MINIMUM), tallest),
+            LayoutDirection::TopBottom => (widest, summed_axis.max(PANE_MINIMUM)),
+        }
+    }
+
     pub(super) fn collect_leaf_geometries(&self, geometries: &mut Vec<LayoutGeometry>) {
         match &self.kind {
             LayoutKind::Pane => geometries.push(self.geometry),

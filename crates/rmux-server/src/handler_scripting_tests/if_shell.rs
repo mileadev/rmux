@@ -1289,7 +1289,7 @@ async fn if_shell_nested_set_buffer_rejects_hyphen_prefixed_content_without_sepa
     };
     assert_eq!(
         error.error,
-        rmux_proto::RmuxError::Server("command set-buffer: unknown flag -value".to_owned())
+        rmux_proto::RmuxError::Server("command set-buffer: unknown flag -v".to_owned())
     );
     assert!(matches!(
         handler
