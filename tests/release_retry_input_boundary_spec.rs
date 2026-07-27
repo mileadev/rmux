@@ -511,7 +511,7 @@ with tempfile.TemporaryDirectory(
     fixture = pathlib.Path(temporary) / "workflow.yml"
     for group, cases in (("governed", governed), ("protected", protected)):
         for name, source, expected_rejection in cases:
-            fixture.write_text(source, encoding="utf-8", newline="")
+            fixture.write_bytes(source.encode("utf-8"))
             try:
                 validate_no_direct_input_expressions((fixture,))
             except ValueError:
@@ -591,7 +591,7 @@ with tempfile.TemporaryDirectory(
 ) as temporary:
     fixture = pathlib.Path(temporary) / "workflow.yml"
     for name, source, expected_rejection in cases:
-        fixture.write_text(source, encoding="utf-8", newline="")
+        fixture.write_bytes(source.encode("utf-8"))
         try:
             validate_no_direct_input_expressions((fixture,))
         except ValueError:
