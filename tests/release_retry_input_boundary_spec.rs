@@ -306,6 +306,289 @@ for relative in (
 }
 
 #[test]
+fn retry_boundary_detects_github_all_bracket_access() {
+    assert_python(
+        r###"
+import sys
+
+sys.path.insert(0, "scripts/release")
+from workflow_run_input_boundary import find_direct_input_expressions
+
+fixture = """steps:
+  - run: echo "${{ github['event']['inputs']['all_brackets'] }}"
+"""
+contexts = tuple(
+    finding.context for finding in find_direct_input_expressions(fixture)
+)
+if contexts != ("github.event.inputs",):
+    raise SystemExit(f"all-bracket access was missed: {contexts}")
+"###,
+    );
+}
+
+#[test]
+fn retry_boundary_detects_github_inputs_bracket_access() {
+    assert_python(
+        r###"
+import sys
+
+sys.path.insert(0, "scripts/release")
+from workflow_run_input_boundary import find_direct_input_expressions
+
+fixture = """steps:
+  - run: echo "${{ github.event['inputs']['input_bracket'] }}"
+"""
+contexts = tuple(
+    finding.context for finding in find_direct_input_expressions(fixture)
+)
+if contexts != ("github.event.inputs",):
+    raise SystemExit(f"bracketed inputs access was missed: {contexts}")
+"###,
+    );
+}
+
+#[test]
+fn retry_boundary_detects_github_event_bracket_access() {
+    assert_python(
+        r###"
+import sys
+
+sys.path.insert(0, "scripts/release")
+from workflow_run_input_boundary import find_direct_input_expressions
+
+fixture = """steps:
+  - run: echo "${{ github['event'].inputs.event_bracket }}"
+"""
+contexts = tuple(
+    finding.context for finding in find_direct_input_expressions(fixture)
+)
+if contexts != ("github.event.inputs",):
+    raise SystemExit(f"bracketed event access was missed: {contexts}")
+"###,
+    );
+}
+
+#[test]
+fn retry_boundary_ignores_terminator_inside_expression_string() {
+    assert_python(
+        r###"
+import sys
+
+sys.path.insert(0, "scripts/release")
+from workflow_run_input_boundary import find_direct_input_expressions
+
+fixture = """steps:
+  - run: echo "${{ format('{{safe}} {0}', inputs.after_terminator) }}"
+"""
+contexts = tuple(
+    finding.context for finding in find_direct_input_expressions(fixture)
+)
+if contexts != ("inputs",):
+    raise SystemExit(f"post-string input access was missed: {contexts}")
+"###,
+    );
+}
+
+#[test]
+fn retry_boundary_scanner_covers_valid_expression_neighborhood() {
+    assert_python(
+        r###"
+import sys
+
+sys.path.insert(0, "scripts/release")
+from workflow_run_input_boundary import find_direct_input_expressions
+
+cases = (
+    (
+        "inputs_dotted_plain",
+        """steps:
+  - run: echo "${{ inputs.pointed }}"
+""",
+        ("inputs",),
+    ),
+    (
+        "inputs_indexed_single_quoted_yaml",
+        """steps:
+  - run: 'echo ${{ inputs[''indexed''] }}'
+""",
+        ("inputs",),
+    ),
+    (
+        "github_dotted_double_quoted_yaml",
+        """steps:
+  - run: "echo ${{ github.event.inputs.pointed }}"
+""",
+        ("github.event.inputs",),
+    ),
+    (
+        "github_all_indexed_literal",
+        """steps:
+  - run: |
+      echo "${{ github['event']['inputs']['indexed'] }}"
+""",
+        ("github.event.inputs",),
+    ),
+    (
+        "github_mixed_folded",
+        """steps:
+  - run: >-
+      echo "${{ github['event'].inputs.mixed }}"
+""",
+        ("github.event.inputs",),
+    ),
+    (
+        "github_spaced_mixed",
+        """steps:
+  - run: echo "${{ github [ 'event' ] . inputs [ 'spaced' ] }}"
+""",
+        ("github.event.inputs",),
+    ),
+    (
+        "escaped_single_quote_and_markers",
+        """steps:
+  - run: |
+      echo "${{ format('it''s }} and ${{ inert', inputs.after_escape) }}"
+""",
+        ("inputs",),
+    ),
+    (
+        "nested_functions_arrays_and_object_string",
+        """steps:
+  - run: |
+      echo "${{ contains(fromJSON('{"values":["}}","${{"]}').values, inputs.nested) }}"
+""",
+        ("inputs",),
+    ),
+    (
+        "flow_plain_expression_string_terminator",
+        """steps:
+  - {run: echo-${{ format('{{safe}} {0}', inputs.flow_plain) }}, shell: bash}
+""",
+        ("inputs",),
+    ),
+    (
+        "multiple_expressions",
+        """steps:
+  - run: echo "${{ steps.safe.outputs.value }} ${{ inputs.first }} ${{ github['event'].inputs.second }}"
+""",
+        ("inputs", "github.event.inputs"),
+    ),
+    (
+        "shell_comment_is_still_active",
+        """steps:
+  - run: |
+      # ${{ github.event['inputs'].commented }}
+      echo safe
+""",
+        ("github.event.inputs",),
+    ),
+    (
+        "bare_inputs_function_argument",
+        """steps:
+  - run: echo "${{ toJSON(inputs) }}"
+""",
+        ("inputs",),
+    ),
+)
+
+errors = []
+for name, fixture, expected in cases:
+    actual = tuple(
+        finding.context for finding in find_direct_input_expressions(fixture)
+    )
+    if actual != expected:
+        errors.append(f"{name}: expected={expected}, actual={actual}")
+if errors:
+    raise SystemExit("valid expression neighborhood failed: " + " | ".join(errors))
+"###,
+    );
+}
+
+#[test]
+fn retry_boundary_scanner_ignores_inert_and_malformed_neighborhood() {
+    assert_python(
+        r###"
+import sys
+
+sys.path.insert(0, "scripts/release")
+from workflow_run_input_boundary import find_direct_input_expressions
+
+cases = (
+    (
+        "ordinary_shell_literal",
+        """steps:
+  - run: echo 'inputs.literal github.event.inputs.literal'
+""",
+    ),
+    (
+        "single_quoted_expression_literal",
+        """steps:
+  - run: echo "${{ 'inputs.literal' }}"
+""",
+    ),
+    (
+        "escaped_expression_string_with_markers",
+        """steps:
+  - run: |
+      echo "${{ 'it''s inputs.literal }} and ${{ literal' }}"
+""",
+    ),
+    (
+        "double_quoted_invalid_expression_string",
+        """steps:
+  - run: echo '${{ "inputs.invalid" }}'
+""",
+    ),
+    (
+        "unbalanced_parenthesis",
+        """steps:
+  - run: echo "${{ contains(inputs.invalid, 'x' }}"
+""",
+    ),
+    (
+        "unterminated_single_quote",
+        """steps:
+  - run: echo "${{ inputs.invalid && 'unterminated }}"
+""",
+    ),
+    (
+        "neighbor_identifiers",
+        """steps:
+  - run: echo "${{ inputs_suffix || github.event.inputs_suffix }}"
+""",
+    ),
+    (
+        "non_run_yaml_scalars",
+        """name: ${{ inputs.workflow_name }}
+env:
+  ORDINARY: ${{ github.event.inputs.environment_value }}
+steps:
+  - name: ${{ inputs.step_name }}
+    run: echo safe
+""",
+    ),
+    (
+        "yaml_comments",
+        """# run: echo "${{ inputs.top_comment }}"
+steps:
+  # - run: echo "${{ github.event.inputs.step_comment }}"
+  - run: echo safe # inputs.comment_text
+""",
+    ),
+)
+
+errors = []
+for name, fixture in cases:
+    findings = find_direct_input_expressions(fixture)
+    if findings:
+        errors.append(f"{name}: {findings}")
+if errors:
+    raise SystemExit("inert or malformed YAML was rejected: " + " | ".join(errors))
+"###,
+    );
+}
+
+#[test]
 fn retry_validators_read_untrusted_values_from_fixed_environment_names() {
     let canonical_key = format!("rmux-downstream-v1:{}", repeated('b', 64));
     let output = run_environment_identity_validator(&canonical_key, None);

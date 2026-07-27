@@ -539,6 +539,7 @@
     "scripts/release/verify-receipt-attestation.py",
     "scripts/release/verify-release-tag.py",
     "scripts/release/web_share_live.py",
+    "scripts/release/workflow_actions_expression.py",
     "scripts/release/workflow_run_input_boundary.py",
     "scripts/release/workflow_yaml_run_scalars.py",
     "scripts/retain-linux-package-history.py",

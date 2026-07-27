@@ -6,6 +6,8 @@ from bisect import bisect_right
 from dataclasses import dataclass
 from enum import Enum
 
+from workflow_actions_expression import scan_actions_expression
+
 
 class ScalarStyle(Enum):
     PLAIN = "plain"
@@ -294,10 +296,8 @@ class _FlowScanner:
         return None
 
     def _skip_expression(self, index: int) -> int:
-        if not self.text.startswith("${{", index):
-            return index
-        end = self.text.find("}}", index + 3)
-        return len(self.text) if end < 0 else end + 2
+        scanned = scan_actions_expression(self.text, index)
+        return index if scanned is None else scanned.end
 
     def _skip_trivia(self, index: int) -> int:
         while index < len(self.text):
