@@ -25,7 +25,8 @@ pub(super) fn parse_list_sessions(mut args: CommandTokens) -> Result<Request, Rm
             "-O" => sort_order = Some(args.required("-O order")?),
             "-r" => reversed = true,
             flag if flag.starts_with('-') => {
-                let Some(flags) = parse_compact_flag_cluster(flag, "r", "FfO") else {
+                let Some(flags) = parse_compact_flag_cluster("list-sessions", flag, "r", "FfO")?
+                else {
                     return Err(unsupported_flag("list-sessions", flag));
                 };
                 for flag in flags {
@@ -79,7 +80,8 @@ pub(super) fn parse_list_windows(
             "-O" => sort_order = Some(args.required("-O order")?),
             "-r" => reversed = true,
             flag if flag.starts_with('-') => {
-                let Some(flags) = parse_compact_flag_cluster(flag, "r", "FfOt") else {
+                let Some(flags) = parse_compact_flag_cluster("list-windows", flag, "r", "FfOt")?
+                else {
                     return Err(unsupported_flag("list-windows", flag));
                 };
                 for flag in flags {
@@ -151,7 +153,8 @@ pub(super) fn parse_list_panes(
             "-O" => sort_order = Some(args.required("-O order")?),
             "-r" => reversed = true,
             flag if flag.starts_with('-') => {
-                let Some(flags) = parse_compact_flag_cluster(flag, "sr", "FfOt") else {
+                let Some(flags) = parse_compact_flag_cluster("list-panes", flag, "sr", "FfOt")?
+                else {
                     return Err(unsupported_flag("list-panes", flag));
                 };
                 for flag in flags {
@@ -246,7 +249,8 @@ pub(super) fn parse_queued_list_windows_all(
                 hook_target = Some(parse_session_name(args.required("-t target")?)?);
             }
             flag if flag.starts_with('-') => {
-                let Some(flags) = parse_compact_flag_cluster(flag, "ar", "FfOt") else {
+                let Some(flags) = parse_compact_flag_cluster("list-windows", flag, "ar", "FfOt")?
+                else {
                     return Ok(None);
                 };
                 for flag in flags {
@@ -301,7 +305,8 @@ pub(super) fn parse_queued_list_panes_all(
             "-O" => sort_order = Some(args.required("-O order")?),
             "-r" => reversed = true,
             flag if flag.starts_with('-') => {
-                let Some(flags) = parse_compact_flag_cluster(flag, "asr", "FfOt") else {
+                let Some(flags) = parse_compact_flag_cluster("list-panes", flag, "asr", "FfOt")?
+                else {
                     return Ok(None);
                 };
                 for flag in flags {

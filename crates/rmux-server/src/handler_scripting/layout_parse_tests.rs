@@ -27,14 +27,15 @@ fn parse(arguments: &[&str]) -> Result<ParsedSelectLayout, RmuxError> {
 
 #[test]
 fn select_layout_rejects_unknown_option_shapes_before_layout() {
-    for (arguments, unknown) in [
-        (&["-x"][..], "-x"),
-        (&["--bogus"][..], "--bogus"),
-        (&["-nx"][..], "-nx"),
+    for (arguments, expected) in [
+        (&["-x"][..], "command select-layout: unknown flag -x"),
+        (&["--bogus"][..], "command select-layout: invalid flag --"),
+        (&["-nx"][..], "command select-layout: unknown flag -x"),
+        (&["-value"][..], "command select-layout: unknown flag -v"),
     ] {
         assert_eq!(
             parse(arguments).expect_err("unknown option must fail before layout parsing"),
-            RmuxError::Server(format!("command select-layout: unknown flag {unknown}"))
+            RmuxError::Server(expected.to_owned())
         );
     }
 }

@@ -67,7 +67,9 @@ pub(super) fn parse_switch_client(mut args: CommandTokens) -> Result<Request, Rm
                 zoom = true;
             }
             _ => {
-                let Some(cluster) = parse_compact_flag_cluster(&token, "ElnprZ", "cOTt") else {
+                let Some(cluster) =
+                    parse_compact_flag_cluster("switch-client", &token, "ElnprZ", "cOTt")?
+                else {
                     if token.starts_with('-') {
                         return Err(unsupported_flag("switch-client", &token));
                     }
@@ -165,7 +167,9 @@ pub(super) fn parse_detach_client(mut args: CommandTokens) -> Result<Request, Rm
                 target_client = Some(args.required("-t target-client")?);
             }
             _ => {
-                let Some(cluster) = parse_compact_flag_cluster(&token, "aP", "Est") else {
+                let Some(cluster) =
+                    parse_compact_flag_cluster("detach-client", &token, "aP", "Est")?
+                else {
                     if token.starts_with('-') {
                         return Err(unsupported_flag("detach-client", &token));
                     }
@@ -244,7 +248,9 @@ pub(super) fn parse_refresh_client(mut args: CommandTokens) -> Result<Request, R
                 target_client = Some(args.required("-t target-client")?);
             }
             _ => {
-                let Some(cluster) = parse_compact_flag_cluster(&token, "lS", "CfFt") else {
+                let Some(cluster) =
+                    parse_compact_flag_cluster("refresh-client", &token, "lS", "CfFt")?
+                else {
                     if token.starts_with('-') {
                         return Err(unsupported_flag("refresh-client", &token));
                     }
@@ -331,7 +337,9 @@ pub(super) fn parse_list_clients(mut args: CommandTokens) -> Result<Request, Rmu
                 target_session = Some(parse_session_name(args.required("-t target-session")?)?);
             }
             _ => {
-                let Some(cluster) = parse_compact_flag_cluster(&token, "r", "FfOt") else {
+                let Some(cluster) =
+                    parse_compact_flag_cluster("list-clients", &token, "r", "FfOt")?
+                else {
                     if token.starts_with('-') {
                         return Err(unsupported_flag("list-clients", &token));
                     }
@@ -454,7 +462,9 @@ pub(super) fn parse_server_access(mut args: CommandTokens) -> Result<Request, Rm
                 return Err(unsupported_flag("server-access", "-t"));
             }
             _ => {
-                let Some(cluster) = parse_compact_flag_cluster(&token, "adlrw", "t") else {
+                let Some(cluster) =
+                    parse_compact_flag_cluster("server-access", &token, "adlrw", "t")?
+                else {
                     match token.as_str() {
                         "--help" => return Err(unsupported_flag("server-access", "--help")),
                         "-" => {

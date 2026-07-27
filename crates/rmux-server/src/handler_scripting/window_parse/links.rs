@@ -511,7 +511,8 @@ pub(in crate::handler::scripting_support) fn parse_swap_window(
                 )?);
             }
             token => {
-                let Some(cluster) = parse_compact_flag_cluster(token, "d", "st") else {
+                let Some(cluster) = parse_compact_flag_cluster("swap-window", token, "d", "st")?
+                else {
                     break;
                 };
                 let _ = args.optional();

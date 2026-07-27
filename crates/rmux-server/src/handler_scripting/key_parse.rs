@@ -19,7 +19,7 @@ pub(super) fn parse_send_keys(mut args: CommandTokens) -> Result<Request, RmuxEr
     let mut repeat_count = None;
 
     while let Some(token) = args.peek().map(str::to_owned) {
-        if let Some(cluster) = parse_compact_flag_cluster(&token, "FHlKMRX", "cNt") {
+        if let Some(cluster) = parse_compact_flag_cluster("send-keys", &token, "FHlKMRX", "cNt")? {
             let _ = args.optional();
             for flag in cluster {
                 match flag {
@@ -199,7 +199,8 @@ pub(super) fn parse_bind_key(mut args: CommandTokens) -> Result<Request, RmuxErr
                 table_name = Some(args.required("-T key-table")?);
             }
             _ => {
-                let Some(cluster) = parse_compact_flag_cluster(&token, "nr", "NT") else {
+                let Some(cluster) = parse_compact_flag_cluster("bind-key", &token, "nr", "NT")?
+                else {
                     reject_unknown_option_before_positional("bind-key", &token)?;
                     break;
                 };
@@ -260,7 +261,8 @@ pub(super) fn parse_unbind_key(mut args: CommandTokens) -> Result<Request, RmuxE
                 table_name = Some(args.required("-T key-table")?);
             }
             _ => {
-                let Some(cluster) = parse_compact_flag_cluster(&token, "anq", "T") else {
+                let Some(cluster) = parse_compact_flag_cluster("unbind-key", &token, "anq", "T")?
+                else {
                     reject_unknown_option_before_positional("unbind-key", &token)?;
                     break;
                 };
@@ -340,7 +342,9 @@ pub(super) fn parse_list_keys(mut args: CommandTokens) -> Result<Request, RmuxEr
                 table_name = Some(args.required("-T key-table")?);
             }
             _ => {
-                let Some(cluster) = parse_compact_flag_cluster(&token, "1aNr", "FOPT") else {
+                let Some(cluster) =
+                    parse_compact_flag_cluster("list-keys", &token, "1aNr", "FOPT")?
+                else {
                     reject_unknown_option_before_positional("list-keys", &token)?;
                     break;
                 };
@@ -408,7 +412,8 @@ pub(super) fn parse_send_prefix(mut args: CommandTokens) -> Result<Request, Rmux
                 )?);
             }
             _ => {
-                let Some(cluster) = parse_compact_flag_cluster(&token, "2", "t") else {
+                let Some(cluster) = parse_compact_flag_cluster("send-prefix", &token, "2", "t")?
+                else {
                     break;
                 };
                 let _ = args.optional();

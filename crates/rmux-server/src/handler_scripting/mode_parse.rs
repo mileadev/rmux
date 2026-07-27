@@ -61,7 +61,9 @@ pub(super) fn parse_copy_mode(mut args: CommandTokens) -> Result<Request, RmuxEr
                 page_up = true;
             }
             token => {
-                let Some(cluster) = parse_compact_flag_cluster(token, "deHMSqu", "st") else {
+                let Some(cluster) =
+                    parse_compact_flag_cluster("copy-mode", token, "deHMSqu", "st")?
+                else {
                     break;
                 };
                 let _ = args.optional();

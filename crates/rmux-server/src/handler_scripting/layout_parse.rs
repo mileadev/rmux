@@ -66,7 +66,9 @@ pub(super) fn parse_display_panes(
                 target_client = Some(args.required("-t target-client")?);
             }
             _ => {
-                let Some(cluster) = parse_compact_flag_cluster(&token, "bN", "dt") else {
+                let Some(cluster) =
+                    parse_compact_flag_cluster("display-panes", &token, "bN", "dt")?
+                else {
                     reject_unknown_option_before_positional("display-panes", &token)?;
                     break;
                 };
@@ -140,7 +142,9 @@ pub(super) fn parse_select_layout(
                 target = Some(parse_select_layout_target(args.required("-t target")?)?);
             }
             _ => {
-                let Some(cluster) = parse_compact_flag_cluster(&token, "Enop", "t") else {
+                let Some(cluster) =
+                    parse_compact_flag_cluster("select-layout", &token, "Enop", "t")?
+                else {
                     reject_unknown_option_before_positional("select-layout", &token)?;
                     break;
                 };
@@ -427,7 +431,12 @@ pub(super) fn parse_resize_pane(
             "-M" => {
                 let _ = args.optional();
             }
-            _ => break,
+            _ => {
+                if token.starts_with('-') && !integer_like_resize_pane_adjustment(token) {
+                    let _ = parse_compact_flag_cluster("resize-pane", token, "DLMRTUZ", "txy")?;
+                }
+                break;
+            }
         }
     }
     relative = parse_trailing_resize_pane_adjustment(&mut args, relative)?;

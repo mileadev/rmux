@@ -3,9 +3,7 @@ use std::path::{Path, PathBuf};
 use rmux_core::{SessionStore, TargetFindContext};
 use rmux_proto::{DeleteBufferRequest, ListBuffersRequest, LoadBufferRequest, Request, RmuxError};
 
-use super::tokens::{
-    first_unsupported_compact_flag, parse_compact_flag_cluster, CommandTokens, CompactFlag,
-};
+use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
 use super::values::{missing_argument, reject_unknown_option_before_positional, unsupported_flag};
 use super::{implicit_pane_target, parse_pane_target};
 
@@ -42,15 +40,8 @@ pub(super) fn parse_set_buffer(mut args: CommandTokens) -> Result<Request, RmuxE
                 set_clipboard = true;
             }
             _ => {
-                let Some(cluster) = parse_compact_flag_cluster(&token, "aw", "bnt") else {
-                    if let Some(flag) = first_unsupported_compact_flag(&token, "aw", "bnt") {
-                        if flag == '-' {
-                            return Err(RmuxError::Server(
-                                "command set-buffer: invalid flag --".to_owned(),
-                            ));
-                        }
-                        return Err(unsupported_flag("set-buffer", &format!("-{flag}")));
-                    }
+                let Some(cluster) = parse_compact_flag_cluster("set-buffer", &token, "aw", "bnt")?
+                else {
                     reject_unknown_option_before_positional("set-buffer", &token)?;
                     break;
                 };

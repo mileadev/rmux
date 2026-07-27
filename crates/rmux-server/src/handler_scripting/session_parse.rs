@@ -51,7 +51,9 @@ pub(super) fn parse_new_session(mut args: CommandTokens) -> Result<Request, Rmux
                 break;
             }
             flag if flag.starts_with('-') => {
-                let Some(cluster) = parse_compact_flag_cluster(flag, "ADdEPX", "cefFnstxy") else {
+                let Some(cluster) =
+                    parse_compact_flag_cluster("new-session", flag, "ADdEPX", "cefFnstxy")?
+                else {
                     return Err(unsupported_flag("new-session", flag));
                 };
                 for compact_flag in cluster {

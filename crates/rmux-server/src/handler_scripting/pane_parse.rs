@@ -55,7 +55,7 @@ pub(super) fn parse_pane_request(
                 target = Some(parse_pane_target(command, args.required("-t target")?)?);
             }
             token => {
-                let Some(cluster) = parse_compact_flag_cluster(token, "a", "t") else {
+                let Some(cluster) = parse_compact_flag_cluster(command, token, "a", "t")? else {
                     break;
                 };
                 let _ = args.optional();
@@ -175,7 +175,9 @@ pub(super) fn parse_select_pane(
                 // tmux 3.7b accepts the hidden value-taking -P option even though
                 // its list-commands signature omits it, so parse compact forms
                 // here without changing the public inventory.
-                let Some(cluster) = parse_compact_flag_cluster(&token, "DdeLlMmRUZ", "PTt") else {
+                let Some(cluster) =
+                    parse_compact_flag_cluster("select-pane", &token, "DdeLlMmRUZ", "PTt")?
+                else {
                     break;
                 };
                 let _ = args.optional();
@@ -400,7 +402,8 @@ fn parse_split_window_command(
                 environment.push(args.required("-e name=value")?);
             }
             token => {
-                let Some(cluster) = parse_compact_flag_cluster(token, "bdfhIkpvZP", "ceFltp")
+                let Some(cluster) =
+                    parse_compact_flag_cluster("split-window", token, "bdfhIkpvZP", "ceFltp")?
                 else {
                     reject_unknown_option_before_positional("split-window", token)?;
                     break;
@@ -589,7 +592,8 @@ pub(super) fn parse_swap_pane(
                 target = Some(parse_pane_target("swap-pane", args.required("-t target")?)?);
             }
             token => {
-                let Some(cluster) = parse_compact_flag_cluster(token, "dDUZ", "st") else {
+                let Some(cluster) = parse_compact_flag_cluster("swap-pane", token, "dDUZ", "st")?
+                else {
                     break;
                 };
                 let _ = args.optional();
@@ -727,7 +731,9 @@ pub(super) fn parse_break_pane(
                 name = Some(args.required("-n name")?);
             }
             token => {
-                let Some(cluster) = parse_compact_flag_cluster(token, "abdP", "Fstn") else {
+                let Some(cluster) =
+                    parse_compact_flag_cluster("break-pane", token, "abdP", "Fstn")?
+                else {
                     break;
                 };
                 let _ = args.optional();

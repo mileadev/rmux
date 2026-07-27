@@ -32,7 +32,8 @@ pub(super) fn parse_queued_list_commands(
                 format = Some(args.required("-F format")?);
             }
             token => {
-                let Some(cluster) = parse_compact_flag_cluster(token, "", "F") else {
+                let Some(cluster) = parse_compact_flag_cluster("list-commands", token, "", "F")?
+                else {
                     if token.starts_with('-') && token != "-" {
                         return Err(unsupported_flag("list-commands", token));
                     }

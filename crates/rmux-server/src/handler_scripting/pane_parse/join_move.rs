@@ -103,7 +103,8 @@ fn parse_join_or_move_pane(
                 target = Some(parse_pane_target(command, args.required("-t target")?)?);
             }
             token => {
-                let Some(cluster) = parse_compact_flag_cluster(token, "bdfhv", "lpst") else {
+                let Some(cluster) = parse_compact_flag_cluster(command, token, "bdfhv", "lpst")?
+                else {
                     break;
                 };
                 let _ = args.optional();

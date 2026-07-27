@@ -362,7 +362,9 @@ pub(super) fn parse_set_environment(
                 select_set_environment_mode(&mut mode, SetEnvironmentMode::Unset);
             }
             _ => {
-                let Some(cluster) = parse_compact_flag_cluster(&token, "Fghru", "t") else {
+                let Some(cluster) =
+                    parse_compact_flag_cluster("set-environment", &token, "Fghru", "t")?
+                else {
                     reject_unknown_option_before_positional("set-environment", &token)?;
                     break;
                 };

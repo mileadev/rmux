@@ -273,9 +273,12 @@ fn parse_display_message_args(
                 let _ = args.optional();
                 duration_ms = Some(parse_display_message_duration(&value)?);
             }
-            flag if is_display_message_compact_cluster(flag) => {
-                let cluster = parse_compact_flag_cluster(flag, "aCIlNpv", "cdFt")
-                    .expect("display-message compact cluster was prevalidated");
+            flag if flag.starts_with('-') && flag.len() > 2 => {
+                let Some(cluster) =
+                    parse_compact_flag_cluster("display-message", flag, "aCIlNpv", "cdFt")?
+                else {
+                    unreachable!("multi-character display-message flag must be a cluster");
+                };
                 let _ = args
                     .optional()
                     .expect("peeked display-message flag must still exist");
@@ -599,10 +602,6 @@ fn verbose_token_is_simple_variable(token: &str) -> bool {
         && token
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-}
-
-fn is_display_message_compact_cluster(flag: &str) -> bool {
-    parse_compact_flag_cluster(flag, "aCIlNpv", "cdFt").is_some()
 }
 
 fn display_all_formats_template() -> String {

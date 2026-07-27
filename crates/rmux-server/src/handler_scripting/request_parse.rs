@@ -666,11 +666,11 @@ mod tests {
                 "-bQ",
             ),
             ("wait-for", &["--bogus"][..], "--bogus"),
-            ("split-window", &["-hQ", "true"][..], "-hQ"),
+            ("split-window", &["-hQ", "true"][..], "-Q"),
             ("pipe-pane", &["-IQ", "true"][..], "-IQ"),
             ("respawn-pane", &["-kQ", "true"][..], "-kQ"),
-            ("bind-key", &["-nQ", "x", "display-message ok"][..], "-nQ"),
-            ("display-panes", &["-bQ", "select-pane -t %%"][..], "-bQ"),
+            ("bind-key", &["-nQ", "x", "display-message ok"][..], "-Q"),
+            ("display-panes", &["-bQ", "select-pane -t %%"][..], "-Q"),
         ] {
             let error = parse_request_result(command, arguments, &SessionStore::default())
                 .expect_err("mixed or long unknown option must fail");

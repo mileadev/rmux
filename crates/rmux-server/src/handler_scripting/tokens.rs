@@ -7,6 +7,8 @@ use rmux_core::{
 };
 use rmux_proto::RmuxError;
 
+use super::values::unsupported_flag;
+
 /// Applies tmux's last-value precedence before queued target lookup.
 ///
 /// Superseded source and target values must be removed before any parser can
@@ -271,6 +273,26 @@ impl CompactFlag {
 }
 
 pub(super) fn parse_compact_flag_cluster(
+    command: &str,
+    token: &str,
+    bare_flags: &str,
+    value_flags: &str,
+) -> Result<Option<Vec<CompactFlag>>, RmuxError> {
+    let cluster = parse_compact_flag_cluster_token(token, bare_flags, value_flags);
+    if cluster.is_none() {
+        if let Some(flag) = first_unsupported_compact_flag(token, bare_flags, value_flags) {
+            if flag == '-' {
+                return Err(RmuxError::Server(format!(
+                    "command {command}: invalid flag --"
+                )));
+            }
+            return Err(unsupported_flag(command, &format!("-{flag}")));
+        }
+    }
+    Ok(cluster)
+}
+
+fn parse_compact_flag_cluster_token(
     token: &str,
     bare_flags: &str,
     value_flags: &str,
@@ -298,7 +320,7 @@ pub(super) fn parse_compact_flag_cluster(
     Some(cluster)
 }
 
-pub(super) fn first_unsupported_compact_flag(
+fn first_unsupported_compact_flag(
     token: &str,
     bare_flags: &str,
     value_flags: &str,

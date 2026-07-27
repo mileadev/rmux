@@ -155,3 +155,70 @@ fn tiled_five_and_six_pane_minimum_avoids_tmux_hang_product_divergence() {
         );
     }
 }
+
+#[test]
+fn tiled_width_deficient_rows_converge_on_first_application_product_divergence() {
+    for (pane_count, size, expected) in [
+        (
+            3,
+            TerminalSize { cols: 1, rows: 5 },
+            vec![
+                PaneGeometry::new(0, 0, 1, 2),
+                PaneGeometry::new(2, 0, 1, 2),
+                PaneGeometry::new(0, 3, 3, 2),
+            ],
+        ),
+        (
+            4,
+            TerminalSize { cols: 1, rows: 7 },
+            vec![
+                PaneGeometry::new(0, 0, 1, 3),
+                PaneGeometry::new(2, 0, 1, 3),
+                PaneGeometry::new(0, 4, 1, 3),
+                PaneGeometry::new(2, 4, 1, 3),
+            ],
+        ),
+        (
+            5,
+            TerminalSize { cols: 1, rows: 9 },
+            vec![
+                PaneGeometry::new(0, 0, 1, 2),
+                PaneGeometry::new(2, 0, 1, 2),
+                PaneGeometry::new(0, 3, 1, 2),
+                PaneGeometry::new(2, 3, 1, 2),
+                PaneGeometry::new(0, 6, 3, 3),
+            ],
+        ),
+        (
+            6,
+            TerminalSize { cols: 1, rows: 11 },
+            vec![
+                PaneGeometry::new(0, 0, 1, 3),
+                PaneGeometry::new(2, 0, 1, 3),
+                PaneGeometry::new(0, 4, 1, 3),
+                PaneGeometry::new(2, 4, 1, 3),
+                PaneGeometry::new(0, 8, 1, 3),
+                PaneGeometry::new(2, 8, 1, 3),
+            ],
+        ),
+    ] {
+        let mut panes = (0..pane_count).map(pane).collect::<Vec<_>>();
+        let tree = apply_layout(&mut panes, LayoutName::Tiled, size, None);
+
+        assert_eq!(
+            tree.size(),
+            TerminalSize {
+                cols: 3,
+                rows: size.rows,
+            }
+        );
+        assert_eq!(
+            panes.iter().map(|pane| pane.geometry()).collect::<Vec<_>>(),
+            expected
+        );
+        assert!(
+            tree.root.check(),
+            "width-deficient tiled rows must remain structurally coherent"
+        );
+    }
+}

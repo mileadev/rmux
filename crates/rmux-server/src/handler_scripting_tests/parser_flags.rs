@@ -99,20 +99,54 @@ fn server_tail_parsers_reject_unknown_flags_before_positionals() {
 }
 
 #[test]
+fn compact_flag_clusters_report_tmux_first_unsupported_flag() {
+    let (sessions, find_context) = parser_fixture();
+
+    for (command, arguments, expected_flag) in [
+        ("select-pane", &["-value"][..], "-v"),
+        ("resize-pane", &["-value"][..], "-v"),
+        ("list-panes", &["-value"][..], "-v"),
+        ("kill-pane", &["-value"][..], "-v"),
+        ("swap-pane", &["-value"][..], "-v"),
+        ("list-windows", &["-value"][..], "-v"),
+        ("new-session", &["-dvalue"][..], "-v"),
+        ("send-keys", &["-Xvalue"][..], "-v"),
+        ("split-window", &["-dvalue"][..], "-a"),
+    ] {
+        let error = parse_server_request(command, arguments, &sessions, &find_context)
+            .expect_err("unsupported flag in compact cluster must fail");
+        assert_eq!(
+            error,
+            RmuxError::Server(format!("command {command}: unknown flag {expected_flag}")),
+            "{command} did not report tmux's first unsupported compact flag"
+        );
+    }
+}
+
+#[test]
 fn server_set_environment_rejects_unknown_option_shapes() {
     let (sessions, find_context) = parser_fixture();
 
-    for (arguments, unknown) in [
-        (&["-g", "-x", "short-poison"][..], "-x"),
-        (&["-g", "--bogus", "long-poison"][..], "--bogus"),
-        (&["-g", "-Fz", "cluster-poison"][..], "-Fz"),
+    for (arguments, expected) in [
+        (
+            &["-g", "-x", "short-poison"][..],
+            "command set-environment: unknown flag -x",
+        ),
+        (
+            &["-g", "--bogus", "long-poison"][..],
+            "command set-environment: invalid flag --",
+        ),
+        (
+            &["-g", "-Fz", "cluster-poison"][..],
+            "command set-environment: unknown flag -z",
+        ),
     ] {
         let error = parse_server_request("set-environment", arguments, &sessions, &find_context)
             .expect_err("unknown set-environment option must fail");
         assert_eq!(
             error,
-            RmuxError::Server(format!("command set-environment: unknown flag {unknown}")),
-            "set-environment absorbed {unknown} as its variable name"
+            RmuxError::Server(expected.to_owned()),
+            "set-environment did not match tmux for {arguments:?}"
         );
     }
 }
