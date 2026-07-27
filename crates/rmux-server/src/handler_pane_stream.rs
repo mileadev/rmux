@@ -21,6 +21,8 @@ mod protocol;
 mod raw;
 #[path = "handler/pane_stream_surface.rs"]
 mod surface;
+#[path = "handler/pane_stream_surface_admission.rs"]
+mod surface_admission;
 #[path = "handler/pane_stream_types.rs"]
 mod types;
 
@@ -39,7 +41,8 @@ use raw::{RawInitializationOutcome, RawSubscriptionStart};
 use types::SurfacePaneStream;
 pub(in crate::handler) use types::{
     CachedRawRebase, EndedPaneStream, PaneStreamSource, PaneStreamSubscription,
-    PendingSurfaceRefresh, SurfaceDriver, SurfaceRefreshToken,
+    PaneSurfaceFingerprint, PendingSurfaceRefresh, SurfaceAdmissionCache, SurfaceDriver,
+    SurfaceRefreshToken,
 };
 
 pub(super) const MAX_SOURCE_CAPTURE_ATTEMPTS: usize = 4;

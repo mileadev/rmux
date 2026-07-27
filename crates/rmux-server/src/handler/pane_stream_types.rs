@@ -4,6 +4,7 @@ use std::time::Instant;
 use rmux_core::events::PaneOutputSubscriptionKey;
 use rmux_proto::{
     PaneRawRebase, PaneRawRebaseReason, PaneStreamEndReason, PaneStreamMode, PaneSurfaceFrame,
+    RmuxError,
 };
 
 use crate::pane_io::{PaneBoundary, PaneObservationItem, PaneOutputReceiver};
@@ -193,6 +194,29 @@ impl PaneSurfaceFingerprint {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(in crate::handler) struct SurfaceAdmissionCache {
+    fingerprint: PaneSurfaceFingerprint,
+    validation: Result<(), RmuxError>,
+}
+
+impl SurfaceAdmissionCache {
+    fn valid(fingerprint: PaneSurfaceFingerprint) -> Self {
+        Self {
+            fingerprint,
+            validation: Ok(()),
+        }
+    }
+
+    pub(in crate::handler) const fn fingerprint(&self) -> &PaneSurfaceFingerprint {
+        &self.fingerprint
+    }
+
+    pub(in crate::handler) fn validation(&self) -> Result<(), RmuxError> {
+        self.validation.clone()
+    }
+}
+
 #[derive(Debug)]
 pub(in crate::handler) struct SurfaceDriver {
     generation: u64,
@@ -205,6 +229,7 @@ pub(in crate::handler) struct SurfaceDriver {
     pub(in crate::handler) refreshing: bool,
     pub(in crate::handler) refresh_token: u64,
     pending_refresh: Option<PendingSurfaceRefresh>,
+    admission_cache: SurfaceAdmissionCache,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,6 +251,7 @@ impl SurfaceDriver {
         latest: Arc<PaneSurfaceFrame>,
         fingerprint: PaneSurfaceFingerprint,
     ) -> Self {
+        let admission_cache = SurfaceAdmissionCache::valid(fingerprint.clone());
         Self {
             generation,
             receiver,
@@ -237,7 +263,23 @@ impl SurfaceDriver {
             refreshing: false,
             refresh_token: 0,
             pending_refresh: None,
+            admission_cache,
         }
+    }
+
+    pub(in crate::handler) fn admission_cache(&self) -> SurfaceAdmissionCache {
+        self.admission_cache.clone()
+    }
+
+    pub(in crate::handler) fn cache_admission(
+        &mut self,
+        fingerprint: PaneSurfaceFingerprint,
+        validation: Result<(), RmuxError>,
+    ) {
+        self.admission_cache = SurfaceAdmissionCache {
+            fingerprint,
+            validation,
+        };
     }
 
     pub(in crate::handler) const fn pending_refresh(&self) -> Option<PendingSurfaceRefresh> {
@@ -271,6 +313,7 @@ impl SurfaceDriver {
         self.receiver = receiver;
         self.revision = latest.revision;
         self.latest = latest;
+        self.admission_cache = SurfaceAdmissionCache::valid(fingerprint.clone());
         self.fingerprint = fingerprint;
         self.frame_lifecycle_revision = frame_lifecycle_revision;
         self.refreshing = false;
@@ -287,6 +330,7 @@ impl SurfaceDriver {
             return false;
         }
         self.receiver = receiver;
+        self.admission_cache = SurfaceAdmissionCache::valid(fingerprint.clone());
         self.fingerprint = fingerprint;
         self.refreshing = false;
         true

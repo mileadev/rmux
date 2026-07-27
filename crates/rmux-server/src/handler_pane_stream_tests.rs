@@ -20,6 +20,10 @@ use super::{validate_raw_rebase_size, RequestHandler};
 mod subscription_kind;
 #[path = "handler_pane_stream_tests/surface_budget.rs"]
 mod surface_budget;
+#[path = "handler_pane_stream_tests/surface_review_regressions.rs"]
+mod surface_review_regressions;
+#[path = "handler_pane_stream_tests/surface_test_support.rs"]
+mod surface_test_support;
 
 const CONNECTION_ID: u64 = 41;
 

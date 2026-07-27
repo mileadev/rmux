@@ -39,14 +39,16 @@ const MAX_RECOVERY_DRAFT_HISTORY_BYTES: usize = MAX_RECOVERY_KEYFRAME_BYTES;
 // leave more than two MiB of detached-frame headroom for a recovery keyframe,
 // bincode headers and lifecycle companions.
 pub(crate) const MAX_RECOVERY_TYPED_SNAPSHOT_CELLS: usize = 96 * 1024;
-// A maximally encoded PaneSnapshotCell is 49 bytes: an eight-byte String
-// length, 21 text bytes, and 20 bytes of fixed-width cell fields. Keep the
-// cell grid inside the same envelope used by Surface cursor responses; exact
-// frame validation accounts for the remaining bounded metadata.
-const MAX_SURFACE_CELL_ENCODED_BYTES: usize = 49;
-const MAX_SURFACE_FRAME_BYTES: usize =
+// Every encoded PaneSnapshotCell occupies at least 28 bytes: an eight-byte
+// empty String length and 20 bytes of fixed-width fields. This is only a
+// necessary structural prefilter: grids above the quotient cannot fit even
+// with empty cells, while grids below it still require exact frame validation
+// for cell text and metadata.
+pub(crate) const MIN_SURFACE_CELL_ENCODED_BYTES: usize = 28;
+pub(crate) const MAX_SURFACE_FRAME_BYTES: usize =
     DEFAULT_MAX_DETACHED_FRAME_LENGTH - 64 * 1024 - std::mem::size_of::<u32>();
-const MAX_RECOVERY_SURFACE_CELLS: usize = MAX_SURFACE_FRAME_BYTES / MAX_SURFACE_CELL_ENCODED_BYTES;
+pub(crate) const MAX_RECOVERY_SURFACE_CELLS: usize =
+    MAX_SURFACE_FRAME_BYTES / MIN_SURFACE_CELL_ENCODED_BYTES;
 
 /// Owned terminal state copied at an atomic pane boundary.
 pub(crate) struct PaneRecoverySeed {

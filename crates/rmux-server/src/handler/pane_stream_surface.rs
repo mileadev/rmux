@@ -11,86 +11,12 @@ use crate::pane_io::PaneObservationItem;
 
 use super::super::subscription_support::{cursor_event_limit, OutputSubscriptionState};
 use super::{
-    capture_surface_source, materialize_surface_frame, owned_stream_record, slow_consumer_response,
-    stream_cursor_response, validate_surface_frame_size, wrong_stream_mode, PaneStreamSource,
-    PaneStreamSubscription, PendingSurfaceRefresh, RequestHandler, SurfaceRefreshGuard,
+    capture_surface_source, materialize_surface_frame, owned_stream_record, stream_cursor_response,
+    validate_surface_frame_size, wrong_stream_mode, PaneStreamSubscription, PendingSurfaceRefresh,
+    RequestHandler, SurfaceRefreshGuard,
 };
 
 impl RequestHandler {
-    #[cfg(test)]
-    pub(in crate::handler) fn install_surface_admission_pause(
-        &self,
-    ) -> Arc<super::super::SurfaceAdmissionPause> {
-        let pause = Arc::new(super::super::SurfaceAdmissionPause::default());
-        *self
-            .surface_admission_pause
-            .lock()
-            .expect("surface admission pause") = Some(Arc::clone(&pause));
-        pause
-    }
-
-    #[cfg(test)]
-    async fn pause_after_surface_admission_validation(&self) {
-        let pause = self
-            .surface_admission_pause
-            .lock()
-            .expect("surface admission pause")
-            .take();
-        if let Some(pause) = pause {
-            pause.reached.notify_one();
-            pause.release.notified().await;
-        }
-    }
-
-    #[cfg(not(test))]
-    async fn pause_after_surface_admission_validation(&self) {}
-
-    pub(super) async fn validate_current_surface_admission(
-        &self,
-        mut source: PaneStreamSource,
-    ) -> Result<PaneStreamSource, RmuxError> {
-        for _ in 0..super::MAX_SOURCE_CAPTURE_ATTEMPTS {
-            let captured = capture_surface_source(&source, None, true)?;
-            if captured.boundary.generation != source.generation {
-                source = self
-                    .resolve_stream_source_for_pane(
-                        source.key.pane_id(),
-                        source.key.runtime_session_name(),
-                    )
-                    .await?;
-                continue;
-            }
-            let seed = captured
-                .seed
-                .as_ref()
-                .expect("forced surface admission capture must materialize a projection");
-            let validation = materialize_surface_frame(
-                self,
-                source.key.pane_id(),
-                1,
-                1,
-                0,
-                captured.boundary.next_output_sequence,
-                seed,
-            )
-            .and_then(|frame| validate_surface_frame_size(&frame));
-            self.pause_after_surface_admission_validation().await;
-            if source.output.is_current_boundary(captured.boundary) {
-                validation?;
-                return Ok(source);
-            }
-            source = self
-                .resolve_stream_source_for_pane(
-                    source.key.pane_id(),
-                    source.key.runtime_session_name(),
-                )
-                .await?;
-        }
-        Err(RmuxError::Server(
-            "pane surface changed repeatedly while validating stream admission".to_owned(),
-        ))
-    }
-
     pub(super) async fn poll_surface_stream(
         &self,
         connection_id: u64,
@@ -355,23 +281,7 @@ impl RequestHandler {
             }
         };
         if let Err(error) = validate_surface_frame_size(&frame) {
-            let mut subscriptions = self
-                .subscriptions
-                .lock()
-                .expect("subscription registry mutex must not be poisoned");
-            if let Some(current_key) = subscriptions.surface_driver_key_for_pane_id(key.pane_id()) {
-                subscriptions.end_pane_streams(
-                    &current_key,
-                    PaneStreamMode::Surface,
-                    PaneStreamEndReason::SlowConsumer,
-                    Instant::now(),
-                );
-                subscriptions.ended_streams.remove(&request.subscription_id);
-            }
-            return match error {
-                RmuxError::FrameTooLarge { .. } => slow_consumer_response(request.subscription_id),
-                error => Response::Error(ErrorResponse { error }),
-            };
+            return Response::Error(ErrorResponse { error });
         }
 
         let mut subscriptions = self
