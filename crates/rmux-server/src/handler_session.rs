@@ -1404,26 +1404,35 @@ impl RequestHandler {
                             removed_session.id(),
                             detach_on_destroy,
                         ));
-                        queued_events.push(prepare_lifecycle_event(
-                            &mut state,
-                            &LifecycleEvent::SessionClosed {
-                                session_name: session_name.clone(),
-                                session_id: Some(removed_session.id().as_u32()),
-                            },
-                        ));
+                        let session_closed = LifecycleEvent::SessionClosed {
+                            session_name: session_name.clone(),
+                            session_id: Some(removed_session.id().as_u32()),
+                        };
+                        let unlinking_only_linked_window = expected_only_linked_window_id.is_some();
+                        let mut removal_events =
+                            Vec::with_capacity(removed_session.windows().len() + 1);
+                        // Explicit kill-session closes the session first. An
+                        // implicit unlink teardown lets the window hook consume
+                        // its state before the session hook cleans that state up.
+                        if !unlinking_only_linked_window {
+                            removal_events.push(session_closed.clone());
+                        }
                         for (window_index, window) in removed_session.windows() {
-                            queued_events.push(prepare_lifecycle_event(
-                                &mut state,
-                                &LifecycleEvent::WindowUnlinked {
-                                    session_name: session_name.clone(),
-                                    target: Some(WindowTarget::with_window(
-                                        session_name.clone(),
-                                        *window_index,
-                                    )),
-                                    window_id: Some(window.id().as_u32()),
-                                    window_name: Some(window.name().unwrap_or_default().to_owned()),
-                                },
-                            ));
+                            removal_events.push(LifecycleEvent::WindowUnlinked {
+                                session_name: session_name.clone(),
+                                target: Some(WindowTarget::with_window(
+                                    session_name.clone(),
+                                    *window_index,
+                                )),
+                                window_id: Some(window.id().as_u32()),
+                                window_name: Some(window.name().unwrap_or_default().to_owned()),
+                            });
+                        }
+                        if unlinking_only_linked_window {
+                            removal_events.push(session_closed);
+                        }
+                        for event in removal_events {
+                            queued_events.push(prepare_lifecycle_event(&mut state, &event));
                         }
                         let _ = state.options.remove_session(session_name);
                         let _ = state.environment.remove_session(session_name);
