@@ -1424,13 +1424,13 @@ impl RequestHandler {
                             session_name: session_name.clone(),
                             session_id: Some(removed_session.id().as_u32()),
                         };
-                        let unlinking_only_linked_window = expected_only_linked_window_id.is_some();
+                        let implicit_unlink_teardown = expected_only_window.is_some();
                         let mut removal_events =
                             Vec::with_capacity(removed_session.windows().len() + 1);
                         // Explicit kill-session closes the session first. An
                         // implicit unlink teardown lets the window hook consume
                         // its state before the session hook cleans that state up.
-                        if !unlinking_only_linked_window {
+                        if !implicit_unlink_teardown {
                             removal_events.push(session_closed.clone());
                         }
                         for (window_index, window) in removed_session.windows() {
@@ -1444,7 +1444,7 @@ impl RequestHandler {
                                 window_name: Some(window.name().unwrap_or_default().to_owned()),
                             });
                         }
-                        if unlinking_only_linked_window {
+                        if implicit_unlink_teardown {
                             removal_events.push(session_closed);
                         }
                         for event in removal_events {
