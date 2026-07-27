@@ -667,6 +667,14 @@ impl RequestHandler {
                     .with_named_value("client_tty", client.tty.clone())
                     .with_named_value("client_activity", client.activity_at.to_string())
                     .with_named_value(
+                        "session_id",
+                        client
+                            .session_id
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_default(),
+                    )
+                    .with_named_value(
                         "session_name",
                         client
                             .session_name
