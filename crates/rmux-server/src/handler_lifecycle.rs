@@ -52,6 +52,12 @@ pub(crate) struct QueuedLifecycleEvent {
     publication_discarded: bool,
 }
 
+impl QueuedLifecycleEvent {
+    pub(in crate::handler) fn suppress_control_effects(&mut self) {
+        self.control_effects_dispatched = true;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StableLifecycleTargetIdentity {
     Session {

@@ -78,27 +78,20 @@ impl SessionTransferSnapshot {
 }
 
 impl WindowGeometrySnapshot {
-    fn capture(state: &HandlerState, targets: &[WindowTarget]) -> Self {
-        let mut windows = Vec::with_capacity(targets.len());
-        for target in targets {
-            let Some(window) = state
-                .sessions
-                .session(target.session_name())
-                .and_then(|session| session.window_at(target.window_index()))
-            else {
-                continue;
-            };
-            if windows
-                .iter()
-                .any(|before: &WindowGeometryBefore| before.window_id == window.id())
-            {
-                continue;
+    fn capture_all(state: &HandlerState) -> Self {
+        let mut seen = HashSet::new();
+        let mut windows = Vec::new();
+        for (session_name, session) in state.sessions.iter() {
+            for (&window_index, window) in session.windows() {
+                if !seen.insert(window.id()) {
+                    continue;
+                }
+                windows.push(WindowGeometryBefore {
+                    window_id: window.id(),
+                    preferred_target: WindowTarget::with_window(session_name.clone(), window_index),
+                    size: window.size(),
+                });
             }
-            windows.push(WindowGeometryBefore {
-                window_id: window.id(),
-                preferred_target: target.clone(),
-                size: window.size(),
-            });
         }
         Self { windows }
     }
@@ -162,21 +155,23 @@ impl WindowGeometryBefore {
 }
 
 impl HandlerState {
-    /// Runs a mutation that can touch more than one stored window, then records
-    /// every surviving stable window identity whose content size changed.
+    /// Runs one join/move mutation, then records every surviving stable
+    /// window identity whose content size changed.
     ///
-    /// The comparison runs after both success and error returns. Transactional
-    /// errors restore their model snapshot and compare equal; a partially
-    /// committed error still owes the same notification as a successful write.
-    pub(crate) fn mutate_and_record_window_geometry_changes<T, F>(
+    /// Both public join/move entry points pass through this boundary and the
+    /// snapshot covers every existing window, so callers cannot silently omit
+    /// a sibling target. The comparison runs after both success and error
+    /// returns. Transactional errors restore their model snapshot and compare
+    /// equal; a partially committed error still owes the same notification as
+    /// a successful write.
+    pub(super) fn mutate_join_or_move_and_record_window_geometry_changes<T, F>(
         &mut self,
-        targets: &[WindowTarget],
         mutate: F,
     ) -> T
     where
         F: FnOnce(&mut Self) -> T,
     {
-        let geometry_before = WindowGeometrySnapshot::capture(self, targets);
+        let geometry_before = WindowGeometrySnapshot::capture_all(self);
         let result = mutate(self);
         geometry_before.record_changes(self);
         result
@@ -239,8 +234,8 @@ impl HandlerState {
     /// `window-layout-changed` and then `window-resized`, and control clients see
     /// the former as `%layout-change`. Publication here is asynchronous, so a
     /// window whose size really moved is recorded on the state and drained by
-    /// `RequestHandler::publish_applied_window_resizes`. Multi-window mutations
-    /// use `mutate_and_record_window_geometry_changes` to preserve the same
+    /// `RequestHandler::publish_applied_window_resizes`. Join/move transfers use
+    /// the mandatory all-window snapshot boundary above to preserve the same
     /// invariant across stable window identities.
     pub(crate) fn mutate_session_and_resize_window_terminal_with_family_if<T, F, P>(
         &mut self,

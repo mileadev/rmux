@@ -35,7 +35,7 @@ Compatibility status values:
 | `join-pane -d -s <only-pane> -t target` moves the pane and removes the empty source session | `ISO required` | Fixed in the current working tree; covered by core and PTY integration tests | Rust unit/integration tests |
 | `split-window -d -t <non-active-pane>` does not change the active pane | `ISO required` | Fixed in the current working tree; detached split restores the previously active pane | Rust integration test |
 | tmux regex-compatible wording for no-server errors | `Deferred` | Mostly aligned for reviewed paths, but wording should be probed per command before claiming byte-level compatibility | release-review smokes plus targeted probes |
-| tmux quirks that lose data, violate caller intent, expose unsafe behavior, or hang | `Do not copy tmux bug` | Standing cases are registered in the structured ledger, including C-D78 through C-D82 | ledger entry, tracked regression, and tmux 3.7b oracle evidence |
+| tmux quirks that lose data, violate caller intent, expose unsafe behavior, or hang | `Do not copy tmux bug` | Standing cases are registered in the structured ledger, including C-D78 through C-D84 | ledger entry, tracked regression, and tmux 3.7b oracle evidence |
 
 ## CI Policy
 

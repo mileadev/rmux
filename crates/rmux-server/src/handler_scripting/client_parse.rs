@@ -466,7 +466,6 @@ pub(super) fn parse_server_access(mut args: CommandTokens) -> Result<Request, Rm
                     parse_compact_flag_cluster("server-access", &token, "adlrw", "t")?
                 else {
                     match token.as_str() {
-                        "--help" => return Err(unsupported_flag("server-access", "--help")),
                         "-" => {
                             return Err(RmuxError::Server(
                                 "command server-access: invalid flag -".to_owned(),

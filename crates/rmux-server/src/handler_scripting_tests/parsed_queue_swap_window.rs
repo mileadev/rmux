@@ -53,7 +53,7 @@ async fn parsed_queue_does_not_expand_the_swap_window_flag_surface() {
 
     assert_eq!(
         error.to_string(),
-        "server error: unexpected argument '-ad' for swap-window"
+        "server error: command swap-window: unknown flag -a"
     );
 }
 

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use rmux_core::{HookStore, LifecycleEvent, WindowId};
 use rmux_proto::{
     BreakPaneRequest, CommandOutput, ErrorResponse, PaneTarget, Response, SessionId, SessionName,
@@ -55,6 +57,22 @@ enum SourceWindowEffect {
     None,
     RemoveLinkedFamily,
     MoveGroupedSlots,
+}
+
+#[derive(Clone, Copy)]
+enum PaneTransferEmissionPolicy {
+    JoinOrMove,
+    Break,
+}
+
+impl PaneTransferEmissionPolicy {
+    fn reserve_applied_resizes(self) -> bool {
+        matches!(self, Self::JoinOrMove)
+    }
+
+    fn include_selection_changes(self) -> bool {
+        matches!(self, Self::Break)
+    }
 }
 
 struct BreakSourceWindowIdentity {
@@ -168,8 +186,7 @@ impl PaneTransferEffects {
         removed_sessions: &[SessionName],
         layout_targets: &[WindowTarget],
         linked_event: Option<LifecycleEvent>,
-        reserve_applied_resizes: bool,
-        include_selection_changes: bool,
+        policy: PaneTransferEmissionPolicy,
     ) -> PreparedPaneTransferEffects {
         let Self {
             refresh_sessions,
@@ -184,16 +201,30 @@ impl PaneTransferEffects {
             .into_iter()
             .map(|event| prepare_deferred_lifecycle_event(state, &mut hook_snapshot, event))
             .collect();
-        let pane_selection_events = if include_selection_changes {
+        let pane_selection_events = if policy.include_selection_changes() {
             selection_before.prepare_window_pane_changes(state, layout_targets)
         } else {
             Vec::new()
         };
+        let mut control_notified_windows = HashSet::new();
         let layout_events = layout_targets
             .iter()
             .cloned()
             .map(|target| {
-                prepare_lifecycle_event(state, &LifecycleEvent::WindowLayoutChanged { target })
+                let window_id = state
+                    .sessions
+                    .session(target.session_name())
+                    .and_then(|session| session.window_at(target.window_index()))
+                    .map(rmux_core::Window::id);
+                let mut event =
+                    prepare_lifecycle_event(state, &LifecycleEvent::WindowLayoutChanged { target });
+                // tmux 3.7b still dispatches both pane-transfer layout hooks
+                // when the source window disappears, but sends only one
+                // `%layout-change` for the surviving target window.
+                if window_id.is_some_and(|window_id| !control_notified_windows.insert(window_id)) {
+                    event.suppress_control_effects();
+                }
+                event
             })
             .collect();
         // Reserve the resize immediately after its layout events. This both
@@ -201,13 +232,15 @@ impl PaneTransferEffects {
         // layout hook from draining the shared resize queue through a nested
         // command. Reserving it before session-close tickets also keeps ticket
         // order identical to the emission order below.
-        let resize_events = reserve_applied_resizes
-            .then(|| prepare_applied_window_resize_events(state))
-            .unwrap_or_default();
+        let resize_events = if policy.reserve_applied_resizes() {
+            prepare_applied_window_resize_events(state)
+        } else {
+            Vec::new()
+        };
         let linked_event = linked_event
             .as_ref()
             .map(|event| prepare_lifecycle_event(state, event));
-        let session_selection_events = if include_selection_changes {
+        let session_selection_events = if policy.include_selection_changes() {
             let mut preferred_sessions = linked_event
                 .as_ref()
                 .and_then(|event| event.event.session_name().cloned())
@@ -370,8 +403,7 @@ impl RequestHandler {
                     &removed_sessions,
                     &layout_targets,
                     None,
-                    true,
-                    false,
+                    PaneTransferEmissionPolicy::JoinOrMove,
                 )
             });
             (response, effects, removed_sessions)
@@ -453,8 +485,7 @@ impl RequestHandler {
                     &removed_sessions,
                     &layout_targets,
                     None,
-                    true,
-                    false,
+                    PaneTransferEmissionPolicy::JoinOrMove,
                 )
             });
             (response, effects, removed_sessions)
@@ -564,8 +595,7 @@ impl RequestHandler {
                     &removed_sessions,
                     &layout_targets,
                     linked_event,
-                    false,
-                    true,
+                    PaneTransferEmissionPolicy::Break,
                 )
             });
             (response, effects, removed_sessions)

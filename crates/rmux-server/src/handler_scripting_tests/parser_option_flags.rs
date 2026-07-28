@@ -51,12 +51,6 @@ fn server_new_positional_parsers_reject_unknown_option_shapes() {
         ("show-window-options", &["-x"][..], "-x"),
         ("show-window-options", &["--bogus"][..], "--bogus"),
         ("show-window-options", &["-gx"][..], "-gx"),
-        ("unbind-key", &["-x"][..], "-x"),
-        ("unbind-key", &["--bogus"][..], "--bogus"),
-        ("unbind-key", &["-nx"][..], "-nx"),
-        ("list-keys", &["-x"][..], "-x"),
-        ("list-keys", &["--bogus"][..], "--bogus"),
-        ("list-keys", &["-ax"][..], "-ax"),
     ] {
         let error = parse_server_request(command, arguments, &sessions, &find_context)
             .expect_err("unknown option before a positional operand must fail");
@@ -64,6 +58,29 @@ fn server_new_positional_parsers_reject_unknown_option_shapes() {
             error,
             RmuxError::Server(format!("command {command}: unknown flag {unknown}")),
             "{command} absorbed {unknown} as a positional operand"
+        );
+    }
+}
+
+#[test]
+fn migrated_key_parsers_report_tmux_first_invalid_flag() {
+    let (sessions, find_context) = parser_fixture();
+
+    // tmux 3.7b was measured directly for every cell in this table.
+    for (command, arguments, expected) in [
+        ("unbind-key", &["-x"][..], "unknown flag -x"),
+        ("unbind-key", &["--bogus"][..], "invalid flag --"),
+        ("unbind-key", &["-nx"][..], "unknown flag -x"),
+        ("list-keys", &["-x"][..], "unknown flag -x"),
+        ("list-keys", &["--bogus"][..], "invalid flag --"),
+        ("list-keys", &["-ax"][..], "unknown flag -x"),
+    ] {
+        let error = parse_server_request(command, arguments, &sessions, &find_context)
+            .expect_err("invalid compact option must fail");
+        assert_eq!(
+            error,
+            RmuxError::Server(format!("command {command}: {expected}")),
+            "{command} did not report tmux's first invalid flag for {arguments:?}"
         );
     }
 }

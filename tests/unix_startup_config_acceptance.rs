@@ -175,9 +175,9 @@ fn startup_direct_group_continues_after_renaming_current_session() -> Result<(),
     let config = harness.tmpdir().join("startup-direct-rename.conf");
     fs::write(
         &config,
-        "new-session -d -s alpha \"/usr/bin/sleep 30\"\n\
+        "new-session -d -s alpha \"sleep 30\"\n\
          rename-session -t alpha beta ; new-window -d -n after-direct-rename \
-         \"/usr/bin/sleep 30\" ; set-option -g @tail U01\n",
+         \"sleep 30\" ; set-option -g @tail U01\n",
     )?;
 
     harness.success([
@@ -187,7 +187,7 @@ fn startup_direct_group_continues_after_renaming_current_session() -> Result<(),
         "-d".into(),
         "-s".into(),
         "keeper".into(),
-        "/usr/bin/sleep 30".into(),
+        "sleep 30".into(),
     ])?;
 
     assert_startup_rename_continuation(&harness, "after-direct-rename", "U01")
@@ -200,10 +200,10 @@ fn startup_non_nested_group_continues_after_renaming_current_session() -> Result
     let config = harness.tmpdir().join("startup-non-nested-rename.conf");
     fs::write(
         &config,
-        "new-session -d -s alpha \"/usr/bin/sleep 30\"\n\
+        "new-session -d -s alpha \"sleep 30\"\n\
          rename-session -t alpha beta\n\
          display-message -p \"#{session_id}|#{session_name}\"\n\
-         new-window -d -n after-non-nested-rename \"/usr/bin/sleep 30\" ; \
+         new-window -d -n after-non-nested-rename \"sleep 30\" ; \
          set-option -g @tail U03\n",
     )?;
 
@@ -214,7 +214,7 @@ fn startup_non_nested_group_continues_after_renaming_current_session() -> Result
         "-d".into(),
         "-s".into(),
         "keeper".into(),
-        "/usr/bin/sleep 30".into(),
+        "sleep 30".into(),
     ])?;
 
     assert_startup_rename_continuation(&harness, "after-non-nested-rename", "U03")
@@ -228,11 +228,11 @@ fn startup_group_follows_successful_new_session_after_rename() -> Result<(), Box
         .join("startup-new-session-transition-group.conf");
     fs::write(
         &config,
-        "new-session -d -s alpha \"/usr/bin/sleep 30\"\n\
+        "new-session -d -s alpha \"sleep 30\"\n\
          rename-session -t alpha beta ; \
-         new-session -d -s newcomer \"/usr/bin/sleep 30\" ; \
-         new-window -d -n transition-first \"/usr/bin/sleep 30\" ; \
-         new-window -d -n transition-repeat \"/usr/bin/sleep 30\"\n",
+         new-session -d -s newcomer \"sleep 30\" ; \
+         new-window -d -n transition-first \"sleep 30\" ; \
+         new-window -d -n transition-repeat \"sleep 30\"\n",
     )?;
 
     start_with_config_and_keeper(&harness, &config)?;
@@ -247,11 +247,11 @@ fn startup_lines_follow_successful_new_session_after_rename() -> Result<(), Box<
         .join("startup-new-session-transition-lines.conf");
     fs::write(
         &config,
-        "new-session -d -s alpha \"/usr/bin/sleep 30\"\n\
+        "new-session -d -s alpha \"sleep 30\"\n\
          rename-session -t alpha beta\n\
-         new-session -d -s newcomer \"/usr/bin/sleep 30\"\n\
-         new-window -d -n transition-first \"/usr/bin/sleep 30\"\n\
-         new-window -d -n transition-repeat \"/usr/bin/sleep 30\"\n",
+         new-session -d -s newcomer \"sleep 30\"\n\
+         new-window -d -n transition-first \"sleep 30\"\n\
+         new-window -d -n transition-repeat \"sleep 30\"\n",
     )?;
 
     start_with_config_and_keeper(&harness, &config)?;
@@ -266,11 +266,11 @@ fn startup_run_shell_follows_successful_new_session_after_rename() -> Result<(),
         .join("startup-new-session-transition-run-shell.conf");
     fs::write(
         &config,
-        "new-session -d -s alpha \"/usr/bin/sleep 30\"\n\
+        "new-session -d -s alpha \"sleep 30\"\n\
          run-shell -C \"rename-session -t alpha beta ; \
-         new-session -d -s newcomer /usr/bin/sleep 30 ; \
-         new-window -d -n transition-first /usr/bin/sleep 30 ; \
-         new-window -d -n transition-repeat /usr/bin/sleep 30\"\n",
+         new-session -d -s newcomer sleep 30 ; \
+         new-window -d -n transition-first sleep 30 ; \
+         new-window -d -n transition-repeat sleep 30\"\n",
     )?;
 
     start_with_config_and_keeper(&harness, &config)?;
@@ -285,12 +285,12 @@ fn startup_group_attach_if_exists_reuse_keeps_renamed_identity() -> Result<(), B
         .join("startup-existing-session-reuse-group.conf");
     fs::write(
         &config,
-        "new-session -d -s occupied \"/usr/bin/sleep 30\"\n\
-         new-session -d -s alpha \"/usr/bin/sleep 30\"\n\
+        "new-session -d -s occupied \"sleep 30\"\n\
+         new-session -d -s alpha \"sleep 30\"\n\
          rename-session -t alpha beta ; \
          new-session -A -s occupied ; \
-         new-window -d -n reuse-first \"/usr/bin/sleep 30\" ; \
-         new-window -d -n reuse-repeat \"/usr/bin/sleep 30\"\n",
+         new-window -d -n reuse-first \"sleep 30\" ; \
+         new-window -d -n reuse-repeat \"sleep 30\"\n",
     )?;
 
     start_with_config_and_keeper(&harness, &config)?;
@@ -306,12 +306,12 @@ fn startup_lines_detached_attach_if_exists_reuse_keeps_renamed_identity(
         .join("startup-existing-session-reuse-lines.conf");
     fs::write(
         &config,
-        "new-session -d -s occupied \"/usr/bin/sleep 30\"\n\
-         new-session -d -s alpha \"/usr/bin/sleep 30\"\n\
+        "new-session -d -s occupied \"sleep 30\"\n\
+         new-session -d -s alpha \"sleep 30\"\n\
          rename-session -t alpha beta\n\
          new-session -Ad -s occupied\n\
-         new-window -d -n reuse-first \"/usr/bin/sleep 30\"\n\
-         new-window -d -n reuse-repeat \"/usr/bin/sleep 30\"\n",
+         new-window -d -n reuse-first \"sleep 30\"\n\
+         new-window -d -n reuse-repeat \"sleep 30\"\n",
     )?;
 
     start_with_config_and_keeper(&harness, &config)?;
@@ -327,12 +327,12 @@ fn startup_run_shell_detached_attach_if_exists_reuse_keeps_renamed_identity(
         .join("startup-existing-session-reuse-run-shell.conf");
     fs::write(
         &config,
-        "new-session -d -s occupied \"/usr/bin/sleep 30\"\n\
-         new-session -d -s alpha \"/usr/bin/sleep 30\"\n\
+        "new-session -d -s occupied \"sleep 30\"\n\
+         new-session -d -s alpha \"sleep 30\"\n\
          run-shell -C \"rename-session -t alpha beta ; \
          new-session -Ad -s occupied ; \
-         new-window -d -n reuse-first /usr/bin/sleep 30 ; \
-         new-window -d -n reuse-repeat /usr/bin/sleep 30\"\n",
+         new-window -d -n reuse-first sleep 30 ; \
+         new-window -d -n reuse-repeat sleep 30\"\n",
     )?;
 
     start_with_config_and_keeper(&harness, &config)?;
@@ -346,15 +346,15 @@ fn startup_nested_source_keeps_renamed_identity_after_new_session() -> Result<()
     fs::write(
         &nested,
         "rename-session -t alpha beta ; \
-         new-session -d -s newcomer \"/usr/bin/sleep 30\" ; \
-         new-window -d -n transition-first \"/usr/bin/sleep 30\" ; \
-         new-window -d -n transition-repeat \"/usr/bin/sleep 30\"\n",
+         new-session -d -s newcomer \"sleep 30\" ; \
+         new-window -d -n transition-first \"sleep 30\" ; \
+         new-window -d -n transition-repeat \"sleep 30\"\n",
     )?;
     let config = harness.tmpdir().join("startup-nested-source.conf");
     fs::write(
         &config,
         format!(
-            "new-session -d -s alpha \"/usr/bin/sleep 30\"\n\
+            "new-session -d -s alpha \"sleep 30\"\n\
              source-file '{}'\n",
             shell_single_quote(&nested)
         ),
@@ -367,14 +367,14 @@ fn startup_nested_source_keeps_renamed_identity_after_new_session() -> Result<()
 #[test]
 fn ordinary_source_keeps_renamed_identity_after_new_session() -> Result<(), Box<dyn Error>> {
     let harness = StartupHarness::new("ordinary-source-transition-boundary")?;
-    harness.success(["new-session", "-d", "-s", "alpha", "/usr/bin/sleep 30"])?;
+    harness.success(["new-session", "-d", "-s", "alpha", "sleep 30"])?;
     let config = harness.tmpdir().join("ordinary-source-transition.conf");
     fs::write(
         &config,
         "rename-session -t alpha beta ; \
-         new-session -d -s newcomer \"/usr/bin/sleep 30\" ; \
-         new-window -d -n transition-first \"/usr/bin/sleep 30\" ; \
-         new-window -d -n transition-repeat \"/usr/bin/sleep 30\"\n",
+         new-session -d -s newcomer \"sleep 30\" ; \
+         new-window -d -n transition-first \"sleep 30\" ; \
+         new-window -d -n transition-repeat \"sleep 30\"\n",
     )?;
 
     harness.success(["source-file".into(), config.into_os_string()])?;
@@ -389,10 +389,10 @@ fn failed_startup_new_session_does_not_supersede_rename_marker() -> Result<(), B
         .join("startup-failed-new-session-transition.conf");
     fs::write(
         &config,
-        "new-session -d -s alpha \"/usr/bin/sleep 30\"\n\
+        "new-session -d -s alpha \"sleep 30\"\n\
          rename-session -t alpha beta\n\
-         new-session -d -s beta \"/usr/bin/sleep 30\"\n\
-         new-window -d -n after-failed-transition \"/usr/bin/sleep 30\"\n",
+         new-session -d -s beta \"sleep 30\"\n\
+         new-window -d -n after-failed-transition \"sleep 30\"\n",
     )?;
 
     start_with_config_and_keeper(&harness, &config)?;
@@ -419,7 +419,7 @@ fn start_with_config_and_keeper(
         "-d".into(),
         "-s".into(),
         "keeper".into(),
-        "/usr/bin/sleep 30".into(),
+        "sleep 30".into(),
     ])
 }
 

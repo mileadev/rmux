@@ -1367,12 +1367,15 @@ async fn source_file_parse_only_rejects_server_access_help_and_bare_dash() {
         panic!("expected source-file -n to reject invalid server-access flags");
     };
     let message = response.error.to_string();
+    // tmux 3.7b, measured through this exact `source-file -n` path, reports
+    // the shared long-option diagnostic rather than treating `--help` as a
+    // command-specific token.
     assert!(
-        message.contains("main.conf:1: command server-access: unknown flag --help"),
+        message.contains("main.conf:1: command server-access: invalid flag --"),
         "{message}"
     );
     assert!(
-        !message.contains("invalid flag -"),
+        !message.contains("main.conf:2"),
         "source-file -n should stop at the first server-access flag error like tmux; got {message}"
     );
 }

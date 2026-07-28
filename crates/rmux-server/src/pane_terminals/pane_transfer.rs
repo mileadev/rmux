@@ -78,59 +78,57 @@ impl HandlerState {
         &mut self,
         request: JoinPaneRequest,
     ) -> Result<JoinPaneResponse, RmuxError> {
+        self.mutate_join_or_move_and_record_window_geometry_changes(|state| {
+            state.join_pane_unrecorded(request)
+        })
+    }
+
+    fn join_pane_unrecorded(
+        &mut self,
+        request: JoinPaneRequest,
+    ) -> Result<JoinPaneResponse, RmuxError> {
         if request.source == request.target {
             return Err(RmuxError::Server(
                 "source and target panes must be different".to_owned(),
             ));
         }
-        let tracked_windows = [
-            WindowTarget::with_window(
-                request.source.session_name().clone(),
-                request.source.window_index(),
-            ),
-            WindowTarget::with_window(
-                request.target.session_name().clone(),
-                request.target.window_index(),
-            ),
-        ];
-        self.mutate_and_record_window_geometry_changes(&tracked_windows, |state| {
-            if pane_targets_share_window_identity(&state.sessions, &request.source, &request.target)
-            {
-                let mut normalized_request = request;
-                normalized_request.source = PaneTarget::with_window(
-                    normalized_request.target.session_name().clone(),
-                    normalized_request.target.window_index(),
-                    normalized_request.source.pane_index(),
-                );
-                return state.join_pane_within_group(normalized_request);
-            }
-            if sessions_share_grouped_window_state(
-                &state.sessions,
-                request.source.session_name(),
-                request.target.session_name(),
-            ) {
-                return state.join_pane_within_group(request);
-            }
+        if pane_targets_share_window_identity(&self.sessions, &request.source, &request.target) {
+            let mut normalized_request = request;
+            normalized_request.source = PaneTarget::with_window(
+                normalized_request.target.session_name().clone(),
+                normalized_request.target.window_index(),
+                normalized_request.source.pane_index(),
+            );
+            return self.join_pane_within_group(normalized_request);
+        }
+        if sessions_share_grouped_window_state(
+            &self.sessions,
+            request.source.session_name(),
+            request.target.session_name(),
+        ) {
+            return self.join_pane_within_group(request);
+        }
 
-            state.join_pane_across_sessions(request)
-        })
+        self.join_pane_across_sessions(request)
     }
 
     pub(crate) fn move_pane(
         &mut self,
         request: MovePaneRequest,
     ) -> Result<MovePaneResponse, RmuxError> {
-        let response = self.join_pane(JoinPaneRequest {
-            source: request.source,
-            target: request.target,
-            direction: request.direction,
-            detached: request.detached,
-            before: request.before,
-            full_size: request.full_size,
-            size: request.size,
-        })?;
-        Ok(MovePaneResponse {
-            target: response.target,
+        self.mutate_join_or_move_and_record_window_geometry_changes(|state| {
+            let response = state.join_pane_unrecorded(JoinPaneRequest {
+                source: request.source,
+                target: request.target,
+                direction: request.direction,
+                detached: request.detached,
+                before: request.before,
+                full_size: request.full_size,
+                size: request.size,
+            })?;
+            Ok(MovePaneResponse {
+                target: response.target,
+            })
         })
     }
 

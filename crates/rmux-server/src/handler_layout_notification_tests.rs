@@ -274,8 +274,8 @@ async fn join_and_move_reflow_minimum_target_and_publish_resize_product_divergen
                         .iter()
                         .filter(|line| line.starts_with("%layout-change "))
                         .count(),
-                    2,
-                    "{label}: resize publication must not duplicate control layout events"
+                    1,
+                    "{label}: tmux 3.7b sends one control layout for the surviving target window"
                 );
                 assert_eq!(
                     events
@@ -286,19 +286,20 @@ async fn join_and_move_reflow_minimum_target_and_publish_resize_product_divergen
                     "{label}"
                 );
                 assert_eq!(
-            events
-                .iter()
-                .filter(|event| {
-                    matches!(
-                        event,
-                        LifecycleEvent::WindowResized { target: resized }
-                            if resized.session_name() == &target && resized.window_index() == 0
-                    )
-                })
-                .count(),
-            expected_resize_events,
-            "{label}: hooks={hook_events:?}, lifecycle={events:?}"
-        );
+                    events
+                        .iter()
+                        .filter(|event| {
+                            matches!(
+                                event,
+                                LifecycleEvent::WindowResized { target: resized }
+                                    if resized.session_name() == &target
+                                        && resized.window_index() == 0
+                            )
+                        })
+                        .count(),
+                    expected_resize_events,
+                    "{label}: hooks={hook_events:?}, lifecycle={events:?}"
+                );
                 assert_eq!(
                     hook_events,
                     Some(expected_hook_events.to_owned()),
