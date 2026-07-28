@@ -7,9 +7,10 @@ use rmux_proto::{
     PaneRawBytes, PaneRawRebase as ProtoRebase, PaneRawRebaseReason as ProtoReason,
     PaneRecoveryCoverage as ProtoCoverage, PaneSnapshotCell, PaneSnapshotCursor,
     PaneSnapshotResponse, PaneStreamCursorRequest, PaneStreamCursorResponse, PaneStreamEndReason,
-    PaneStreamEvent, PaneStreamLifecycleEvent as ProtoLifecycle, PaneStreamMode, PaneTarget,
-    PaneTargetRef, Request, Response, SessionName, SubscribePaneStreamRequest,
-    SubscribePaneStreamResponse, UnsubscribePaneStreamRequest, UnsubscribePaneStreamResponse,
+    PaneStreamEvent, PaneStreamLifecycleEvent as ProtoLifecycle, PaneStreamMode,
+    PaneSurfaceDynamicColors, PaneSurfaceFrame, PaneSurfaceSnapshot, PaneTarget, PaneTargetRef,
+    Request, Response, SessionName, SubscribePaneStreamRequest, SubscribePaneStreamResponse,
+    UnsubscribePaneStreamRequest, UnsubscribePaneStreamResponse,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
@@ -133,6 +134,39 @@ fn glyph_cell() -> PaneSnapshotCell {
         bg: 8,
         us: 8,
         link: 0,
+    }
+}
+
+/// A well-formed frame from the sibling Surface projection, used as a negative
+/// control: a raw stream must refuse it before its own mapper is consulted.
+fn surface_frame() -> PaneSurfaceFrame {
+    PaneSurfaceFrame {
+        epoch: 1,
+        revision: 1,
+        next_output_sequence: 5,
+        snapshot: PaneSurfaceSnapshot {
+            cols: 1,
+            rows: 1,
+            cells: vec![glyph_cell()],
+            hyperlinks: Vec::new(),
+            cursor: PaneSnapshotCursor {
+                row: 0,
+                col: 0,
+                visible: true,
+                style: 0,
+            },
+            title: String::new(),
+            path: String::new(),
+            dynamic_colors: PaneSurfaceDynamicColors::default(),
+            metadata_complete: true,
+            mode_bits: 0,
+            alternate: false,
+            scroll_top: 0,
+            scroll_bottom: 0,
+            history_size: 0,
+            history_bytes: 0,
+            revision: 1,
+        },
     }
 }
 
@@ -767,7 +801,7 @@ async fn recovery_rejects_a_response_for_a_foreign_slot_target() {
 }
 
 #[tokio::test]
-async fn recovery_rejects_an_initial_event_that_is_not_a_rebase() {
+async fn recovery_rejects_an_initial_event_that_is_neither_a_rebase_nor_a_typed_end() {
     let events = [
         (
             PaneStreamEvent::RawBytes(PaneRawBytes {
@@ -784,8 +818,12 @@ async fn recovery_rejects_an_initial_event_that_is_not_a_rebase() {
             "lifecycle",
         ),
         (
-            PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved),
-            "end",
+            PaneStreamEvent::SurfaceReset(Box::new(surface_frame())),
+            "surface-reset",
+        ),
+        (
+            PaneStreamEvent::SurfacePatch(Box::new(surface_frame())),
+            "surface-patch",
         ),
     ];
 
@@ -793,10 +831,55 @@ async fn recovery_rejects_an_initial_event_that_is_not_a_rebase() {
         expect_rejected_admission(
             PaneTargetRef::slot(target()),
             subscribed(event),
-            &format!("raw recovery stream opened with a {kind} event instead of a rebase"),
+            &format!(
+                "raw recovery stream opened with a {kind} event instead of a rebase or a typed end"
+            ),
         )
         .await;
     }
+}
+
+/// A revocation that lands between admission and response is a deliberate,
+/// typed server decision: the daemon has already removed the subscription and
+/// answers the opening request with its terminal reason instead of a keyframe.
+#[tokio::test]
+async fn recovery_admits_a_revoked_access_end_without_exposing_or_releasing_anything() {
+    let (client, mut server) = tokio::io::duplex(64 * 1024);
+    let transport = TransportClient::spawn(client);
+    let shared_transport = transport.clone();
+    let open = tokio::spawn(async move {
+        PaneRecoveryStream::open(
+            transport,
+            PaneTargetRef::slot(target()),
+            PaneRecoveryOptions::default(),
+        )
+        .await
+    });
+
+    serve_subscribe_response(
+        &mut server,
+        subscribed(PaneStreamEvent::End(PaneStreamEndReason::AccessRevoked)),
+    )
+    .await;
+
+    let mut stream = open
+        .await
+        .expect("stream open task joins")
+        .expect("a revoked opening response is a typed end, not protocol drift");
+    assert_eq!(
+        stream.next().await.expect("typed revocation"),
+        Some(PaneRecoveryEvent::End(SdkEndReason::AccessRevoked))
+    );
+    assert_eq!(stream.next().await.expect("closed recovery stream"), None);
+    drop(stream);
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), read_request(&mut server))
+            .await
+            .is_err(),
+        "a subscription the daemon already released must be neither polled nor unsubscribed"
+    );
+    drop(shared_transport);
 }
 
 #[tokio::test]

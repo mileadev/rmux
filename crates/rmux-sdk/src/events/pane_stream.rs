@@ -112,7 +112,7 @@ impl<T> RecoverablePaneStream<T> {
         };
         let subscription_id = response.subscription_id;
         let transport = transport.reusable();
-        let drop_guard = DropGuard::best_effort(
+        let mut drop_guard = DropGuard::best_effort(
             transport.clone(),
             Request::UnsubscribePaneStream(UnsubscribePaneStreamRequest { subscription_id }),
         );
@@ -121,12 +121,20 @@ impl<T> RecoverablePaneStream<T> {
         validate_subscribed_identity(&target, &response)?;
         (projection.admit_initial)(&response.event)?;
         let initial = (projection.map_event)(response.event)?;
+        // A terminal first event is the whole stream. The daemon substitutes
+        // one for the opening event only after removing the subscription that
+        // event answers for, so this stream holds no reservation to release
+        // here or on drop.
+        let closed = initial.terminal;
+        if closed {
+            drop_guard.disarm();
+        }
         Ok(Self {
             inner: PaneStreamSubscription {
                 transport,
                 subscription_id,
                 drop_guard,
-                closed: false,
+                closed,
             },
             pending: VecDeque::from([initial]),
             poll_delay: POLL_INITIAL_DELAY,

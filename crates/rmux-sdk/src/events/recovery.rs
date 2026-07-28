@@ -405,11 +405,12 @@ impl Error for PaneRecoveryApplyError {}
 /// sequence continuity.
 ///
 /// The stream fails closed. It opens only on a valid initial rebase for the
-/// pane identity the caller named, and it enforces epoch, generation, and
-/// sequence continuity before returning any event. A rejected response or a
-/// broken continuation closes the stream and releases the daemon subscription
-/// exactly once, so a consumer can never be fed the wrong pane, a stream that
-/// started without a keyframe, or a silently desynchronized byte run.
+/// pane identity the caller named, or on the typed end the daemon substitutes
+/// for that rebase, and it enforces epoch, generation, and sequence continuity
+/// before returning any event. A rejected response or a broken continuation
+/// closes the stream and releases the daemon subscription exactly once, so a
+/// consumer can never be fed the wrong pane, a stream that started without a
+/// keyframe, or a silently desynchronized byte run.
 pub struct PaneRecoveryStream {
     inner: RecoverablePaneStream<PaneRecoveryEvent>,
     state: PaneRecoveryState,
@@ -489,24 +490,32 @@ impl std::fmt::Debug for PaneRecoveryStream {
     }
 }
 
-/// A raw recovery stream opens only on an authoritative initial keyframe.
+/// A raw recovery stream opens on an authoritative initial keyframe, or on the
+/// typed end the daemon substitutes for one.
 ///
-/// Bytes, a lifecycle observation, or a typed end as the first event would
-/// leave the consumer emulator without the state those events continue.
+/// Bytes, a lifecycle observation, a surface frame, or a rebase that resumes an
+/// established epoch would leave the consumer emulator without the state those
+/// events continue. A terminal end continues nothing and carries no bytes, so
+/// it needs neither keyframe nor emulator: it is the entire stream. The daemon
+/// replaces the opening event with one when observation permission is revoked
+/// while the subscribe request is in flight, and refusing it would report a
+/// deliberate authorization decision as server drift. Which terminal reasons
+/// are transportable stays [`end_from_proto`]'s single fail-closed allowlist,
+/// so a new one needs no second gate here.
 fn admit_initial_raw_event(event: &ProtoEvent) -> Result<()> {
-    let ProtoEvent::RawRebase(rebase) = event else {
-        return Err(invalid_recovery_admission(format!(
-            "raw recovery stream opened with a {} event instead of a rebase",
+    match event {
+        ProtoEvent::RawRebase(rebase) if rebase.reason != ProtoReason::Initial => {
+            Err(invalid_recovery_admission(format!(
+                "raw recovery stream opened with a {:?} rebase instead of an initial one",
+                rebase.reason
+            )))
+        }
+        ProtoEvent::RawRebase(_) | ProtoEvent::End(_) => Ok(()),
+        _ => Err(invalid_recovery_admission(format!(
+            "raw recovery stream opened with a {} event instead of a rebase or a typed end",
             stream_event_kind(event)
-        )));
-    };
-    if rebase.reason != ProtoReason::Initial {
-        return Err(invalid_recovery_admission(format!(
-            "raw recovery stream opened with a {:?} rebase instead of an initial one",
-            rebase.reason
-        )));
+        ))),
     }
-    Ok(())
 }
 
 const fn stream_event_kind(event: &ProtoEvent) -> &'static str {

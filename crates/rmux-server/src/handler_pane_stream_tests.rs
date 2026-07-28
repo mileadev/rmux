@@ -2489,6 +2489,50 @@ async fn revoked_access_replaces_an_inflight_subscribe_and_releases_quota() {
     );
 }
 
+/// Pins the exact opening response a revoked Raw subscribe puts on the wire.
+///
+/// The SDK checks the answered identity before admitting the opening event, so
+/// substituting the terminal reason must keep the response addressed to the
+/// pane the caller named. The rmux-sdk recovery test
+/// `recovery_admits_a_revoked_access_end_without_exposing_or_releasing_anything`
+/// consumes exactly this shape on the client side of the same wire type.
+#[tokio::test]
+async fn revoked_raw_subscribe_keeps_its_identity_and_only_replaces_the_keyframe() {
+    let handler = RequestHandler::new();
+    let (target, _, _) = test_pane(&handler).await;
+    let subscribed = subscribe(&handler, &target, PaneStreamMode::Raw).await;
+    let subscription_id = subscribed.subscription_id;
+    let answered_target = subscribed.target.clone();
+    let answered_pane_id = subscribed.pane_id;
+    assert!(
+        matches!(subscribed.event, PaneStreamEvent::RawRebase(_)),
+        "a Raw subscribe opens on a keyframe before revocation: {:?}",
+        subscribed.event
+    );
+
+    let response = handler.revoke_inflight_pane_stream_response(
+        CONNECTION_ID,
+        Response::SubscribePaneStream(Box::new(subscribed)),
+    );
+
+    let Response::SubscribePaneStream(response) = response else {
+        panic!("unexpected revoked subscribe response: {response:?}");
+    };
+    assert_eq!(response.subscription_id, subscription_id);
+    assert_eq!(response.target, answered_target);
+    assert_eq!(response.pane_id, answered_pane_id);
+    assert_eq!(
+        response.event,
+        PaneStreamEvent::End(PaneStreamEndReason::AccessRevoked)
+    );
+    assert!(
+        handler
+            .pane_output_subscription_key_for_test(subscription_id)
+            .is_none(),
+        "the revoked stream is released before the client sees its typed end"
+    );
+}
+
 #[test]
 fn raw_rebases_reserve_enough_space_for_the_detached_response_envelope() {
     let rebase = PaneRawRebase {
