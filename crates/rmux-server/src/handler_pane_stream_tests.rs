@@ -1348,7 +1348,7 @@ async fn assert_kill_drains_buffered_stream_events(
         .lock()
         .expect("transcript lock")
         .append_bytes(b"killed-tail");
-    output.send(b"killed-tail".to_vec());
+    let tail_sequence = output.send(b"killed-tail".to_vec());
 
     let response = handler.handle(kill).await;
     assert!(matches!(response, Response::KillPane(_)), "{response:?}");
@@ -1402,17 +1402,16 @@ async fn assert_kill_drains_buffered_stream_events(
         .iter()
         .filter_map(surface_frame)
         .collect::<Vec<_>>();
+    let final_surface_frame = surface_frames
+        .last()
+        .expect("a killed Surface stream must publish its final authoritative frame");
+    // Raw above proves exact-byte delivery. Surface instead proves that its
+    // final authoritative state includes the tail's output boundary, even if
+    // terminal teardown has since moved those cells out of the visible grid.
     assert!(
-        surface_frames.iter().any(|frame| {
-            frame
-                .snapshot
-                .cells
-                .iter()
-                .map(|cell| cell.text.as_str())
-                .collect::<String>()
-                .contains("killed-tail")
-        }),
-        "a Surface frame before End must contain the staged tail: {surface_events:?}"
+        final_surface_frame.next_output_sequence > tail_sequence,
+        "the final Surface frame must represent the staged output boundary before End: \
+         tail sequence {tail_sequence}, events {surface_events:?}"
     );
     assert!(
         surface_events
@@ -1537,7 +1536,7 @@ async fn natural_pane_exit_drains_raw_and_surface_streams_before_end() {
         .lock()
         .expect("transcript lock")
         .append_bytes(b"natural-tail");
-    output.send(b"natural-tail".to_vec());
+    let tail_sequence = output.send(b"natural-tail".to_vec());
     output.send(Vec::new());
     handler
         .state
@@ -1571,13 +1570,7 @@ async fn natural_pane_exit_drains_raw_and_surface_streams_before_end() {
             PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. }),
             PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved),
         ] if frame.snapshot.revision > initial_surface_revision
-            && frame
-                .snapshot
-                .cells
-                .iter()
-                .map(|cell| cell.text.as_str())
-                .collect::<String>()
-                .contains("natural-tail")
+            && frame.next_output_sequence > tail_sequence
     ));
     assert!(
         handler
@@ -1616,7 +1609,7 @@ async fn assert_exit_commit_keeps_stream_source_available(
         .lock()
         .expect("transcript lock")
         .append_bytes(b"commit-tail");
-    output.send(b"commit-tail".to_vec());
+    let tail_sequence = output.send(b"commit-tail".to_vec());
     output.mutate_transcript(&transcript, PaneInvalidationReason::Resize, |transcript| {
         transcript.resize(TerminalSize { cols: 13, rows: 4 });
         ((), true)
@@ -1674,15 +1667,18 @@ async fn assert_exit_commit_keeps_stream_source_available(
                 }),
             _ => false,
         })),
-        PaneStreamMode::Surface => assert!(events.iter().filter_map(surface_frame).any(|frame| {
-            frame
-                .snapshot
-                .cells
+        PaneStreamMode::Surface => {
+            let final_surface_frame = events
                 .iter()
-                .map(|cell| cell.text.as_str())
-                .collect::<String>()
-                .contains("commit-tail")
-        })),
+                .filter_map(surface_frame)
+                .next_back()
+                .expect("committed Surface source must remain available after state removal");
+            assert!(
+                final_surface_frame.next_output_sequence > tail_sequence,
+                "committed Surface source must advance past the staged output boundary: \
+                 tail sequence {tail_sequence}, events {events:?}"
+            );
+        }
         _ => panic!("test requested an unsupported pane stream projection"),
     }
     pause.release.notify_one();
