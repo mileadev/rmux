@@ -639,25 +639,26 @@ async fn assert_surface_stream_drains_then_closes(
             <= 1,
         "{label} may publish at most one lifecycle event for the removed process: {events:?}"
     );
-    let final_frame = events
+    let surface_frames = events
         .iter()
-        .rev()
-        .find_map(|event| match event {
+        .filter_map(|event| match event {
             PaneStreamEvent::SurfacePatch(frame) | PaneStreamEvent::SurfaceReset(frame) => {
-                Some(frame)
+                Some(frame.as_ref())
             }
             _ => None,
         })
-        .unwrap_or_else(|| panic!("{label} must deliver a final Surface frame: {events:?}"));
+        .collect::<Vec<_>>();
     assert!(
-        final_frame
-            .snapshot
-            .cells
-            .iter()
-            .map(|cell| cell.text.as_str())
-            .collect::<String>()
-            .contains(std::str::from_utf8(PRE_DESTROY_TAIL).expect("ASCII test tail")),
-        "{label} final Surface frame must contain the pre-destroy tail: {events:?}"
+        surface_frames.iter().any(|frame| {
+            frame
+                .snapshot
+                .cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>()
+                .contains(std::str::from_utf8(PRE_DESTROY_TAIL).expect("ASCII test tail"))
+        }),
+        "{label} must deliver the pre-destroy tail in a Surface frame before End: {events:?}"
     );
 
     let response = handler

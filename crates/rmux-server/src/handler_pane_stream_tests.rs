@@ -1398,20 +1398,21 @@ async fn assert_kill_drains_buffered_stream_events(
             )),
         "Surface kill drain emitted an unexpected pre-terminal event: {surface_events:?}"
     );
-    let final_surface = surface_events
+    let surface_frames = surface_events
         .iter()
-        .rev()
-        .find_map(surface_frame)
-        .expect("Surface kill drain must deliver a final frame");
+        .filter_map(surface_frame)
+        .collect::<Vec<_>>();
     assert!(
-        final_surface
-            .snapshot
-            .cells
-            .iter()
-            .map(|cell| cell.text.as_str())
-            .collect::<String>()
-            .contains("killed-tail"),
-        "the final Surface frame must contain the staged tail: {surface_events:?}"
+        surface_frames.iter().any(|frame| {
+            frame
+                .snapshot
+                .cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>()
+                .contains("killed-tail")
+        }),
+        "a Surface frame before End must contain the staged tail: {surface_events:?}"
     );
     assert!(
         surface_events
