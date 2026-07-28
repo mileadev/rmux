@@ -502,6 +502,15 @@ async fn serve_connection(
                     None
                 };
 
+                // Tests park the loop here to make the captured admission stale
+                // between a dispatched pane-stream open and its recheck.
+                #[cfg(test)]
+                inflight_access_tests::pause_before_inflight_pane_stream_recheck(
+                    &handler,
+                    &outcome.response,
+                )
+                .await;
+
                 if matches!(
                     outcome.response,
                     Response::SubscribePaneStream(_) | Response::PaneStreamCursor(_)
@@ -2200,6 +2209,10 @@ mod tests {
 #[cfg(all(test, unix, feature = "web"))]
 #[path = "listener_web_share_tests.rs"]
 mod web_share_tests;
+
+#[cfg(test)]
+#[path = "listener_inflight_access_tests.rs"]
+mod inflight_access_tests;
 
 #[cfg(all(test, windows))]
 mod windows_tests {

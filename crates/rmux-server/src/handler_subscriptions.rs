@@ -32,8 +32,10 @@ const EXITED_PANE_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const EXITED_PANE_DRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl RequestHandler {
+    // `pub(crate)` so the listener tests can assert the same stream-quota
+    // release the handler unit tests assert.
     #[cfg(test)]
-    pub(in crate::handler) fn pane_output_subscription_key_for_test(
+    pub(crate) fn pane_output_subscription_key_for_test(
         &self,
         subscription_id: PaneOutputSubscriptionId,
     ) -> Option<PaneOutputSubscriptionKey> {
