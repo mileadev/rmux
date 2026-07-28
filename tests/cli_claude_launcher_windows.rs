@@ -128,12 +128,20 @@ fn run_attached_probe(
             fake_log,
             escaped_output(&output)
         );
+        let default_shell = fake_log
+            .lines()
+            .find_map(|line| line.strip_prefix("default_shell_stdout="))
+            .map(str::trim)
+            .expect("fake Claude must record the private server default-shell");
         assert!(
-            fake_log.contains("default_shell_stdout=")
-                && fake_log.to_ascii_lowercase().contains("bash")
+            fake_log.contains("default_shell_status=exit code: 0")
+                && !default_shell.is_empty()
+                && Path::new(default_shell).file_name().is_some_and(|name| {
+                    name.to_string_lossy().eq_ignore_ascii_case("bash.exe")
+                })
                 && fake_log.contains("new_window_status=exit code: 0")
                 && fake_log.contains("posix_send_status=exit code: 0"),
-            "fake Claude did not get a POSIX teammate shell through bare tmux inheritance; log: {}; output: {}",
+            "fake Claude did not get the configured Git Bash default-shell through bare tmux inheritance; observed default-shell={default_shell:?}; log: {}; output: {}",
             fake_log,
             escaped_output(&output)
         );

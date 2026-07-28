@@ -192,7 +192,10 @@ fn start_server_with_captured_output_returns_after_empty_windows_daemon_exits(
         "captured-start-server-windows-{}",
         std::process::id()
     ))?;
-    let output = run_rmux_command(&socket_path, &["start-server"])?;
+    let output = run_rmux_command(
+        &socket_path,
+        &["start-server", ";", "display-message", "-p", "#{pid}"],
+    )?;
     assert!(
         output.status.success(),
         "captured start-server failed: status={:?}\nstdout={}\nstderr={}",
@@ -200,8 +203,12 @@ fn start_server_with_captured_output_returns_after_empty_windows_daemon_exits(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
+    let daemon_pid = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .expect("the queued observational tail must prove that the daemon existed");
+    assert_ne!(daemon_pid, 0, "the observed daemon PID must be nonzero");
 
     wait_for_daemon_process_absent(&socket_path)?;
     Ok(())
@@ -491,7 +498,7 @@ fn wait_for_daemon_process_absent(socket_path: &Path) -> Result<(), Box<dyn Erro
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "{process_count} hidden daemon process(es) still match the test pipe after kill-server"
+                "{process_count} hidden daemon process(es) still match the test pipe after waiting for shutdown"
             )
             .into());
         }
