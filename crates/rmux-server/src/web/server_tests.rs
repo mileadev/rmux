@@ -9,9 +9,9 @@ use crate::web::SecretHashForCrypto;
 use base64::Engine;
 use rmux_proto::{
     CreateWebShareRequest, KillSessionRequest, ListSessionsRequest, ListWindowsRequest,
-    NewSessionRequest, NewWindowRequest, PaneTarget, Request, Response, SessionName,
-    SplitDirection, SplitWindowRequest, SplitWindowTarget, StopWebShareRequest, TerminalSize,
-    WebShareCreatedResponse, WebShareRequest, WebShareResponse, WebShareScope,
+    NewSessionExtRequest, NewSessionRequest, NewWindowRequest, PaneTarget, Request, Response,
+    SessionName, SplitDirection, SplitWindowRequest, SplitWindowTarget, StopWebShareRequest,
+    TerminalSize, WebShareCreatedResponse, WebShareRequest, WebShareResponse, WebShareScope,
 };
 use rmux_web_crypto::{derive_client_session, generate_ephemeral, Message, Opener, Sealer};
 use serde_json::Value;
@@ -492,13 +492,10 @@ async fn pane_keyframe_redacts_spectator_metadata_and_preserves_operator_access(
     const VISIBLE_CONTENT: &[u8] = b"visible terminal content";
 
     let handler = Arc::new(RequestHandler::new());
-    let session_name = create_session(&handler, "websocket-metadata-policy").await;
+    let session_name = create_quiet_session(&handler, "websocket-metadata-policy").await;
     let target = PaneTarget::new(session_name.clone(), 0);
     handler
         .wait_for_pane_startup_to_finish_for_test(&target)
-        .await;
-    handler
-        .wait_for_initial_pane_output_to_quiesce_for_test(&target)
         .await;
     let mut pane_bytes = b"\x1b]2;".to_vec();
     pane_bytes.extend_from_slice(STACKED_TITLE);
@@ -1690,6 +1687,59 @@ async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
             .await,
         Response::NewSession(_)
     ));
+    session_name
+}
+
+#[cfg(unix)]
+fn quiet_pane_command() -> Vec<String> {
+    vec![
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
+        "exec sleep 120".to_owned(),
+    ]
+}
+
+#[cfg(windows)]
+fn quiet_pane_command() -> Vec<String> {
+    let system_root =
+        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+    vec![
+        std::path::PathBuf::from(system_root)
+            .join("System32")
+            .join("cmd.exe")
+            .to_string_lossy()
+            .into_owned(),
+        "/d".to_owned(),
+        "/q".to_owned(),
+        "/c".to_owned(),
+        "ping -n 120 127.0.0.1 >NUL".to_owned(),
+    ]
+}
+
+async fn create_quiet_session(handler: &RequestHandler, name: &str) -> SessionName {
+    let session_name = SessionName::new(name).expect("valid session");
+    let response = handler
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(session_name.clone()),
+            working_directory: None,
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: Some(quiet_pane_command()),
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
+        })))
+        .await;
+    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
     session_name
 }
 

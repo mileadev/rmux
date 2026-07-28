@@ -66,39 +66,4 @@ impl RequestHandler {
             sleep(Duration::from_millis(25)).await;
         }
     }
-
-    pub(crate) async fn wait_for_initial_pane_output_to_quiesce_for_test(
-        &self,
-        target: &PaneTarget,
-    ) {
-        const QUIET_PERIOD: Duration = Duration::from_secs(1);
-
-        let deadline = Instant::now() + Duration::from_secs(15);
-        let mut last_sequence = None;
-        let mut unchanged_since = Instant::now();
-        loop {
-            let transcript = {
-                let state = self.state.lock().await;
-                state
-                    .transcript_handle(target)
-                    .expect("pane transcript must exist while waiting for initial output")
-            };
-            let sequence = transcript
-                .lock()
-                .expect("pane transcript mutex must not be poisoned")
-                .output_sequence();
-            if last_sequence != Some(sequence) {
-                last_sequence = Some(sequence);
-                unchanged_since = Instant::now();
-            }
-            if sequence > 0 && unchanged_since.elapsed() >= QUIET_PERIOD {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for pane {target} initial output to quiesce"
-            );
-            sleep(Duration::from_millis(25)).await;
-        }
-    }
 }
