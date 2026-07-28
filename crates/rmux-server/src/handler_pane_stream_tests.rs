@@ -1684,49 +1684,61 @@ async fn assert_exit_commit_keeps_stream_source_available(
         })),
         _ => panic!("test requested an unsupported pane stream projection"),
     }
-    let delivered_raw_exit_sequences = events
-        .iter()
-        .filter_map(|event| match event {
-            PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited {
-                output_sequence,
-            }) if mode == PaneStreamMode::Raw => Some(*output_sequence),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-
     pause.release.notify_one();
     exit_task.await.expect("pane exit task joins");
     let final_events = cursor(handler.as_ref(), subscribed.subscription_id).await;
     assert_unique_pane_removed_end(&final_events, "post-commit pane exit");
+    let final_projection_events = &final_events[..final_events.len() - 1];
     assert!(
-        final_events[..final_events.len() - 1]
-            .iter()
-            .all(|event| matches!(
+        final_projection_events.iter().all(|event| match mode {
+            PaneStreamMode::Raw => matches!(
                 event,
-                PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. })
-            )),
-        "only a fixture-child EOF may precede the terminal event: {final_events:?}"
+                PaneStreamEvent::RawRebase(_)
+                    | PaneStreamEvent::RawBytes(_)
+                    | PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. })
+            ),
+            PaneStreamMode::Surface => matches!(
+                event,
+                PaneStreamEvent::SurfaceReset(_)
+                    | PaneStreamEvent::SurfacePatch(_)
+                    | PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. })
+            ),
+            _ => false,
+        }),
+        "only valid projection events may precede the terminal event: {final_events:?}"
     );
     assert!(
-        final_events.len() <= 2,
+        final_projection_events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. })
+            ))
+            .count()
+            <= 1,
         "the fixture child may publish at most one additional EOF: {final_events:?}"
     );
     // This fixture injects an EOF while its quiet OS child is still running.
-    // Windows may synchronously tear that child down after the commit pause,
-    // producing a second, real output sequence before the logical-pane end.
+    // Windows may synchronously emit terminal-mode teardown bytes and a second,
+    // real EOF after the commit pause. Every raw output sequence must still be
+    // new and strictly ordered before the logical-pane end.
     if mode == PaneStreamMode::Raw {
-        for event in &final_events[..final_events.len() - 1] {
-            let PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited {
-                output_sequence: Some(output_sequence),
-            }) = event
-            else {
-                panic!("the fixture child's second raw EOF needs an exact sequence: {event:?}");
-            };
-            assert!(
-                !delivered_raw_exit_sequences.contains(&Some(*output_sequence)),
-                "the same process-exit lifecycle was delivered twice: {final_events:?}"
-            );
-        }
+        let raw_sequences = events
+            .iter()
+            .chain(final_projection_events)
+            .filter_map(|event| match event {
+                PaneStreamEvent::RawBytes(bytes) => Some(bytes.sequence),
+                PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited {
+                    output_sequence: Some(output_sequence),
+                }) => Some(*output_sequence),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            raw_sequences.windows(2).all(|pair| pair[0] < pair[1]),
+            "raw output and EOF sequences must remain strictly monotonic: \
+             {raw_sequences:?}; events={events:?}; final={final_events:?}"
+        );
     }
 }
 
