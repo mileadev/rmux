@@ -12,6 +12,9 @@ use tokio::sync::{mpsc, oneshot};
 use super::RequestHandler;
 use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
 
+#[path = "handler_layout_notification_tests/linked_transfer_aliases.rs"]
+mod linked_transfer_aliases;
+
 const CONTROL_NOTIFICATION_SETTLE: Duration = Duration::from_millis(100);
 const CONTROL_NOTIFICATION_POLL: Duration = Duration::from_millis(10);
 

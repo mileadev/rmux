@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rmux_core::{
     EnvironmentStore, HookStore, OptionStore, PaneId, Session, SessionStore, WindowId,
 };
-use rmux_proto::{RmuxError, SessionName, TerminalPixels, TerminalSize, WindowTarget};
+use rmux_proto::{PaneTarget, RmuxError, SessionName, TerminalPixels, TerminalSize, WindowTarget};
 
 use super::{
     session_not_found, AppliedWindowResizeQueue, HandlerState, PaneExitMetadata,
@@ -30,11 +30,44 @@ pub(crate) struct SessionTransferSnapshot {
 struct WindowGeometryBefore {
     window_id: WindowId,
     preferred_target: WindowTarget,
+    preferred_sessions: Vec<SessionName>,
     size: TerminalSize,
 }
 
 struct WindowGeometrySnapshot {
     windows: Vec<WindowGeometryBefore>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PaneTransferGeometryContext {
+    source: WindowTarget,
+    target: WindowTarget,
+}
+
+impl PaneTransferGeometryContext {
+    pub(super) fn new(source: &PaneTarget, target: &PaneTarget) -> Self {
+        Self {
+            source: WindowTarget::with_window(source.session_name().clone(), source.window_index()),
+            target: WindowTarget::with_window(target.session_name().clone(), target.window_index()),
+        }
+    }
+
+    fn preferred_sessions(
+        &self,
+        window_id: WindowId,
+        source_window_id: Option<WindowId>,
+    ) -> Vec<SessionName> {
+        let (first, second) = if source_window_id == Some(window_id) {
+            (self.source.session_name(), self.target.session_name())
+        } else {
+            (self.target.session_name(), self.source.session_name())
+        };
+        let mut sessions = vec![first.clone()];
+        if second != first {
+            sessions.push(second.clone());
+        }
+        sessions
+    }
 }
 
 impl SessionTransferSnapshot {
@@ -78,21 +111,61 @@ impl SessionTransferSnapshot {
 }
 
 impl WindowGeometrySnapshot {
-    fn capture_all(state: &HandlerState) -> Self {
-        let mut seen = HashSet::new();
-        let mut windows = Vec::new();
+    fn capture_all(state: &HandlerState, context: &PaneTransferGeometryContext) -> Self {
+        let source_window_id = window_id_at(state, &context.source);
+        let target_window_id = window_id_at(state, &context.target);
+        let mut aliases_by_window = BTreeMap::<WindowId, Vec<(WindowTarget, TerminalSize)>>::new();
         for (session_name, session) in state.sessions.iter() {
             for (&window_index, window) in session.windows() {
-                if !seen.insert(window.id()) {
-                    continue;
-                }
-                windows.push(WindowGeometryBefore {
-                    window_id: window.id(),
-                    preferred_target: WindowTarget::with_window(session_name.clone(), window_index),
-                    size: window.size(),
-                });
+                aliases_by_window.entry(window.id()).or_default().push((
+                    WindowTarget::with_window(session_name.clone(), window_index),
+                    window.size(),
+                ));
             }
         }
+
+        for aliases in aliases_by_window.values_mut() {
+            aliases.sort_by(|(left, _), (right, _)| {
+                (left.session_name().as_str(), left.window_index())
+                    .cmp(&(right.session_name().as_str(), right.window_index()))
+            });
+        }
+
+        let mut seen = HashSet::new();
+        let mut ordered_window_ids = Vec::with_capacity(aliases_by_window.len());
+        for window_id in [source_window_id, target_window_id].into_iter().flatten() {
+            if aliases_by_window.contains_key(&window_id) && seen.insert(window_id) {
+                ordered_window_ids.push(window_id);
+            }
+        }
+        for &window_id in aliases_by_window.keys() {
+            if seen.insert(window_id) {
+                ordered_window_ids.push(window_id);
+            }
+        }
+
+        let windows = ordered_window_ids
+            .into_iter()
+            .filter_map(|window_id| {
+                let aliases = aliases_by_window.remove(&window_id)?;
+                let preferred_sessions = context.preferred_sessions(window_id, source_window_id);
+                let requested_target = if source_window_id == Some(window_id) {
+                    Some(&context.source)
+                } else if target_window_id == Some(window_id) {
+                    Some(&context.target)
+                } else {
+                    None
+                };
+                let (preferred_target, size) =
+                    preferred_alias(&aliases, requested_target, &preferred_sessions)?;
+                Some(WindowGeometryBefore {
+                    window_id,
+                    preferred_target,
+                    preferred_sessions,
+                    size,
+                })
+            })
+            .collect();
         Self { windows }
     }
 
@@ -110,23 +183,26 @@ impl WindowGeometrySnapshot {
 
 impl WindowGeometryBefore {
     fn resolve_current(&self, state: &HandlerState) -> Option<(WindowTarget, TerminalSize)> {
-        if let Some(session) = state.sessions.session(self.preferred_target.session_name()) {
-            if let Some(window) = session
-                .window_at(self.preferred_target.window_index())
-                .filter(|window| window.id() == self.window_id)
-            {
-                return Some((self.preferred_target.clone(), window.size()));
-            }
+        if let Some(window) = state
+            .sessions
+            .session(self.preferred_target.session_name())
+            .and_then(|session| session.window_at(self.preferred_target.window_index()))
+            .filter(|window| window.id() == self.window_id)
+        {
+            return Some((self.preferred_target.clone(), window.size()));
+        }
+
+        for session_name in &self.preferred_sessions {
+            let Some(session) = state.sessions.session(session_name) else {
+                continue;
+            };
             if let Some((&window_index, window)) = session
                 .windows()
                 .iter()
                 .find(|(_, window)| window.id() == self.window_id)
             {
                 return Some((
-                    WindowTarget::with_window(
-                        self.preferred_target.session_name().clone(),
-                        window_index,
-                    ),
+                    WindowTarget::with_window(session_name.clone(), window_index),
                     window.size(),
                 ));
             }
@@ -154,24 +230,60 @@ impl WindowGeometryBefore {
     }
 }
 
+fn window_id_at(state: &HandlerState, target: &WindowTarget) -> Option<WindowId> {
+    state
+        .sessions
+        .session(target.session_name())
+        .and_then(|session| session.window_at(target.window_index()))
+        .map(rmux_core::Window::id)
+}
+
+fn preferred_alias(
+    aliases: &[(WindowTarget, TerminalSize)],
+    requested_target: Option<&WindowTarget>,
+    preferred_sessions: &[SessionName],
+) -> Option<(WindowTarget, TerminalSize)> {
+    if let Some(requested_target) = requested_target {
+        if let Some((target, size)) = aliases
+            .iter()
+            .find(|(target, _)| target == requested_target)
+        {
+            return Some((target.clone(), *size));
+        }
+    }
+    for session_name in preferred_sessions {
+        if let Some((target, size)) = aliases
+            .iter()
+            .find(|(target, _)| target.session_name() == session_name)
+        {
+            return Some((target.clone(), *size));
+        }
+    }
+    aliases
+        .first()
+        .map(|(target, size)| (target.clone(), *size))
+}
+
 impl HandlerState {
     /// Runs one join/move mutation, then records every surviving stable
     /// window identity whose content size changed.
     ///
     /// Both public join/move entry points pass through this boundary and the
     /// snapshot covers every existing window, so callers cannot silently omit
-    /// a sibling target. The comparison runs after both success and error
-    /// returns. Transactional errors restore their model snapshot and compare
-    /// equal; a partially committed error still owes the same notification as
-    /// a successful write.
+    /// a sibling target. The typed context controls deterministic alias and
+    /// publication preference only; it never limits snapshot coverage. The
+    /// comparison runs after both success and error returns. Transactional
+    /// errors restore their model snapshot and compare equal; a partially
+    /// committed error still owes the same notification as a successful write.
     pub(super) fn mutate_join_or_move_and_record_window_geometry_changes<T, F>(
         &mut self,
+        context: PaneTransferGeometryContext,
         mutate: F,
     ) -> T
     where
         F: FnOnce(&mut Self) -> T,
     {
-        let geometry_before = WindowGeometrySnapshot::capture_all(self);
+        let geometry_before = WindowGeometrySnapshot::capture_all(self, &context);
         let result = mutate(self);
         geometry_before.record_changes(self);
         result
@@ -460,3 +572,7 @@ impl HandlerState {
         Ok((result, committed))
     }
 }
+
+#[cfg(test)]
+#[path = "session_mutation_tests.rs"]
+mod tests;

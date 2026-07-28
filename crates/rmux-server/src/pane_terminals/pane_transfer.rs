@@ -5,7 +5,7 @@ use rmux_proto::{
     SwapPaneRequest, SwapPaneResponse, WindowTarget,
 };
 
-use super::{session_not_found, HandlerState};
+use super::{session_mutation::PaneTransferGeometryContext, session_not_found, HandlerState};
 
 #[path = "pane_transfer/cross_session.rs"]
 mod cross_session;
@@ -78,7 +78,8 @@ impl HandlerState {
         &mut self,
         request: JoinPaneRequest,
     ) -> Result<JoinPaneResponse, RmuxError> {
-        self.mutate_join_or_move_and_record_window_geometry_changes(|state| {
+        let geometry_context = PaneTransferGeometryContext::new(&request.source, &request.target);
+        self.mutate_join_or_move_and_record_window_geometry_changes(geometry_context, |state| {
             state.join_pane_unrecorded(request)
         })
     }
@@ -116,7 +117,8 @@ impl HandlerState {
         &mut self,
         request: MovePaneRequest,
     ) -> Result<MovePaneResponse, RmuxError> {
-        self.mutate_join_or_move_and_record_window_geometry_changes(|state| {
+        let geometry_context = PaneTransferGeometryContext::new(&request.source, &request.target);
+        self.mutate_join_or_move_and_record_window_geometry_changes(geometry_context, |state| {
             let response = state.join_pane_unrecorded(JoinPaneRequest {
                 source: request.source,
                 target: request.target,
