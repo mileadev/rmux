@@ -210,7 +210,12 @@ def new_session_cold_sh(adapter: Adapter) -> float:
 def new_session_warm_sh(adapter: Adapter) -> float:
     socket = socket_name("new_session_warm_sh", adapter.tool)
     try:
-        quiet(adapter.command(socket, ["start-server"]))
+        quiet(
+            adapter.command(
+                socket,
+                ["start-server", ";", "set-option", "-g", "exit-empty", "off"],
+            )
+        )
         return timed(adapter.command(socket, ["new-session", "-d", "-s", "bench"]))
     finally:
         adapter.cleanup(socket)

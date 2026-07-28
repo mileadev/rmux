@@ -43,7 +43,7 @@ fn control_control_mode_uses_tmux_text_protocol() -> Result<(), Box<dyn Error>> 
     let input_path = temp_file_path(&label, "in");
     let output_path = temp_file_path(&label, "out");
     let error_path = temp_file_path(&label, "err");
-    fs::write(&input_path, b"list-sessions\nbad-command\n")?;
+    fs::write(&input_path, b"list-sessions\nbad-command\ndetach-client\n")?;
 
     let mut child = rmux_command()
         .args(["-L", &label, "-CC"])
@@ -142,7 +142,16 @@ fn blocking_wait_for_is_cancelled_when_redirected_stdin_reaches_eof() -> Result<
 
     assert_command_success(
         rmux_command()
-            .args(["-L", &label, "start-server"])
+            .args([
+                "-L",
+                &label,
+                "start-server",
+                ";",
+                "set-option",
+                "-g",
+                "exit-empty",
+                "off",
+            ])
             .stdin(Stdio::null())
             .output()?,
         "start control-mode server",

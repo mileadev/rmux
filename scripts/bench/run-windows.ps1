@@ -673,7 +673,17 @@ function Measure-NativeTmuxLikeOperation {
             return Measure-CommandMs -Command @($Executable, "-L", $socket, "new-session", "-d", "-s", "bench")
         }
         if ($Operation -eq "new_session_warm_sh") {
-            Invoke-Quiet -Command @($Executable, "-L", $socket, "start-server")
+            Invoke-Quiet -Command @(
+                $Executable,
+                "-L",
+                $socket,
+                "start-server",
+                ";",
+                "set-option",
+                "-g",
+                "exit-empty",
+                "off"
+            )
             return Measure-CommandMs -Command @($Executable, "-L", $socket, "new-session", "-d", "-s", "bench")
         }
         $command = $null
@@ -913,7 +923,10 @@ function Measure-WslTmuxOperation {
             return Measure-CommandMs -Command (New-WslTmuxCommand "-L" $socket "new-session" "-d" "-s" "bench")
         }
         if ($Operation -eq "new_session_warm_sh") {
-            Invoke-Quiet -Command (New-WslTmuxCommand "-L" $socket "start-server")
+            Invoke-Quiet -Command (
+                New-WslTmuxCommand "-L" $socket "start-server" ";" `
+                    "set-option" "-g" "exit-empty" "off"
+            )
             return Measure-CommandMs -Command (New-WslTmuxCommand "-L" $socket "new-session" "-d" "-s" "bench")
         }
         $command = $null

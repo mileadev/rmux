@@ -494,21 +494,20 @@ fn windows_cmd_default_shell_script_runs_through_cmd_wrapper() -> Result<(), Box
     )?;
     let _guard = RmuxServerGuard::new(&binary, label.clone());
 
-    run_rmux(&binary, &label, ["start-server"])?;
-    let set_default = Command::new(&binary)
+    let setup = Command::new(&binary)
         .arg("-L")
         .arg(&label)
-        .args(["set-option", "-g", "default-shell"])
+        .args(["start-server", ";", "set-option", "-g", "default-shell"])
         .arg(&script)
+        .args([";", "new-session", "-d", "-s", "cmddefault"])
         .output()?;
     assert!(
-        set_default.status.success(),
-        "setting .cmd default-shell failed: {:?}\nstdout:\n{}\nstderr:\n{}",
-        set_default.status,
-        String::from_utf8_lossy(&set_default.stdout),
-        String::from_utf8_lossy(&set_default.stderr)
+        setup.status.success(),
+        "atomic .cmd default-shell setup failed: {:?}\nstdout:\n{}\nstderr:\n{}",
+        setup.status,
+        String::from_utf8_lossy(&setup.stdout),
+        String::from_utf8_lossy(&setup.stderr)
     );
-    run_rmux(&binary, &label, ["new-session", "-d", "-s", "cmddefault"])?;
 
     let output = wait_for_capture_contains(
         &binary,

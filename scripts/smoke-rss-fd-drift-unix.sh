@@ -171,7 +171,8 @@ measure_pair() {
 }
 
 log "using $RMUX_BIN"
-"$RMUX_BIN" -S "$SOCKET_PATH" start-server >/dev/null
+"$RMUX_BIN" -S "$SOCKET_PATH" \
+    start-server ';' set-option -g exit-empty off >/dev/null
 sleep 0.2
 
 DAEMON_PID="$(find_daemon_pid "$SOCKET_PATH")"
