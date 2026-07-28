@@ -383,6 +383,9 @@ async fn active_low_window_removals_select_oracle_stable_fallback_after_renumber
         let handler = RequestHandler::new();
         let alpha = session_name(&format!("oracle-fallback-{case_index}"));
         create_session(&handler, alpha.as_str()).await;
+        handler
+            .wait_for_pane_startup_to_finish_for_test(&PaneTarget::with_window(alpha.clone(), 0, 0))
+            .await;
         insert_window(&handler, &alpha, 1).await;
         insert_window(&handler, &alpha, 2).await;
         let set_renumber = handler

@@ -6,10 +6,10 @@ use rmux_proto::{
     KillSessionRequest, KillWindowRequest, LinkWindowRequest, MoveWindowRequest, MoveWindowTarget,
     NewSessionRequest, NewWindowRequest, PaneOptionSetRequest, PaneOutputCursorRequest,
     PaneOutputSubscriptionId, PaneOutputSubscriptionStart, PaneStreamCursorRequest,
-    PaneStreamEndReason, PaneStreamEvent, PaneStreamMode, PaneTarget, PaneTargetRef, Request,
-    RespawnWindowRequest, Response, SessionName, SetOptionMode, SplitDirection, SplitWindowRequest,
-    SplitWindowTarget, SubscribePaneOutputRefRequest, SubscribePaneStreamRequest,
-    UnlinkWindowRequest, WindowTarget,
+    PaneStreamEndReason, PaneStreamEvent, PaneStreamLifecycleEvent, PaneStreamMode, PaneTarget,
+    PaneTargetRef, Request, RespawnWindowRequest, Response, SessionName, SetOptionMode,
+    SplitDirection, SplitWindowRequest, SplitWindowTarget, SubscribePaneOutputRefRequest,
+    SubscribePaneStreamRequest, UnlinkWindowRequest, WindowTarget,
 };
 
 use super::RequestHandler;
@@ -606,19 +606,58 @@ async fn assert_surface_stream_drains_then_closes(
 
     assert!(
         matches!(
-            events.as_slice(),
-            [
-                PaneStreamEvent::SurfacePatch(frame) | PaneStreamEvent::SurfaceReset(frame),
-                PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved),
-            ] if frame
-                .snapshot
-                .cells
-                .iter()
-                .map(|cell| cell.text.as_str())
-                .collect::<String>()
-                .contains(std::str::from_utf8(PRE_DESTROY_TAIL).expect("ASCII test tail"))
+            events.last(),
+            Some(PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved))
         ),
-        "{label} must deliver exactly one final Surface frame and one PaneRemoved end: {events:?}"
+        "{label} must terminate with PaneRemoved: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, PaneStreamEvent::End(_)))
+            .count(),
+        1,
+        "{label} must publish exactly one terminal event: {events:?}"
+    );
+    assert!(
+        events[..events.len() - 1].iter().all(|event| matches!(
+            event,
+            PaneStreamEvent::SurfacePatch(_)
+                | PaneStreamEvent::SurfaceReset(_)
+                | PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. })
+        )),
+        "{label} emitted an unexpected pre-terminal event: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. })
+            ))
+            .count()
+            <= 1,
+        "{label} may publish at most one lifecycle event for the removed process: {events:?}"
+    );
+    let final_frame = events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            PaneStreamEvent::SurfacePatch(frame) | PaneStreamEvent::SurfaceReset(frame) => {
+                Some(frame)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{label} must deliver a final Surface frame: {events:?}"));
+    assert!(
+        final_frame
+            .snapshot
+            .cells
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>()
+            .contains(std::str::from_utf8(PRE_DESTROY_TAIL).expect("ASCII test tail")),
+        "{label} final Surface frame must contain the pre-destroy tail: {events:?}"
     );
 
     let response = handler

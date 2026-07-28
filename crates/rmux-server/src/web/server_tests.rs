@@ -494,6 +494,9 @@ async fn pane_keyframe_redacts_spectator_metadata_and_preserves_operator_access(
     let handler = Arc::new(RequestHandler::new());
     let session_name = create_session(&handler, "websocket-metadata-policy").await;
     let target = PaneTarget::new(session_name.clone(), 0);
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&target)
+        .await;
     let mut pane_bytes = b"\x1b]2;".to_vec();
     pane_bytes.extend_from_slice(STACKED_TITLE);
     pane_bytes.extend_from_slice(b"\x1b\\\x1b[22;2t\x1b]2;");

@@ -852,6 +852,13 @@ async fn web_session_snapshot_tracks_canonical_session_size() {
 async fn web_session_snapshot_uses_content_geometry_without_reapplying_status_rows() {
     let handler = RequestHandler::new();
     let session_name = new_session(&handler, "websession-content-geometry").await;
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&PaneTarget::with_window(
+            session_name.clone(),
+            0,
+            0,
+        ))
+        .await;
     {
         let mut state = handler.state.lock().await;
         state

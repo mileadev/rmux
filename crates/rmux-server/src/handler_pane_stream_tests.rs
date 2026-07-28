@@ -1354,32 +1354,93 @@ async fn assert_kill_drains_buffered_stream_events(
     assert!(matches!(response, Response::KillPane(_)), "{response:?}");
 
     let raw_events = cursor_until_unlimited(handler, raw.subscription_id, 1).await;
+    assert_unique_pane_removed_end(&raw_events, "raw kill drain");
     assert!(
-        matches!(
-            raw_events.as_slice(),
-            [
-                PaneStreamEvent::RawBytes(bytes),
-                PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved),
-            ] if bytes.bytes == b"killed-tail"
-        ),
-        "{raw_events:?}"
+        raw_events[..raw_events.len() - 1].iter().all(|event| {
+            matches!(
+                event,
+                PaneStreamEvent::RawBytes(_)
+                    | PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. })
+            )
+        }),
+        "raw kill drain emitted an unexpected pre-terminal event: {raw_events:?}"
     );
+    assert_eq!(
+        raw_events
+            .iter()
+            .filter(|event| matches!(event, PaneStreamEvent::RawBytes(bytes) if bytes.bytes == b"killed-tail"))
+            .count(),
+        1,
+        "raw kill drain must deliver the staged tail exactly once: {raw_events:?}"
+    );
+    assert!(
+        raw_events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. })
+            ))
+            .count()
+            <= 1,
+        "one killed process may publish at most one lifecycle event: {raw_events:?}"
+    );
+
     let surface_events = cursor_until_unlimited(handler, surface.subscription_id, 1).await;
+    assert_unique_pane_removed_end(&surface_events, "Surface kill drain");
+    assert!(
+        surface_events[..surface_events.len() - 1]
+            .iter()
+            .all(|event| matches!(
+                event,
+                PaneStreamEvent::SurfacePatch(_)
+                    | PaneStreamEvent::SurfaceReset(_)
+                    | PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. })
+            )),
+        "Surface kill drain emitted an unexpected pre-terminal event: {surface_events:?}"
+    );
+    let final_surface = surface_events
+        .iter()
+        .rev()
+        .find_map(surface_frame)
+        .expect("Surface kill drain must deliver a final frame");
+    assert!(
+        final_surface
+            .snapshot
+            .cells
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>()
+            .contains("killed-tail"),
+        "the final Surface frame must contain the staged tail: {surface_events:?}"
+    );
+    assert!(
+        surface_events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. })
+            ))
+            .count()
+            <= 1,
+        "one killed process may publish at most one Surface lifecycle event: {surface_events:?}"
+    );
+}
+
+fn assert_unique_pane_removed_end(events: &[PaneStreamEvent], label: &str) {
     assert!(
         matches!(
-            surface_events.as_slice(),
-            [
-                PaneStreamEvent::SurfacePatch(frame),
-                PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved),
-            ] if frame
-                .snapshot
-                .cells
-                .iter()
-                .map(|cell| cell.text.as_str())
-                .collect::<String>()
-                .contains("killed-tail")
+            events.last(),
+            Some(PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved))
         ),
-        "{surface_events:?}"
+        "{label} must end with PaneRemoved: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, PaneStreamEvent::End(_)))
+            .count(),
+        1,
+        "{label} must publish exactly one terminal event: {events:?}"
     );
 }
 
@@ -1623,13 +1684,50 @@ async fn assert_exit_commit_keeps_stream_source_available(
         })),
         _ => panic!("test requested an unsupported pane stream projection"),
     }
+    let delivered_raw_exit_sequences = events
+        .iter()
+        .filter_map(|event| match event {
+            PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited {
+                output_sequence,
+            }) if mode == PaneStreamMode::Raw => Some(*output_sequence),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
 
     pause.release.notify_one();
     exit_task.await.expect("pane exit task joins");
-    assert_eq!(
-        cursor(handler.as_ref(), subscribed.subscription_id).await,
-        vec![PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved)]
+    let final_events = cursor(handler.as_ref(), subscribed.subscription_id).await;
+    assert_unique_pane_removed_end(&final_events, "post-commit pane exit");
+    assert!(
+        final_events[..final_events.len() - 1]
+            .iter()
+            .all(|event| matches!(
+                event,
+                PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. })
+            )),
+        "only a fixture-child EOF may precede the terminal event: {final_events:?}"
     );
+    assert!(
+        final_events.len() <= 2,
+        "the fixture child may publish at most one additional EOF: {final_events:?}"
+    );
+    // This fixture injects an EOF while its quiet OS child is still running.
+    // Windows may synchronously tear that child down after the commit pause,
+    // producing a second, real output sequence before the logical-pane end.
+    if mode == PaneStreamMode::Raw {
+        for event in &final_events[..final_events.len() - 1] {
+            let PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited {
+                output_sequence: Some(output_sequence),
+            }) = event
+            else {
+                panic!("the fixture child's second raw EOF needs an exact sequence: {event:?}");
+            };
+            assert!(
+                !delivered_raw_exit_sequences.contains(&Some(*output_sequence)),
+                "the same process-exit lifecycle was delivered twice: {final_events:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
