@@ -12,8 +12,8 @@ use crate::{
 use rmux_proto::{
     encode_frame, FrameDecoder, HandshakeResponse, HasSessionRequest, HasSessionResponse,
     PaneSnapshotCell, PaneSnapshotCursor, PaneSnapshotResponse, PaneTarget, Request, Response,
-    SessionName, SplitWindowIdentityResponse, CAPABILITY_SDK_PANE_SPLIT_IDENTITY,
-    RMUX_WIRE_VERSION, SUPPORTED_CAPABILITIES,
+    SessionName, SplitWindowIdentityResponse, CAPABILITY_SDK_PANE_RAW_RECOVERY,
+    CAPABILITY_SDK_PANE_SPLIT_IDENTITY, RMUX_WIRE_VERSION, SUPPORTED_CAPABILITIES,
 };
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -161,6 +161,62 @@ async fn split_rejects_missing_identity_capability_before_mutation() {
         .await
         .is_err(),
         "capability rejection must happen before the split mutation"
+    );
+    drop(keepalive);
+}
+
+#[tokio::test]
+async fn recovery_rejects_the_missing_capability_before_resolving_the_pane() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+    let transport = TransportClient::spawn(client_stream);
+    let keepalive = transport.clone();
+    let session_name = SessionName::new("alpha").expect("valid session");
+    // A slot that no longer exists: resolution would answer with a target
+    // error, hiding the compatibility error the caller must observe.
+    let pane = super::Pane::new(
+        PaneRef::new(session_name, 0, 7),
+        RmuxEndpoint::Default,
+        None,
+        transport,
+    );
+
+    let recovery = tokio::spawn(async move { pane.recover_output().await.map(|_| ()) });
+    let negotiation = read_transport_request(&mut server_stream).await;
+    assert!(
+        matches!(negotiation, Request::Handshake(_)),
+        "recovery must negotiate before any pane resolution, got {negotiation:?}"
+    );
+    let capabilities = SUPPORTED_CAPABILITIES
+        .iter()
+        .copied()
+        .filter(|capability| *capability != CAPABILITY_SDK_PANE_RAW_RECOVERY)
+        .map(str::to_owned)
+        .collect();
+    write_transport_response(
+        &mut server_stream,
+        &Response::Handshake(HandshakeResponse {
+            wire_version: RMUX_WIRE_VERSION,
+            capabilities,
+        }),
+    )
+    .await;
+
+    let error = recovery
+        .await
+        .expect("recovery task must not panic")
+        .expect_err("a daemon without the recovery capability must fail closed");
+    assert!(
+        error.to_string().contains(CAPABILITY_SDK_PANE_RAW_RECOVERY),
+        "unexpected error: {error}"
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            read_transport_request(&mut server_stream)
+        )
+        .await
+        .is_err(),
+        "a refused capability must not run list-panes or list-sessions resolution"
     );
     drop(keepalive);
 }

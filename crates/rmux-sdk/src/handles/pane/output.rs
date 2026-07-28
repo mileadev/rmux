@@ -24,12 +24,15 @@ impl Pane {
         options: PaneRecoveryOptions,
     ) -> Result<PaneRecoveryStream> {
         let pane = self.begin_operation_handle();
-        let target = pane.required_resolved_proto_target_ref().await?;
+        // Negotiate before resolving. A daemon without the capability answers
+        // with the compatibility error instead of a target error produced by
+        // inventory sweeps it could never have served.
         crate::capabilities::require(
             &pane.transport,
             &[rmux_proto::CAPABILITY_SDK_PANE_RAW_RECOVERY],
         )
         .await?;
+        let target = pane.required_resolved_proto_target_ref().await?;
         match PaneRecoveryStream::open(pane.transport.clone(), target.clone(), options).await {
             Ok(stream) => Ok(stream),
             Err(error) if pane.is_stable_id() && is_stale_pane_id_target_error(&error, &target) => {
