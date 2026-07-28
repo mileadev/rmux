@@ -10,7 +10,7 @@ use rmux_proto::{
 
 use super::pane_stream::{
     end_from_proto, lifecycle_from_proto, unsupported_stream_variant, MappedEvent,
-    PaneStreamEndReason, PaneStreamLifecycleEvent, RecoverablePaneStream,
+    PaneStreamEndReason, PaneStreamLifecycleEvent, PaneStreamProjection, RecoverablePaneStream,
 };
 use crate::handles::pane::snapshot::snapshot_from_response;
 use crate::transport::TransportClient;
@@ -129,6 +129,11 @@ pub enum PaneRecoveryEvent {
 /// Feed a rebase keyframe after resetting the consumer emulator, then feed
 /// each accepted byte event. A later rebase atomically replaces the prior
 /// epoch; callers never stitch state across epochs.
+///
+/// [`PaneRecoveryStream`] already enforces these invariants before handing an
+/// event to its consumer, so a stream event never fails here. This reducer
+/// stays public for consumers that want the derived epoch, generation, and
+/// sequence state, or that replay recovery events from their own storage.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PaneRecoveryState {
     epoch: Option<u64>,
@@ -398,8 +403,16 @@ impl Error for PaneRecoveryApplyError {}
 /// rebase cannot fit the detached transport, the stream ends with
 /// [`PaneStreamEndReason::SlowConsumer`]: skipping that rebase would break byte
 /// sequence continuity.
+///
+/// The stream fails closed. It opens only on a valid initial rebase for the
+/// pane identity the caller named, and it enforces epoch, generation, and
+/// sequence continuity before returning any event. A rejected response or a
+/// broken continuation closes the stream and releases the daemon subscription
+/// exactly once, so a consumer can never be fed the wrong pane, a stream that
+/// started without a keyframe, or a silently desynchronized byte run.
 pub struct PaneRecoveryStream {
     inner: RecoverablePaneStream<PaneRecoveryEvent>,
+    state: PaneRecoveryState,
 }
 
 impl PaneRecoveryStream {
@@ -412,22 +425,59 @@ impl PaneRecoveryStream {
             inner: RecoverablePaneStream::open(
                 transport,
                 target,
-                PaneStreamMode::Raw,
-                options.include_snapshot,
-                map_event,
+                PaneStreamProjection {
+                    mode: PaneStreamMode::Raw,
+                    include_snapshot: options.include_snapshot,
+                    admit_initial: admit_initial_raw_event,
+                    map_event,
+                },
             )
             .await?,
+            state: PaneRecoveryState::default(),
         })
     }
 
     /// Returns the next raw event, waiting for pane activity when necessary.
     pub async fn next(&mut self) -> Result<Option<PaneRecoveryEvent>> {
-        self.inner.next().await
+        match self.inner.next().await {
+            Ok(Some(event)) => {
+                self.admit(&event)?;
+                Ok(Some(event))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => Err(self.reject(error)),
+        }
     }
 
     /// Performs at most one daemon cursor round trip and returns ready events.
     pub async fn poll_once(&mut self) -> Result<Vec<PaneRecoveryEvent>> {
-        self.inner.poll_once().await
+        let events = match self.inner.poll_once().await {
+            Ok(events) => events,
+            Err(error) => return Err(self.reject(error)),
+        };
+        for event in &events {
+            self.admit(event)?;
+        }
+        Ok(events)
+    }
+
+    /// Enforces raw continuity before an event is exposed to the consumer.
+    fn admit(&mut self, event: &PaneRecoveryEvent) -> Result<()> {
+        match self.state.apply(event) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(
+                self.reject(RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+                    "rmux daemon broke raw recovery continuity: {error}"
+                )))),
+            ),
+        }
+    }
+
+    /// Raw output is sequence-bearing, so a rejected poll cannot be retried on
+    /// the same subscription without losing byte continuity.
+    fn reject(&mut self, error: RmuxError) -> RmuxError {
+        self.inner.close_after_rejection();
+        error
     }
 }
 
@@ -436,6 +486,38 @@ impl std::fmt::Debug for PaneRecoveryStream {
         formatter
             .debug_struct("PaneRecoveryStream")
             .finish_non_exhaustive()
+    }
+}
+
+/// A raw recovery stream opens only on an authoritative initial keyframe.
+///
+/// Bytes, a lifecycle observation, or a typed end as the first event would
+/// leave the consumer emulator without the state those events continue.
+fn admit_initial_raw_event(event: &ProtoEvent) -> Result<()> {
+    let ProtoEvent::RawRebase(rebase) = event else {
+        return Err(invalid_recovery_admission(format!(
+            "raw recovery stream opened with a {} event instead of a rebase",
+            stream_event_kind(event)
+        )));
+    };
+    if rebase.reason != ProtoReason::Initial {
+        return Err(invalid_recovery_admission(format!(
+            "raw recovery stream opened with a {:?} rebase instead of an initial one",
+            rebase.reason
+        )));
+    }
+    Ok(())
+}
+
+const fn stream_event_kind(event: &ProtoEvent) -> &'static str {
+    match event {
+        ProtoEvent::RawRebase(_) => "raw-rebase",
+        ProtoEvent::RawBytes(_) => "raw-bytes",
+        ProtoEvent::SurfaceReset(_) => "surface-reset",
+        ProtoEvent::SurfacePatch(_) => "surface-patch",
+        ProtoEvent::Lifecycle(_) => "lifecycle",
+        ProtoEvent::End(_) => "end",
+        _ => "unsupported",
     }
 }
 
@@ -462,6 +544,28 @@ fn map_event(event: ProtoEvent) -> Result<MappedEvent<PaneRecoveryEvent>> {
 
 fn rebase_from_proto(value: ProtoRebase) -> Result<PaneRecoveryRebase> {
     let snapshot = value.snapshot.map(snapshot_from_response).transpose()?;
+    // A keyframe that carries no geometry or no bytes cannot reset and
+    // reconstruct an emulator, and a typed snapshot describes the very grid
+    // the keyframe paints.
+    if value.cols == 0 || value.rows == 0 {
+        return Err(invalid_recovery_admission(format!(
+            "raw recovery rebase reported an empty {}x{} keyframe geometry",
+            value.cols, value.rows
+        )));
+    }
+    if value.keyframe.is_empty() {
+        return Err(invalid_recovery_admission(
+            "raw recovery rebase carried no keyframe bytes".to_owned(),
+        ));
+    }
+    if let Some(snapshot) = snapshot.as_ref() {
+        if snapshot.cols != value.cols || snapshot.rows != value.rows {
+            return Err(invalid_recovery_admission(format!(
+                "raw recovery rebase snapshot geometry {}x{} does not match its {}x{} keyframe",
+                snapshot.cols, snapshot.rows, value.cols, value.rows
+            )));
+        }
+    }
     Ok(PaneRecoveryRebase {
         epoch: value.epoch,
         generation: value.generation,
@@ -499,6 +603,12 @@ fn wrong_projection() -> RmuxError {
     RmuxError::protocol(rmux_proto::RmuxError::Server(
         "rmux daemon sent a surface event to a raw recovery stream".to_owned(),
     ))
+}
+
+fn invalid_recovery_admission(detail: String) -> RmuxError {
+    RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+        "rmux daemon {detail}"
+    )))
 }
 
 #[cfg(test)]

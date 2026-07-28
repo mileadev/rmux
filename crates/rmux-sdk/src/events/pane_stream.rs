@@ -4,7 +4,7 @@ use std::time::Duration;
 use rmux_proto::{
     PaneOutputSubscriptionId, PaneStreamCursorRequest, PaneStreamEvent as ProtoEvent,
     PaneStreamLifecycleEvent as ProtoLifecycle, PaneStreamMode, PaneTargetRef, Request, Response,
-    SubscribePaneStreamRequest, UnsubscribePaneStreamRequest,
+    SubscribePaneStreamRequest, SubscribePaneStreamResponse, UnsubscribePaneStreamRequest,
 };
 
 use crate::handles::session::unexpected_response;
@@ -69,6 +69,15 @@ impl<T> MappedEvent<T> {
     }
 }
 
+/// Projection-specific admission and mapping rules for one pane stream mode.
+pub(super) struct PaneStreamProjection<T> {
+    pub(super) mode: PaneStreamMode,
+    pub(super) include_snapshot: bool,
+    /// Decides whether a subscribe response may open this projection at all.
+    pub(super) admit_initial: fn(&ProtoEvent) -> Result<()>,
+    pub(super) map_event: fn(ProtoEvent) -> Result<MappedEvent<T>>,
+}
+
 pub(super) struct RecoverablePaneStream<T> {
     inner: PaneStreamSubscription,
     pending: VecDeque<MappedEvent<T>>,
@@ -80,7 +89,7 @@ pub(super) struct RecoverablePaneStream<T> {
 struct PaneStreamSubscription {
     transport: TransportClient,
     subscription_id: PaneOutputSubscriptionId,
-    _drop_guard: DropGuard,
+    drop_guard: DropGuard,
     closed: bool,
 }
 
@@ -88,15 +97,13 @@ impl<T> RecoverablePaneStream<T> {
     pub(super) async fn open(
         transport: TransportClient,
         target: PaneTargetRef,
-        mode: PaneStreamMode,
-        include_snapshot: bool,
-        map_event: fn(ProtoEvent) -> Result<MappedEvent<T>>,
+        projection: PaneStreamProjection<T>,
     ) -> Result<Self> {
         let response = transport
             .request(Request::SubscribePaneStream(SubscribePaneStreamRequest {
-                target,
-                mode,
-                include_snapshot,
+                target: target.clone(),
+                mode: projection.mode,
+                include_snapshot: projection.include_snapshot,
             }))
             .await?;
         let response = match response {
@@ -109,19 +116,31 @@ impl<T> RecoverablePaneStream<T> {
             transport.clone(),
             Request::UnsubscribePaneStream(UnsubscribePaneStreamRequest { subscription_id }),
         );
-        let initial = map_event(response.event)?;
+        // Admission runs behind the armed guard, so every rejection below
+        // releases the reserved daemon subscription exactly once.
+        validate_subscribed_identity(&target, &response)?;
+        (projection.admit_initial)(&response.event)?;
+        let initial = (projection.map_event)(response.event)?;
         Ok(Self {
             inner: PaneStreamSubscription {
                 transport,
                 subscription_id,
-                _drop_guard: drop_guard,
+                drop_guard,
                 closed: false,
             },
             pending: VecDeque::from([initial]),
             poll_delay: POLL_INITIAL_DELAY,
             cursor_request: None,
-            map_event,
+            map_event: projection.map_event,
         })
+    }
+
+    /// Closes a stream that failed closed, releasing the daemon subscription
+    /// exactly once. A later drop of the stream stays silent.
+    pub(super) fn close_after_rejection(&mut self) {
+        self.pending.clear();
+        self.inner.closed = true;
+        self.inner.drop_guard.trigger();
     }
 
     pub(super) async fn next(&mut self) -> Result<Option<T>> {
@@ -229,6 +248,47 @@ impl<T> RecoverablePaneStream<T> {
             self.inner.subscription_id.as_u64()
         ))))
     }
+}
+
+/// Checks that a subscribe response answers the identity the caller named.
+///
+/// The daemon reports both the resolved slot and the stable pane identity, so
+/// a misrouted or drifted response is rejected before any event reaches the
+/// consumer. Only the components the caller actually pinned are compared:
+///
+/// * a stable-id subscription pins the pane, whose slot may legitimately move
+///   to another window, index, or renamed runtime session;
+/// * a slot subscription pins the window and pane index, whose session
+///   component the daemon rekeys when a live session is renamed underneath an
+///   opening stream.
+fn validate_subscribed_identity(
+    requested: &PaneTargetRef,
+    response: &SubscribePaneStreamResponse,
+) -> Result<()> {
+    match requested {
+        PaneTargetRef::Id { pane_id, .. } if response.pane_id != *pane_id => {
+            Err(foreign_pane_stream(format!(
+                "pane {} instead of requested pane {}",
+                response.pane_id, pane_id
+            )))
+        }
+        PaneTargetRef::Slot(slot)
+            if response.target.window_index() != slot.window_index()
+                || response.target.pane_index() != slot.pane_index() =>
+        {
+            Err(foreign_pane_stream(format!(
+                "{} instead of requested {slot}",
+                response.target
+            )))
+        }
+        PaneTargetRef::Id { .. } | PaneTargetRef::Slot(_) => Ok(()),
+    }
+}
+
+fn foreign_pane_stream(detail: String) -> RmuxError {
+    RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+        "rmux daemon opened a pane stream for {detail}"
+    )))
 }
 
 pub(super) fn lifecycle_from_proto(lifecycle: ProtoLifecycle) -> Result<PaneStreamLifecycleEvent> {

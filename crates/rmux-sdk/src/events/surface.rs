@@ -11,7 +11,7 @@ use rmux_proto::{
 
 use super::pane_stream::{
     end_from_proto, lifecycle_from_proto, unsupported_stream_variant, MappedEvent,
-    PaneStreamEndReason, PaneStreamLifecycleEvent, RecoverablePaneStream,
+    PaneStreamEndReason, PaneStreamLifecycleEvent, PaneStreamProjection, RecoverablePaneStream,
 };
 use crate::handles::pane::snapshot::{cell_from_wire, cursor_from_wire};
 use crate::transport::TransportClient;
@@ -306,9 +306,14 @@ impl PaneSurfaceStream {
             inner: RecoverablePaneStream::open(
                 transport,
                 target,
-                PaneStreamMode::Surface,
-                false,
-                map_event,
+                PaneStreamProjection {
+                    mode: PaneStreamMode::Surface,
+                    include_snapshot: false,
+                    // Surface frames are self-contained: any initial event the
+                    // mapper accepts can open the projection.
+                    admit_initial: |_| Ok(()),
+                    map_event,
+                },
             )
             .await?,
         })

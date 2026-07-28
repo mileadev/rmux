@@ -5,11 +5,11 @@ use std::time::Duration;
 use rmux_proto::{
     encode_frame, FrameDecoder, HasSessionRequest, HasSessionResponse, PaneOutputSubscriptionId,
     PaneRawBytes, PaneRawRebase as ProtoRebase, PaneRawRebaseReason as ProtoReason,
-    PaneRecoveryCoverage as ProtoCoverage, PaneSnapshotCursor, PaneSnapshotResponse,
-    PaneStreamCursorRequest, PaneStreamCursorResponse, PaneStreamEndReason, PaneStreamEvent,
-    PaneStreamMode, PaneTarget, PaneTargetRef, Request, Response, SessionName,
-    SubscribePaneStreamRequest, SubscribePaneStreamResponse, UnsubscribePaneStreamRequest,
-    UnsubscribePaneStreamResponse,
+    PaneRecoveryCoverage as ProtoCoverage, PaneSnapshotCell, PaneSnapshotCursor,
+    PaneSnapshotResponse, PaneStreamCursorRequest, PaneStreamCursorResponse, PaneStreamEndReason,
+    PaneStreamEvent, PaneStreamLifecycleEvent as ProtoLifecycle, PaneStreamMode, PaneTarget,
+    PaneTargetRef, Request, Response, SessionName, SubscribePaneStreamRequest,
+    SubscribePaneStreamResponse, UnsubscribePaneStreamRequest, UnsubscribePaneStreamResponse,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
@@ -97,6 +97,121 @@ async fn open_stream(client: DuplexStream) -> PaneRecoveryStream {
     )
     .await
     .expect("open recovery stream")
+}
+
+fn session(name: &str) -> SessionName {
+    SessionName::new(name).expect("valid session name")
+}
+
+fn pane_id() -> PaneId {
+    PaneId::new(1)
+}
+
+fn subscribed(event: PaneStreamEvent) -> SubscribePaneStreamResponse {
+    SubscribePaneStreamResponse {
+        subscription_id: subscription_id(),
+        target: target(),
+        pane_id: pane_id(),
+        event,
+    }
+}
+
+fn initial_subscribed() -> SubscribePaneStreamResponse {
+    subscribed(PaneStreamEvent::RawRebase(Box::new(rebase(
+        1,
+        ProtoReason::Initial,
+    ))))
+}
+
+fn glyph_cell() -> PaneSnapshotCell {
+    PaneSnapshotCell {
+        text: "x".to_owned(),
+        width: 1,
+        padding: false,
+        attributes: 0,
+        fg: 8,
+        bg: 8,
+        us: 8,
+        link: 0,
+    }
+}
+
+async fn serve_subscribe_response(
+    server: &mut DuplexStream,
+    response: SubscribePaneStreamResponse,
+) {
+    assert!(matches!(
+        read_request(server).await,
+        Request::SubscribePaneStream(_)
+    ));
+    write_response(server, Response::SubscribePaneStream(Box::new(response))).await;
+}
+
+/// Asserts that a rejection released the reserved subscription exactly once.
+async fn expect_single_unsubscribe(server: &mut DuplexStream, context: &str) {
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), read_request(server))
+            .await
+            .unwrap_or_else(|_| panic!("{context} must schedule cleanup")),
+        Request::UnsubscribePaneStream(UnsubscribePaneStreamRequest {
+            subscription_id: subscription_id(),
+        })
+    );
+    write_response(
+        server,
+        Response::UnsubscribePaneStream(UnsubscribePaneStreamResponse {
+            subscription_id: subscription_id(),
+            removed: true,
+        }),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), read_request(server))
+            .await
+            .is_err(),
+        "{context} must emit exactly one unsubscribe"
+    );
+}
+
+/// Drives one fail-closed admission: the daemon answers `response`, the open
+/// is refused with `expected`, and the reserved subscription is released once.
+async fn expect_rejected_admission(
+    requested: PaneTargetRef,
+    response: SubscribePaneStreamResponse,
+    expected: &str,
+) {
+    let (client, mut server) = tokio::io::duplex(64 * 1024);
+    let transport = TransportClient::spawn(client);
+    let shared_transport = transport.clone();
+    let subscribe_target = requested.clone();
+    let open = tokio::spawn(async move {
+        PaneRecoveryStream::open(transport, requested, PaneRecoveryOptions::default()).await
+    });
+
+    assert_eq!(
+        read_request(&mut server).await,
+        Request::SubscribePaneStream(SubscribePaneStreamRequest {
+            target: subscribe_target,
+            mode: PaneStreamMode::Raw,
+            include_snapshot: false,
+        })
+    );
+    write_response(
+        &mut server,
+        Response::SubscribePaneStream(Box::new(response)),
+    )
+    .await;
+
+    let error = open
+        .await
+        .expect("stream open task joins")
+        .expect_err("a rejected recovery response must not open a stream");
+    assert!(
+        error.to_string().contains(expected),
+        "unexpected error: {error}"
+    );
+    expect_single_unsubscribe(&mut server, "a refused recovery admission").await;
+    drop(shared_transport);
 }
 
 async fn serve_subscribe(server: &mut DuplexStream) {
@@ -623,6 +738,400 @@ fn recovered_unsequenced_lifecycle_does_not_advance_the_rebase_boundary() {
             bytes: b"after-rebase".to_vec(),
         })
         .expect("rebase still owns exact continuation");
+}
+
+#[tokio::test]
+async fn recovery_rejects_a_response_for_a_foreign_pane_id() {
+    let mut response = initial_subscribed();
+    response.pane_id = PaneId::new(9);
+
+    expect_rejected_admission(
+        PaneTargetRef::by_id(session("recovery"), pane_id()),
+        response,
+        "opened a pane stream for pane %9 instead of requested pane %1",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn recovery_rejects_a_response_for_a_foreign_slot_target() {
+    let mut response = initial_subscribed();
+    response.target = PaneTarget::with_window(session("recovery"), 3, 4);
+
+    expect_rejected_admission(
+        PaneTargetRef::slot(target()),
+        response,
+        "opened a pane stream for recovery:3.4 instead of requested recovery:0.0",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn recovery_rejects_an_initial_event_that_is_not_a_rebase() {
+    let events = [
+        (
+            PaneStreamEvent::RawBytes(PaneRawBytes {
+                epoch: 1,
+                sequence: 5,
+                bytes: b"live".to_vec(),
+            }),
+            "raw-bytes",
+        ),
+        (
+            PaneStreamEvent::Lifecycle(ProtoLifecycle::ProcessExited {
+                output_sequence: Some(5),
+            }),
+            "lifecycle",
+        ),
+        (
+            PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved),
+            "end",
+        ),
+    ];
+
+    for (event, kind) in events {
+        expect_rejected_admission(
+            PaneTargetRef::slot(target()),
+            subscribed(event),
+            &format!("raw recovery stream opened with a {kind} event instead of a rebase"),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn recovery_rejects_an_initial_rebase_that_is_not_the_stream_start() {
+    expect_rejected_admission(
+        PaneTargetRef::slot(target()),
+        subscribed(PaneStreamEvent::RawRebase(Box::new(rebase(
+            1,
+            ProtoReason::Lag,
+        )))),
+        "raw recovery stream opened with a Lag rebase instead of an initial one",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn recovery_rejects_a_keyframe_without_geometry_or_bytes() {
+    let mut without_geometry = rebase(1, ProtoReason::Initial);
+    without_geometry.cols = 0;
+    expect_rejected_admission(
+        PaneTargetRef::slot(target()),
+        subscribed(PaneStreamEvent::RawRebase(Box::new(without_geometry))),
+        "raw recovery rebase reported an empty 0x24 keyframe geometry",
+    )
+    .await;
+
+    let mut without_bytes = rebase(1, ProtoReason::Initial);
+    without_bytes.keyframe = Vec::new();
+    expect_rejected_admission(
+        PaneTargetRef::slot(target()),
+        subscribed(PaneStreamEvent::RawRebase(Box::new(without_bytes))),
+        "raw recovery rebase carried no keyframe bytes",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn recovery_rejects_a_snapshot_that_contradicts_the_keyframe_geometry() {
+    let mut mismatched = rebase(1, ProtoReason::Initial);
+    mismatched.snapshot = Some(PaneSnapshotResponse {
+        cols: 2,
+        rows: 1,
+        cells: vec![glyph_cell(), glyph_cell()],
+        cursor: PaneSnapshotCursor {
+            row: 0,
+            col: 0,
+            visible: true,
+            style: 0,
+        },
+        revision: 1,
+    });
+
+    expect_rejected_admission(
+        PaneTargetRef::slot(target()),
+        subscribed(PaneStreamEvent::RawRebase(Box::new(mismatched))),
+        "raw recovery rebase snapshot geometry 2x1 does not match its 80x24 keyframe",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn recovery_rejects_a_noncontiguous_byte_sequence_before_exposing_it() {
+    let (client, mut server) = tokio::io::duplex(64 * 1024);
+    let transport = TransportClient::spawn(client);
+    let shared_transport = transport.clone();
+    let consumer = tokio::spawn(async move {
+        let mut stream = PaneRecoveryStream::open(
+            transport,
+            PaneTargetRef::slot(target()),
+            PaneRecoveryOptions::default(),
+        )
+        .await
+        .expect("open recovery stream");
+        assert!(matches!(
+            stream.next().await.expect("initial event"),
+            Some(PaneRecoveryEvent::Rebase(_))
+        ));
+        let error = stream
+            .next()
+            .await
+            .expect_err("a sequence hole must not reach the consumer");
+        assert!(
+            error
+                .to_string()
+                .contains("raw recovery expected output sequence 5, got 6"),
+            "unexpected error: {error}"
+        );
+        // The stream stays closed instead of resuming a desynchronized epoch.
+        assert_eq!(stream.next().await.expect("closed stream"), None);
+        drop(stream);
+    });
+
+    serve_subscribe_response(&mut server, initial_subscribed()).await;
+    assert!(matches!(
+        read_request(&mut server).await,
+        Request::PaneStreamCursor(_)
+    ));
+    write_response(
+        &mut server,
+        Response::PaneStreamCursor(Box::new(PaneStreamCursorResponse {
+            subscription_id: subscription_id(),
+            events: vec![PaneStreamEvent::RawBytes(PaneRawBytes {
+                epoch: 1,
+                sequence: 6,
+                bytes: b"hole".to_vec(),
+            })],
+            limited: false,
+        })),
+    )
+    .await;
+
+    expect_single_unsubscribe(&mut server, "a broken byte sequence").await;
+    consumer.await.expect("consumer task");
+    drop(shared_transport);
+}
+
+#[tokio::test]
+async fn recovery_rejects_bytes_from_a_foreign_epoch_before_exposing_them() {
+    let (client, mut server) = tokio::io::duplex(64 * 1024);
+    let transport = TransportClient::spawn(client);
+    let shared_transport = transport.clone();
+    let consumer = tokio::spawn(async move {
+        let mut stream = PaneRecoveryStream::open(
+            transport,
+            PaneTargetRef::slot(target()),
+            PaneRecoveryOptions::default(),
+        )
+        .await
+        .expect("open recovery stream");
+        assert!(matches!(
+            stream.next().await.expect("initial event"),
+            Some(PaneRecoveryEvent::Rebase(_))
+        ));
+        let error = stream
+            .poll_once()
+            .await
+            .expect_err("a foreign epoch must not reach the consumer");
+        assert!(
+            error
+                .to_string()
+                .contains("raw recovery byte epoch 2 does not match 1"),
+            "unexpected error: {error}"
+        );
+        drop(stream);
+    });
+
+    serve_subscribe_response(&mut server, initial_subscribed()).await;
+    assert!(matches!(
+        read_request(&mut server).await,
+        Request::PaneStreamCursor(_)
+    ));
+    write_response(
+        &mut server,
+        Response::PaneStreamCursor(Box::new(PaneStreamCursorResponse {
+            subscription_id: subscription_id(),
+            events: vec![PaneStreamEvent::RawBytes(PaneRawBytes {
+                epoch: 2,
+                sequence: 5,
+                bytes: b"stray".to_vec(),
+            })],
+            limited: false,
+        })),
+    )
+    .await;
+
+    expect_single_unsubscribe(&mut server, "a foreign byte epoch").await;
+    consumer.await.expect("consumer task");
+    drop(shared_transport);
+}
+
+#[tokio::test]
+async fn recovery_rejects_an_in_band_rebase_that_does_not_advance_the_epoch() {
+    let (client, mut server) = tokio::io::duplex(64 * 1024);
+    let transport = TransportClient::spawn(client);
+    let shared_transport = transport.clone();
+    let consumer = tokio::spawn(async move {
+        let mut stream = PaneRecoveryStream::open(
+            transport,
+            PaneTargetRef::slot(target()),
+            PaneRecoveryOptions::default(),
+        )
+        .await
+        .expect("open recovery stream");
+        assert!(matches!(
+            stream.next().await.expect("initial event"),
+            Some(PaneRecoveryEvent::Rebase(_))
+        ));
+        let error = stream
+            .next()
+            .await
+            .expect_err("a stale rebase must not reach the consumer");
+        assert!(
+            error
+                .to_string()
+                .contains("raw recovery rebase epoch 1 does not advance 1"),
+            "unexpected error: {error}"
+        );
+        drop(stream);
+    });
+
+    serve_subscribe_response(&mut server, initial_subscribed()).await;
+    assert!(matches!(
+        read_request(&mut server).await,
+        Request::PaneStreamCursor(_)
+    ));
+    write_response(
+        &mut server,
+        Response::PaneStreamCursor(Box::new(PaneStreamCursorResponse {
+            subscription_id: subscription_id(),
+            events: vec![PaneStreamEvent::RawRebase(Box::new(rebase(
+                1,
+                ProtoReason::Resize,
+            )))],
+            limited: false,
+        })),
+    )
+    .await;
+
+    expect_single_unsubscribe(&mut server, "a stale in-band rebase").await;
+    consumer.await.expect("consumer task");
+    drop(shared_transport);
+}
+
+#[tokio::test]
+async fn recovery_accepts_a_rekeyed_session_and_a_moved_pane_slot() {
+    // A slot subscription keeps its window and pane index while the daemon
+    // rekeys a renamed runtime session underneath the opening stream.
+    let mut renamed = initial_subscribed();
+    renamed.target = PaneTarget::with_window(session("renamed"), 0, 0);
+    expect_admitted_open(PaneTargetRef::slot(target()), renamed).await;
+
+    // A stable-id subscription keeps its pane while the resolved slot moves
+    // to another window of another session.
+    let mut moved = initial_subscribed();
+    moved.target = PaneTarget::with_window(session("elsewhere"), 7, 2);
+    expect_admitted_open(PaneTargetRef::by_id(session("recovery"), pane_id()), moved).await;
+}
+
+/// Opens a stream against a legitimate response and drops it cleanly.
+async fn expect_admitted_open(requested: PaneTargetRef, response: SubscribePaneStreamResponse) {
+    let (client, mut server) = tokio::io::duplex(64 * 1024);
+    let transport = TransportClient::spawn(client);
+    let shared_transport = transport.clone();
+    let consumer = tokio::spawn(async move {
+        let mut stream =
+            PaneRecoveryStream::open(transport, requested, PaneRecoveryOptions::default())
+                .await
+                .expect("a legitimate rekey must keep the stream open");
+        assert!(matches!(
+            stream.next().await.expect("initial event"),
+            Some(PaneRecoveryEvent::Rebase(_))
+        ));
+        drop(stream);
+    });
+
+    serve_subscribe_response(&mut server, response).await;
+    expect_single_unsubscribe(&mut server, "dropping an admitted stream").await;
+    consumer.await.expect("consumer task");
+    drop(shared_transport);
+}
+
+fn lag_rebase() -> ProtoRebase {
+    let mut lag = rebase(2, ProtoReason::Lag);
+    lag.next_sequence = 40;
+    lag
+}
+
+#[tokio::test]
+async fn recovery_keeps_an_in_band_lag_rebase_and_its_repositioned_bytes() {
+    let (client, mut server) = tokio::io::duplex(64 * 1024);
+    let transport = TransportClient::spawn(client);
+    let shared_transport = transport.clone();
+    let consumer = tokio::spawn(async move {
+        let mut stream = PaneRecoveryStream::open(
+            transport,
+            PaneTargetRef::slot(target()),
+            PaneRecoveryOptions::default(),
+        )
+        .await
+        .expect("open recovery stream");
+        assert!(matches!(
+            stream.next().await.expect("initial event"),
+            Some(PaneRecoveryEvent::Rebase(_))
+        ));
+        assert_eq!(
+            stream.poll_once().await.expect("in-band lag recovery"),
+            vec![
+                PaneRecoveryEvent::Bytes {
+                    epoch: 1,
+                    sequence: 5,
+                    bytes: b"before".to_vec(),
+                },
+                PaneRecoveryEvent::Rebase(
+                    super::rebase_from_proto(lag_rebase()).expect("lag rebase"),
+                ),
+                PaneRecoveryEvent::Bytes {
+                    epoch: 2,
+                    sequence: 40,
+                    bytes: b"after".to_vec(),
+                },
+            ]
+        );
+        drop(stream);
+    });
+
+    serve_subscribe_response(&mut server, initial_subscribed()).await;
+    assert!(matches!(
+        read_request(&mut server).await,
+        Request::PaneStreamCursor(_)
+    ));
+    write_response(
+        &mut server,
+        Response::PaneStreamCursor(Box::new(PaneStreamCursorResponse {
+            subscription_id: subscription_id(),
+            events: vec![
+                PaneStreamEvent::RawBytes(PaneRawBytes {
+                    epoch: 1,
+                    sequence: 5,
+                    bytes: b"before".to_vec(),
+                }),
+                PaneStreamEvent::RawRebase(Box::new(lag_rebase())),
+                PaneStreamEvent::RawBytes(PaneRawBytes {
+                    epoch: 2,
+                    sequence: 40,
+                    bytes: b"after".to_vec(),
+                }),
+            ],
+            limited: false,
+        })),
+    )
+    .await;
+
+    expect_single_unsubscribe(&mut server, "dropping a recovered stream").await;
+    consumer.await.expect("consumer task");
+    drop(shared_transport);
 }
 
 #[test]
