@@ -497,6 +497,9 @@ async fn pane_keyframe_redacts_spectator_metadata_and_preserves_operator_access(
     handler
         .wait_for_pane_startup_to_finish_for_test(&target)
         .await;
+    handler
+        .wait_for_initial_pane_output_to_quiesce_for_test(&target)
+        .await;
     let mut pane_bytes = b"\x1b]2;".to_vec();
     pane_bytes.extend_from_slice(STACKED_TITLE);
     pane_bytes.extend_from_slice(b"\x1b\\\x1b[22;2t\x1b]2;");
