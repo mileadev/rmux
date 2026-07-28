@@ -178,7 +178,7 @@ fn attach_session_preserves_preexisting_empty_windows_daemon_and_state(
 }
 
 #[test]
-fn start_server_with_captured_output_returns_after_spawning_windows_daemon(
+fn start_server_with_captured_output_returns_after_empty_windows_daemon_exits(
 ) -> Result<(), Box<dyn Error>> {
     let _guard = env_lock().lock().expect("lock env");
     let previous_binary = std::env::var_os(BINARY_OVERRIDE_ENV);
@@ -203,14 +203,6 @@ fn start_server_with_captured_output_returns_after_spawning_windows_daemon(
     assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
 
-    let output = run_rmux_command(&socket_path, &["kill-server"])?;
-    assert!(
-        output.status.success(),
-        "captured kill-server failed: status={:?}\nstdout={}\nstderr={}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
     wait_for_daemon_process_absent(&socket_path)?;
     Ok(())
 }
