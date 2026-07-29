@@ -10,9 +10,16 @@ use super::Pane;
 impl Pane {
     /// Opens raw pane output that automatically repairs renderer state.
     ///
-    /// The first item is a complete ANSI rebase. Resize, clear-history,
-    /// parser expiry, lag, and process-generation changes emit later rebases
-    /// in-band on the same subscription; callers never need to reopen it.
+    /// The first item is a complete ANSI rebase, except on the revoked
+    /// opening described below. Resize, clear-history, parser expiry, lag,
+    /// and process-generation changes emit later rebases in-band on the same
+    /// subscription; callers never need to reopen it.
+    ///
+    /// The daemon substitutes a typed end for that opening rebase in exactly
+    /// one case: observation permission revoked after this request is
+    /// dispatched and before its response is written. The stream then consists
+    /// solely of [`PaneRecoveryEvent::End`](crate::PaneRecoveryEvent::End)
+    /// carrying [`AccessRevoked`](crate::PaneStreamEndReason::AccessRevoked).
     pub async fn recover_output(&self) -> Result<PaneRecoveryStream> {
         self.recover_output_with(PaneRecoveryOptions::default())
             .await
