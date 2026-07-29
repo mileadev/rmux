@@ -457,23 +457,15 @@ where
             PendingCtrlCForward::InputClosed => return Ok(()),
         }
 
-        let input_ready =
-            terminal::wait_for_key_input(input_handle, 50).map_err(ClientError::Io)?;
-        if !input_ready {
+        if !terminal::wait_for_key_input(input_handle, 50).map_err(ClientError::Io)? {
             if lock_state.is_closed() || input_tx.is_closed() {
                 return Ok(());
             }
             match forward_pending_ctrl_c_event(&input_tx, &lock_state) {
-                PendingCtrlCForward::None => {}
-                PendingCtrlCForward::Sent => continue,
+                PendingCtrlCForward::None | PendingCtrlCForward::Sent => {}
                 PendingCtrlCForward::InputClosed => return Ok(()),
             }
-            let pending_deadline_expired = console_input
-                .as_ref()
-                .is_some_and(input::ConsoleInputReader::pending_input_deadline_expired);
-            if !pending_deadline_expired {
-                continue;
-            }
+            continue;
         }
 
         if !lock_state.begin_input_read() {
@@ -481,14 +473,10 @@ where
         }
 
         let inputs = if let Some(console_input) = console_input.as_mut() {
-            if input_ready {
-                match console_input.read_key_inputs() {
-                    Ok(inputs) => Ok(inputs),
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => Err(None),
-                    Err(error) => Err(Some(ClientError::Io(error))),
-                }
-            } else {
-                Ok(console_input.flush_expired_pending_input())
+            match console_input.read_key_inputs() {
+                Ok(inputs) => Ok(inputs),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => Err(None),
+                Err(error) => Err(Some(ClientError::Io(error))),
             }
         } else {
             let bytes_read = match input.read(&mut read_buffer) {
