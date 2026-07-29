@@ -304,42 +304,135 @@ fn base_index_one_resolves_every_automation_target_spelling() -> Result<(), Box<
     Ok(())
 }
 
+/// One CLI flag whose value is parsed by `parse_duration`.
+struct DurationFlag {
+    command: &'static str,
+    flag: &'static str,
+    /// An invocation whose only defect is the unitless duration value, so the
+    /// parser rejection is the first — and therefore the observed — error.
+    unitless: &'static [&'static str],
+}
+
+/// Every flag routed through `parse_duration`, and nothing else.
+///
+/// `wait-pane` and `send-keys` each own a `--stable-for` and a `--timeout`, and
+/// `with-session` owns `--ttl`. Adding a sixth duration flag without adding it
+/// here leaves its unit contract unpinned.
+const DURATION_FLAGS: &[DurationFlag] = &[
+    DurationFlag {
+        command: "wait-pane",
+        flag: "--stable-for",
+        unitless: &[
+            "wait-pane",
+            "-t",
+            "alpha:1.1",
+            "--quiet",
+            "--stable-for",
+            "8000",
+        ],
+    },
+    DurationFlag {
+        command: "wait-pane",
+        flag: "--timeout",
+        unitless: &[
+            "wait-pane",
+            "-t",
+            "alpha:1.1",
+            "--text",
+            "marker",
+            "--timeout",
+            "8000",
+        ],
+    },
+    DurationFlag {
+        command: "send-keys",
+        flag: "--stable-for",
+        unitless: &[
+            "send-keys",
+            "-t",
+            "alpha:1.1",
+            "--wait",
+            "quiet",
+            "--stable-for",
+            "8000",
+            "--",
+            "printf marker",
+            "Enter",
+        ],
+    },
+    DurationFlag {
+        command: "send-keys",
+        flag: "--timeout",
+        unitless: &[
+            "send-keys",
+            "-t",
+            "alpha:1.1",
+            "--wait-next-text",
+            "marker",
+            "--timeout",
+            "8000",
+            "--",
+            "printf marker",
+            "Enter",
+        ],
+    },
+    DurationFlag {
+        command: "with-session",
+        flag: "--ttl",
+        unitless: &["with-session", "owned", "--ttl", "8000", "--", "true"],
+    },
+];
+
 /// `parse_duration` rejects bare integers on purpose, so `--help` has to say
 /// which units are accepted — otherwise the requirement is only discoverable by
 /// triggering the error.
+///
+/// Both halves of that contract are pinned for every flag in [`DURATION_FLAGS`],
+/// not just for the two `--timeout`s: `--help` must name the value `<DURATION>`
+/// and state the accepted units on the flag's own entry, and a unitless value
+/// must be rejected with the rule *and* a usable example. Dropping
+/// `value_name`, `help` or the example from any single one of the five turns
+/// this test red.
 #[test]
 fn duration_flags_document_their_required_unit() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("automation-duration-help")?;
 
-    for command in ["wait-pane", "send-keys"] {
+    for &DurationFlag {
+        command,
+        flag,
+        unitless,
+    } in DURATION_FLAGS
+    {
         let help = harness.run(&[command, "--help"])?;
         assert_ok(&help);
         let help = stdout(&help);
+        let entry = help_entry(&help, flag)
+            .ok_or_else(|| format!("{command} --help does not list {flag}:\n{help}"))?;
         assert!(
-            help.contains("--timeout <DURATION>"),
-            "{command} --help should name the duration value: {help}"
+            entry.contains(&format!("{flag} <DURATION>")),
+            "{command} {flag} should name its value <DURATION>: {entry:?}"
         );
         assert!(
-            help.contains("ms, s, or m"),
-            "{command} --help should state the accepted units: {help}"
+            entry.contains("ms, s, or m"),
+            "{command} {flag} should state the accepted units: {entry:?}"
+        );
+
+        let rejected = harness.run(unitless)?;
+        assert_ne!(
+            rejected.status.code(),
+            Some(0),
+            "{command} {flag} should reject a unitless value"
+        );
+        let message = stderr(&rejected);
+        assert!(
+            message.contains("duration requires an explicit unit: ms, s, or m"),
+            "{command} {flag} should state the rule it enforced: {message}"
+        );
+        assert!(
+            message.contains("for example 500ms, 8s, 2m"),
+            "{command} {flag} should show a usable example: {message}"
         );
     }
-
-    let rejected = harness.run(&[
-        "wait-pane",
-        "-t",
-        "alpha:1.1",
-        "--text",
-        "marker",
-        "--timeout",
-        "8000",
-    ])?;
-    assert_ne!(rejected.status.code(), Some(0));
-    assert!(
-        stderr(&rejected).contains("for example 500ms, 8s, 2m"),
-        "the rejection should show a usable example: {}",
-        stderr(&rejected)
-    );
 
     Ok(())
 }
@@ -1260,6 +1353,33 @@ fn assert_ok(output: &std::process::Output) {
         stderr(output)
     );
     assert!(stderr(output).is_empty(), "stderr should be empty");
+}
+
+/// Returns `flag`'s own entry in a `--help` listing: the line that declares it
+/// plus any wrapped continuation, with runs of whitespace collapsed.
+///
+/// Scoping to the entry is what makes the assertions per-flag: searching the
+/// whole listing would let one documented flag vouch for its silent siblings.
+/// The five duration flags are long-only, so clap always starts their
+/// declaration at the beginning of the (indented) line.
+fn help_entry(help: &str, flag: &str) -> Option<String> {
+    let declares = |line: &str| {
+        line.trim_start()
+            .strip_prefix(flag)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+    };
+    let mut lines = help.lines().skip_while(|line| !declares(line));
+    let declaration = lines.next()?;
+    let continuation = lines.take_while(|line| {
+        let trimmed = line.trim();
+        !trimmed.is_empty() && !trimmed.starts_with('-')
+    });
+    let entry = std::iter::once(declaration)
+        .chain(continuation)
+        .flat_map(str::split_whitespace)
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(entry)
 }
 
 /// Looks up the stable `%id` of a pane by its *display* index in `window`.
