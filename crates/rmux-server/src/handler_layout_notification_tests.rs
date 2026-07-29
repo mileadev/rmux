@@ -212,9 +212,19 @@ async fn join_and_move_reflow_minimum_target_and_publish_resize_product_divergen
                 .await;
 
                 let source_target = if route == "same" {
+                    // `sleep` is not a Windows command, so cmd.exe would exit at
+                    // once and destroy `:9` before the transfer. The shared
+                    // stdin-discard command blocks on the pane's own terminal
+                    // instead, which keeps the source window alive on both
+                    // platforms.
                     run_detached_command(
                         &handler,
-                        &format!("new-window -d -t {target}:9 'sleep 60'"),
+                        &format!(
+                            "new-window -d -t {target}:9 {}",
+                            crate::test_shell::command_quote(
+                                &crate::test_shell::stdin_discard_command()
+                            )
+                        ),
                     )
                     .await;
                     format!("{target}:9.0")
