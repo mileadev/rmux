@@ -37,6 +37,12 @@ mod options;
 #[path = "handler_session/output.rs"]
 mod output;
 
+// The deferred bracketed-paste final-sink proof lives next to the flush it
+// exercises. It is Windows-only because the starting-pane input queue is.
+#[cfg(all(test, windows))]
+#[path = "handler_session/bracketed_paste_final_sink_tests.rs"]
+mod bracketed_paste_final_sink_tests;
+
 #[cfg(windows)]
 const DEFERRED_INITIAL_PANE_READY_TIMEOUT: Duration = Duration::from_millis(250);
 #[cfg(windows)]

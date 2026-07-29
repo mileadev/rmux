@@ -138,3 +138,54 @@ fn starting_pane_keeps_bracketed_paste_distinct_from_plain_bytes() {
     assert_eq!(starting.queued_input_bytes, payload.len());
     state.shutdown_terminals_for_test();
 }
+
+/// The typed bracketed-paste entry must be accounted for exactly like plain
+/// bytes, otherwise the starting-pane queue silently stops enforcing the
+/// 64-KiB bound that protects a pane that never finishes starting.
+#[test]
+fn queued_bracketed_paste_is_charged_against_the_starting_input_limit() {
+    let mut state = HandlerState::default();
+    let session = session_name("deferred-bracketed-capacity");
+    let job = prepare_deferred_session(&mut state, &session);
+    let limit = super::STARTING_PANE_INPUT_MAX_BYTES;
+    let chunk = vec![b'p'; 4096];
+
+    let mut queued = 0;
+    while queued + chunk.len() <= limit {
+        assert!(
+            state
+                .queue_starting_pane_bracketed_paste_input(&session, 0, 0, &chunk)
+                .expect("a bracketed paste below the limit queues"),
+            "the pane is still starting, so the paste must be queued"
+        );
+        queued += chunk.len();
+    }
+    assert_eq!(
+        queued, limit,
+        "the chunk size must divide the limit exactly"
+    );
+
+    let overflow = state
+        .queue_starting_pane_bracketed_paste_input(&session, 0, 0, b"x")
+        .expect_err("one byte past the limit must be rejected");
+    assert!(
+        overflow.to_string().contains("input queue is full"),
+        "unexpected overflow error: {overflow}"
+    );
+
+    let starting = state
+        .starting_panes
+        .get(&job.runtime_session_name)
+        .and_then(|panes| panes.get(&job.identity.pane_id()))
+        .expect("starting pane remains registered");
+    assert_eq!(
+        starting.queued_input_bytes, limit,
+        "every queued bracketed paste must contribute its own byte length"
+    );
+    assert_eq!(
+        starting.queued_input.len(),
+        limit / chunk.len(),
+        "the rejected byte must not have been appended"
+    );
+    state.shutdown_terminals_for_test();
+}
