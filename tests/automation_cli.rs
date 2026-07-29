@@ -177,9 +177,12 @@ fn nonzero_pane_base_index_preserves_targeted_automation_and_percent_resize(
 /// slot below it, so the caller was served the wrong pane rather than an
 /// error. All three spellings run through that same slot lookup — a `%id` and
 /// a bare session target are both resolved to a `session:window.pane` slot
-/// before the comparison — so none of them escaped it. The tmux-compatible
-/// surface (`capture-pane`) resolves server-side and was unaffected, which is
-/// why the break only showed up in the rmux-specific commands.
+/// before the comparison — so none of them escaped it. `capture-pane` was
+/// spared because its target stays server-side, not because it is
+/// tmux-compatible: `resize-pane -x/-y <n>%` shares that surface yet still
+/// ran a sibling client-side lookup, listing `#{pane_index}` to size the
+/// window, so its first visible pane failed too, with
+/// `resize-pane could not resolve dimensions for pane <session>:<window>.0`.
 ///
 /// The existing `nonzero_pane_base_index_*` test pins `pane-base-index` alone;
 /// this one pins both indices at once and covers all three target spellings,
