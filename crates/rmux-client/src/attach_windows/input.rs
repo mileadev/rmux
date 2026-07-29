@@ -1004,8 +1004,11 @@ fn encode_paste_body_key_event(
         // Live Ctrl+Enter remains a modified console key, but inside a burst
         // independently identified as paste this record represents the literal
         // U+000A clipboard byte. Encoding it through VK_RETURN would turn it
-        // into CSI 13;5u and corrupt the paste body.
-        pending_high_surrogate.take();
+        // into CSI 13;5u and corrupt the paste body. A UTF-16 pair being
+        // decoded across this record is unrelated state: like the Ctrl+J
+        // control-byte path this branch generalizes, it returns its byte
+        // without disturbing a pending high surrogate, so the low half still
+        // finds its partner after the newline.
         return vec![b'\n'; usize::from(event.repeat_count.max(1))];
     }
     encode_key_event(event, pending_high_surrogate)
@@ -3194,6 +3197,63 @@ mod tests {
                 assert_eq!(batch_bytes(&inputs), bracketed_text(expected));
                 assert!(!paste_open);
             }
+        }
+    }
+
+    #[test]
+    fn a_qualified_paste_lf_preserves_a_pending_high_surrogate() {
+        // U+1F600 as UTF-16: the console delivers the halves as two records,
+        // and a clipboard newline between them is unrelated to that pair.
+        let high = key_event(0, 0xd83d, 0);
+        let low = key_event(0, 0xde00, 0);
+        let mut expected = b"\n".to_vec();
+        expected.extend_from_slice("\u{1f600}".as_bytes());
+
+        for lf in [
+            key_event(b'J' as u16, b'\n' as u16, LEFT_CTRL_PRESSED),
+            conpty_lf_event(LEFT_CTRL_PRESSED),
+        ] {
+            let mut paste_open = false;
+            let mut pending = None;
+            let inputs = encode_input_batch(
+                &[
+                    BatchEvent::Key(high),
+                    BatchEvent::Key(lf),
+                    BatchEvent::Key(low),
+                ],
+                true,
+                &mut paste_open,
+                &mut Vec::new(),
+                &mut pending,
+                &mut 0,
+            );
+
+            assert_eq!(
+                batch_bytes(&inputs),
+                bracketed_text(&expected),
+                "the pair split by a paste LF in one batch"
+            );
+            assert_eq!(pending, None, "the low half consumed the pending high one");
+            assert!(!paste_open);
+
+            let mut paste_open = false;
+            let mut pending = Some(0xd83d);
+            let inputs = encode_input_batch(
+                &[BatchEvent::Key(lf), BatchEvent::Key(low)],
+                true,
+                &mut paste_open,
+                &mut Vec::new(),
+                &mut pending,
+                &mut 0,
+            );
+
+            assert_eq!(
+                batch_bytes(&inputs),
+                bracketed_text(&expected),
+                "the high half was already pending from an earlier batch"
+            );
+            assert_eq!(pending, None);
+            assert!(!paste_open);
         }
     }
 
