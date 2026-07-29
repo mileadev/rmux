@@ -233,15 +233,30 @@ pub fn write_windows_console_utf8(process_id: ProcessId, bytes: &[u8]) -> io::Re
     let _attachment = attach_to_process_console(process_id)?;
     let handle = open_console_input()?;
     let handle = handle.as_raw_handle() as HANDLE;
+    write_console_utf8_batches(text, |keys| write_console_key_batch_to_handle(handle, keys))
+}
+
+/// Splits `text` into bounded literal-key batches and hands each one to
+/// `write_batch`.
+///
+/// The record writer is a parameter purely so a test can observe the batch
+/// boundaries and the emitted code units: `WriteConsoleInputW` needs a real
+/// attached ConPTY child console, which a unit test cannot provide, and the
+/// bound itself is what keeps a large paste from being submitted as one
+/// unbounded record array.
+fn write_console_utf8_batches<W>(text: &str, mut write_batch: W) -> io::Result<()>
+where
+    W: FnMut(&[WindowsConsoleKeyEvent]) -> io::Result<()>,
+{
     let mut keys = Vec::with_capacity(CONSOLE_TEXT_KEY_BATCH);
     for code_unit in text.encode_utf16() {
         keys.push(literal_console_key(code_unit));
         if keys.len() == CONSOLE_TEXT_KEY_BATCH {
-            write_console_key_batch_to_handle(handle, &keys)?;
+            write_batch(&keys)?;
             keys.clear();
         }
     }
-    write_console_key_batch_to_handle(handle, &keys)
+    write_batch(&keys)
 }
 
 fn write_console_key_batch_to_handle(
@@ -763,6 +778,87 @@ mod tests {
                 assert_eq!(key.virtual_scan_code(), 0);
             }
         }
+    }
+
+    /// The bound is pinned as a literal, not read from
+    /// [`CONSOLE_TEXT_KEY_BATCH`]: a test that derives its payload from the
+    /// constant follows the constant, so raising or removing the bound would
+    /// leave it green while an arbitrarily large record array reached
+    /// `WriteConsoleInputW` in a single call.
+    const PINNED_BATCH: usize = 2048;
+
+    /// Collects the code units of every batch the writer seam emits.
+    fn batched_code_units(text: &str) -> Vec<Vec<u16>> {
+        let mut batches = Vec::new();
+        write_console_utf8_batches(text, |keys| {
+            batches.push(keys.iter().map(|key| key.unicode_char()).collect());
+            Ok(())
+        })
+        .expect("the recording writer never fails");
+        batches
+    }
+
+    /// One code unit past the bound, with the surrogate pair away from it.
+    fn text_crossing_the_batch_bound() -> String {
+        let mut text = String::from("😀");
+        while text.encode_utf16().count() < PINNED_BATCH + 1 {
+            text.push('a');
+        }
+        text
+    }
+
+    #[test]
+    fn console_text_is_written_in_bounded_batches_without_losing_code_units() {
+        assert_eq!(
+            CONSOLE_TEXT_KEY_BATCH, PINNED_BATCH,
+            "the console record batch bound is a contract, not an implementation detail"
+        );
+        let text = text_crossing_the_batch_bound();
+        let expected = text.encode_utf16().collect::<Vec<_>>();
+        assert_eq!(expected.len(), PINNED_BATCH + 1);
+
+        let batches = batched_code_units(&text);
+
+        assert_eq!(
+            batches.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![PINNED_BATCH, 1],
+            "a payload one unit past the bound must produce exactly 2048 + 1"
+        );
+        assert_eq!(
+            batches.concat(),
+            expected,
+            "batching must not truncate or reorder the paste"
+        );
+        for (index, batch) in batches.iter().enumerate() {
+            assert!(
+                !batch
+                    .last()
+                    .is_some_and(|unit| (0xd800..0xdc00).contains(unit)),
+                "batch {index} must not end on an unpaired high surrogate"
+            );
+        }
+    }
+
+    #[test]
+    fn a_surrogate_pair_astride_the_batch_bound_still_delivers_both_halves_in_order() {
+        // 2047 ASCII units then the pair, so the high half ends batch one.
+        let mut text = "a".repeat(PINNED_BATCH - 1);
+        text.push('😀');
+        let expected = text.encode_utf16().collect::<Vec<_>>();
+        assert_eq!(expected.len(), PINNED_BATCH + 1);
+
+        let batches = batched_code_units(&text);
+
+        assert_eq!(
+            batches.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![PINNED_BATCH, 1]
+        );
+        // The halves land in different `WriteConsoleInputW` calls, but both
+        // calls append to the same console input buffer under one attachment,
+        // so the reader still sees the pair intact and in order.
+        assert_eq!(batches.concat(), expected);
+        assert_eq!(batches[0].last().copied(), Some(0xd83d));
+        assert_eq!(batches[1].first().copied(), Some(0xde00));
     }
 
     #[test]
