@@ -59,11 +59,6 @@ const SLOT_ARTIFACTS: [&str; 6] = [
     DONE_FILE,
 ];
 
-/// DECSET 2004: the pane advertises bracketed-paste support for real, so
-/// per-destination mode is decided from production transcript state rather than
-/// from a stamped test transcript.
-pub(crate) const ENABLE_BRACKETED_PASTE: &[u8] = b"\x1b[?2004h";
-
 /// How long the child stays alive after capturing, so the harness can still
 /// resolve it as a live synchronized destination while it asserts.
 const CHILD_PARK_SECONDS: u64 = 120;

@@ -43,6 +43,75 @@ mod output;
 #[path = "handler_session/bracketed_paste_final_sink_tests.rs"]
 mod bracketed_paste_final_sink_tests;
 
+/// Lets a test hold a deferred initial pane at the lifecycle boundary between
+/// "the child is running and publishing output" and "the starting queue is
+/// drained".
+///
+/// The deferred proof needs a real child to announce `ESC[?2004h` through
+/// actual pane output *while its pane is still starting*. That window exists in
+/// production but is not otherwise observable, and stamping the transcript
+/// instead only proves that a synthetic mode selects a route.
+///
+/// The gate is keyed by runtime session name, so a gated test never delays
+/// another one, and it is `#[cfg(test)]`, so no shipped code path can reach it.
+#[cfg(all(test, windows))]
+pub(crate) mod deferred_initial_gate {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use rmux_proto::SessionName;
+    use tokio::sync::Semaphore;
+
+    fn gates() -> &'static Mutex<HashMap<SessionName, Arc<Semaphore>>> {
+        static GATES: OnceLock<Mutex<HashMap<SessionName, Arc<Semaphore>>>> = OnceLock::new();
+        GATES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Installed before the session is created; dropping it releases the pane.
+    pub(crate) struct DeferredInitialGate {
+        runtime_session_name: SessionName,
+        permits: Arc<Semaphore>,
+    }
+
+    impl DeferredInitialGate {
+        pub(crate) fn install(runtime_session_name: &SessionName) -> Self {
+            let permits = Arc::new(Semaphore::new(0));
+            gates()
+                .lock()
+                .expect("deferred initial gate registry")
+                .insert(runtime_session_name.clone(), Arc::clone(&permits));
+            Self {
+                runtime_session_name: runtime_session_name.clone(),
+                permits,
+            }
+        }
+    }
+
+    impl Drop for DeferredInitialGate {
+        fn drop(&mut self) {
+            // A stored permit releases the spawn task whether or not it has
+            // reached the boundary yet, so a test can never deadlock by
+            // finishing early.
+            self.permits.add_permits(1);
+            gates()
+                .lock()
+                .expect("deferred initial gate registry")
+                .remove(&self.runtime_session_name);
+        }
+    }
+
+    pub(super) async fn wait_if_gated(runtime_session_name: &SessionName) {
+        let permits = gates()
+            .lock()
+            .expect("deferred initial gate registry")
+            .get(runtime_session_name)
+            .map(Arc::clone);
+        if let Some(permits) = permits {
+            let _ = permits.acquire().await;
+        }
+    }
+}
+
 #[cfg(windows)]
 const DEFERRED_INITIAL_PANE_READY_TIMEOUT: Duration = Duration::from_millis(250);
 #[cfg(windows)]
@@ -924,6 +993,14 @@ impl RequestHandler {
         {
             runtime_session_name_hint = current_runtime_session_name;
         }
+
+        // An existing boundary: the child is running and its output already
+        // reaches the transcript, while the pane is still inside the production
+        // `Starting` window that the loop below closes. A test may hold it here
+        // to observe a real capability announcement. Nothing is stamped, no
+        // sink is selected, and no session outside a test is ever gated.
+        #[cfg(test)]
+        deferred_initial_gate::wait_if_gated(&runtime_session_name_hint).await;
 
         let input_grace_deadline = tokio::time::Instant::now() + DEFERRED_INITIAL_PANE_INPUT_GRACE;
         loop {
