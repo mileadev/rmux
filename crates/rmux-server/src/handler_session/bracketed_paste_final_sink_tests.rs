@@ -104,10 +104,8 @@ fn deferred_bracketed_paste_reaches_the_child_with_its_delimiters() {
             .wait_for_pane_startup_to_finish_for_test(&target)
             .await;
 
-        assert_eq!(
-            slot.application_bytes(),
-            expected,
-            "input queued before the pane started must reach the child with its delimiters"
+        slot.assert_application_bytes(
+            "input queued before the pane started must reach the child with its delimiters",
         );
     });
 }

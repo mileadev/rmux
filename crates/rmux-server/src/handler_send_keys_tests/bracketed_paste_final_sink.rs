@@ -133,10 +133,8 @@ async fn active_aware_pane_child_receives_the_bracketed_paste_delimiters() {
         .await
         .expect("attached bracketed paste");
 
-    assert_eq!(
-        slot.application_bytes(),
-        expected,
-        "a bracketed-paste-aware child must receive ESC[200~ + body + ESC[201~ verbatim"
+    slot.assert_application_bytes(
+        "a bracketed-paste-aware child must receive ESC[200~ + body + ESC[201~ verbatim",
     );
 }
 
@@ -154,11 +152,7 @@ async fn active_unaware_pane_child_receives_only_the_paste_body() {
         .await
         .expect("attached bracketed paste");
 
-    assert_eq!(
-        slot.application_bytes(),
-        body,
-        "an unaware child must receive the body with no delimiters"
-    );
+    slot.assert_application_bytes("an unaware child must receive the body with no delimiters");
 }
 
 /// More UTF-16 code units than one `write_windows_console_utf8` record batch,
@@ -187,10 +181,8 @@ async fn bracketed_paste_child_receives_a_body_crossing_the_record_batch_boundar
         .await
         .expect("attached bracketed paste");
 
-    assert_eq!(
-        slot.application_bytes(),
-        expected,
-        "a payload longer than one console record batch must arrive whole"
+    slot.assert_application_bytes(
+        "a payload longer than one console record batch must arrive whole",
     );
 }
 
@@ -222,10 +214,8 @@ async fn split_bracketed_paste_delimiters_reach_the_child_unchanged() {
     }
     assert!(pending_input.is_empty());
 
-    assert_eq!(
-        slot.application_bytes(),
-        expected,
-        "delimiters split across reads must be reassembled for the child"
+    slot.assert_application_bytes(
+        "delimiters split across reads must be reassembled for the child",
     );
 }
 
@@ -266,16 +256,12 @@ async fn assert_mixed_synchronized_final_sink(label: &str, active_pane: u32) {
         .await
         .expect("synchronized bracketed paste");
 
-    assert_eq!(
-        aware.application_bytes(),
-        aware_expected,
+    aware.assert_application_bytes(&format!(
         "the aware destination must keep its delimiters (active pane {active_pane})"
-    );
-    assert_eq!(
-        unaware.application_bytes(),
-        body,
+    ));
+    unaware.assert_application_bytes(&format!(
         "the unaware destination must receive the body only (active pane {active_pane})"
-    );
+    ));
 }
 
 #[tokio::test]
@@ -316,11 +302,7 @@ async fn send_keys_never_wraps_its_payload_for_an_aware_child() {
         Response::SendKeys(SendKeysResponse { key_count: 1 })
     ));
 
-    assert_eq!(
-        slot.application_bytes(),
-        literal.as_bytes(),
-        "send-keys must not enter the bracketed-paste sink"
-    );
+    slot.assert_application_bytes("send-keys must not enter the bracketed-paste sink");
 }
 
 #[tokio::test]
@@ -362,9 +344,7 @@ async fn pane_input_and_raw_attached_keystrokes_are_never_wrapped_for_an_aware_c
         .await
         .expect("raw attached keystrokes");
 
-    assert_eq!(
-        slot.application_bytes(),
-        expected,
-        "SDK/raw keystrokes and pane-input must reach the child unwrapped"
+    slot.assert_application_bytes(
+        "SDK/raw keystrokes and pane-input must reach the child unwrapped",
     );
 }
