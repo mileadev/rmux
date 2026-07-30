@@ -244,12 +244,23 @@ pub fn write_windows_console_utf8(process_id: ProcessId, bytes: &[u8]) -> io::Re
 /// attached ConPTY child console, which a unit test cannot provide, and the
 /// bound itself is what keeps a large paste from being submitted as one
 /// unbounded record array.
+///
+/// A surrogate pair is never divided between two calls. Splitting purely on the
+/// bound would end a batch on a high surrogate whenever a supplementary
+/// character straddles it, submitting each half in a separate
+/// `WriteConsoleInputW` call; a reader that decodes what one call delivered
+/// then sees an unpaired half. Closing the batch one unit early keeps the pair
+/// in a single call and still respects the bound.
 fn write_console_utf8_batches<W>(text: &str, mut write_batch: W) -> io::Result<()>
 where
     W: FnMut(&[WindowsConsoleKeyEvent]) -> io::Result<()>,
 {
     let mut keys = Vec::with_capacity(CONSOLE_TEXT_KEY_BATCH);
     for code_unit in text.encode_utf16() {
+        if keys.len() == CONSOLE_TEXT_KEY_BATCH - 1 && is_high_surrogate(code_unit) {
+            write_batch(&keys)?;
+            keys.clear();
+        }
         keys.push(literal_console_key(code_unit));
         if keys.len() == CONSOLE_TEXT_KEY_BATCH {
             write_batch(&keys)?;
@@ -257,6 +268,10 @@ where
         }
     }
     write_batch(&keys)
+}
+
+const fn is_high_surrogate(code_unit: u16) -> bool {
+    matches!(code_unit, 0xd800..=0xdbff)
 }
 
 fn write_console_key_batch_to_handle(
@@ -807,6 +822,23 @@ mod tests {
         text
     }
 
+    /// No batch may exceed the bound, and none may end on a high surrogate:
+    /// that half's pair would be submitted in a separate call.
+    fn assert_batches_are_bounded_and_whole(batches: &[Vec<u16>]) {
+        for (index, batch) in batches.iter().enumerate() {
+            assert!(
+                batch.len() <= PINNED_BATCH,
+                "batch {index} holds {} code units, past the 2048 bound",
+                batch.len()
+            );
+            assert!(
+                !batch.last().copied().is_some_and(is_high_surrogate),
+                "batch {index} ends on a high surrogate, dividing a pair across \
+                 two WriteConsoleInputW calls"
+            );
+        }
+    }
+
     #[test]
     fn console_text_is_written_in_bounded_batches_without_losing_code_units() {
         assert_eq!(
@@ -829,19 +861,13 @@ mod tests {
             expected,
             "batching must not truncate or reorder the paste"
         );
-        for (index, batch) in batches.iter().enumerate() {
-            assert!(
-                !batch
-                    .last()
-                    .is_some_and(|unit| (0xd800..0xdc00).contains(unit)),
-                "batch {index} must not end on an unpaired high surrogate"
-            );
-        }
+        assert_batches_are_bounded_and_whole(&batches);
     }
 
     #[test]
-    fn a_surrogate_pair_astride_the_batch_bound_still_delivers_both_halves_in_order() {
-        // 2047 ASCII units then the pair, so the high half ends batch one.
+    fn a_surrogate_pair_astride_the_batch_bound_is_never_divided_between_writer_calls() {
+        // 2047 ASCII units then the pair, so splitting on the bound alone would
+        // end batch one on the high half.
         let mut text = "a".repeat(PINNED_BATCH - 1);
         text.push('😀');
         let expected = text.encode_utf16().collect::<Vec<_>>();
@@ -851,14 +877,37 @@ mod tests {
 
         assert_eq!(
             batches.iter().map(Vec::len).collect::<Vec<_>>(),
-            vec![PINNED_BATCH, 1]
+            vec![PINNED_BATCH - 1, 2],
+            "the batch must close one unit early so the pair stays in one call"
         );
-        // The halves land in different `WriteConsoleInputW` calls, but both
-        // calls append to the same console input buffer under one attachment,
-        // so the reader still sees the pair intact and in order.
-        assert_eq!(batches.concat(), expected);
-        assert_eq!(batches[0].last().copied(), Some(0xd83d));
-        assert_eq!(batches[1].first().copied(), Some(0xde00));
+        assert_eq!(
+            batches.concat(),
+            expected,
+            "closing early must not truncate or reorder the paste"
+        );
+        assert_eq!(
+            batches[1],
+            vec![0xd83d, 0xde00],
+            "both halves must reach the same WriteConsoleInputW call, in order"
+        );
+        assert_batches_are_bounded_and_whole(&batches);
+    }
+
+    /// The early close is for pairs only: an ordinary BMP payload must still
+    /// fill every batch to the bound.
+    #[test]
+    fn a_bmp_payload_still_fills_each_batch_to_the_bound() {
+        let text = "β".repeat(PINNED_BATCH * 2 + 5);
+
+        let batches = batched_code_units(&text);
+
+        assert_eq!(
+            batches.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![PINNED_BATCH, PINNED_BATCH, 5],
+            "only a straddling surrogate pair may close a batch early"
+        );
+        assert_eq!(batches.concat(), text.encode_utf16().collect::<Vec<_>>());
+        assert_batches_are_bounded_and_whole(&batches);
     }
 
     #[test]
