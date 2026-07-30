@@ -19,6 +19,10 @@
 //! | `stop`     | harness    | the child may leave its keep-alive park         |
 //! | `done`     | child      | the child left its park, so teardown is over    |
 //!
+//! Only the child's own files are evidence that a child ran. `stop` is written
+//! by the harness, so reading it back would make teardown believe in a child
+//! for every slot it ever touched.
+//!
 //! `out` means *complete*: both children create it only by renaming an
 //! `out.part` that already holds exactly the expected byte count, and any
 //! failure keeps `out.part` and writes `error` instead. A reported `error`
@@ -48,7 +52,7 @@ use std::collections::hash_map::RandomState;
 use std::fs;
 use std::hash::{BuildHasher, Hasher};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 /// The historical standard-input byte boundary the Windows child reads through,
@@ -84,6 +88,19 @@ const SLOT_ARTIFACTS: [&str; 6] = [
     DONE_FILE,
 ];
 
+/// The subset only a child writes, which is therefore the only file evidence
+/// that a child ran.
+///
+/// `stop` is excluded deliberately: teardown writes it itself, so counting it
+/// would be the harness taking its own signal as proof of a process.
+const CHILD_ARTIFACTS: [&str; 5] = [
+    READY_FILE,
+    OUT_PARTIAL_FILE,
+    OUT_FILE,
+    ERROR_FILE,
+    DONE_FILE,
+];
+
 /// How long the child stays alive after capturing, so the harness can still
 /// resolve it as a live synchronized destination while it asserts.
 const CHILD_PARK_SECONDS: u64 = 120;
@@ -113,6 +130,13 @@ pub(crate) struct FinalSinkSlot {
     capture_timeout: Duration,
     capture_idle_gap: Duration,
     teardown_timeout: Duration,
+    /// Whether the command carrying this slot's child was ever submitted.
+    ///
+    /// Shared rather than owned because the call sites that submit it hold the
+    /// slot by reference, and it is the fact teardown cannot recover from the
+    /// filesystem: a child that dies before writing anything leaves a slot
+    /// indistinguishable from one that was never launched.
+    launch_attempted: AtomicBool,
 }
 
 impl FinalSinkSlot {
@@ -160,7 +184,30 @@ impl FinalSinkSlot {
             capture_timeout: CAPTURE_TIMEOUT,
             capture_idle_gap: CAPTURE_IDLE_GAP,
             teardown_timeout: TEARDOWN_TIMEOUT,
+            launch_attempted: AtomicBool::new(false),
         })
+    }
+
+    /// Records that the command carrying this slot's child was submitted.
+    ///
+    /// Called immediately *before* submission rather than after it returns:
+    /// from the moment the request is in flight a process may exist, and a
+    /// teardown that ran against this slot must not read it as never launched.
+    fn record_launch_attempt(&self) {
+        self.launch_attempted.store(true, Ordering::SeqCst);
+    }
+
+    fn launch_was_attempted(&self) -> bool {
+        self.launch_attempted.load(Ordering::SeqCst)
+    }
+
+    /// The child-written files present in this slot.
+    fn child_artifacts(&self) -> Vec<&'static str> {
+        CHILD_ARTIFACTS
+            .iter()
+            .filter(|artifact| self.directory.join(artifact).exists())
+            .copied()
+            .collect()
     }
 
     /// Shortens the diagnostic bounds so a harness regression can reach them
@@ -390,32 +437,36 @@ impl FinalSinkSlot {
 /// slot that was the only evidence the child never left its park.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TeardownOutcome {
-    /// The child never signalled readiness, so there is nothing to acknowledge.
-    NotStarted,
+    /// No command was ever submitted and the slot holds nothing a child wrote,
+    /// so there is no process to ask and nothing to acknowledge.
+    NeverLaunched,
     /// The child wrote `done`: it observably left its park.
     Acknowledged,
     /// `stop` could not be written, so the child was never asked to leave.
     StopNotSignalled { reason: String },
-    /// The wait expired with no acknowledgement.
+    /// The wait expired with no acknowledgement. Carries why teardown believed
+    /// a child existed, so a preserved slot names the evidence it was kept for.
     TimedOut {
         waited: Duration,
+        launch_attempted: bool,
+        child_artifacts: Vec<&'static str>,
         child_error: Option<String>,
     },
 }
 
 impl TeardownOutcome {
-    /// Only an observed end of the child's park lets its slot be removed.
-    const fn permits_removal(&self) -> bool {
-        matches!(self, Self::NotStarted | Self::Acknowledged)
+    /// Only a slot no child ever inhabited, or one whose child observably left
+    /// its park, may be removed.
+    fn permits_removal(&self) -> bool {
+        matches!(self, Self::NeverLaunched | Self::Acknowledged)
     }
 }
 
 impl std::fmt::Display for TeardownOutcome {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotStarted => formatter.write_str(
-                "the child never signalled readiness, so there was nothing to acknowledge",
-            ),
+            Self::NeverLaunched => formatter
+                .write_str("no child was ever launched for this slot and it left nothing behind"),
             Self::Acknowledged => formatter.write_str("the child acknowledged teardown"),
             Self::StopNotSignalled { reason } => write!(
                 formatter,
@@ -424,10 +475,15 @@ impl std::fmt::Display for TeardownOutcome {
             ),
             Self::TimedOut {
                 waited,
+                launch_attempted,
+                child_artifacts,
                 child_error,
             } => write!(
                 formatter,
-                "the child never acknowledged teardown within {waited:?}; child error: {}",
+                "the child never acknowledged teardown within {waited:?}; \
+                 launch attempted: {launch_attempted}; \
+                 child artifacts: {child_artifacts:?}; \
+                 child error: {}",
                 child_error.as_deref().unwrap_or("none")
             ),
         }
@@ -458,11 +514,21 @@ impl FinalSinkSlot {
     /// Signals `stop`, then waits, bounded, for the child to acknowledge that
     /// it left its park.
     ///
-    /// A child that never started cannot acknowledge anything, so the wait is
-    /// skipped for it. Slot paths are unique per instance, so a child that
-    /// outlives this wait can still never satisfy a later run; the wait exists
-    /// so teardown is *observed* rather than assumed, and so its failure is
-    /// reported together with the slot that proves it.
+    /// The question is whether a child exists, and readiness was the wrong way
+    /// to ask it. Both children establish raw mode *before* signalling `ready`,
+    /// so a setup failure writes `error`, parks, and writes `done` only once
+    /// `stop` appears — a live child with no `ready` at all. Teardown used to
+    /// map every missing `ready` to "never started" and let the slot be
+    /// removed, which discarded that `error` and the directory proving it.
+    ///
+    /// So the launch attempt is recorded where the command is submitted, and
+    /// the child's own files are read as evidence that something ran. Only a
+    /// slot that was never launched *and* holds nothing a child wrote skips the
+    /// wait; everything else is owed an acknowledgement. Slot paths are unique
+    /// per instance, so a child that outlives this wait can still never satisfy
+    /// a later run; the wait exists so teardown is *observed* rather than
+    /// assumed, and so its failure is reported together with the slot that
+    /// proves it.
     ///
     /// Terminating and reaping the child *process* is deliberately not done
     /// here. That is owned by `PaneTerminal::terminate_with_bounded_grace`,
@@ -471,13 +537,20 @@ impl FinalSinkSlot {
     /// → `PaneTerminalStore::remove_session`. A slot that also managed the
     /// process would be a second, competing owner of that lifecycle.
     fn teardown(&self) -> TeardownOutcome {
+        // An acknowledgement already on disk answers everything, whether or not
+        // the child ever reached `ready`, and there is nobody left to signal.
+        if self.directory.join(DONE_FILE).is_file() {
+            return TeardownOutcome::Acknowledged;
+        }
+        let launch_attempted = self.launch_was_attempted();
+        let child_artifacts = self.child_artifacts();
+        if !launch_attempted && child_artifacts.is_empty() {
+            return TeardownOutcome::NeverLaunched;
+        }
         if let Err(error) = fs::write(self.directory.join(STOP_FILE), b"1") {
             return TeardownOutcome::StopNotSignalled {
                 reason: error.to_string(),
             };
-        }
-        if !self.directory.join(READY_FILE).is_file() {
-            return TeardownOutcome::NotStarted;
         }
         let deadline = Instant::now() + self.teardown_timeout;
         loop {
@@ -487,6 +560,8 @@ impl FinalSinkSlot {
             if Instant::now() >= deadline {
                 return TeardownOutcome::TimedOut {
                     waited: self.teardown_timeout,
+                    launch_attempted,
+                    child_artifacts,
                     child_error: self.child_error(),
                 };
             }
@@ -564,6 +639,10 @@ pub(crate) async fn create_final_sink_session(
     session: &rmux_proto::SessionName,
     slot: &FinalSinkSlot,
 ) {
+    let command = slot.pane_command();
+    // Recorded before the request is submitted: from here on a child may exist,
+    // and its slot must never be torn down as one that was never launched.
+    slot.record_launch_attempt();
     let created = handler
         .handle(rmux_proto::Request::NewSessionExt(Box::new(
             rmux_proto::NewSessionExtRequest {
@@ -582,7 +661,7 @@ pub(crate) async fn create_final_sink_session(
                 window_name: None,
                 print_session_info: false,
                 print_format: None,
-                command: Some(slot.pane_command()),
+                command: Some(command),
                 process_command: None,
                 client_environment: None,
                 skip_environment_update: false,
@@ -601,6 +680,9 @@ pub(crate) async fn split_final_sink_pane(
     session: &rmux_proto::SessionName,
     slot: &FinalSinkSlot,
 ) -> rmux_proto::PaneTarget {
+    let command = slot.pane_command();
+    // Same obligation as the session call site above.
+    slot.record_launch_attempt();
     let split = handler
         .handle(rmux_proto::Request::SplitWindowExt(Box::new(
             rmux_proto::SplitWindowExtRequest {
@@ -611,7 +693,7 @@ pub(crate) async fn split_final_sink_pane(
                 direction: rmux_proto::SplitDirection::Horizontal,
                 before: false,
                 environment: None,
-                command: Some(slot.pane_command()),
+                command: Some(command),
                 process_command: None,
                 start_directory: None,
                 keep_alive_on_exit: None,
@@ -632,6 +714,16 @@ pub(crate) async fn split_final_sink_pane(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stages the acknowledgement a real child would have written.
+    ///
+    /// The capture-diagnostic cases below fabricate slot files with no child
+    /// behind them. That fabrication is exactly what teardown now reads as a
+    /// started child, so without this every one of their slots would be
+    /// correctly preserved as unacknowledged.
+    fn stage_acknowledgement(slot: &FinalSinkSlot) {
+        fs::write(slot.directory.join(DONE_FILE), b"1").expect("stage the acknowledgement");
+    }
 
     /// A slot must not adopt a directory an earlier child left behind: it would
     /// accept that child's `ready` and `out` as this run's evidence.
@@ -672,6 +764,7 @@ mod tests {
         // Exactly what the legacy console path leaves behind: the body with
         // both six-byte delimiters consumed.
         fs::write(slot.directory.join(OUT_PARTIAL_FILE), b"body").expect("stage the partial");
+        stage_acknowledgement(&slot);
 
         let failure = slot
             .try_application_bytes()
@@ -702,6 +795,7 @@ mod tests {
         let slot = FinalSinkSlot::new("truncated-capture", b"abcdef", false)
             .with_capture_bounds(Duration::from_secs(30), Duration::from_millis(200));
         fs::write(slot.directory.join(OUT_PARTIAL_FILE), b"abc").expect("stage the partial");
+        stage_acknowledgement(&slot);
 
         let failure = slot
             .try_application_bytes()
@@ -727,6 +821,7 @@ mod tests {
             b"standard input ended after 3 of 6 bytes",
         )
         .expect("stage the child's own reason");
+        stage_acknowledgement(&slot);
 
         let failure = slot
             .try_application_bytes()
@@ -758,6 +853,8 @@ mod tests {
             outcome,
             TeardownOutcome::TimedOut {
                 waited: Duration::from_millis(150),
+                launch_attempted: false,
+                child_artifacts: vec![READY_FILE],
                 child_error: None,
             },
             "an expired wait must be distinguishable from an acknowledgement"
@@ -805,25 +902,212 @@ mod tests {
         assert!(!directory.exists(), "an acknowledged slot is removed");
     }
 
-    /// A child that failed before readiness cannot acknowledge anything, so
-    /// teardown must not spend its bound waiting for it — but `stop` is still
-    /// signalled, because a process may exist even when `ready` never appeared.
+    /// The F3 finding itself. Both children establish raw mode *before* they
+    /// signal readiness, so a setup failure writes `error`, parks, and writes
+    /// `done` only once `stop` appears. Teardown used to read the missing
+    /// `ready` as "never started" and let the slot be removed — discarding the
+    /// `error` that was the only account of what went wrong.
     #[test]
-    fn a_child_that_never_signalled_readiness_is_not_waited_for() {
-        let slot = FinalSinkSlot::new("teardown-not-started", b"abc", false)
+    fn a_setup_failure_without_readiness_is_waited_for_and_keeps_its_slot() {
+        let slot = FinalSinkSlot::new("teardown-error-no-ready", b"abc", true)
+            .with_teardown_timeout(Duration::from_millis(150));
+        fs::write(
+            slot.directory.join(ERROR_FILE),
+            b"GetConsoleMode failed: standard input is not a console",
+        )
+        .expect("stage the child's setup failure");
+        let directory = slot.directory.clone();
+
+        let outcome = slot.teardown();
+
+        assert_eq!(
+            outcome,
+            TeardownOutcome::TimedOut {
+                waited: Duration::from_millis(150),
+                launch_attempted: false,
+                child_artifacts: vec![ERROR_FILE],
+                child_error: Some(
+                    "GetConsoleMode failed: standard input is not a console".to_owned()
+                ),
+            },
+            "a child that reported a setup failure must never be read as never launched"
+        );
+        assert!(
+            !outcome.permits_removal(),
+            "an unacknowledged setup failure must not authorise removal"
+        );
+        assert!(
+            outcome.to_string().contains(
+                "child artifacts: [\"error\"]; \
+                 child error: GetConsoleMode failed: standard input is not a console"
+            ),
+            "the evidence and the child's own reason must reach the report: {outcome}"
+        );
+        assert!(
+            directory.join(STOP_FILE).is_file(),
+            "the child must still have been asked to leave its park"
+        );
+
+        drop(slot);
+
+        assert!(
+            directory.is_dir(),
+            "the slot carrying the setup failure is the evidence"
+        );
+        fs::remove_dir_all(&directory).expect("clean up the preserved slot");
+    }
+
+    /// The same child once it has acknowledged: `error` with no `ready` is
+    /// still a complete teardown when `done` is there, and needs no `stop`
+    /// because the park is already over.
+    #[test]
+    fn a_setup_failure_that_acknowledged_teardown_releases_its_slot() {
+        let slot = FinalSinkSlot::new("teardown-error-acknowledged", b"abc", true)
+            .with_teardown_timeout(Duration::from_millis(150));
+        fs::write(
+            slot.directory.join(ERROR_FILE),
+            b"readiness could not be signalled",
+        )
+        .expect("stage the child's setup failure");
+        fs::write(slot.directory.join(DONE_FILE), b"1").expect("stage the acknowledgement");
+        let directory = slot.directory.clone();
+
+        let outcome = slot.teardown();
+
+        assert_eq!(outcome, TeardownOutcome::Acknowledged);
+        assert!(outcome.permits_removal());
+        assert!(
+            !directory.join(STOP_FILE).exists(),
+            "a child that already left its park is not asked again"
+        );
+
+        drop(slot);
+
+        assert!(!directory.exists(), "an acknowledged slot is removed");
+    }
+
+    /// A launch that produced no artifact at all is still a launch: the command
+    /// was submitted, so a process may exist and its acknowledgement is owed.
+    /// The filesystem cannot show this, which is why the attempt is recorded.
+    #[test]
+    fn a_recorded_launch_with_no_artifacts_is_waited_for_and_keeps_its_slot() {
+        let slot = FinalSinkSlot::new("teardown-launched-silent", b"abc", true)
+            .with_teardown_timeout(Duration::from_millis(150));
+        slot.record_launch_attempt();
+        let directory = slot.directory.clone();
+
+        let outcome = slot.teardown();
+
+        assert_eq!(
+            outcome,
+            TeardownOutcome::TimedOut {
+                waited: Duration::from_millis(150),
+                launch_attempted: true,
+                child_artifacts: Vec::new(),
+                child_error: None,
+            },
+            "a submitted command must not be read as never launched"
+        );
+        assert!(!outcome.permits_removal());
+        assert!(
+            outcome.to_string().contains("launch attempted: true"),
+            "the report must say a launch was attempted: {outcome}"
+        );
+        assert!(directory.join(STOP_FILE).is_file());
+
+        drop(slot);
+
+        assert!(
+            directory.is_dir(),
+            "a launched child that never acknowledged keeps its slot"
+        );
+        fs::remove_dir_all(&directory).expect("clean up the preserved slot");
+    }
+
+    /// The genuine fast path: nothing was ever submitted and no child wrote
+    /// anything, so there is nobody to ask and nothing to wait for. `stop` is
+    /// not written either — there is no park to end.
+    #[test]
+    fn a_slot_whose_child_was_never_launched_is_removed_without_waiting() {
+        let slot = FinalSinkSlot::new("teardown-never-launched", b"abc", false)
             .with_teardown_timeout(Duration::from_secs(30));
         let directory = slot.directory.clone();
 
         let started = Instant::now();
         let outcome = slot.teardown();
 
-        assert_eq!(outcome, TeardownOutcome::NotStarted);
+        assert_eq!(outcome, TeardownOutcome::NeverLaunched);
         assert!(
             started.elapsed() < Duration::from_secs(5),
-            "teardown must not wait for a child that never started"
+            "teardown must not wait for a child that was never launched"
         );
-        assert!(directory.join(STOP_FILE).is_file());
+        assert!(
+            !directory.join(STOP_FILE).exists(),
+            "a child that was never launched is not asked to leave a park"
+        );
         assert!(outcome.permits_removal());
+
+        drop(slot);
+
+        assert!(!directory.exists(), "a never-launched slot is removed");
+    }
+
+    /// `stop` is the harness's own signal. Counting it as evidence that a child
+    /// ran would make every slot teardown ever touched look inhabited, so a
+    /// slot holding nothing but `stop` is still never-launched.
+    #[test]
+    fn the_harness_written_stop_is_never_read_as_child_evidence() {
+        let slot = FinalSinkSlot::new("teardown-stop-not-evidence", b"abc", false)
+            .with_teardown_timeout(Duration::from_secs(30));
+        fs::write(slot.directory.join(STOP_FILE), b"1").expect("stage a harness signal");
+        let directory = slot.directory.clone();
+
+        let started = Instant::now();
+        let outcome = slot.teardown();
+
+        assert_eq!(outcome, TeardownOutcome::NeverLaunched);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the harness's own signal must not make teardown wait"
+        );
+        assert!(outcome.permits_removal());
+
+        drop(slot);
+
+        assert!(!directory.exists());
+    }
+
+    /// A child that could not be asked to leave its park tells us nothing about
+    /// whether it left, so its slot is kept and the reason is reported.
+    #[test]
+    fn a_stop_that_could_not_be_written_is_reported_and_keeps_the_slot() {
+        let slot = FinalSinkSlot::new("teardown-stop-unwritable", b"abc", true)
+            .with_teardown_timeout(Duration::from_millis(150));
+        fs::write(slot.directory.join(ERROR_FILE), b"the child failed early")
+            .expect("stage child evidence");
+        // A directory at `stop` cannot be replaced by a file write on either
+        // platform, which is the failure teardown has to survive.
+        fs::create_dir(slot.directory.join(STOP_FILE)).expect("block the stop signal");
+        let directory = slot.directory.clone();
+
+        let outcome = slot.teardown();
+
+        let TeardownOutcome::StopNotSignalled { reason } = &outcome else {
+            panic!("a `stop` that could not be written must be reported: {outcome:?}");
+        };
+        assert!(!reason.is_empty(), "the reason must be carried through");
+        assert!(
+            !outcome.permits_removal(),
+            "a child that was never asked to leave must not authorise removal"
+        );
+
+        drop(slot);
+
+        assert!(
+            directory.is_dir(),
+            "a child that was never asked to leave keeps its slot"
+        );
+        fs::remove_dir_all(&directory).expect("clean up the preserved slot");
     }
 
     #[test]
