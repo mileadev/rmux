@@ -15,9 +15,15 @@
 //! | `ready`    | child      | terminal is raw and the read is starting        |
 //! | `out.part` | child      | the capture so far, grown as bytes arrive       |
 //! | `out`      | child      | the complete application-side capture           |
-//! | `error`    | child      | the child failed before capturing               |
+//! | `error`    | child      | a step failed, with the reason that step gives  |
 //! | `stop`     | harness    | the child may leave its keep-alive park         |
 //! | `done`     | child      | the child left its park, so teardown is over    |
+//!
+//! `out` means *complete*: both children create it only by renaming an
+//! `out.part` that already holds exactly the expected byte count, and any
+//! failure keeps `out.part` and writes `error` instead. A reported `error`
+//! therefore outranks everything the harness might otherwise infer from a
+//! file's presence.
 //!
 //! `out.part` is what makes a mutation red readable. A mutation that routes a
 //! bracketed paste back through the delimiter-consuming legacy path leaves the
@@ -52,6 +58,10 @@ use std::time::{Duration, Instant};
 /// the directory its declaration names, not one named after itself.
 #[path = "final_sink/byte_observer.rs"]
 mod byte_observer;
+/// The Unix child's capture protocol. Generated on every platform so its shape
+/// is checked wherever this crate's tests run, executed only on Unix.
+#[path = "final_sink/unix_child.rs"]
+mod unix_child;
 #[cfg(windows)]
 #[path = "final_sink/windows_byte_child.rs"]
 mod windows_byte_child;
@@ -218,6 +228,17 @@ impl FinalSinkSlot {
         let mut partial_len = self.partial_bytes().len();
         let mut partial_grew_at = Instant::now();
         loop {
+            // A reported failure outranks a published capture. Both children
+            // now publish `out` only after an exact capture, so the two are
+            // mutually exclusive; checking `out` first is what let a script
+            // that renamed a short partial be read as a completed publication
+            // and reported as merely the wrong bytes with `child error: none`.
+            if let Some(error) = self.child_error() {
+                return Err(self.describe(
+                    "the child failed before persisting its capture",
+                    Some(error),
+                ));
+            }
             if self.directory.join(OUT_FILE).is_file() {
                 return fs::read(self.directory.join(OUT_FILE)).map_err(|error| {
                     self.describe(
@@ -225,12 +246,6 @@ impl FinalSinkSlot {
                         None,
                     )
                 });
-            }
-            if let Some(error) = self.child_error() {
-                return Err(self.describe(
-                    "the child failed before persisting its capture",
-                    Some(error),
-                ));
             }
             let now = Instant::now();
             let current = self.partial_bytes().len();
@@ -319,36 +334,12 @@ impl FinalSinkSlot {
         report
     }
 
+    /// Runs the checked `/bin/sh` capture protocol. `dd bs=1` writes each byte
+    /// to `out.part` as it arrives, so a capture that never completes still
+    /// exposes exactly what reached the child.
     #[cfg(unix)]
     pub(crate) fn pane_command(&self) -> Vec<String> {
-        let announce = if self.bracket_aware {
-            r"printf '\033[?2004h'"
-        } else {
-            ":"
-        };
-        // `dd bs=1` writes each byte to `out.part` as it arrives, so a capture
-        // that never completes still exposes exactly what reached the child.
-        let script = format!(
-            "stty raw -echo\n\
-             {announce}\n\
-             : > {ready}\n\
-             dd bs=1 count={count} of={partial} 2>/dev/null\n\
-             mv {partial} {out}\n\
-             i=0\n\
-             while [ \"$i\" -lt {ticks} ] && [ ! -e {stop} ]; do\n\
-             sleep 0.05\n\
-             i=$((i+1))\n\
-             done\n\
-             : > {done}\n",
-            ready = super::sh_quote(&self.path(READY_FILE)),
-            count = self.expected.len(),
-            partial = super::sh_quote(&self.path(OUT_PARTIAL_FILE)),
-            out = super::sh_quote(&self.path(OUT_FILE)),
-            stop = super::sh_quote(&self.path(STOP_FILE)),
-            done = super::sh_quote(&self.path(DONE_FILE)),
-            ticks = CHILD_PARK_SECONDS * 20,
-        );
-        vec!["/bin/sh".to_owned(), "-c".to_owned(), script]
+        unix_child::pane_command(self)
     }
 
     /// Runs the pinned Rust child, whose read boundary is the historical
@@ -627,6 +618,35 @@ mod tests {
         assert!(
             failure.contains("the received bytes are an exact prefix; 3 byte(s) never arrived"),
             "a truncation must not be reported as a mismatch: {failure}"
+        );
+    }
+
+    /// A child that reported a failure must be diagnosed by that reason, not by
+    /// whichever slot file the harness happens to look at first. A script that
+    /// renamed a short partial used to be read as a completed publication and
+    /// reported as merely the wrong bytes with `child error: none`.
+    #[test]
+    fn a_reported_child_failure_outranks_a_published_capture() {
+        let slot = FinalSinkSlot::new("error-precedence", b"abcdef", false);
+        fs::write(slot.directory.join(OUT_PARTIAL_FILE), b"abc").expect("stage the partial");
+        fs::write(slot.directory.join(OUT_FILE), b"abc").expect("stage a published capture");
+        fs::write(
+            slot.directory.join(ERROR_FILE),
+            b"standard input ended after 3 of 6 bytes",
+        )
+        .expect("stage the child's own reason");
+
+        let failure = slot
+            .try_application_bytes()
+            .expect_err("a reported failure must not be read as a completed capture");
+
+        assert!(
+            failure.contains("the child failed before persisting its capture"),
+            "the reported failure must be the diagnosis: {failure}"
+        );
+        assert!(
+            failure.contains("child error: standard input ended after 3 of 6 bytes"),
+            "the child's own reason must be carried through: {failure}"
         );
     }
 
