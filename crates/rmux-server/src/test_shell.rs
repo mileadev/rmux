@@ -143,9 +143,9 @@ pub(crate) mod final_sink {
 
     impl FinalSinkSlot {
         /// `expected` is the exact byte sequence the child must read. It must be
-        /// valid UTF-8: the Windows child reads UTF-16 console characters, and
-        /// arbitrary non-UTF-8 bytes are a separate policy that this harness
-        /// deliberately does not exercise.
+        /// valid UTF-8: the Windows child converts the console's UTF-16 to UTF-8
+        /// itself, and arbitrary non-UTF-8 bytes are a separate policy that this
+        /// harness deliberately does not exercise.
         pub(crate) fn new(label: &str, expected: &[u8], bracket_aware: bool) -> Self {
             assert!(
                 std::str::from_utf8(expected).is_ok(),
@@ -167,14 +167,6 @@ pub(crate) mod final_sink {
 
         fn path(&self, file: &str) -> String {
             self.directory.join(file).display().to_string()
-        }
-
-        /// Number of UTF-16 code units the Windows child must accumulate.
-        fn expected_code_units(&self) -> usize {
-            std::str::from_utf8(&self.expected)
-                .expect("checked in `new`")
-                .encode_utf16()
-                .count()
         }
 
         pub(crate) fn wait_until_ready(&self) {
@@ -248,8 +240,27 @@ pub(crate) mod final_sink {
         }
 
         /// Puts the pane console into the mode a bracketed-paste-aware
-        /// application uses, then reads exactly the expected number of UTF-16
-        /// console characters and persists them as UTF-8.
+        /// application uses, then reads exactly the expected number of
+        /// standard-input *bytes* and persists them.
+        ///
+        /// This is the read boundary the historical Windows probe used: a
+        /// standard-input `Read` that yields UTF-8 bytes. Reproducing it needs
+        /// three properties, not just a call swap.
+        ///
+        /// * The console is drained as UTF-16 and converted in the child. The
+        ///   obvious alternative — `ReadFile` on the console handle under the
+        ///   UTF-8 input code page, which `[Console]::OpenStandardInput()`
+        ///   wraps — is *not* equivalent: it is byte-exact for CR/LF, `β`,
+        ///   `ESC` and control bytes, but conhost converts each UTF-16 code
+        ///   unit on its own, so a surrogate pair arrives as two U+FFFD and
+        ///   `😀` is destroyed.
+        /// * A high surrogate left at the end of one read is carried into the
+        ///   next instead of being encoded alone, because a lone surrogate
+        ///   encodes to U+FFFD. This is the child-side fixup a standard
+        ///   library's console `Read` performs.
+        /// * The loop counts bytes, so both platforms use one expected length —
+        ///   the same one the Unix `dd bs=1 count=N` child consumes — and a
+        ///   short capture is reported in bytes.
         #[cfg(windows)]
         fn windows_script(&self) -> String {
             let announce = if self.bracket_aware {
@@ -284,18 +295,39 @@ public static extern bool ReadConsoleW(IntPtr h, [Out] char[] buffer, uint toRea
     if (-not [RmuxFinalSink.Con]::SetConsoleMode($handle, $raw)) {{ throw 'SetConsoleMode failed' }}
     {announce}
     [IO.File]::WriteAllText($ready, '1')
-    $want = {units}
-    $builder = New-Object System.Text.StringBuilder
+    $want = {bytes}
+    $captured = New-Object System.IO.MemoryStream
     $buffer = New-Object char[] 4096
-    while ($builder.Length -lt $want) {{
+    $pendingHigh = -1
+    while ($captured.Length -lt $want) {{
         $read = [uint32]0
         if (-not [RmuxFinalSink.Con]::ReadConsoleW($handle, $buffer, [uint32]$buffer.Length, [ref]$read, [IntPtr]::Zero)) {{
             throw 'ReadConsoleW failed'
         }}
-        if ($read -eq 0) {{ throw "console input ended after $($builder.Length) of $want units" }}
-        $null = $builder.Append($buffer, 0, $read)
+        if ($read -eq 0) {{ throw "console input ended after $($captured.Length) of $want bytes" }}
+        $chunk = [string]::new($buffer, 0, [int]$read)
+        if ($pendingHigh -ge 0) {{
+            $chunk = [string][char]$pendingHigh + $chunk
+            $pendingHigh = -1
+        }}
+        # A lone high surrogate would encode to U+FFFD and destroy the pair, so
+        # carry it into the next read instead of converting it now.
+        if ($chunk.Length -gt 0) {{
+            $last = [int]$chunk[$chunk.Length - 1]
+            if ($last -ge 0xD800 -and $last -le 0xDBFF) {{
+                $pendingHigh = $last
+                $chunk = $chunk.Substring(0, $chunk.Length - 1)
+            }}
+        }}
+        if ($chunk.Length -gt 0) {{
+            $encoded = [Text.Encoding]::UTF8.GetBytes($chunk)
+            $captured.Write($encoded, 0, $encoded.Length)
+        }}
     }}
-    [IO.File]::WriteAllBytes($partial, [Text.Encoding]::UTF8.GetBytes($builder.ToString()))
+    if ($pendingHigh -ge 0) {{
+        throw "console input ended on an unpaired high surrogate after $($captured.Length) of $want bytes"
+    }}
+    [IO.File]::WriteAllBytes($partial, $captured.ToArray())
     Move-Item -LiteralPath $partial -Destination $out
     $deadline = (Get-Date).AddSeconds({park})
     while ((Get-Date) -lt $deadline -and -not (Test-Path -LiteralPath $stop)) {{
@@ -311,7 +343,7 @@ public static extern bool ReadConsoleW(IntPtr h, [Out] char[] buffer, uint toRea
                 out = super::powershell_quote(&self.path(OUT_FILE)),
                 stop = super::powershell_quote(&self.path(STOP_FILE)),
                 error_file = super::powershell_quote(&self.path(ERROR_FILE)),
-                units = self.expected_code_units(),
+                bytes = self.expected.len(),
                 park = CHILD_PARK_SECONDS,
             )
         }
