@@ -15,21 +15,66 @@
 //! this test binary compiles and drives, so the observer the harness asserts on
 //! and the observer the child runs are the same bytes by construction.
 //!
-//! The build is cached under the OS temporary directory, keyed by a digest of
-//! those exact sources, and the sources plus the `rustc` identity are kept
-//! beside the program so the later Windows 10 build-19045 A/B can prove it
-//! rebuilt this observer and not another one.
+//! # Why every build is fresh and private
+//!
+//! The whole value of this child is that the R1 A/B can say *which* observer it
+//! measured. The build this replaces cached the executable under a predictable
+//! shared path and returned it whenever `rmux-final-sink-child.exe` there
+//! happened to be a file — so a stale, half-installed or deliberately planted
+//! executable was executed as the pinned child, and the diagnostic would have
+//! reported on whatever that was.
+//!
+//! A path is not provenance, and neither is anything stored beside an
+//! executable: a file the harness does not control cannot vouch for a file the
+//! harness does not control. The correction is therefore not a stronger cache
+//! but no cache at all. Each process compiles its own child into a directory it
+//! created exclusively, never adopting an existing one, and [`OnceLock`] is an
+//! in-process compile-once guard over *that* build rather than a way to reuse
+//! another process's work.
+//!
+//! # What one build retains
+//!
+//! Beside the executable, in the directory the build owns:
+//!
+//! | File               | Meaning                                              |
+//! |--------------------|------------------------------------------------------|
+//! | `byte_observer.rs` | the observer bytes `rustc` was given                 |
+//! | `main.rs`          | the generated child bytes `rustc` was given          |
+//! | `rustc-program.txt`| the one resolved compiler value, displayed and exact |
+//! | `rustc-argv.txt`   | the complete compilation argv, as invoked            |
+//! | `rustc-identity.txt`| `rustc -vV` from that same value                    |
+//! | `source-identity.txt`| the informational source digest and byte counts    |
+//!
+//! The retained sources *are* the compilation inputs — `rustc` is pointed at
+//! this `main.rs`, not at a copy — so an A/B compares the executable against the
+//! bytes that produced it and cannot be shown a file that drifted from them.
+//! The digest is recorded so two hosts can say they built the same source; it
+//! never authorises reusing anything.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
 const OBSERVER_FILE: &str = "byte_observer.rs";
 const MAIN_FILE: &str = "main.rs";
 const PROGRAM_FILE: &str = "rmux-final-sink-child.exe";
-const TOOLCHAIN_FILE: &str = "toolchain.txt";
+/// What the compiler writes. Renamed to [`PROGRAM_FILE`] only after the
+/// compilation succeeded, so nothing observing this directory can reach a
+/// half-written executable under the child's name.
+const PARTIAL_PROGRAM_FILE: &str = "rmux-final-sink-child.partial.exe";
+const COMPILER_PROGRAM_FILE: &str = "rustc-program.txt";
+const COMPILER_ARGV_FILE: &str = "rustc-argv.txt";
+const COMPILER_IDENTITY_FILE: &str = "rustc-identity.txt";
+const SOURCE_IDENTITY_FILE: &str = "source-identity.txt";
+
+const BUILD_DIRECTORY_PREFIX: &str = "build-";
+/// How many candidate directories one build will create-or-skip before giving
+/// up. Only an occupied candidate costs an attempt, and in a fresh root the
+/// first one always wins; the bound exists so a root that cannot be built in
+/// fails attributably instead of looping.
+const BUILD_DIRECTORY_ATTEMPTS: u32 = 64;
 
 /// The observer module this test binary itself compiles.
 pub(super) const OBSERVER_SOURCE: &str = include_str!("byte_observer.rs");
@@ -165,10 +210,35 @@ fn park_until_stopped(slot: &Slot, seconds: u64) {
 }
 "##;
 
+/// Everything one build of the child is identified by.
+///
+/// The compiler value, the argv and the identity are carried together
+/// deliberately: they are the three facts that must agree, and returning only
+/// a path is what let the previous build key one compiler and invoke another.
+#[derive(Debug)]
+struct ChildBuild {
+    /// The directory this build created exclusively and owns.
+    directory: PathBuf,
+    /// The published executable inside it.
+    program: PathBuf,
+    /// The single resolved compiler value.
+    compiler: OsString,
+    /// The complete compilation argv, program first, exactly as invoked.
+    argv: Vec<OsString>,
+    /// `rustc -vV` from that same value.
+    identity: String,
+}
+
 /// The compiled child, built once per process and shared by every slot.
+///
+/// The cache is in-process and nothing more: it remembers the outcome of *this*
+/// process's own build. It is never a way to adopt an executable some other
+/// process left behind.
 pub(super) fn child_program() -> Result<PathBuf, String> {
     static PROGRAM: OnceLock<Result<PathBuf, String>> = OnceLock::new();
-    PROGRAM.get_or_init(compile_child_program).clone()
+    PROGRAM
+        .get_or_init(|| compile_child_program().map(|build| build.program))
+        .clone()
 }
 
 /// A stable digest of the exact child sources.
@@ -177,6 +247,9 @@ pub(super) fn child_program() -> Result<PathBuf, String> {
 /// implementation detail, so this is an explicit FNV-1a. Carriage returns are
 /// excluded so a checkout's line endings cannot change the identity a later
 /// Windows 10 A/B compares against.
+///
+/// This is evidence, never authorisation: it says two hosts compiled the same
+/// bytes, and it is not consulted to decide whether an executable may be used.
 pub(super) fn source_digest() -> u64 {
     let mut digest = 0xcbf2_9ce4_8422_2325_u64;
     for byte in OBSERVER_SOURCE
@@ -190,33 +263,58 @@ pub(super) fn source_digest() -> u64 {
     digest
 }
 
-fn compile_child_program() -> Result<PathBuf, String> {
-    let directory =
-        std::env::temp_dir().join(format!("rmux-final-sink-child-{:016x}", source_digest()));
-    let program = directory.join(PROGRAM_FILE);
-    if program.is_file() {
-        return Ok(program);
-    }
+fn compile_child_program() -> Result<ChildBuild, String> {
+    build_child_program(&default_build_root(), compiler_program())
+}
 
-    // Compiled in a process-private staging directory: several test processes
-    // can reach this at once, and only the final install is allowed to race.
-    let staging = directory.join(format!("build-{}", std::process::id()));
-    write_source_tree(&staging)?;
-    let compiler = compiler_program();
-    let built = staging.join(PROGRAM_FILE);
-    let compiled = Command::new(&compiler)
-        .arg("--edition")
-        .arg("2021")
-        .arg("--crate-name")
-        .arg("rmux_final_sink_child")
-        .arg("-o")
-        .arg(&built)
-        .arg(staging.join(MAIN_FILE))
+/// The container this process's build directories are created under.
+///
+/// Named for the process and the source digest so concurrent test binaries do
+/// not contend and a differently-sourced checkout lands elsewhere. Neither is a
+/// safety property: an operating system reuses process ids, so the exclusive
+/// creation below is what actually keeps a build out of an occupied directory.
+fn default_build_root() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "rmux-final-sink-child-{}-{:016x}",
+        std::process::id(),
+        source_digest()
+    ))
+}
+
+/// Compiles one child into a directory this call exclusively created.
+fn build_child_program(root: &Path, compiler: OsString) -> Result<ChildBuild, String> {
+    let directory = fresh_build_directory(root)?;
+
+    // The retained sources are the compilation inputs themselves, so a later
+    // A/B reads the bytes that produced this executable rather than a copy of
+    // them. Every write is checked: a build whose provenance was not recorded
+    // is not a build this diagnostic may use.
+    write_checked(&directory.join(OBSERVER_FILE), OBSERVER_SOURCE)?;
+    write_checked(&directory.join(MAIN_FILE), CHILD_MAIN_SOURCE)?;
+    write_checked(&directory.join(SOURCE_IDENTITY_FILE), &source_identity())?;
+
+    // One resolved value, both uses. Asking the environment a second time is
+    // how a `RUSTC` or `PATH` change records compiler A and invokes compiler B.
+    let identity = compiler_identity(&compiler)?;
+    write_checked(
+        &directory.join(COMPILER_PROGRAM_FILE),
+        &describe_program(&compiler),
+    )?;
+    write_checked(&directory.join(COMPILER_IDENTITY_FILE), &identity)?;
+
+    let partial = directory.join(PARTIAL_PROGRAM_FILE);
+    let argv = compilation_argv(&compiler, &directory, &partial);
+    write_checked(&directory.join(COMPILER_ARGV_FILE), &describe_argv(&argv))?;
+
+    // Invoked *through* the recorded argv rather than beside it, so the record
+    // and the invocation cannot describe different commands.
+    let compiled = Command::new(&argv[0])
+        .args(&argv[1..])
         .output()
         .map_err(|error| {
             format!(
                 "{} could not be run to build the final-sink child: {error}",
-                compiler.to_string_lossy()
+                Path::new(&compiler).display()
             )
         })?;
     if !compiled.status.success() {
@@ -227,70 +325,231 @@ fn compile_child_program() -> Result<PathBuf, String> {
         ));
     }
 
-    // Kept beside the program: the Windows 10 A/B has to be able to show it
-    // rebuilt this observer, with this toolchain, and not another one.
-    let _ = fs::write(directory.join(OBSERVER_FILE), OBSERVER_SOURCE);
-    let _ = fs::write(directory.join(MAIN_FILE), CHILD_MAIN_SOURCE);
-    let _ = fs::write(
-        directory.join(TOOLCHAIN_FILE),
-        toolchain_identity(&compiler),
-    );
-
-    match fs::rename(&built, &program) {
-        Ok(()) => {}
-        // Another process installed the byte-identical program first.
-        Err(_) if program.is_file() => {}
-        Err(error) => {
-            return Err(format!(
-                "the compiled final-sink child could not be installed at {}: {error}",
-                program.display()
-            ))
-        }
-    }
-    let _ = fs::remove_dir_all(&staging);
-    Ok(program)
-}
-
-fn write_source_tree(staging: &std::path::Path) -> Result<(), String> {
-    fs::create_dir_all(staging).map_err(|error| {
+    let program = directory.join(PROGRAM_FILE);
+    fs::rename(&partial, &program).map_err(|error| {
         format!(
-            "the final-sink child build directory {} could not be created: {error}",
-            staging.display()
+            "the compiled final-sink child could not be published at {}: {error}",
+            program.display()
         )
     })?;
-    for (name, source) in [
-        (OBSERVER_FILE, OBSERVER_SOURCE),
-        (MAIN_FILE, CHILD_MAIN_SOURCE),
-    ] {
-        fs::write(staging.join(name), source).map_err(|error| {
-            format!(
-                "the final-sink child source {} could not be written: {error}",
-                staging.join(name).display()
-            )
-        })?;
+
+    Ok(ChildBuild {
+        directory,
+        program,
+        compiler,
+        argv,
+        identity,
+    })
+}
+
+/// The one site at which a build takes ownership of a directory.
+///
+/// Every candidate is created exclusively and none is ever adopted. This is the
+/// correction: the previous build resolved a predictable shared path and
+/// returned the executable there whenever it was a file, so a stale,
+/// half-installed or planted program ran as the pinned child. An occupied
+/// candidate belongs to something else — another process's build in flight, an
+/// abandoned run, or someone's plant — and none of those can be told apart from
+/// a path, so the next candidate is created instead.
+fn fresh_build_directory(root: &Path) -> Result<PathBuf, String> {
+    fs::create_dir_all(root).map_err(|error| {
+        format!(
+            "the final-sink child build root {} could not be created: {error}",
+            root.display()
+        )
+    })?;
+    for attempt in 0..BUILD_DIRECTORY_ATTEMPTS {
+        let directory = root.join(format!("{BUILD_DIRECTORY_PREFIX}{attempt}"));
+        match fs::create_dir(&directory) {
+            Ok(()) => return Ok(directory),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "the final-sink child build directory {} could not be created: {error}",
+                    directory.display()
+                ))
+            }
+        }
     }
-    Ok(())
+    Err(format!(
+        "no free final-sink child build directory was available under {} \
+         after {BUILD_DIRECTORY_ATTEMPTS} attempts",
+        root.display()
+    ))
+}
+
+/// The complete compilation command, program first.
+fn compilation_argv(compiler: &OsStr, directory: &Path, output: &Path) -> Vec<OsString> {
+    vec![
+        compiler.to_owned(),
+        OsString::from("--edition"),
+        OsString::from("2021"),
+        OsString::from("--crate-name"),
+        OsString::from("rmux_final_sink_child"),
+        OsString::from("-o"),
+        output.as_os_str().to_owned(),
+        directory.join(MAIN_FILE).into_os_string(),
+    ]
+}
+
+fn write_checked(path: &Path, contents: &str) -> Result<(), String> {
+    fs::write(path, contents).map_err(|error| {
+        format!(
+            "the final-sink child build could not write {}: {error}",
+            path.display()
+        )
+    })
 }
 
 /// Cargo does not export `RUSTC` to a test binary, but the test's working
 /// directory is inside the workspace, so the `rustup` shim resolves the
 /// `rust-toolchain.toml` channel. An explicit `RUSTC` still wins.
+///
+/// Called once per build; the value it returns is what is recorded *and* what
+/// is invoked.
 fn compiler_program() -> OsString {
     std::env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"))
 }
 
-fn toolchain_identity(compiler: &OsStr) -> String {
-    Command::new(compiler)
+/// `rustc -vV` from the value that is about to compile the child.
+///
+/// A compiler that cannot be run, exits non-zero or reports nothing is a hard
+/// failure: an unidentified compiler is exactly what an R1 A/B cannot have, and
+/// the previous build recorded that condition as a sidecar string and carried
+/// on.
+fn compiler_identity(compiler: &OsStr) -> Result<String, String> {
+    let displayed = Path::new(compiler).display().to_string();
+    let identity = Command::new(compiler)
         .arg("--version")
         .arg("--verbose")
         .output()
-        .map(|identity| String::from_utf8_lossy(&identity.stdout).into_owned())
-        .unwrap_or_else(|error| format!("the compiler identity is unavailable: {error}"))
+        .map_err(|error| {
+            format!(
+                "{displayed} could not be run to identify the final-sink child's compiler: {error}"
+            )
+        })?;
+    if !identity.status.success() {
+        return Err(format!(
+            "{displayed} could not identify itself ({}):\n{}",
+            identity.status,
+            String::from_utf8_lossy(&identity.stderr)
+        ));
+    }
+    let reported = String::from_utf8_lossy(&identity.stdout).into_owned();
+    if reported.trim().is_empty() {
+        return Err(format!(
+            "{displayed} reported an empty compiler identity, so this build cannot be attributed"
+        ));
+    }
+    Ok(reported)
+}
+
+/// Both forms of the one compiler value: what a person reads, and the exact
+/// form, which survives a path the lossy display would mangle.
+fn describe_program(compiler: &OsStr) -> String {
+    format!(
+        "display: {}\nexact: {compiler:?}\n",
+        Path::new(compiler).display()
+    )
+}
+
+fn describe_argv(argv: &[OsString]) -> String {
+    let mut described = String::new();
+    for (index, argument) in argv.iter().enumerate() {
+        described.push_str(&format!("{index}: {argument:?}\n"));
+    }
+    described
+}
+
+fn source_identity() -> String {
+    format!(
+        "source-digest: {:016x}\n{OBSERVER_FILE}: {} bytes\n{MAIN_FILE}: {} bytes\n",
+        source_digest(),
+        OBSERVER_SOURCE.len(),
+        CHILD_MAIN_SOURCE.len()
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A genuine executable that is not the pinned child. Compiled rather than
+    /// written as text: the rejection under test must not depend on the planted
+    /// bytes being unrunnable, because a real attacker plants something that
+    /// runs.
+    const POISON_MAIN_SOURCE: &str = r#"fn main() {
+    println!("a planted final-sink child");
+}
+"#;
+
+    /// Set by the outer half of the `RUSTC` override case in the environment of
+    /// the child test process that performs the overridden build.
+    const OVERRIDE_CASE_ENV: &str = "RMUX_FINAL_SINK_CHILD_RUSTC_OVERRIDE_CASE";
+    /// The full path of this case, so the outer half can re-run exactly it.
+    const OVERRIDE_CASE_NAME: &str = "test_shell::final_sink::windows_byte_child::tests::\
+         a_real_absolute_rustc_override_builds_the_child_with_that_exact_compiler";
+
+    /// A build root no other case in this process can collide with.
+    fn scratch_root(label: &str) -> PathBuf {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "rmux-final-sink-child-case-{}-{}-{label}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).expect("create the scratch build root");
+        root
+    }
+
+    /// Proves a candidate really is this harness's child rather than merely a
+    /// file at the child's path: run with no arguments, the pinned child
+    /// answers with its own usage and exit code 2.
+    fn assert_is_the_pinned_child(program: &Path) {
+        let answered = Command::new(program)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap_or_else(|error| panic!("run {}: {error}", program.display()));
+        let usage = String::from_utf8_lossy(&answered.stderr).into_owned();
+        assert_eq!(
+            answered.status.code(),
+            Some(2),
+            "{} did not answer as the pinned child: {usage}",
+            program.display()
+        );
+        assert!(
+            usage.contains("usage: rmux-final-sink-child <ready>"),
+            "{} did not answer as the pinned child: {usage}",
+            program.display()
+        );
+    }
+
+    /// Compiles [`POISON_MAIN_SOURCE`] to `output` with the same toolchain.
+    fn plant_executable(output: &Path) -> Vec<u8> {
+        let staging = output
+            .parent()
+            .expect("the planted executable has a directory")
+            .join("planted-main.rs");
+        fs::write(&staging, POISON_MAIN_SOURCE).expect("write the planted source");
+        let compiled = Command::new(compiler_program())
+            .arg("--edition")
+            .arg("2021")
+            .arg("--crate-name")
+            .arg("planted_final_sink_child")
+            .arg("-o")
+            .arg(output)
+            .arg(&staging)
+            .output()
+            .expect("run the compiler for the planted executable");
+        assert!(
+            compiled.status.success(),
+            "the planted executable did not compile: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        fs::remove_file(&staging).expect("remove the planted source");
+        fs::read(output).expect("read the planted executable")
+    }
 
     /// The whole point of the correction: the child must read through the
     /// historical standard-input byte boundary, not a hand-written console
@@ -347,17 +606,270 @@ mod tests {
         assert!(!CHILD_MAIN_SOURCE.contains('\r'));
     }
 
-    /// The pinned source must actually build with the workspace toolchain;
-    /// otherwise every final-sink proof fails for a reason unrelated to the
-    /// sink under test.
+    /// The pinned source must actually build with the workspace toolchain, and
+    /// the build must be able to say what it built: these are the links the R1
+    /// A/B follows from a committed source byte to an executed one.
     #[test]
-    fn the_pinned_child_source_compiles_with_the_workspace_toolchain() {
-        let program = child_program().unwrap_or_else(|failure| panic!("{failure}"));
-        assert!(
-            program.is_file(),
-            "the compiled child is missing at {}",
-            program.display()
+    fn a_fresh_private_build_retains_the_sources_compiler_and_executable_it_used() {
+        let root = scratch_root("provenance");
+        let build = build_child_program(&root, compiler_program())
+            .unwrap_or_else(|failure| panic!("{failure}"));
+        eprintln!(
+            "final-sink child build: directory={} program={}",
+            build.directory.display(),
+            build.program.display()
         );
+
+        assert_eq!(
+            build.directory,
+            root.join(format!("{BUILD_DIRECTORY_PREFIX}0")),
+            "a fresh root's first candidate is the one that is created"
+        );
+        assert_eq!(build.program, build.directory.join(PROGRAM_FILE));
+        assert!(build.program.is_file(), "the child was not published");
+        assert!(
+            !build.directory.join(PARTIAL_PROGRAM_FILE).exists(),
+            "publication renames the partial executable rather than copying it"
+        );
+
+        // The retained sources are the compilation inputs, not copies of them.
+        assert_eq!(
+            fs::read_to_string(build.directory.join(OBSERVER_FILE)).expect("retained observer"),
+            OBSERVER_SOURCE
+        );
+        assert_eq!(
+            fs::read_to_string(build.directory.join(MAIN_FILE)).expect("retained main"),
+            CHILD_MAIN_SOURCE
+        );
+        assert_eq!(
+            build.argv.last().expect("the argv names a source"),
+            build.directory.join(MAIN_FILE).as_os_str(),
+            "the compiler must have been pointed at the retained source"
+        );
+        assert_eq!(
+            fs::read_to_string(build.directory.join(SOURCE_IDENTITY_FILE))
+                .expect("retained source identity"),
+            source_identity()
+        );
+
+        // One compiler value produced both the identity and the executable.
+        assert_eq!(
+            build.argv.first().expect("the argv names a compiler"),
+            &build.compiler,
+            "the recorded compiler must be the one that was invoked"
+        );
+        assert_eq!(
+            fs::read_to_string(build.directory.join(COMPILER_PROGRAM_FILE))
+                .expect("retained compiler"),
+            describe_program(&build.compiler)
+        );
+        assert_eq!(
+            fs::read_to_string(build.directory.join(COMPILER_ARGV_FILE)).expect("retained argv"),
+            describe_argv(&build.argv)
+        );
+        let identity =
+            fs::read_to_string(build.directory.join(COMPILER_IDENTITY_FILE)).expect("retained -vV");
+        assert_eq!(identity, build.identity);
+        assert!(
+            identity.starts_with("rustc ") && identity.contains("\nhost: "),
+            "the retained identity must be a real `rustc -vV`: {identity}"
+        );
+
+        assert_is_the_pinned_child(&build.program);
+    }
+
+    /// The finding itself, against the production selector rather than a
+    /// helper: an executable planted at the path a build would use must never
+    /// become this harness's child.
+    ///
+    /// The plant is a genuine compiled program, so nothing here turns on the
+    /// bytes being unrunnable — only on the build refusing to adopt what it did
+    /// not create.
+    #[test]
+    fn a_pre_populated_build_target_is_never_selected_as_the_child() {
+        let root = scratch_root("planted-target");
+        let occupied = root.join(format!("{BUILD_DIRECTORY_PREFIX}0"));
+        fs::create_dir_all(&occupied).expect("stage the occupied build target");
+        let planted_path = occupied.join(PROGRAM_FILE);
+        let planted = plant_executable(&planted_path);
+
+        let build = build_child_program(&root, compiler_program())
+            .unwrap_or_else(|failure| panic!("{failure}"));
+
+        assert_ne!(
+            build.directory, occupied,
+            "an occupied build target must never be adopted"
+        );
+        assert_eq!(
+            build.directory,
+            root.join(format!("{BUILD_DIRECTORY_PREFIX}1")),
+            "the build must move to a distinct freshly created directory"
+        );
+        assert_ne!(
+            build.program, planted_path,
+            "the planted path must never be the selected child"
+        );
+        assert_ne!(
+            fs::read(&build.program).expect("the selected child"),
+            planted,
+            "the planted executable must never be the selected child's bytes"
+        );
+        assert_eq!(
+            fs::read(&planted_path).expect("the planted executable survives"),
+            planted,
+            "refusing a build target must not destroy the evidence in it"
+        );
+        assert_is_the_pinned_child(&build.program);
+    }
+
+    /// A root in which no candidate can be created fails attributably instead
+    /// of adopting one or looping.
+    #[test]
+    fn a_root_whose_candidates_are_all_occupied_fails_attributably() {
+        let root = scratch_root("exhausted");
+        for attempt in 0..BUILD_DIRECTORY_ATTEMPTS {
+            fs::create_dir(root.join(format!("{BUILD_DIRECTORY_PREFIX}{attempt}")))
+                .expect("occupy a candidate");
+        }
+
+        let failure = build_child_program(&root, compiler_program())
+            .expect_err("an exhausted root must not produce a child");
+
+        assert!(
+            failure.contains("no free final-sink child build directory was available"),
+            "unexpected failure: {failure}"
+        );
+        assert!(
+            failure.contains(&root.display().to_string()),
+            "the failure must name the root it gave up on: {failure}"
+        );
+    }
+
+    /// A compiler that cannot identify itself must stop the build rather than
+    /// produce a child no A/B can attribute.
+    #[test]
+    fn a_compiler_that_cannot_identify_itself_stops_the_build() {
+        let root = scratch_root("unidentifiable");
+
+        let failure = build_child_program(
+            &root,
+            OsString::from("rmux-final-sink-child-no-such-compiler"),
+        )
+        .expect_err("an unidentifiable compiler must not produce a child");
+
+        assert!(
+            failure.contains("could not be run to identify"),
+            "unexpected failure: {failure}"
+        );
+        assert!(
+            !root
+                .join(format!("{BUILD_DIRECTORY_PREFIX}0"))
+                .join(PROGRAM_FILE)
+                .exists(),
+            "a build that could not identify its compiler must publish nothing"
+        );
+    }
+
+    /// A real build driven by an explicit absolute `RUSTC`.
+    ///
+    /// Two halves of one case. The outer half resolves the toolchain's own
+    /// `rustc.exe`, then re-runs *this exact case* in a child test process with
+    /// `RUSTC` set to that absolute path; the inner half performs a genuine
+    /// build there and prints what it used. Nothing mutates this process's
+    /// environment, so no parallel case can observe a half-applied override,
+    /// and the override is exercised through `compiler_program` itself rather
+    /// than through a value handed to a helper.
+    #[test]
+    fn a_real_absolute_rustc_override_builds_the_child_with_that_exact_compiler() {
+        if std::env::var_os(OVERRIDE_CASE_ENV).is_some() {
+            perform_the_overridden_build();
+            return;
+        }
+
+        let absolute = toolchain_rustc_executable();
+        assert!(
+            absolute.is_absolute() && absolute.is_file(),
+            "{} is not an absolute compiler to override with",
+            absolute.display()
+        );
+
+        let inner = Command::new(std::env::current_exe().expect("this test binary"))
+            .args([
+                OVERRIDE_CASE_NAME,
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(OVERRIDE_CASE_ENV, "1")
+            .env("RUSTC", &absolute)
+            .output()
+            .expect("re-run this case with an absolute RUSTC");
+        let reported = format!(
+            "{}{}",
+            String::from_utf8_lossy(&inner.stdout),
+            String::from_utf8_lossy(&inner.stderr)
+        );
+        assert!(
+            inner.status.success(),
+            "the overridden build failed:\n{reported}"
+        );
+        assert!(
+            reported.contains(&format!(
+                "overridden-build compiler: {}",
+                absolute.display()
+            )),
+            "the overridden build must have used the absolute compiler:\n{reported}"
+        );
+        assert!(
+            reported.contains(&format!("overridden-build argv0: {}", absolute.display())),
+            "the compilation must have been invoked through it:\n{reported}"
+        );
+        assert!(
+            reported.contains("overridden-build identity: rustc "),
+            "the identity must have come from it:\n{reported}"
+        );
+    }
+
+    /// The inner half: a genuine build whose compiler came from `RUSTC`.
+    fn perform_the_overridden_build() {
+        let root = scratch_root("rustc-override");
+        let compiler = compiler_program();
+        assert!(
+            Path::new(&compiler).is_absolute(),
+            "the overridden case must receive an absolute RUSTC: {compiler:?}"
+        );
+
+        let build =
+            build_child_program(&root, compiler).unwrap_or_else(|failure| panic!("{failure}"));
+
+        println!(
+            "overridden-build compiler: {}",
+            Path::new(&build.compiler).display()
+        );
+        println!(
+            "overridden-build argv0: {}",
+            Path::new(build.argv.first().expect("argv0")).display()
+        );
+        println!(
+            "overridden-build identity: {}",
+            build.identity.lines().next().unwrap_or_default()
+        );
+        println!("overridden-build program: {}", build.program.display());
+        assert_is_the_pinned_child(&build.program);
+    }
+
+    /// The toolchain's own `rustc.exe`, resolved through the compiler that is
+    /// in use rather than through `PATH`.
+    fn toolchain_rustc_executable() -> PathBuf {
+        let sysroot = Command::new(compiler_program())
+            .arg("--print")
+            .arg("sysroot")
+            .output()
+            .expect("ask the compiler for its sysroot");
+        assert!(sysroot.status.success(), "the compiler has a sysroot");
+        PathBuf::from(String::from_utf8_lossy(&sysroot.stdout).trim().to_owned())
+            .join("bin")
+            .join("rustc.exe")
     }
 
     /// The child's own failure path: a standard input that is not a console
