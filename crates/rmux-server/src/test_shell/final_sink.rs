@@ -99,7 +99,8 @@ const CAPTURE_TIMEOUT: Duration = Duration::from_secs(60);
 /// promptly instead of after the full timeout.
 const CAPTURE_IDLE_GAP: Duration = Duration::from_secs(8);
 /// Teardown is bounded: a child that will not leave its park must not hang the
-/// suite, and its slot is kept for inspection instead.
+/// suite. The wait returns what it observed, and a slot whose teardown was not
+/// acknowledged is kept, with its path and reason printed, instead of removed.
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// Escaped byte dumps stay readable; elision is always stated, never silent.
@@ -111,6 +112,7 @@ pub(crate) struct FinalSinkSlot {
     bracket_aware: bool,
     capture_timeout: Duration,
     capture_idle_gap: Duration,
+    teardown_timeout: Duration,
 }
 
 impl FinalSinkSlot {
@@ -157,6 +159,7 @@ impl FinalSinkSlot {
             bracket_aware,
             capture_timeout: CAPTURE_TIMEOUT,
             capture_idle_gap: CAPTURE_IDLE_GAP,
+            teardown_timeout: TEARDOWN_TIMEOUT,
         })
     }
 
@@ -165,6 +168,12 @@ impl FinalSinkSlot {
     fn with_capture_bounds(mut self, timeout: Duration, idle_gap: Duration) -> Self {
         self.capture_timeout = timeout;
         self.capture_idle_gap = idle_gap;
+        self
+    }
+
+    /// Same, for the teardown bound.
+    fn with_teardown_timeout(mut self, timeout: Duration) -> Self {
+        self.teardown_timeout = timeout;
         self
     }
 
@@ -374,40 +383,123 @@ impl FinalSinkSlot {
     }
 }
 
+/// What bounded teardown actually observed.
+///
+/// Teardown used to return nothing, so an expired wait was indistinguishable
+/// from an acknowledgement and the slot was removed either way — including the
+/// slot that was the only evidence the child never left its park.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TeardownOutcome {
+    /// The child never signalled readiness, so there is nothing to acknowledge.
+    NotStarted,
+    /// The child wrote `done`: it observably left its park.
+    Acknowledged,
+    /// `stop` could not be written, so the child was never asked to leave.
+    StopNotSignalled { reason: String },
+    /// The wait expired with no acknowledgement.
+    TimedOut {
+        waited: Duration,
+        child_error: Option<String>,
+    },
+}
+
+impl TeardownOutcome {
+    /// Only an observed end of the child's park lets its slot be removed.
+    const fn permits_removal(&self) -> bool {
+        matches!(self, Self::NotStarted | Self::Acknowledged)
+    }
+}
+
+impl std::fmt::Display for TeardownOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotStarted => formatter.write_str(
+                "the child never signalled readiness, so there was nothing to acknowledge",
+            ),
+            Self::Acknowledged => formatter.write_str("the child acknowledged teardown"),
+            Self::StopNotSignalled { reason } => write!(
+                formatter,
+                "`stop` could not be written, so the child was never asked to leave its park: \
+                 {reason}"
+            ),
+            Self::TimedOut {
+                waited,
+                child_error,
+            } => write!(
+                formatter,
+                "the child never acknowledged teardown within {waited:?}; child error: {}",
+                child_error.as_deref().unwrap_or("none")
+            ),
+        }
+    }
+}
+
 impl Drop for FinalSinkSlot {
     fn drop(&mut self) {
-        let _ = fs::write(self.directory.join(STOP_FILE), b"1");
-        self.await_bounded_teardown();
+        let outcome = self.teardown();
         if std::thread::panicking() {
-            // The failing assertion's diagnosis needs these artifacts.
-            eprintln!(
-                "final-sink slot preserved for diagnosis: {}",
-                self.directory.display()
+            self.preserve(
+                "the failing assertion's diagnosis needs these artifacts",
+                &outcome,
             );
             return;
         }
-        let _ = fs::remove_dir_all(&self.directory);
+        if !outcome.permits_removal() {
+            self.preserve("teardown was not acknowledged", &outcome);
+            return;
+        }
+        if let Err(error) = fs::remove_dir_all(&self.directory) {
+            self.preserve(&format!("the slot could not be removed: {error}"), &outcome);
+        }
     }
 }
 
 impl FinalSinkSlot {
-    /// Waits, bounded, for the child to acknowledge that it left its park.
+    /// Signals `stop`, then waits, bounded, for the child to acknowledge that
+    /// it left its park.
     ///
-    /// A child that never started cannot acknowledge anything, so this only
-    /// waits once readiness was observed. Slot paths are unique per instance,
-    /// so a child that outlives this wait can still never satisfy a later run;
-    /// the wait exists so teardown is observed rather than assumed.
-    fn await_bounded_teardown(&self) {
-        if !self.directory.join(READY_FILE).is_file() {
-            return;
+    /// A child that never started cannot acknowledge anything, so the wait is
+    /// skipped for it. Slot paths are unique per instance, so a child that
+    /// outlives this wait can still never satisfy a later run; the wait exists
+    /// so teardown is *observed* rather than assumed, and so its failure is
+    /// reported together with the slot that proves it.
+    ///
+    /// Terminating and reaping the child *process* is deliberately not done
+    /// here. That is owned by `PaneTerminal::terminate_with_bounded_grace`,
+    /// which signals the process tree and waits for its exit; in tests it is
+    /// reached through `Drop for RequestHandler` → `shutdown_terminals_for_test`
+    /// → `PaneTerminalStore::remove_session`. A slot that also managed the
+    /// process would be a second, competing owner of that lifecycle.
+    fn teardown(&self) -> TeardownOutcome {
+        if let Err(error) = fs::write(self.directory.join(STOP_FILE), b"1") {
+            return TeardownOutcome::StopNotSignalled {
+                reason: error.to_string(),
+            };
         }
-        let deadline = Instant::now() + TEARDOWN_TIMEOUT;
-        while Instant::now() < deadline {
-            if self.directory.join(DONE_FILE).is_file() || self.child_error().is_some() {
-                return;
+        if !self.directory.join(READY_FILE).is_file() {
+            return TeardownOutcome::NotStarted;
+        }
+        let deadline = Instant::now() + self.teardown_timeout;
+        loop {
+            if self.directory.join(DONE_FILE).is_file() {
+                return TeardownOutcome::Acknowledged;
+            }
+            if Instant::now() >= deadline {
+                return TeardownOutcome::TimedOut {
+                    waited: self.teardown_timeout,
+                    child_error: self.child_error(),
+                };
             }
             std::thread::sleep(POLL_INTERVAL);
         }
+    }
+
+    /// Keeps a slot and names both why it was kept and what teardown saw.
+    fn preserve(&self, reason: &str, outcome: &TeardownOutcome) {
+        eprintln!(
+            "final-sink slot preserved for diagnosis: {}\n  reason: {reason}\n  teardown: {outcome}",
+            self.directory.display()
+        );
     }
 }
 
@@ -648,6 +740,90 @@ mod tests {
             failure.contains("child error: standard input ended after 3 of 6 bytes"),
             "the child's own reason must be carried through: {failure}"
         );
+    }
+
+    /// The F3 case: a child that reached readiness and then never left its
+    /// park. The expired wait must be observable, and the slot that proves it
+    /// must survive — it used to be deleted exactly like an acknowledged one.
+    #[test]
+    fn a_teardown_that_is_never_acknowledged_times_out_and_keeps_the_slot() {
+        let slot = FinalSinkSlot::new("teardown-timeout", b"abc", true)
+            .with_teardown_timeout(Duration::from_millis(150));
+        fs::write(slot.directory.join(READY_FILE), b"1").expect("stage readiness");
+        let directory = slot.directory.clone();
+
+        let outcome = slot.teardown();
+
+        assert_eq!(
+            outcome,
+            TeardownOutcome::TimedOut {
+                waited: Duration::from_millis(150),
+                child_error: None,
+            },
+            "an expired wait must be distinguishable from an acknowledgement"
+        );
+        assert!(
+            !outcome.permits_removal(),
+            "an unacknowledged teardown must not authorise removal"
+        );
+        assert!(
+            outcome
+                .to_string()
+                .contains("never acknowledged teardown within 150ms"),
+            "the timeout must be reportable: {outcome}"
+        );
+        assert!(
+            directory.join(STOP_FILE).is_file(),
+            "the child must still have been asked to leave its park"
+        );
+
+        drop(slot);
+
+        assert!(
+            directory.is_dir(),
+            "the slot of a child that never acknowledged teardown is the evidence"
+        );
+        fs::remove_dir_all(&directory).expect("clean up the preserved slot");
+    }
+
+    /// The converse: an acknowledged teardown is what authorises removal.
+    #[test]
+    fn an_acknowledged_teardown_removes_the_slot() {
+        let slot = FinalSinkSlot::new("teardown-acknowledged", b"abc", true)
+            .with_teardown_timeout(Duration::from_millis(150));
+        fs::write(slot.directory.join(READY_FILE), b"1").expect("stage readiness");
+        fs::write(slot.directory.join(DONE_FILE), b"1").expect("stage the acknowledgement");
+        let directory = slot.directory.clone();
+
+        let outcome = slot.teardown();
+
+        assert_eq!(outcome, TeardownOutcome::Acknowledged);
+        assert!(outcome.permits_removal());
+
+        drop(slot);
+
+        assert!(!directory.exists(), "an acknowledged slot is removed");
+    }
+
+    /// A child that failed before readiness cannot acknowledge anything, so
+    /// teardown must not spend its bound waiting for it — but `stop` is still
+    /// signalled, because a process may exist even when `ready` never appeared.
+    #[test]
+    fn a_child_that_never_signalled_readiness_is_not_waited_for() {
+        let slot = FinalSinkSlot::new("teardown-not-started", b"abc", false)
+            .with_teardown_timeout(Duration::from_secs(30));
+        let directory = slot.directory.clone();
+
+        let started = Instant::now();
+        let outcome = slot.teardown();
+
+        assert_eq!(outcome, TeardownOutcome::NotStarted);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "teardown must not wait for a child that never started"
+        );
+        assert!(directory.join(STOP_FILE).is_file());
+        assert!(outcome.permits_removal());
     }
 
     #[test]
