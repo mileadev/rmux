@@ -305,37 +305,188 @@ mod tests {
     // Real `/bin/sh` execution.
     //
     // These carry the authority for this correction and cannot run on Windows,
-    // so this attempt does not claim them; the targeted Unix job does.
+    // so this attempt does not claim them; the targeted Unix job does. The
+    // read-only slot guard lives here too: it is Unix permission behaviour, and
+    // the case that needs it is one of these.
     // -----------------------------------------------------------------------
 
     #[cfg(unix)]
     mod execution {
         use super::*;
         use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
         use std::process::{Command, Stdio};
 
-        /// Runs the script with `input` on standard input and waits for it.
+        /// What one real `/bin/sh` run left behind.
         ///
-        /// `stop` is pre-signalled so the park is immediate. A pipe is not a
-        /// terminal, so cases that need to reach the read replace the raw-mode
-        /// step; the case that exercises raw-mode failure keeps the real one.
-        fn run(slot: &FinalSinkSlot, input: &[u8], raw_setup: &str) -> std::process::ExitStatus {
+        /// Only [`launch`] builds one, and only once `spawn` has returned a
+        /// live process, so a caller holding a `ChildRun` has already proved
+        /// that the child existed: a helper that failed while preparing the
+        /// slot can never produce one, and its absence is no longer
+        /// indistinguishable from a child that ran and said nothing.
+        ///
+        /// `diagnostic` is the shell's own account of the steps it could not
+        /// perform. It is the only channel left when the slot the child was
+        /// given is not writable, because `error` lives in that same slot.
+        struct ChildRun {
+            process_id: u32,
+            status: std::process::ExitStatus,
+            diagnostic: String,
+        }
+
+        impl ChildRun {
+            /// The process the script actually ran in.
+            fn launched_process_id(&self) -> u32 {
+                self.process_id
+            }
+        }
+
+        impl std::fmt::Display for ChildRun {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(
+                    formatter,
+                    "`/bin/sh` process {} finished with {}, reporting: {}",
+                    self.process_id,
+                    self.status,
+                    if self.diagnostic.trim().is_empty() {
+                        "nothing"
+                    } else {
+                        self.diagnostic.trim_end()
+                    }
+                )
+            }
+        }
+
+        /// Stages the harness-owned `stop` so the child's park ends at once.
+        ///
+        /// Deliberately separate from [`launch`]: this is the *harness* writing
+        /// into the slot directory, and the unwritable-slot case has to stage it
+        /// while that directory is still writable. Staging it inside the runner
+        /// made this the first write attempted after the mode change, so it
+        /// failed with `EACCES` and `/bin/sh` was never spawned at all.
+        fn pre_signal_stop(slot: &FinalSinkSlot) {
             std::fs::write(slot.directory.join(STOP_FILE), b"1").expect("pre-signal `stop`");
+        }
+
+        /// Spawns the script with `input` on standard input and waits for it.
+        ///
+        /// A pipe is not a terminal, so cases that need to reach the read
+        /// replace the raw-mode step; the case that exercises raw-mode failure
+        /// keeps the real one.
+        fn launch(slot: &FinalSinkSlot, input: &[u8], raw_setup: &str) -> ChildRun {
             let mut child = Command::new("/bin/sh")
                 .arg("-c")
                 .arg(script_with_raw_setup(slot, raw_setup))
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .expect("spawn the final-sink child script");
-            child
+            let process_id = child.id();
+            let offered = child
                 .stdin
                 .take()
                 .expect("the child has a standard input")
-                .write_all(input)
-                .expect("write the payload");
-            child.wait().expect("wait for the child script")
+                .write_all(input);
+            // A child whose setup already failed stops reading and may be gone
+            // before the payload is offered, which is precisely what the failure
+            // cases below are about. A closed pipe is therefore an outcome to
+            // report through the exit status and the diagnostic, not a harness
+            // failure; anything else still is one.
+            if let Err(error) = offered {
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe,
+                    "the payload could not be written to the child: {error}"
+                );
+            }
+            let finished = child
+                .wait_with_output()
+                .expect("wait for the final-sink child script");
+            ChildRun {
+                process_id,
+                status: finished.status,
+                diagnostic: String::from_utf8_lossy(&finished.stderr).into_owned(),
+            }
+        }
+
+        /// Stages `stop` and then runs the child, which is what every case whose
+        /// slot the harness can still write to needs.
+        fn run(slot: &FinalSinkSlot, input: &[u8], raw_setup: &str) -> ChildRun {
+            pre_signal_stop(slot);
+            launch(slot, input, raw_setup)
+        }
+
+        /// Readable and traversable, but nothing may be created in it.
+        const READ_ONLY_SLOT_MODE: u32 = 0o555;
+
+        /// Makes a slot directory read-only for as long as it is held, then
+        /// restores exactly the mode it found.
+        ///
+        /// The mode is read rather than assumed: restoring a hard-coded `0o755`
+        /// would widen a slot created under a stricter umask, and would pass its
+        /// own test for the wrong reason.
+        ///
+        /// Restoration belongs to `Drop` because an assertion that fails while
+        /// the slot is read-only must still unwind through it; the statements
+        /// this replaces sat after the run and were simply skipped. Holding a
+        /// borrow of the slot is what orders the two teardowns: the compiler
+        /// will not let a [`FinalSinkSlot`] be dropped while a guard borrowing
+        /// it is alive, so the mode is always restored before the slot's own
+        /// cleanup, which has to write to that directory to remove it.
+        struct ReadOnlySlot<'slot> {
+            slot: &'slot FinalSinkSlot,
+            original: std::fs::Permissions,
+        }
+
+        impl<'slot> ReadOnlySlot<'slot> {
+            fn new(slot: &'slot FinalSinkSlot) -> Self {
+                let original = slot_permissions(slot);
+                let mut read_only = original.clone();
+                read_only.set_mode(READ_ONLY_SLOT_MODE);
+                std::fs::set_permissions(&slot.directory, read_only)
+                    .expect("make the slot read-only");
+                Self { slot, original }
+            }
+        }
+
+        impl Drop for ReadOnlySlot<'_> {
+            fn drop(&mut self) {
+                if let Err(error) =
+                    std::fs::set_permissions(&self.slot.directory, self.original.clone())
+                {
+                    let report = format!(
+                        "the final-sink slot {} could not be restored to mode {:04o}: {error}",
+                        self.slot.directory.display(),
+                        self.original.mode() & 0o7777,
+                    );
+                    // Panicking while already unwinding aborts the process,
+                    // which would destroy the failure being reported.
+                    if std::thread::panicking() {
+                        eprintln!("{report}");
+                    } else {
+                        panic!("{report}");
+                    }
+                }
+            }
+        }
+
+        fn slot_permissions(slot: &FinalSinkSlot) -> std::fs::Permissions {
+            std::fs::metadata(&slot.directory)
+                .expect("the slot exists")
+                .permissions()
+        }
+
+        /// The slot directory's permission bits, without the file-type bits a
+        /// raw `mode()` also carries.
+        fn slot_mode(slot: &FinalSinkSlot) -> u32 {
+            slot_permissions(slot).mode() & 0o7777
+        }
+
+        fn set_slot_mode(slot: &FinalSinkSlot, mode: u32) {
+            let mut permissions = slot_permissions(slot);
+            permissions.set_mode(mode);
+            std::fs::set_permissions(&slot.directory, permissions).expect("set the slot mode");
         }
 
         fn slot_file(slot: &FinalSinkSlot, file: &str) -> Option<Vec<u8>> {
@@ -347,9 +498,12 @@ mod tests {
             let payload = "\u{1b}[200~alpha\r\nβ 😀\u{1b}[201~".as_bytes();
             let slot = FinalSinkSlot::new("unix-exact", payload, true);
 
-            let status = run(&slot, payload, "true");
+            let child = run(&slot, payload, "true");
 
-            assert!(status.success(), "an exact capture must succeed");
+            assert!(
+                child.status.success(),
+                "an exact capture must succeed: {child}"
+            );
             assert_eq!(
                 slot_file(&slot, OUT_FILE).as_deref(),
                 Some(payload),
@@ -369,9 +523,13 @@ mod tests {
         fn end_of_input_before_the_expected_count_never_publishes_out() {
             let slot = FinalSinkSlot::new("unix-short-eof", b"0123456789", false);
 
-            let status = run(&slot, b"01234", "true");
+            let child = run(&slot, b"01234", "true");
 
-            assert_eq!(status.code(), Some(1), "a short capture must fail");
+            assert_eq!(
+                child.status.code(),
+                Some(1),
+                "a short capture must fail: {child}"
+            );
             assert_eq!(
                 slot_file(&slot, ERROR_FILE)
                     .map(|reason| String::from_utf8(reason).expect("the reason is text")),
@@ -394,9 +552,13 @@ mod tests {
             let slot = FinalSinkSlot::new("unix-raw-failure", b"abc", true);
 
             // The real `stty raw -echo`, against a pipe: it cannot succeed.
-            let status = run(&slot, b"abc", RAW_SETUP_COMMAND);
+            let child = run(&slot, b"abc", RAW_SETUP_COMMAND);
 
-            assert_eq!(status.code(), Some(1), "a failed setup must fail the child");
+            assert_eq!(
+                child.status.code(),
+                Some(1),
+                "a failed setup must fail the child: {child}"
+            );
             let reported = String::from_utf8(
                 slot_file(&slot, ERROR_FILE).expect("a failed setup must write `error`"),
             )
@@ -415,30 +577,107 @@ mod tests {
 
         /// A slot the child cannot write is a setup failure, not a silent
         /// readiness signal followed by a capture timeout.
+        ///
+        /// The harness's own `stop` is staged first, while the slot is still
+        /// writable. It used to be staged by the runner, after the mode change,
+        /// so the harness's write was the one that hit `EACCES`: `/bin/sh` was
+        /// never spawned and the child-side failure this case exists for was
+        /// never reached. The child is therefore launched directly here, and
+        /// what it reports is read from the shell's own diagnostics — `error`
+        /// lives in the very slot it cannot write.
         #[test]
         fn a_slot_it_cannot_write_is_reported_rather_than_silently_skipped() {
-            use std::os::unix::fs::PermissionsExt;
-
             let slot = FinalSinkSlot::new("unix-unwritable", b"abc", false);
-            let mut permissions = std::fs::metadata(&slot.directory)
-                .expect("the slot exists")
-                .permissions();
-            permissions.set_mode(0o555);
-            std::fs::set_permissions(&slot.directory, permissions.clone())
-                .expect("make the slot read-only");
+            pre_signal_stop(&slot);
+            let original_mode = slot_mode(&slot);
 
-            let status = run(&slot, b"abc", "true");
+            let read_only = ReadOnlySlot::new(&slot);
+            let child = launch(&slot, b"abc", "true");
 
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&slot.directory, permissions)
-                .expect("restore the slot permissions");
-
-            assert_eq!(status.code(), Some(1), "an unwritable slot must fail");
+            // The Unix job's evidence for this case is that a real child ran
+            // and said why it could not go on, so the witness is retained in
+            // the output and not only asserted on.
+            println!("unwritable slot: {child}");
+            assert_ne!(
+                child.launched_process_id(),
+                std::process::id(),
+                "the script must have run in a real child process: {child}"
+            );
+            assert_eq!(
+                child.status.code(),
+                Some(1),
+                "an unwritable slot must fail the child: {child}"
+            );
+            assert!(
+                child.diagnostic.contains(&slot.path(READY_FILE)),
+                "the child must have reached the readiness write and been refused: {child}"
+            );
+            assert!(
+                child.diagnostic.contains(&slot.path(ERROR_FILE)),
+                "the child must have run its failure path: {child}"
+            );
             assert!(
                 slot_file(&slot, READY_FILE).is_none(),
                 "readiness must not be claimed when it could not be written"
             );
+            assert!(
+                slot_file(&slot, ERROR_FILE).is_none(),
+                "an unwritable slot cannot even hold the child's own reason, \
+                 which is why the shell's diagnostic is the channel here"
+            );
             assert!(slot_file(&slot, OUT_FILE).is_none());
+
+            drop(read_only);
+
+            assert_eq!(
+                slot_mode(&slot),
+                original_mode,
+                "the case must leave the slot exactly as it found it"
+            );
+        }
+
+        /// The guard restores the mode it found. A hard-coded `0o755` would
+        /// widen a slot created under a stricter umask, and no assertion in the
+        /// case above would notice.
+        #[test]
+        fn a_read_only_slot_is_restored_to_exactly_the_mode_it_had() {
+            let slot = FinalSinkSlot::new("unix-restore-exact", b"abc", false);
+            // Deliberately not `0o755`: restoring a constant would pass here.
+            set_slot_mode(&slot, 0o700);
+
+            let read_only = ReadOnlySlot::new(&slot);
+            assert_eq!(
+                slot_mode(&slot),
+                READ_ONLY_SLOT_MODE,
+                "the guard must make the slot read-only"
+            );
+            drop(read_only);
+
+            assert_eq!(slot_mode(&slot), 0o700, "exactly the original mode returns");
+        }
+
+        /// Restoration is owned by `Drop`, so a failing assertion between the
+        /// mode change and the end of the case still leaves the slot as it was.
+        /// The statements this replaces ran after the child and were skipped by
+        /// the unwind, leaving a read-only directory behind.
+        #[test]
+        fn a_panic_while_the_slot_is_read_only_still_restores_its_mode() {
+            let slot = FinalSinkSlot::new("unix-restore-unwind", b"abc", false);
+            set_slot_mode(&slot, 0o700);
+
+            let unwound: std::thread::Result<()> =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _read_only = ReadOnlySlot::new(&slot);
+                    assert_eq!(slot_mode(&slot), READ_ONLY_SLOT_MODE);
+                    panic!("deliberate: the case fails while the slot is read-only");
+                }));
+
+            assert!(unwound.is_err(), "the deliberate panic must have unwound");
+            assert_eq!(
+                slot_mode(&slot),
+                0o700,
+                "an unwind must restore the exact mode rather than skip restoration"
+            );
         }
     }
 }
