@@ -30,9 +30,13 @@
 //! discipline treats the paste's leading `ESC` as an editing command and
 //! rewrites CR/LF, so the captured bytes would say nothing about the sink. The
 //! crate is `#![forbid(unsafe_code)]`, so the child cannot be this test binary
-//! re-executed — the Windows console-mode change needs FFI. Each platform
-//! therefore uses its native interpreter, which is exactly what
-//! [`super`] already exists to build.
+//! re-executed — the Windows console-mode change needs FFI.
+//!
+//! Unix therefore uses `/bin/sh`, which [`super`] already exists to build, and
+//! Windows uses a small pinned Rust program: its read boundary is the whole
+//! point of the R1 diagnostic, so it is the historical
+//! `stdin().lock().read(&mut [0_u8; 4096])` itself rather than an emulation of
+//! it. See [`byte_observer`] and [`windows_byte_child`].
 
 use std::collections::hash_map::RandomState;
 use std::fs;
@@ -40,6 +44,17 @@ use std::hash::{BuildHasher, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
+
+/// The historical standard-input byte boundary the Windows child reads through,
+/// compiled both into this binary and into that child.
+///
+/// Explicitly pathed, like this module itself: a `#[path]`-loaded module owns
+/// the directory its declaration names, not one named after itself.
+#[path = "final_sink/byte_observer.rs"]
+mod byte_observer;
+#[cfg(windows)]
+#[path = "final_sink/windows_byte_child.rs"]
+mod windows_byte_child;
 
 const READY_FILE: &str = "ready";
 const OUT_FILE: &str = "out";
@@ -62,7 +77,7 @@ const SLOT_ARTIFACTS: [&str; 6] = [
 /// How long the child stays alive after capturing, so the harness can still
 /// resolve it as a live synchronized destination while it asserts.
 const CHILD_PARK_SECONDS: u64 = 120;
-/// Generous: the Windows child compiles a small P/Invoke shim on start.
+/// Generous: a pane child starts a process and a terminal before it can read.
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Once at least one byte has arrived, a gap this long with no further byte
 /// means the sink has stopped delivering.
@@ -336,138 +351,35 @@ impl FinalSinkSlot {
         vec!["/bin/sh".to_owned(), "-c".to_owned(), script]
     }
 
+    /// Runs the pinned Rust child, whose read boundary is the historical
+    /// `stdin().lock().read(&mut [0_u8; 4096])`.
+    ///
+    /// The slot files, expected byte count, awareness and park duration are
+    /// arguments rather than an interpolated script, so nothing about the
+    /// child's source varies between runs — which is what lets the Windows 10
+    /// A/B rebuild exactly this observer.
     #[cfg(windows)]
     pub(crate) fn pane_command(&self) -> Vec<String> {
+        let program = windows_byte_child::child_program().unwrap_or_else(|failure| {
+            panic!("the final-sink Windows child is unavailable: {failure}")
+        });
         vec![
-            "powershell.exe".to_owned(),
-            "-NoProfile".to_owned(),
-            "-NonInteractive".to_owned(),
-            "-EncodedCommand".to_owned(),
-            super::encode_powershell_script(&self.windows_script()),
+            program.display().to_string(),
+            self.path(READY_FILE),
+            self.path(OUT_PARTIAL_FILE),
+            self.path(OUT_FILE),
+            self.path(ERROR_FILE),
+            self.path(STOP_FILE),
+            self.path(DONE_FILE),
+            self.expected.len().to_string(),
+            if self.bracket_aware {
+                "aware"
+            } else {
+                "unaware"
+            }
+            .to_owned(),
+            CHILD_PARK_SECONDS.to_string(),
         ]
-    }
-
-    /// Puts the pane console into the mode a bracketed-paste-aware application
-    /// uses, then reads exactly the expected number of standard-input *bytes*
-    /// and persists them.
-    ///
-    /// This is the read boundary the historical Windows probe used: a
-    /// standard-input `Read` that yields UTF-8 bytes. Reproducing it needs
-    /// three properties, not just a call swap.
-    ///
-    /// * The console is drained as UTF-16 and converted in the child. The
-    ///   obvious alternative — `ReadFile` on the console handle under the UTF-8
-    ///   input code page, which `[Console]::OpenStandardInput()` wraps — is
-    ///   *not* equivalent: it is byte-exact for CR/LF, `β`, `ESC` and control
-    ///   bytes, but conhost converts each UTF-16 code unit on its own, so a
-    ///   surrogate pair arrives as two U+FFFD and `😀` is destroyed.
-    /// * A high surrogate left at the end of one read is carried into the next
-    ///   instead of being encoded alone, because a lone surrogate encodes to
-    ///   U+FFFD. This is the child-side fixup a standard library's console
-    ///   `Read` performs.
-    /// * The loop counts bytes, so both platforms use one expected length — the
-    ///   same one the Unix `dd bs=1 count=N` child consumes — and a short
-    ///   capture is reported in bytes.
-    ///
-    /// The capture is written to `out.part` as it arrives, under a share mode
-    /// the harness can read, so a capture that never completes still exposes
-    /// the exact bytes the child received.
-    #[cfg(windows)]
-    fn windows_script(&self) -> String {
-        let announce = if self.bracket_aware {
-            "[Console]::Out.Write([char]27 + '[?2004h'); [Console]::Out.Flush()"
-        } else {
-            "$null = $null"
-        };
-        format!(
-            r#"
-$ErrorActionPreference = 'Stop'
-$ready = {ready}
-$partial = {partial}
-$out = {out}
-$stop = {stop}
-$done = {done}
-$errorFile = {error_file}
-try {{
-    Add-Type -Namespace RmuxFinalSink -Name Con -MemberDefinition @'
-[DllImport("kernel32.dll", SetLastError = true)]
-public static extern IntPtr GetStdHandle(int nStdHandle);
-[DllImport("kernel32.dll", SetLastError = true)]
-public static extern bool GetConsoleMode(IntPtr h, out uint mode);
-[DllImport("kernel32.dll", SetLastError = true)]
-public static extern bool SetConsoleMode(IntPtr h, uint mode);
-[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-public static extern bool ReadConsoleW(IntPtr h, [Out] char[] buffer, uint toRead, out uint read, IntPtr control);
-'@
-    $handle = [RmuxFinalSink.Con]::GetStdHandle(-10)
-    $mode = [uint32]0
-    if (-not [RmuxFinalSink.Con]::GetConsoleMode($handle, [ref]$mode)) {{ throw 'GetConsoleMode failed' }}
-    # Clear PROCESSED|LINE|ECHO, set VIRTUAL_TERMINAL_INPUT.
-    $raw = ($mode -band (-bnot 0x7)) -bor 0x200
-    if (-not [RmuxFinalSink.Con]::SetConsoleMode($handle, $raw)) {{ throw 'SetConsoleMode failed' }}
-    {announce}
-    [IO.File]::WriteAllText($ready, '1')
-    $want = {bytes}
-    # CreateNew refuses a partial file left by another child; ReadWrite sharing
-    # lets the harness read the capture while it is still growing.
-    $partialStream = New-Object System.IO.FileStream($partial, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
-    $received = 0
-    $buffer = New-Object char[] 4096
-    $pendingHigh = -1
-    try {{
-        while ($received -lt $want) {{
-            $read = [uint32]0
-            if (-not [RmuxFinalSink.Con]::ReadConsoleW($handle, $buffer, [uint32]$buffer.Length, [ref]$read, [IntPtr]::Zero)) {{
-                throw 'ReadConsoleW failed'
-            }}
-            if ($read -eq 0) {{ throw "console input ended after $received of $want bytes" }}
-            $chunk = [string]::new($buffer, 0, [int]$read)
-            if ($pendingHigh -ge 0) {{
-                $chunk = [string][char]$pendingHigh + $chunk
-                $pendingHigh = -1
-            }}
-            # A lone high surrogate would encode to U+FFFD and destroy the pair,
-            # so carry it into the next read instead of converting it now.
-            if ($chunk.Length -gt 0) {{
-                $last = [int]$chunk[$chunk.Length - 1]
-                if ($last -ge 0xD800 -and $last -le 0xDBFF) {{
-                    $pendingHigh = $last
-                    $chunk = $chunk.Substring(0, $chunk.Length - 1)
-                }}
-            }}
-            if ($chunk.Length -gt 0) {{
-                $encoded = [Text.Encoding]::UTF8.GetBytes($chunk)
-                $partialStream.Write($encoded, 0, $encoded.Length)
-                $partialStream.Flush()
-                $received += $encoded.Length
-            }}
-        }}
-    }} finally {{
-        $partialStream.Dispose()
-    }}
-    if ($pendingHigh -ge 0) {{
-        throw "console input ended on an unpaired high surrogate after $received of $want bytes"
-    }}
-    Move-Item -LiteralPath $partial -Destination $out
-    $deadline = (Get-Date).AddSeconds({park})
-    while ((Get-Date) -lt $deadline -and -not (Test-Path -LiteralPath $stop)) {{
-        Start-Sleep -Milliseconds 50
-    }}
-    [IO.File]::WriteAllText($done, '1')
-}} catch {{
-    [IO.File]::WriteAllText($errorFile, $_.Exception.Message)
-    exit 1
-}}
-"#,
-            ready = super::powershell_quote(&self.path(READY_FILE)),
-            partial = super::powershell_quote(&self.path(OUT_PARTIAL_FILE)),
-            out = super::powershell_quote(&self.path(OUT_FILE)),
-            stop = super::powershell_quote(&self.path(STOP_FILE)),
-            done = super::powershell_quote(&self.path(DONE_FILE)),
-            error_file = super::powershell_quote(&self.path(ERROR_FILE)),
-            bytes = self.expected.len(),
-            park = CHILD_PARK_SECONDS,
-        )
     }
 }
 
