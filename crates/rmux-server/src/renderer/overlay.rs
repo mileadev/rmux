@@ -52,13 +52,24 @@ pub(crate) struct MenuRenderSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PopupContent {
+    /// Rows captured from the popup's terminal surface, each already carrying
+    /// its own SGR state. They are drawn verbatim so a process keeps the
+    /// colours and attributes it emitted, and `#[` in its output stays literal.
+    Surface(Vec<Vec<u8>>),
+    /// Static lines drawn through the status format pipeline, which expands
+    /// `#[...]` clauses and scrubs control characters.
+    Text(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PopupRenderSpec {
     pub(crate) rect: OverlayRect,
     pub(crate) title: String,
     pub(crate) style: Style,
     pub(crate) border_style: Style,
     pub(crate) border_lines: BoxLines,
-    pub(crate) content_lines: Vec<String>,
+    pub(crate) content: PopupContent,
 }
 
 pub(crate) fn resolve_overlay_rect(
@@ -347,23 +358,39 @@ pub(crate) fn render_popup_overlay(spec: &PopupRenderSpec) -> Vec<u8> {
     }
 
     let inner = inner_rect(spec.rect, spec.border_lines);
-    for (index, line) in spec.content_lines.iter().enumerate() {
-        let row = inner
-            .y
-            .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
-        if row >= inner.y.saturating_add(inner.height) {
-            break;
+    match &spec.content {
+        PopupContent::Surface(rows) => {
+            for (index, row) in rows.iter().enumerate() {
+                let Some(y) = content_row_y(inner, index) else {
+                    break;
+                };
+                draw_surface_row(&mut frame, inner.x, y, row, usize::from(inner.width));
+            }
         }
-        draw_formatted_text(
-            &mut frame,
-            inner.x,
-            row,
-            line,
-            &spec.style,
-            usize::from(inner.width),
-        );
+        PopupContent::Text(lines) => {
+            for (index, line) in lines.iter().enumerate() {
+                let Some(y) = content_row_y(inner, index) else {
+                    break;
+                };
+                draw_formatted_text(
+                    &mut frame,
+                    inner.x,
+                    y,
+                    line,
+                    &spec.style,
+                    usize::from(inner.width),
+                );
+            }
+        }
     }
     frame
+}
+
+fn content_row_y(inner: OverlayRect, index: usize) -> Option<u16> {
+    let row = inner
+        .y
+        .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
+    (row < inner.y.saturating_add(inner.height)).then_some(row)
 }
 
 fn popup_centre_x(cols: u16, width: u16) -> i64 {
@@ -554,6 +581,22 @@ fn draw_styled_text(frame: &mut Vec<u8>, x: u16, y: u16, text: &str, style: &Sty
     frame.extend_from_slice(super::style_sgr_bytes(style, true).as_slice());
     frame.extend_from_slice(text.as_bytes());
     frame.extend_from_slice(b"\x1b[0m\x1b[u");
+}
+
+/// Draws one captured terminal row verbatim.
+///
+/// The row is clipped to the popup's inner width without splitting an escape
+/// sequence, and is bracketed by resets so neither the popup style nor a
+/// trailing attribute from the process bleeds into the rest of the frame.
+fn draw_surface_row(frame: &mut Vec<u8>, x: u16, y: u16, row: &[u8], width: usize) {
+    let clipped = super::truncate_rendered_pane_line(row, width, &rmux_core::Utf8Config::default());
+    if clipped.is_empty() {
+        return;
+    }
+    frame.extend_from_slice(b"\x1b7\x1b[0m");
+    frame.extend_from_slice(super::cursor_position_bytes(y, x).as_slice());
+    frame.extend_from_slice(&clipped);
+    frame.extend_from_slice(b"\x1b[0m\x1b8");
 }
 
 fn draw_formatted_text(

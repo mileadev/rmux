@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use rmux_core::input::InputParser;
-use rmux_core::{GridRenderOptions, Screen, ScreenCaptureRange};
+use rmux_core::{GridRenderOptions, Screen, Style};
 use rmux_proto::{RmuxError, TerminalSize};
 #[cfg(unix)]
 use rmux_pty::Signal;
@@ -65,19 +65,26 @@ impl PopupSurface {
         self.screen.mode()
     }
 
-    pub(super) fn lines(&self) -> Vec<String> {
-        let bytes = self
-            .screen
-            .capture_transcript(ScreenCaptureRange::default(), GridRenderOptions::default());
-        let rendered = String::from_utf8_lossy(&bytes);
-        let mut lines = rendered
-            .split('\n')
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>();
-        while lines.last().is_some_and(String::is_empty) {
-            let _ = lines.pop();
-        }
-        lines
+    /// Visible rows of the popup surface, each rendered from a fresh SGR state.
+    ///
+    /// Popup content is terminal output, not a status format: capturing it
+    /// without sequences discarded every colour and attribute the process
+    /// emitted. Each row carries its own state because the renderer repositions
+    /// the cursor per row, and `style` only paints the cells the process left
+    /// unstyled, so `display-popup -s` keeps colouring the popup background.
+    pub(super) fn rows(&self, style: &Style) -> Vec<Vec<u8>> {
+        let options = GridRenderOptions {
+            with_sequences: true,
+            include_empty_cells: true,
+            trim_spaces: false,
+            ..GridRenderOptions::default()
+        };
+        (0..usize::from(self.screen.size().rows))
+            .filter_map(|row| {
+                self.screen
+                    .render_visible_line_independent_with_default_style(row, options, style)
+            })
+            .collect()
     }
 }
 

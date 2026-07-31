@@ -56,7 +56,7 @@ pub(crate) use format_draw::{
 pub(crate) use overlay::{
     render_menu_overlay, render_popup_overlay, resolve_overlay_rect, status_line_layout,
     MenuRenderItem, MenuRenderSpec, OverlayMousePosition, OverlayPositionContext, OverlayRect,
-    PopupRenderSpec,
+    PopupContent, PopupRenderSpec,
 };
 pub(crate) use pane_delta::{PaneRenderDelta, PaneRenderDeltaFrame, PaneRenderSnapshot};
 pub(crate) use pane_screen::{

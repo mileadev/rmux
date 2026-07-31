@@ -827,6 +827,208 @@ where
     (popup.rect, cleanup)
 }
 
+/// Feeds `output` to the popup's terminal surface the way its child process
+/// would, then returns the overlay frame the attached client receives.
+async fn popup_surface_frame(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
+    output: &[u8],
+) -> String {
+    {
+        let mut active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get_mut(&requester_pid)
+            .expect("attached client");
+        let Some(ClientOverlayState::Popup(popup)) = active.overlay.as_mut() else {
+            panic!("expected popup overlay");
+        };
+        popup
+            .surface
+            .lock()
+            .expect("popup surface")
+            .append_for_test(output);
+    }
+    let frame = refresh_client_overlay_frame(handler, requester_pid, control_rx).await;
+    String::from_utf8(frame.frame).expect("popup frame is utf-8")
+}
+
+#[tokio::test]
+async fn display_popup_preserves_process_colours_and_attributes() {
+    // Issue #181: popup content was captured as plain text and then drawn
+    // through the status format pipeline, so every SGR attribute a process
+    // emitted was discarded before the client ever saw it.
+    let handler = RequestHandler::new();
+    let alpha = session_name("popup-process-sgr");
+    let requester_pid = std::process::id();
+    let mut control_rx = create_attached_session(&handler, &alpha, requester_pid).await;
+
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-popup -N -T Colours -w 40 -h 12 -x C -y C"#,
+    )
+    .await;
+    let _ = next_overlay_frame(&mut control_rx).await;
+
+    let frame = popup_surface_frame(
+        &handler,
+        requester_pid,
+        &mut control_rx,
+        b"\x1b[31mRED\x1b[0m\r\n\
+          \x1b[38;5;208mIDX\x1b[0m\r\n\
+          \x1b[38;2;10;200;30mTRUE\x1b[0m\r\n\
+          \x1b[1mBOLD\x1b[0m \x1b[4mUNDER\x1b[0m \x1b[7mREV\x1b[0m\r\n\
+          plain\r\n",
+    )
+    .await;
+
+    for (sequence, text) in [
+        ("\u{1b}[31m", "RED"),
+        ("\u{1b}[38;5;208m", "IDX"),
+        ("\u{1b}[38;2;10;200;30m", "TRUE"),
+        ("\u{1b}[1m", "BOLD"),
+        ("\u{1b}[4m", "UNDER"),
+        ("\u{1b}[7m", "REV"),
+    ] {
+        assert!(
+            frame.contains(&format!("{sequence}{text}")),
+            "popup content must keep {sequence:?} before {text:?}: {frame:?}"
+        );
+    }
+    assert!(
+        frame.contains("plain"),
+        "unstyled popup content still renders: {frame:?}"
+    );
+}
+
+#[tokio::test]
+async fn display_popup_resets_process_attributes_at_their_boundaries() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("popup-process-sgr-reset");
+    let requester_pid = std::process::id();
+    let mut control_rx = create_attached_session(&handler, &alpha, requester_pid).await;
+
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-popup -N -T Reset -w 30 -h 8 -x C -y C"#,
+    )
+    .await;
+    let _ = next_overlay_frame(&mut control_rx).await;
+
+    let frame = popup_surface_frame(
+        &handler,
+        requester_pid,
+        &mut control_rx,
+        b"\x1b[31mRED\x1b[0mTAIL\r\n",
+    )
+    .await;
+
+    let row = frame
+        .split("\u{1b}7")
+        .find(|chunk| chunk.contains("RED"))
+        .expect("styled popup row is emitted");
+    let tail = row.split("RED").nth(1).expect("text after the styled run");
+    assert!(
+        tail.starts_with('\u{1b}'),
+        "the colour must be closed before the unstyled tail: {row:?}"
+    );
+    assert!(
+        !tail
+            .split("TAIL")
+            .next()
+            .expect("prefix before the tail text")
+            .contains("31"),
+        "the unstyled tail must not stay red: {row:?}"
+    );
+}
+
+#[tokio::test]
+async fn display_popup_style_only_paints_cells_the_process_left_unstyled() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("popup-style-defaults");
+    let requester_pid = std::process::id();
+    let mut control_rx = create_attached_session(&handler, &alpha, requester_pid).await;
+
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-popup -N -T Styled -s bg=blue -w 30 -h 8 -x C -y C"#,
+    )
+    .await;
+    let _ = next_overlay_frame(&mut control_rx).await;
+
+    let frame = popup_surface_frame(
+        &handler,
+        requester_pid,
+        &mut control_rx,
+        b"\x1b[41mRED\x1b[0m plain\r\n",
+    )
+    .await;
+
+    // Asserted on the content row itself, not on the whole frame: the popup
+    // background fill would otherwise satisfy a frame-wide check on its own.
+    let row = frame
+        .split("\u{1b}7")
+        .find(|chunk| chunk.contains("RED"))
+        .expect("styled popup row is emitted");
+    assert!(
+        row.contains("\u{1b}[41mRED"),
+        "-s must not override a background the process chose: {row:?}"
+    );
+    let tail = row.split("RED").nth(1).expect("text after the styled run");
+    assert!(
+        tail.contains("44"),
+        "-s must still colour the cells the process left unstyled: {row:?}"
+    );
+}
+
+#[tokio::test]
+async fn display_popup_keeps_wide_characters_whole_when_clipping() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("popup-unicode-clip");
+    let requester_pid = std::process::id();
+    let mut control_rx = create_attached_session(&handler, &alpha, requester_pid).await;
+
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-popup -N -T Unicode -w 10 -h 6 -x C -y C"#,
+    )
+    .await;
+    let _ = next_overlay_frame(&mut control_rx).await;
+
+    let frame = popup_surface_frame(
+        &handler,
+        requester_pid,
+        &mut control_rx,
+        "\u{1b}[32m日本語テキスト\u{1b}[0m\r\n".as_bytes(),
+    )
+    .await;
+
+    assert!(
+        frame.contains("\u{1b}[32m日本"),
+        "wide characters keep their colour: {frame:?}"
+    );
+    let row = frame
+        .split("\u{1b}7")
+        .find(|chunk| chunk.contains('日'))
+        .expect("unicode popup row is emitted");
+    let painted = row.matches('日').count()
+        + row.matches('本').count()
+        + row.matches('語').count()
+        + row.matches('テ').count()
+        + row.matches('キ').count()
+        + row.matches('ス').count()
+        + row.matches('ト').count();
+    assert!(
+        painted <= 4,
+        "an 8-column content area holds at most four wide cells: {row:?}"
+    );
+}
+
 #[tokio::test]
 async fn display_menu_keyboard_navigation_wraps_around_separators() {
     let handler = RequestHandler::new();

@@ -35,6 +35,13 @@
   matches now require a fallback arm, so future capability-gated additions
   cannot silently become source-breaking patch updates.
 
+### Compatibility
+
+- Render `display-popup` content as terminal output instead of status-format
+  text. A popup process keeps the colours and attributes it emits, including
+  basic, indexed, and 24-bit colour, and `-s` now colours only the cells the
+  process left unstyled.
+
 ### Reliability and performance
 
 - Linearize pane generation, output sequence, invalidation revision, transcript
