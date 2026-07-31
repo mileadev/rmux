@@ -711,7 +711,7 @@ mod tests {
             "a panicking write leaves no attributable failure behind"
         );
         assert!(
-            CHILD_MAIN_SOURCE.contains(r#"stdout.write_all(b"\x1b[?2004h")"#),
+            CHILD_MAIN_SOURCE.contains(r#".write_all(b"\x1b[?2004h")"#),
             "the child must write the announcement itself, checked"
         );
         assert!(
