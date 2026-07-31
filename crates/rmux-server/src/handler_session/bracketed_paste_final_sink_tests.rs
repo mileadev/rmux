@@ -28,7 +28,9 @@ use rmux_core::input::mode;
 use rmux_proto::{PaneTarget, SessionName};
 use tokio::time::sleep;
 
-use crate::test_shell::final_sink::{create_final_sink_session, FinalSinkSlot};
+use crate::test_shell::final_sink::{
+    create_final_sink_session, describe_missing_bracketed_mode, observe_pane_output, FinalSinkSlot,
+};
 
 use super::super::RequestHandler;
 use super::deferred_initial_gate::DeferredInitialGate;
@@ -73,17 +75,32 @@ async fn bracketed_mode_while_starting(handler: &RequestHandler, session: &Sessi
 
 /// Waits for the real child's own `ESC[?2004h` to reach the production
 /// transcript, asserting on every poll that the pane is still starting.
+///
+/// An expired wait carries what the transcript had observed, so a missing
+/// announcement names the boundary it stopped at rather than only the deadline.
 async fn await_child_bracketed_announcement(handler: &RequestHandler, session: &SessionName) {
     let deadline = Instant::now() + OBSERVATION_TIMEOUT;
     loop {
         if bracketed_mode_while_starting(handler, session).await {
             return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "the real child never announced ESC[?2004h through pane output \
-             while its pane was starting"
-        );
+        if Instant::now() >= deadline {
+            let target = PaneTarget::with_window(session.clone(), 0, 0);
+            let observed = {
+                let state = handler.state.lock().await;
+                observe_pane_output(&state, &target)
+            };
+            panic!(
+                "the real child never announced ESC[?2004h through pane output \
+                 while its pane was starting\n{}",
+                describe_missing_bracketed_mode(
+                    &target.to_string(),
+                    true,
+                    OBSERVATION_TIMEOUT,
+                    &observed,
+                )
+            );
+        }
         sleep(Duration::from_millis(25)).await;
     }
 }

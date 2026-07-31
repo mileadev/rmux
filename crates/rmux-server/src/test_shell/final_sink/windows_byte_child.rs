@@ -79,10 +79,19 @@ const BUILD_DIRECTORY_ATTEMPTS: u32 = 64;
 /// The observer module this test binary itself compiles.
 pub(super) const OBSERVER_SOURCE: &str = include_str!("byte_observer.rs");
 
-/// The child's entry point: console mode, the capability announcement, the
-/// readiness signal, the historical read boundary, and the park/`done`
+/// The child's entry point: both console modes, the capability announcement,
+/// the readiness signal, the historical read boundary, and the park/`done`
 /// teardown handshake. Everything about the capture itself is delegated to the
 /// observer module, which is why nothing here re-implements a console read.
+///
+/// The console *output* mode is as load-bearing as the input one. Windows
+/// interprets a VT sequence written to a console only when that output handle
+/// carries `ENABLE_VIRTUAL_TERMINAL_PROCESSING`; without it the announcement is
+/// text the console deposits in its screen buffer, and what a pseudoconsole then
+/// reproduces downstream is the host build's business rather than this child's.
+/// The Unix sibling inherits nothing to do here because a pseudoterminal carries
+/// its bytes verbatim, which is exactly why porting that protocol to a console
+/// had to add the step instead.
 pub(super) const CHILD_MAIN_SOURCE: &str = r##"#![allow(dead_code)]
 //! The Windows final-sink pane child.
 //!
@@ -108,12 +117,18 @@ extern "system" {
 }
 
 const STD_INPUT_HANDLE: i32 = -10;
+const STD_OUTPUT_HANDLE: i32 = -11;
 /// `ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT`: a cooked
 /// console treats the paste's leading ESC as an editing command and rewrites
 /// CR/LF, so the captured bytes would say nothing about the sink.
 const COOKED_INPUT_FLAGS: u32 = 0x7;
 /// `ENABLE_VIRTUAL_TERMINAL_INPUT`.
 const VIRTUAL_TERMINAL_INPUT: u32 = 0x200;
+/// `ENABLE_VIRTUAL_TERMINAL_PROCESSING`: without it a console takes the
+/// announcement below as text for its screen buffer rather than as a sequence
+/// to interpret, so this child would be leaving to the host build what it is
+/// here to state itself.
+const VIRTUAL_TERMINAL_OUTPUT: u32 = 0x4;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 struct Slot {
@@ -168,11 +183,11 @@ fn capture(slot: &Slot, want: usize, aware: bool) -> Result<(), String> {
     // signalled first could be read in cooked mode, which would corrupt the
     // capture without ever reporting a setup failure.
     set_raw_console_input()?;
+    // Established by both children, so an aware pane and an unaware one differ
+    // in the announcement itself and in nothing else about their console.
+    set_virtual_terminal_output()?;
     if aware {
-        print!("\u{1b}[?2004h");
-        std::io::stdout()
-            .flush()
-            .map_err(|error| format!("the capability announcement failed: {error}"))?;
+        announce_bracketed_paste()?;
     }
     std::fs::write(&slot.ready, b"1")
         .map_err(|error| format!("readiness could not be signalled: {error}"))?;
@@ -198,6 +213,44 @@ fn set_raw_console_input() -> Result<(), String> {
     };
     let _ = mode;
     Ok(())
+}
+
+/// Puts standard output into virtual-terminal processing mode.
+///
+/// A console does not interpret a VT sequence unless its output handle carries
+/// `ENABLE_VIRTUAL_TERMINAL_PROCESSING`; the announcement below is otherwise
+/// plain text for the screen buffer, and whether a pseudoconsole reproduces
+/// anything a terminal can read as a mode change stops being this child's
+/// decision. Establishing it is what makes the announcement mean the same thing
+/// on every Windows build.
+fn set_virtual_terminal_output() -> Result<(), String> {
+    unsafe {
+        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        let mut mode = 0_u32;
+        if GetConsoleMode(handle, &mut mode) == 0 {
+            return Err("GetConsoleMode failed: standard output is not a console".to_owned());
+        }
+        let processed = mode | VIRTUAL_TERMINAL_OUTPUT;
+        if SetConsoleMode(handle, processed) == 0 {
+            return Err(format!(
+                "SetConsoleMode({processed:#x}) failed for standard output"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Writes this child's own bracketed-paste capability announcement.
+///
+/// Checked like every other step, and like the Unix sibling's `printf`:
+/// `print!` panics when the write fails, which would leave the harness a child
+/// that died with no `error` to read.
+fn announce_bracketed_paste() -> Result<(), String> {
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(b"\x1b[?2004h")
+        .and_then(|()| stdout.flush())
+        .map_err(|error| format!("the capability announcement failed: {error}"))
 }
 
 /// Stays alive after capturing so the harness can still resolve this pane as a
@@ -595,6 +648,76 @@ mod tests {
         );
         assert!(CHILD_MAIN_SOURCE.contains("const COOKED_INPUT_FLAGS: u32 = 0x7;"));
         assert!(CHILD_MAIN_SOURCE.contains("const VIRTUAL_TERMINAL_INPUT: u32 = 0x200;"));
+    }
+
+    /// The finding this correction is for. A console interprets a VT sequence
+    /// only when its output handle carries
+    /// `ENABLE_VIRTUAL_TERMINAL_PROCESSING`; a child that announces
+    /// `ESC[?2004h` without it has handed the meaning of its own announcement
+    /// to whatever the host build does with text in a screen buffer. The child
+    /// established its input mode and never its output mode, which is the step
+    /// the Unix sibling has no need of and the port therefore never gained.
+    ///
+    /// Both children establish it, so the aware proof and the unaware negative
+    /// control differ in the announcement and in nothing else.
+    #[test]
+    fn the_child_enables_virtual_terminal_output_before_it_announces_the_capability() {
+        assert!(
+            CHILD_MAIN_SOURCE.contains("const STD_OUTPUT_HANDLE: i32 = -11;"),
+            "the child must address its own standard output"
+        );
+        assert!(
+            CHILD_MAIN_SOURCE.contains("const VIRTUAL_TERMINAL_OUTPUT: u32 = 0x4;"),
+            "the child must name ENABLE_VIRTUAL_TERMINAL_PROCESSING"
+        );
+
+        let at = |needle: &str| {
+            CHILD_MAIN_SOURCE
+                .find(needle)
+                .unwrap_or_else(|| panic!("the child must run {needle:?}"))
+        };
+        let raw_input = at("set_raw_console_input()?");
+        let virtual_terminal_output = at("set_virtual_terminal_output()?");
+        let awareness = at("if aware {");
+        let announcement = at("announce_bracketed_paste()?");
+        let readiness = at("std::fs::write(&slot.ready");
+
+        assert!(
+            raw_input < virtual_terminal_output,
+            "the console modes are established together, input first"
+        );
+        assert!(
+            virtual_terminal_output < awareness,
+            "an unaware child must establish exactly the console an aware one does"
+        );
+        assert!(
+            awareness < announcement,
+            "only an aware child announces the capability"
+        );
+        assert!(
+            announcement < readiness,
+            "readiness must never be signalled before the announcement it precedes"
+        );
+    }
+
+    /// The announcement is this child's own capability claim, so a write it
+    /// could not perform is owed an `error` like every other step — the Unix
+    /// sibling has always guarded its `printf`. `print!` panicked instead,
+    /// leaving the harness a dead child and nothing to read.
+    #[test]
+    fn an_announcement_the_child_could_not_write_is_reported_rather_than_panicked() {
+        assert!(
+            !CHILD_MAIN_SOURCE.contains("print!("),
+            "a panicking write leaves no attributable failure behind"
+        );
+        assert!(
+            CHILD_MAIN_SOURCE.contains(r#"stdout.write_all(b"\x1b[?2004h")"#),
+            "the child must write the announcement itself, checked"
+        );
+        assert!(
+            CHILD_MAIN_SOURCE.contains("the capability announcement failed"),
+            "a failed announcement must name itself"
+        );
     }
 
     /// A digest that is not stable is not identity. This also fails loudly if

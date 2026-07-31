@@ -62,6 +62,10 @@ use std::time::{Duration, Instant};
 /// the directory its declaration names, not one named after itself.
 #[path = "final_sink/byte_observer.rs"]
 mod byte_observer;
+/// What the production transcript observed when a proof gave up waiting for a
+/// child's announcement. Shared, because both final-sink siblings wait for it.
+#[path = "final_sink/pane_observation.rs"]
+pub(crate) mod pane_observation;
 /// The Unix child's capture protocol. Generated on every platform so its shape
 /// is checked wherever this crate's tests run, executed only on Unix.
 #[path = "final_sink/unix_child.rs"]
@@ -69,6 +73,8 @@ mod unix_child;
 #[cfg(windows)]
 #[path = "final_sink/windows_byte_child.rs"]
 mod windows_byte_child;
+
+pub(crate) use pane_observation::{describe_missing_bracketed_mode, observe_pane_output};
 
 const READY_FILE: &str = "ready";
 const OUT_FILE: &str = "out";

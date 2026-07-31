@@ -15,7 +15,8 @@ use std::time::Instant;
 
 use super::*;
 use crate::test_shell::final_sink::{
-    create_final_sink_session, split_final_sink_pane, FinalSinkSlot,
+    create_final_sink_session, describe_missing_bracketed_mode, observe_pane_output,
+    split_final_sink_pane, FinalSinkSlot,
 };
 
 const OPEN: &[u8] = b"\x1b[200~";
@@ -32,14 +33,24 @@ fn wrapped(body: &[u8]) -> Vec<u8> {
     wrapped
 }
 
+/// How long a real child is given to publish its capability through pane output.
+const ANNOUNCEMENT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Waits until the server transcript has observed the child's real DECSET 2004
 /// announcement, so routing is decided from production state.
+///
+/// An expired wait reports what that transcript had actually observed. The
+/// deadline alone said only that the mode never changed, which reads the same
+/// for a pane that received no child output, one that received output carrying
+/// no announcement, and one whose console handed it the announcement as screen
+/// text — and a Windows 10 release execution costs a thirteen-minute
+/// compilation before it can say so.
 pub(super) async fn wait_for_bracketed_mode(
     handler: &RequestHandler,
     target: &PaneTarget,
     expected: bool,
 ) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + ANNOUNCEMENT_TIMEOUT;
     loop {
         {
             let state = handler.state.lock().await;
@@ -55,11 +66,20 @@ pub(super) async fn wait_for_bracketed_mode(
             if (pane_mode & mode::MODE_BRACKETPASTE != 0) == expected {
                 return;
             }
+            // Read under the same lock as the mode above, so the report and the
+            // decision it explains describe one state of the transcript.
+            if Instant::now() >= deadline {
+                panic!(
+                    "{}",
+                    describe_missing_bracketed_mode(
+                        &target.to_string(),
+                        expected,
+                        ANNOUNCEMENT_TIMEOUT,
+                        &observe_pane_output(&state, target),
+                    )
+                );
+            }
         }
-        assert!(
-            Instant::now() < deadline,
-            "pane {target} never reached bracketed-paste mode {expected}"
-        );
         sleep(Duration::from_millis(25)).await;
     }
 }
