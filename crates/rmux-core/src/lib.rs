@@ -85,7 +85,7 @@ pub use screen::{
 };
 pub use session::{
     BreakPaneOptions, KillPaneOutcome, PaneJoinOptions, PaneSwapOptions, Session,
-    SessionPaneTarget, SessionStore,
+    SessionPaneTarget, SessionRecency, SessionStore,
 };
 pub use style::{
     colour_to_string, parse_colour, style_parse, style_tostring, ColourParseError, Style,

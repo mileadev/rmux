@@ -552,9 +552,8 @@ fn latest_detached_session_target(sessions: &SessionStore) -> Option<Target> {
         .iter()
         .max_by(|(left_name, left_session), (right_name, right_session)| {
             left_session
-                .activity_at()
-                .cmp(&right_session.activity_at())
-                .then(left_session.created_at().cmp(&right_session.created_at()))
+                .recency()
+                .cmp(&right_session.recency())
                 .then(left_session.id().cmp(&right_session.id()))
                 .then(right_name.as_str().cmp(left_name.as_str()))
         })
@@ -931,6 +930,70 @@ mod tests {
                 .expect("session create succeeds");
         }
         sessions
+    }
+
+    /// One arbitrary but fixed second shared by every session in a fixture.
+    const PINNED_SECOND: i64 = 1_785_500_000;
+
+    /// Builds a store created in `m03`, `z99`, `a01` order and then used in
+    /// `z99`, `m03` order, with every public second pinned to one value.
+    ///
+    /// `m03` is deliberately neither the alphabetically first name nor the
+    /// highest creation id, so no legacy tiebreak can select it. Pinning is
+    /// what makes the collision a property of the fixture instead of a race
+    /// against the wall clock.
+    fn same_second_session_store() -> SessionStore {
+        let mut sessions = SessionStore::new();
+        for name in ["m03", "z99", "a01"] {
+            sessions
+                .create_session(
+                    session_name(name),
+                    rmux_proto::TerminalSize { cols: 80, rows: 24 },
+                )
+                .expect("session create succeeds");
+        }
+        for name in ["z99", "m03"] {
+            sessions
+                .session_mut(&session_name(name))
+                .expect("used session exists")
+                .touch_attached();
+        }
+        for name in ["m03", "z99", "a01"] {
+            sessions
+                .session_mut(&session_name(name))
+                .expect("created session exists")
+                .pin_public_times_for_tests(PINNED_SECOND);
+        }
+        sessions
+    }
+
+    #[test]
+    fn queue_global_fallback_selects_the_last_used_same_second_session() {
+        let sessions = same_second_session_store();
+        let options = OptionStore::default();
+
+        // No requester pane, no attached session and no current target, so the
+        // queue falls back to the most recently used detached session — the
+        // fourth reader of the shared recency invariant.
+        let context = queue_target_find_context(QueueTargetFindContextInput {
+            sessions: &sessions,
+            options: &options,
+            requester_pane_id: None,
+            attached_session: None,
+            current_target: None,
+            missing_current_target_fallback: MissingCurrentTargetFallback::AllowDefaultSession,
+            mouse_target: None,
+            marked_target: None,
+        });
+
+        assert_eq!(
+            context.current(),
+            Some(&Target::Pane(PaneTarget::with_window(
+                session_name("m03"),
+                0,
+                0,
+            )))
+        );
     }
 
     #[test]

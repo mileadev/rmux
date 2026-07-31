@@ -428,9 +428,7 @@ impl RequestHandler {
                             .pane_pid_in_window(session_name, active_window, active_pane)
                             .ok()
                             .map(session_selection_prefers_live_process),
-                        session.last_attached_at(),
-                        session.activity_at(),
-                        session.created_at(),
+                        session.recency(),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -442,18 +440,9 @@ impl RequestHandler {
         };
 
         let mut preferred = Vec::new();
-        for (session_name, session_id, live_process, last_attached_at, activity_at, created_at) in
-            &sessions
-        {
+        for (session_name, session_id, live_process, recency) in &sessions {
             if self.attached_count(session_name).await == 0 {
-                preferred.push((
-                    session_name.clone(),
-                    *session_id,
-                    *live_process,
-                    *last_attached_at,
-                    *activity_at,
-                    *created_at,
-                ));
+                preferred.push((session_name.clone(), *session_id, *live_process, *recency));
             }
         }
 
@@ -474,21 +463,21 @@ impl RequestHandler {
             candidates
         };
 
+        // Unattached preference and the live-process filter above have already
+        // narrowed the candidate set, so what remains is a pure recency rank,
+        // matching `cmd_find_session_better`. A previous attach no longer
+        // outranks a later lifetime event: `touch_attached` mints a recency
+        // token of its own, so attach history is expressed by the same order
+        // instead of by a separate leading key.
         let (session_name, ..) = candidates
             .into_iter()
             .max_by(
-                |(left_name, left_id, _, left_attached, left_activity, left_created),
-                 (right_name, right_id, _, right_attached, right_activity, right_created)| {
-                    left_attached
-                        .unwrap_or(i64::MIN)
-                        .cmp(&right_attached.unwrap_or(i64::MIN))
-                        .then(
-                            left_activity
-                                .cmp(right_activity)
-                                .then(left_created.cmp(right_created))
-                                .then(left_id.cmp(right_id))
-                                .then(right_name.as_str().cmp(left_name.as_str())),
-                        )
+                |(left_name, left_id, _, left_recency),
+                 (right_name, right_id, _, right_recency)| {
+                    left_recency
+                        .cmp(right_recency)
+                        .then(left_id.cmp(right_id))
+                        .then(right_name.as_str().cmp(left_name.as_str()))
                 },
             )
             .ok_or_else(|| RmuxError::Server("no sessions".to_owned()))?;

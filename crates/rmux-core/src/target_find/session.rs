@@ -62,9 +62,8 @@ impl SessionStore {
         let (session_name, _) = candidates
             .into_iter()
             .max_by(|(left_name, left), (right_name, right)| {
-                left.activity_at()
-                    .cmp(&right.activity_at())
-                    .then(left.created_at().cmp(&right.created_at()))
+                left.recency()
+                    .cmp(&right.recency())
                     .then(right_name.as_str().cmp(left_name.as_str()))
             })
             .ok_or_else(|| RmuxError::Server("no current target".to_owned()))?;

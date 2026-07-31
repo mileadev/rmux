@@ -874,3 +874,9 @@ mod client_security;
 
 #[path = "handler_attach_tests/attached_count_identity.rs"]
 mod attached_count_identity;
+
+#[path = "handler_attach_tests/session_recency.rs"]
+mod session_recency;
+
+#[path = "handler_attach_tests/session_recency_input.rs"]
+mod session_recency_input;

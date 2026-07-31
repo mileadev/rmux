@@ -402,10 +402,37 @@ impl RequestHandler {
         .await
     }
 
+    /// Commits the recency of one accepted attached-client interaction.
+    ///
+    /// This is the single admission boundary for live client input, reached
+    /// before the server decides whether the bytes become a prefix, a key
+    /// binding, prompt or overlay editing, a copy/clock/mode-tree key,
+    /// display-panes selection, a bracketed paste, a clipboard or terminal
+    /// response, or a pane write. Committing here is what makes locally
+    /// consumed interaction count as session use, matching tmux, which updates
+    /// session activity immediately after admitting a key and before any
+    /// dispatch decision. Committing after pane I/O instead would silently
+    /// drop every key the server handles itself.
+    ///
+    /// Both counters are advanced under the same two guards, so client order
+    /// and session order share one policy and one linearization point:
+    /// concurrent clients are ordered by which one acquires these locks first,
+    /// not by which pane write finishes first. One logical input advances the
+    /// session once here regardless of how many panes it later reaches, so
+    /// `synchronize-panes` cannot inflate recency.
+    ///
+    /// Rejected input never reaches the commit: empty frames are filtered by
+    /// the caller, a vanished or closing attach fails, and a client that
+    /// cannot write or is read-only returns without advancing anything. That
+    /// read-only exclusion is a deliberate RMUX divergence — tmux does count
+    /// read-only keys — and is the existing client-activity policy this
+    /// boundary reuses rather than a new rule.
     async fn record_attached_input_activity(
         &self,
         identity: ActiveAttachIdentity,
     ) -> io::Result<()> {
+        // Handler lock order is state before active_attach.
+        let mut state = self.state.lock().await;
         let mut active_attach = self.active_attach.lock().await;
         let active = active_attach
             .by_pid
@@ -416,6 +443,17 @@ impl RequestHandler {
             })
             .ok_or_else(|| io_other("attached client disappeared"))?;
         if active.can_write && !active.flags.contains(ClientFlags::READONLY) {
+            // The attach owns its current session, which a switch may have
+            // changed since `identity` was captured. Requiring the session id
+            // to still match keeps a same-name session recreated underneath
+            // this client from inheriting the older session's interaction.
+            if let Some(session) = state
+                .sessions
+                .session_mut(&active.session_name)
+                .filter(|session| session.id() == active.session_id)
+            {
+                session.touch_activity();
+            }
             let sequence = self.next_client_activity_sequence();
             let _ = active_attach.record_client_activity(identity.attach_pid(), sequence);
         }

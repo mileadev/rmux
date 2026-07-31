@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
+use rmux_core::SessionRecency;
 use rmux_proto::{OptionName, SessionId, SessionName, TerminalGeometry};
 
 use super::{AttachedSwitchCommitRequest, ClientFlags, RequestHandler};
@@ -44,8 +45,7 @@ impl SessionDetachOnDestroy {
 struct DestroySwitchCandidate {
     session_name: SessionName,
     session_id: SessionId,
-    activity_at: i64,
-    created_at: i64,
+    recency: SessionRecency,
     attached: bool,
 }
 
@@ -257,8 +257,7 @@ impl RequestHandler {
             .map(|(candidate_name, session)| DestroySwitchCandidate {
                 session_name: candidate_name.clone(),
                 session_id: session.id(),
-                activity_at: session.activity_at(),
-                created_at: session.created_at(),
+                recency: session.recency(),
                 attached: attached_session_ids.contains(&session.id()),
             })
             .collect::<Vec<_>>();
@@ -363,9 +362,8 @@ fn most_recent_destroy_switch_candidate(
     candidates
         .iter()
         .max_by(|left, right| {
-            left.activity_at
-                .cmp(&right.activity_at)
-                .then_with(|| left.created_at.cmp(&right.created_at))
+            left.recency
+                .cmp(&right.recency)
                 .then_with(|| left.session_id.cmp(&right.session_id))
                 .then_with(|| right.session_name.as_str().cmp(left.session_name.as_str()))
         })

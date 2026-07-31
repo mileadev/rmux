@@ -17,6 +17,8 @@ mod pane_transfer;
 mod pane_transfer_cross;
 #[path = "session/pane_transfer_shared.rs"]
 mod pane_transfer_shared;
+#[path = "session/recency.rs"]
+mod recency;
 #[path = "session/resize.rs"]
 mod resize;
 #[path = "session/store.rs"]
@@ -28,6 +30,7 @@ mod types;
 #[path = "session/window_ops.rs"]
 mod window_ops;
 
+pub use recency::SessionRecency;
 pub use store::SessionStore;
 use target_error::{invalid_pane_target, invalid_window_target};
 pub(crate) use types::WindowIdAllocator;
@@ -53,6 +56,9 @@ pub struct Session {
     created_at: i64,
     activity_at: i64,
     last_attached_at: Option<i64>,
+    /// Internal total order behind the whole-second `activity_at`/`created_at`
+    /// pair, so same-second lifetime and interaction events stay orderable.
+    recency: SessionRecency,
     cwd: Option<PathBuf>,
 }
 
@@ -91,6 +97,7 @@ impl Session {
             created_at: now,
             activity_at: now,
             last_attached_at: None,
+            recency: SessionRecency::next(),
             cwd: None,
         }
     }

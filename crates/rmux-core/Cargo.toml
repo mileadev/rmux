@@ -9,6 +9,11 @@ description = "Core session, pane, layout, format, hook, and buffer model for th
 keywords = ["terminal", "multiplexer", "core"]
 categories = ["command-line-interface"]
 
+[features]
+# Test-only seams for dependent crates' tests. Off by default, so a published
+# build never exposes them.
+test-seams = []
+
 [dependencies]
 chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
 compact_str = "0.8.1"
