@@ -1648,7 +1648,7 @@ mod tests {
             .by_pid
             .get_mut(&attach_pid)
             .expect("test attached client exists");
-        active.client_size = size;
+        active.set_declared_client_size(size);
         active.size_sequence = size_sequence;
         drop(active_attach);
         handler.bump_active_attach_epoch();
@@ -1834,7 +1834,7 @@ mod tests {
             .by_pid
             .get_mut(&attach_pid)
             .expect("attach exists")
-            .client_size = client_size;
+            .set_declared_client_size(client_size);
         let pause = install_switch_target_identity_pause(beta.clone());
 
         let switch_handler = handler.clone();

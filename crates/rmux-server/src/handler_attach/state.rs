@@ -30,6 +30,21 @@ pub(in crate::handler) struct ActiveAttachState {
         HashMap<rmux_proto::SessionName, HashMap<u32, u32>>,
 }
 
+/// How an attached client's outer terminal geometry became known.
+///
+/// This is server-internal typing only; it never crosses the wire and must
+/// never be reconstructed from the numeric dimensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::handler) enum AttachClientSizeProvenance {
+    /// The client declared this outer terminal geometry itself.
+    Declared,
+    /// The client declared no size, so registration anchored it to the outer
+    /// terminal geometry of the session it joined. Anchoring to the session's
+    /// *content* geometry instead would hand an already status-subtracted row
+    /// count to every consumer that subtracts the status rows again.
+    InferredFromSession,
+}
+
 #[derive(Debug)]
 pub(in crate::handler) struct ActiveAttach {
     pub(in crate::handler) id: u64,
@@ -56,7 +71,11 @@ pub(in crate::handler) struct ActiveAttach {
     /// The server initiated this close without first emitting `client-detached`.
     pub(in crate::handler) emit_detached_on_finish: bool,
     pub(in crate::handler) terminal_context: OuterTerminalContext,
+    /// Outer terminal geometry, status rows included. Every consumer derives
+    /// content geometry from it by subtracting the status rows exactly once,
+    /// so an already-subtracted row count must never be stored here.
     pub(in crate::handler) client_size: TerminalSize,
+    pub(in crate::handler) client_size_provenance: AttachClientSizeProvenance,
     pub(in crate::handler) client_pixels: Option<TerminalPixels>,
     pub(in crate::handler) size_sequence: u64,
     /// Server-monotonic ordering of the client's latest accepted live input.
@@ -170,6 +189,22 @@ impl ActiveAttachIdentity {
 impl ActiveAttach {
     pub(in crate::handler) const fn identity(&self, attach_pid: u32) -> ActiveAttachIdentity {
         ActiveAttachIdentity::new(attach_pid, self.id, self.session_id)
+    }
+
+    /// `true` while `client_size` is still the anchor registration inferred
+    /// from the session rather than geometry the client declared.
+    pub(in crate::handler) const fn client_size_is_inferred(&self) -> bool {
+        matches!(
+            self.client_size_provenance,
+            AttachClientSizeProvenance::InferredFromSession
+        )
+    }
+
+    /// Records outer terminal geometry the client itself reported, promoting an
+    /// inferred anchor even when the dimensions are numerically unchanged.
+    pub(in crate::handler) fn set_declared_client_size(&mut self, client_size: TerminalSize) {
+        self.client_size = client_size;
+        self.client_size_provenance = AttachClientSizeProvenance::Declared;
     }
 }
 

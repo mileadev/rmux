@@ -158,6 +158,100 @@ async fn choose_tree_switch_notifies_the_destination_session_layout_change_like_
     );
 }
 
+/// `choose-tree` reaches the same switch helper as `switch-client`, so a client
+/// that never declared a size must carry its outer terminal anchor — not the
+/// status-subtracted content rows it was registered against — onto the
+/// destination session.
+#[tokio::test]
+async fn choose_tree_switch_carries_a_sizeless_client_outer_terminal_anchor() {
+    let handler = RequestHandler::new();
+    let source = SessionName::new("choose-tree-sizeless-source").expect("valid session");
+    let target = SessionName::new("choose-tree-sizeless-target").expect("valid session");
+    create_test_session(&handler, &source).await;
+    create_test_session(&handler, &target).await;
+    for session in [&source, &target] {
+        assert!(matches!(
+            handler
+                .handle(Request::SetOption(SetOptionRequest {
+                    scope: ScopeSelector::Session((*session).clone()),
+                    option: OptionName::Status,
+                    value: "2".to_owned(),
+                    mode: SetOptionMode::Replace,
+                }))
+                .await,
+            Response::SetOption(_)
+        ));
+    }
+
+    let declared_pid = std::process::id().saturating_add(311);
+    let sizeless_pid = declared_pid.saturating_add(1);
+    let (declared_tx, _declared_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(declared_pid, source.clone(), declared_tx)
+        .await;
+    handler
+        .handle_attached_resize(declared_pid, TerminalSize { cols: 80, rows: 24 })
+        .await
+        .expect("declared terminal geometry seeds status-aware content size");
+    assert_eq!(
+        window_size(&handler, &source).await,
+        TerminalSize { cols: 80, rows: 22 }
+    );
+
+    let (sizeless_tx, _sizeless_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(sizeless_pid, source.clone(), sizeless_tx)
+        .await;
+
+    let target_session_id = handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&target)
+        .expect("target session exists")
+        .id();
+    let parsed = CommandParser::new()
+        .parse_arguments(["choose-tree"])
+        .expect("choose-tree parses");
+    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+        .expect("mode-tree command parses")
+        .expect("mode-tree command recognized");
+    handler
+        .execute_queued_mode_tree(
+            sizeless_pid,
+            command,
+            &QueueExecutionContext::without_caller_cwd(),
+        )
+        .await
+        .expect("choose-tree opens");
+    handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .get_mut(&sizeless_pid)
+        .and_then(|active| active.mode_tree.as_mut())
+        .expect("choose-tree remains active")
+        .selected_id = Some(session_item_id(target_session_id));
+
+    handler
+        .accept_mode_tree_selection(sizeless_pid)
+        .await
+        .expect("choose-tree switch-client -Zt succeeds");
+
+    assert_eq!(
+        session_terminal_size(&handler, &target).await,
+        TerminalSize { cols: 80, rows: 24 },
+        "choose-tree must carry the outer terminal anchor to the destination"
+    );
+    assert_eq!(
+        window_size(&handler, &target).await,
+        TerminalSize { cols: 80, rows: 22 },
+        "the destination subtracts its own status rows exactly once"
+    );
+}
+
 #[tokio::test]
 async fn choose_tree_pane_switch_keeps_the_control_selection_model_current() {
     let handler = RequestHandler::new();
@@ -401,10 +495,24 @@ async fn set_attached_client_size(handler: &RequestHandler, attach_pid: u32, siz
         .by_pid
         .get_mut(&attach_pid)
         .expect("attached client remains registered");
-    active.client_size = size;
+    active.set_declared_client_size(size);
     active.size_sequence = size_sequence;
     drop(active_attach);
     handler.bump_active_attach_epoch();
+}
+
+async fn session_terminal_size(
+    handler: &RequestHandler,
+    session_name: &SessionName,
+) -> TerminalSize {
+    handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(session_name)
+        .expect("session remains present")
+        .terminal_size()
 }
 
 async fn window_size(handler: &RequestHandler, session_name: &SessionName) -> TerminalSize {

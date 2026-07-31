@@ -19,7 +19,9 @@ use crate::server_access::{
     current_owner_uid, pause_before_access_registration, AccessRegistrationKind,
 };
 
-use super::state::{ActiveAttach, ActiveAttachIdentity, AttachRegistration};
+use super::state::{
+    ActiveAttach, ActiveAttachIdentity, AttachClientSizeProvenance, AttachRegistration,
+};
 
 #[cfg(test)]
 struct TestAttachRegistration {
@@ -257,9 +259,18 @@ impl RequestHandler {
             return None;
         }
         let active_window_index = Some(session.active_window_index());
-        let client_size = registration
-            .client_size
-            .unwrap_or_else(|| session.window().size());
+        // A client that declared no size still needs an outer terminal anchor,
+        // because `client_size` is outer geometry everywhere it is read. The
+        // session's own terminal size is that anchor; its window size is the
+        // content geometry already reduced by the status rows, and storing it
+        // here made every consumer subtract those rows a second time.
+        let (client_size, client_size_provenance) = match registration.client_size {
+            Some(client_size) => (client_size, AttachClientSizeProvenance::Declared),
+            None => (
+                session.terminal_size(),
+                AttachClientSizeProvenance::InferredFromSession,
+            ),
+        };
         let attach_id = {
             let mut active_attach = self.active_attach.lock().await;
             // Keep the client-state lock across policy revalidation and publication.
@@ -317,6 +328,7 @@ impl RequestHandler {
                     emit_detached_on_finish: false,
                     terminal_context: registration.terminal_context,
                     client_size,
+                    client_size_provenance,
                     client_pixels: None,
                     size_sequence,
                     last_activity_sequence: activity_sequence,

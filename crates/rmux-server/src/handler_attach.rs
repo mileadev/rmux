@@ -1840,8 +1840,9 @@ mod tests {
 
     use super::{
         attach_target_for_session, install_attach_control_identity_pause,
-        reset_interactive_attach_state_for_session_switch, ActiveAttach, AttachRegistration,
-        RequestHandler, SessionDetachOnDestroy, ATTACH_CONTROL_BACKLOG_LIMIT,
+        reset_interactive_attach_state_for_session_switch, state::AttachClientSizeProvenance,
+        ActiveAttach, AttachRegistration, RequestHandler, SessionDetachOnDestroy,
+        ATTACH_CONTROL_BACKLOG_LIMIT,
     };
     use crate::client_flags::ClientFlags;
     use crate::handler::scripting_support::QueueExecutionContext;
@@ -2357,6 +2358,7 @@ mod tests {
             emit_detached_on_finish: false,
             terminal_context: OuterTerminalContext::default(),
             client_size: TerminalSize { cols: 80, rows: 24 },
+            client_size_provenance: AttachClientSizeProvenance::Declared,
             client_pixels: None,
             size_sequence: 0,
             last_activity_sequence: 0,

@@ -519,14 +519,19 @@ impl RequestHandler {
                 .flags
                 .contains(super::attach_support::ClientFlags::IGNORESIZE);
             let client_size_changed = active.client_size != size;
-            let geometry_changed = client_size_changed || active.client_pixels != geometry.pixels;
+            // A real resize promotes an inferred anchor to declared geometry
+            // even when the dimensions match it, so the declaration takes its
+            // place in `window-size latest` ordering.
+            let geometry_changed = client_size_changed
+                || active.client_pixels != geometry.pixels
+                || active.client_size_is_inferred();
             let size_sequence = geometry_changed.then(|| self.next_client_size_sequence());
             let active = active_attach
                 .by_pid
                 .get_mut(&attach_pid)
                 .expect("attached client checked above");
             if let Some(size_sequence) = size_sequence {
-                active.client_size = size;
+                active.set_declared_client_size(size);
                 active.client_pixels = geometry.pixels;
                 active.size_sequence = size_sequence;
             }

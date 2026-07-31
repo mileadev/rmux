@@ -157,7 +157,7 @@ async fn set_attached_geometry(handler: &RequestHandler, attach_pid: u32) {
         .by_pid
         .get_mut(&attach_pid)
         .expect("attached test client exists");
-    active.client_size = SWITCH_SIZE;
+    active.set_declared_client_size(SWITCH_SIZE);
     active.client_pixels = Some(TerminalPixels::new(1170, 780));
     active.size_sequence = size_sequence;
     drop(active_attach);

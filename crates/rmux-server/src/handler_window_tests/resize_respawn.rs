@@ -341,10 +341,10 @@ async fn resize_window_largest_smallest_with_attached_clients_still_use_client_s
             .by_pid
             .get_mut(&42)
             .expect("registered attach must exist");
-        active.client_size = TerminalSize {
+        active.set_declared_client_size(TerminalSize {
             cols: 100,
             rows: 30,
-        };
+        });
     }
 
     for adjustment in [

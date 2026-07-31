@@ -1788,7 +1788,7 @@ async fn register_attached_client(
         .by_pid
         .get_mut(&requester_pid)
         .expect("attached client remains registered");
-    active.client_size = size;
+    active.set_declared_client_size(size);
     active.size_sequence = size_sequence;
     drop(active_attach);
     handler.bump_active_attach_epoch();

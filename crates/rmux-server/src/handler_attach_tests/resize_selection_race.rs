@@ -208,7 +208,7 @@ async fn attached_size_selection_retries_after_the_captured_window_is_killed() {
             .by_pid
             .get_mut(&attach_pid)
             .expect("attached client exists");
-        active.client_size = LARGE_SIZE;
+        active.set_declared_client_size(LARGE_SIZE);
         active.size_sequence = size_sequence;
     }
     handler.bump_active_attach_epoch();
@@ -391,7 +391,7 @@ async fn attached_candidate_cannot_change_between_final_validation_and_apply() {
                 .by_pid
                 .get_mut(&attach_pid)
                 .expect("attached client exists");
-            active.client_size = LARGE_SIZE;
+            active.set_declared_client_size(LARGE_SIZE);
             active.size_sequence = size_sequence;
             drop(active_attach);
             mutation_handler.bump_active_attach_epoch();
@@ -438,7 +438,7 @@ async fn set_attached_candidate_size(
         .by_pid
         .get_mut(&attach_pid)
         .expect("attached client exists");
-    active.client_size = size;
+    active.set_declared_client_size(size);
     active.size_sequence = size_sequence;
     drop(active_attach);
     handler.bump_active_attach_epoch();

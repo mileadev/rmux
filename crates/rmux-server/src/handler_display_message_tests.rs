@@ -2363,7 +2363,7 @@ async fn display_message_initial_frame_uses_the_target_clients_geometry() {
             .by_pid
             .get_mut(&attach_pid)
             .expect("attached client exists")
-            .client_size = client_size;
+            .set_declared_client_size(client_size);
     }
     let message = "CLIENT-GEOMETRY-MESSAGE";
     assert!(matches!(

@@ -777,6 +777,42 @@ async fn web_session_operator_registers_writable_attach() {
 }
 
 #[tokio::test]
+async fn web_session_operator_without_browser_size_keeps_status_aware_geometry() {
+    let handler = RequestHandler::new();
+    let session_name = new_session(&handler, "websession-sizeless-operator").await;
+    seed_two_line_status_geometry(&handler, &session_name, 81_001).await;
+
+    let created = create_share(
+        &handler,
+        CreateWebShareRequest {
+            operator: true,
+            ..share_request(WebShareScope::Session(session_name.clone()))
+        },
+    )
+    .await;
+    let operator_token = token_from_url(created.operator_url.as_deref().expect("operator URL"));
+    let stream = handler
+        .open_web_share(&operator_token, None)
+        .await
+        .expect("session web share opens");
+    let WebShareStream::Session(_session_stream) = stream else {
+        panic!("expected session web share stream");
+    };
+
+    // A browser that never reported its size registers without one. Repeated
+    // status changes must still take the status rows off the outer terminal
+    // anchor exactly once, never off the already-subtracted content rows.
+    for value in ["off", "2", "off", "2"] {
+        set_session_status(&handler, &session_name, value).await;
+    }
+    assert_eq!(
+        session_window_size(&handler, &session_name).await,
+        TerminalSize { cols: 80, rows: 22 },
+        "a sizeless WebShare operator must not shrink the session on every status change"
+    );
+}
+
+#[tokio::test]
 async fn web_session_spectator_share_attach_ignores_browser_size() {
     let handler = RequestHandler::new();
     let session_name = new_session(&handler, "websession-read-size").await;
@@ -1934,6 +1970,55 @@ async fn new_session_with_size(
         Response::NewSession(_)
     ));
     session_name
+}
+
+async fn set_session_status(handler: &RequestHandler, session_name: &SessionName, value: &str) {
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Session(session_name.clone()),
+                option: OptionName::Status,
+                value: value.to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+}
+
+async fn session_window_size(handler: &RequestHandler, session_name: &SessionName) -> TerminalSize {
+    handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(session_name)
+        .expect("session exists")
+        .window()
+        .size()
+}
+
+/// Leaves `session_name` with a two-line status, an 80x24 outer terminal and an
+/// 80x22 content window, with no client still attached.
+async fn seed_two_line_status_geometry(
+    handler: &RequestHandler,
+    session_name: &SessionName,
+    attach_pid: u32,
+) {
+    set_session_status(handler, session_name, "2").await;
+    let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
+    let attach_id = handler
+        .register_attach(attach_pid, session_name.clone(), control_tx)
+        .await;
+    handler
+        .handle_attached_resize(attach_pid, TerminalSize { cols: 80, rows: 24 })
+        .await
+        .expect("declared terminal geometry seeds status-aware content size");
+    handler.finish_attach(attach_pid, attach_id).await;
+    assert_eq!(
+        session_window_size(handler, session_name).await,
+        TerminalSize { cols: 80, rows: 22 }
+    );
 }
 
 async fn create_share(

@@ -376,7 +376,7 @@ async fn parsed_queue_resize_window_balanced_flags_use_attached_client_sizes() {
             .by_pid
             .get_mut(&pid)
             .expect("registered attach exists")
-            .client_size = size;
+            .set_declared_client_size(size);
     }
 
     let grow = CommandParser::new()
