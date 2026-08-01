@@ -159,10 +159,6 @@ impl RequestHandler {
             )
             .await;
         }
-        // Resolved before the resize: an already-attached client is moving, so
-        // the resize displaces exactly the registration the switch below then
-        // commits. Resolving it afterwards would let the two disagree, and a
-        // stale generation would already have moved the shared geometry.
         let managed_client = match expected_attach {
             Some(identity) => Some(SwitchManagedClientIdentity::Attach {
                 pid: identity.attach_pid(),
@@ -170,18 +166,31 @@ impl RequestHandler {
             }),
             None => self.managed_client_for_pid(requester_pid).await,
         };
-        if let Err(error) = self
-            .resize_session_for_attach_client(
-                &session_name,
-                super::AttachResizeClient::new(
-                    managed_client.and_then(SwitchManagedClientIdentity::attach_generation),
-                    request.client_size,
-                    flags,
-                ),
-            )
-            .await
-        {
-            return HandleOutcome::response(Response::Error(ErrorResponse { error }));
+        // An already-attached client is *moving*, and its switch commit performs
+        // that whole move — size selection, window and PTY mutation, and the
+        // delivery of the frame — inside one `state` -> `active_attach` ->
+        // `active_control` region. Sizing the destination here as well would be a
+        // second write to the same shared window from outside that region: it
+        // cannot see whether the captured generation can still receive the
+        // switch, and the commit that decides so runs afterwards. The commit
+        // re-selects from that same registration, so on the path where the
+        // command succeeds this write is also redundant.
+        //
+        // A first attach and a control client own no attach registration and
+        // deliver no switch frame, so their resize is the only one there is.
+        if !matches!(
+            managed_client,
+            Some(SwitchManagedClientIdentity::Attach { .. })
+        ) {
+            if let Err(error) = self
+                .resize_session_for_attach_client(
+                    &session_name,
+                    super::AttachResizeClient::new(request.client_size, flags),
+                )
+                .await
+            {
+                return HandleOutcome::response(Response::Error(ErrorResponse { error }));
+            }
         }
         if let Some(client) = managed_client {
             #[cfg(test)]

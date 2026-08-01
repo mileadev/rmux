@@ -212,14 +212,6 @@ impl AttachGeneration {
     pub(in crate::handler) fn is(self, attach_pid: u32, active: &ActiveAttach) -> bool {
         self.attach_pid == attach_pid && self.attach_id == active.id
     }
-
-    /// `true` while this exact registration is still the one its pid holds.
-    pub(in crate::handler) fn is_live(self, active_attach: &ActiveAttachState) -> bool {
-        active_attach
-            .by_pid
-            .get(&self.attach_pid)
-            .is_some_and(|active| self.is(self.attach_pid, active))
-    }
 }
 
 impl ActiveAttach {

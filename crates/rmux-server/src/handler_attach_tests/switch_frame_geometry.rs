@@ -48,6 +48,15 @@ const REPLACEMENT_CLIENT_SIZE: TerminalSize = TerminalSize {
     cols: 120,
     rows: 50,
 };
+/// The geometry a live registration owns while its own sized command is paused.
+/// Both statuses are `off` in the delivery rows too, so content rows and outer
+/// rows coincide there as well.
+const HELD_CLIENT_SIZE: TerminalSize = TerminalSize {
+    cols: 120,
+    rows: 50,
+};
+/// The smaller geometry that paused, sized `attach-session` request carries.
+const REQUESTED_CLIENT_SIZE: TerminalSize = TerminalSize { cols: 80, rows: 24 };
 const STATUS_TWO: &str = "2";
 const STATUS_OFF: &str = "off";
 const SWITCHING_PID: u32 = 93_101;
@@ -367,6 +376,272 @@ async fn a_stale_attach_session_must_not_displace_a_same_pid_replacement() {
         "a stale command must fail before it displaces or moves a same-pid \
          replacement, but {regressions:?}"
     );
+}
+
+/// How the captured generation stops being able to receive its own switch while
+/// its sized `attach-session` is paused.
+///
+/// All three keep the registration discoverable in `by_pid` under the *same* pid
+/// and the *same* generation id, so `AttachGeneration::is_live` still holds. Each
+/// one nevertheless makes `commit_attached_session_switch` fail, so each one must
+/// be decided before, not after, the shared window moves.
+#[derive(Clone, Copy, Debug)]
+enum LostSwitchDelivery {
+    /// `detach-client` succeeded: the registration stays in `by_pid` with its
+    /// generation intact and `closing` latched, until the attach task finishes.
+    Detached,
+    /// The attach task's control receiver is gone. Closing the receiving half
+    /// rather than dropping it produces the identical `is_closed` state for every
+    /// sender while keeping the queue readable, so the row can also prove that no
+    /// switch was delivered.
+    ClosedReceiver,
+    /// The bounded attach-control backlog is full, so the switch delivery cannot
+    /// be accepted.
+    OverloadedBacklog,
+}
+
+/// A `detach-client` that lands while this client's own sized `attach-session`
+/// is paused must not let that command resize the window it is leaving.
+#[tokio::test]
+async fn a_detached_attach_session_must_not_resize_before_its_switch_fails() {
+    assert_lost_switch_delivery_fails_before_any_resize(LostSwitchDelivery::Detached).await;
+}
+
+/// The same rule for a client whose attach-control receiver is already gone.
+#[tokio::test]
+async fn a_closed_attach_receiver_must_not_resize_before_its_switch_fails() {
+    assert_lost_switch_delivery_fails_before_any_resize(LostSwitchDelivery::ClosedReceiver).await;
+}
+
+/// The same rule for a client that has stopped draining its bounded backlog.
+#[tokio::test]
+async fn an_overloaded_attach_session_must_not_resize_before_its_switch_fails() {
+    assert_lost_switch_delivery_fails_before_any_resize(LostSwitchDelivery::OverloadedBacklog)
+        .await;
+}
+
+/// A sized `attach-session` selects geometry, applies it, commits client state
+/// and only then delivers its switch. The generation it captured can already be
+/// unable to receive that switch by the time the command resumes, and the switch
+/// commit does reject all three states — but rejecting them after the shared
+/// linked window, both of its aliases and the pane PTY have already moved from
+/// `120x50` to the request's `80x24` leaves every other client of that window
+/// resized by a command that failed.
+///
+/// Both policies must hold, and they hold for the same reason here: the captured
+/// generation is displaced out of the candidate field by the command itself, so
+/// the stale `80x24` request is the only vote left and wins `largest` and
+/// `smallest` alike. The window may therefore only stay `120x50` if the command
+/// fails *before* the mutation.
+async fn assert_lost_switch_delivery_fails_before_any_resize(lost: LostSwitchDelivery) {
+    let mut regressions = Vec::new();
+    for policy in ["largest", "smallest"] {
+        let handler = RequestHandler::new();
+        let (alpha, beta) = linked_alias_sessions(&handler, STATUS_OFF, STATUS_OFF).await;
+        set_window_size_policy(&handler, &alpha, SOURCE_WINDOW_INDEX, policy).await;
+        set_window_size_policy(&handler, &beta, TARGET_WINDOW_INDEX, policy).await;
+
+        let mut control_rx =
+            register_declared_attach(&handler, SWITCHING_PID, &alpha, HELD_CLIENT_SIZE).await;
+        drain_attach_controls(&mut control_rx);
+        let identity = handler.active_attach_identity_for_test(SWITCHING_PID).await;
+        assert_held_geometry(&handler, &alpha, &beta, HELD_CLIENT_SIZE, "before").await;
+
+        // The pause lands after the command has selected its size and released
+        // every lock, which is exactly the window in which a client can detach,
+        // lose its receiver, or stop draining.
+        let pause = handler.install_attached_size_selection_pause();
+        // Attached key dispatch and the command prompt run `attach-session`
+        // inside the registration that issued it, so the command speaks for that
+        // exact generation and for no other.
+        let sized_attach = super::super::with_expected_attach_and_session_identity(
+            identity,
+            alpha.clone(),
+            identity.session_id(),
+            handler.dispatch(
+                SWITCHING_PID,
+                Request::AttachSessionExt2(Box::new(AttachSessionExt2Request {
+                    target: Some(beta.clone()),
+                    target_spec: Some(beta.to_string()),
+                    detach_other_clients: false,
+                    kill_other_clients: false,
+                    read_only: false,
+                    skip_environment_update: false,
+                    flags: None,
+                    working_directory: None,
+                    client_terminal: rmux_proto::ClientTerminalContext::default(),
+                    client_size: Some(REQUESTED_CLIENT_SIZE),
+                })),
+            ),
+        );
+        let lose_the_delivery = async {
+            pause.reached.notified().await;
+            lose_switch_delivery(&handler, lost, identity.attach_id(), &mut control_rx).await;
+            let staged = window_content_size(&handler, &beta, TARGET_WINDOW_INDEX).await;
+            pause.release.notify_one();
+            staged
+        };
+        let (attached, staged) = tokio::join!(sized_attach, lose_the_delivery);
+
+        assert_eq!(
+            staged, HELD_CLIENT_SIZE,
+            "window-size={policy}: {lost:?} must not itself move the shared window \
+             before the paused command is released"
+        );
+
+        if !matches!(attached.response, Response::Error(_)) {
+            regressions.push(format!(
+                "window-size={policy}: {lost:?}: the sized attach-session must fail, \
+                 got {:?}",
+                attached.response
+            ));
+        }
+        for (alias, window_index) in [(&beta, TARGET_WINDOW_INDEX), (&alpha, SOURCE_WINDOW_INDEX)] {
+            let settled = window_content_size(&handler, alias, window_index).await;
+            if settled != HELD_CLIENT_SIZE {
+                regressions.push(format!(
+                    "window-size={policy}: {lost:?}: alias {alias}:{window_index} is \
+                     {settled:?}, expected the held {HELD_CLIENT_SIZE:?}"
+                ));
+            }
+            let pty = pane_pty_size(&handler, alias, window_index).await;
+            if pty != HELD_CLIENT_SIZE {
+                regressions.push(format!(
+                    "window-size={policy}: {lost:?}: the PTY behind {alias}:{window_index} \
+                     is {pty:?}, expected the held {HELD_CLIENT_SIZE:?}"
+                ));
+            }
+        }
+        while let Ok(control) = control_rx.try_recv() {
+            if matches!(control, AttachControl::Switch(_)) {
+                regressions.push(format!(
+                    "window-size={policy}: {lost:?}: a failed command must not frame \
+                     the client"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        regressions.is_empty(),
+        "a generation that can no longer receive its switch must fail before the \
+         shared window moves, but {regressions:?}"
+    );
+}
+
+/// Removes exactly one delivery precondition, and proves the registration is
+/// still discoverable as the same generation afterwards. Without that proof the
+/// row could pass for the unrelated reason that the identity itself disappeared.
+async fn lose_switch_delivery(
+    handler: &RequestHandler,
+    lost: LostSwitchDelivery,
+    expected_attach_id: u64,
+    control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
+) {
+    match lost {
+        LostSwitchDelivery::Detached => {
+            let response = handler
+                .dispatch(SWITCHING_PID, Request::DetachClient(DetachClientRequest))
+                .await
+                .response;
+            assert!(
+                matches!(response, Response::DetachClient(_)),
+                "detach-client must succeed, got {response:?}"
+            );
+        }
+        LostSwitchDelivery::ClosedReceiver => control_rx.close(),
+        LostSwitchDelivery::OverloadedBacklog => {
+            let mut active_attach = handler.active_attach.lock().await;
+            let active = active_attach
+                .by_pid
+                .get_mut(&SWITCHING_PID)
+                .expect("the attached client is registered");
+            // One real oversized control, charged through the production sender.
+            // The receiver stays open and simply never drains it, which is the
+            // state a wedged client reaches.
+            let payload = vec![
+                0_u8;
+                (super::super::attach_support::ATTACH_CONTROL_BACKLOG_LIMIT - 1)
+                    * AttachControl::BACKLOG_UNIT_BYTES
+            ];
+            active
+                .control_tx
+                .send(AttachControl::Write(payload))
+                .expect("the last control that fits the budget is accepted");
+        }
+    }
+
+    let active_attach = handler.active_attach.lock().await;
+    let active = active_attach
+        .by_pid
+        .get(&SWITCHING_PID)
+        .expect("every one of these states keeps the registration under its pid");
+    assert_eq!(
+        active.id, expected_attach_id,
+        "{lost:?} must not replace the captured generation"
+    );
+    let closing = active.closing.load(Ordering::SeqCst);
+    let receiver_closed = active.control_tx.is_closed();
+    let backlog = active.control_backlog.load(Ordering::Acquire);
+    match lost {
+        LostSwitchDelivery::Detached => assert!(
+            closing && !receiver_closed,
+            "a detached registration is latched closing with its receiver intact"
+        ),
+        LostSwitchDelivery::ClosedReceiver => assert!(
+            receiver_closed && !closing,
+            "a closed receiver is visible to the sender without latching closing"
+        ),
+        LostSwitchDelivery::OverloadedBacklog => assert!(
+            backlog >= super::super::attach_support::ATTACH_CONTROL_BACKLOG_LIMIT
+                && !closing
+                && !receiver_closed,
+            "an overloaded backlog leaves a live receiver that cannot accept more, \
+             got {backlog} units"
+        ),
+    }
+}
+
+/// The premise every delivery row starts from: one live registration owns the
+/// linked window through both aliases and the real pane PTY.
+async fn assert_held_geometry(
+    handler: &RequestHandler,
+    alpha: &SessionName,
+    beta: &SessionName,
+    expected: TerminalSize,
+    phase: &str,
+) {
+    for (alias, window_index) in [(alpha, SOURCE_WINDOW_INDEX), (beta, TARGET_WINDOW_INDEX)] {
+        assert_eq!(
+            window_content_size(handler, alias, window_index).await,
+            expected,
+            "{phase}: alias {alias}:{window_index} must hold {expected:?}"
+        );
+        assert_eq!(
+            pane_pty_size(handler, alias, window_index).await,
+            expected,
+            "{phase}: the PTY behind {alias}:{window_index} must hold {expected:?}"
+        );
+    }
+}
+
+/// The real pane PTY behind an alias, not the model geometry that drove it.
+async fn pane_pty_size(
+    handler: &RequestHandler,
+    session: &SessionName,
+    window_index: u32,
+) -> TerminalSize {
+    let master = {
+        let mut state = handler.state.lock().await;
+        state
+            .clone_pane_master_if_alive(session, window_index, 0)
+            .expect("pane PTY is alive")
+    };
+    let size = master.size().expect("pane PTY size is readable");
+    TerminalSize {
+        cols: size.cols,
+        rows: size.rows,
+    }
 }
 
 /// The geometry the switch payload really carries: the active pane rectangle is

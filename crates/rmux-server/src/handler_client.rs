@@ -14,7 +14,7 @@ use crate::pane_io::AttachControl;
 use crate::pane_terminals::session_not_found;
 
 use super::{
-    attach_support::{ActiveAttachIdentity, AttachGeneration, ClientFlags, IncomingSizeClient},
+    attach_support::{ActiveAttachIdentity, ClientFlags, IncomingSizeClient},
     attached_client_matches_target, command_output_from_lines, control_client_target_pid,
     control_support::{current_control_queue_identity, ManagedClient},
     format_client_uid, format_client_user, format_requester_uid, normalize_target_client,
@@ -43,30 +43,24 @@ pub(in crate::handler) use switching::{
 
 /// The client a session resize is being performed for.
 ///
-/// `displaced` is the exact attach registration this command already holds and
-/// is moving. `attach-session` from an already-attached client is a client move,
-/// and that registration still names the session it is leaving, so the selection
-/// must count it through `geometry` alone.
+/// This is a client that holds no `active_attach` registration to displace — a
+/// first attach, or a control client, which is registered in `active_control`
+/// instead. Such a command stands beside every attached vote rather than
+/// replacing one, and it delivers no switch frame, so its resize is the only
+/// shared-geometry write it makes.
 ///
-/// `None` means there is no previous attach to displace — a first attach, or a
-/// control client, which owns no `active_attach` entry. Such a command displaces
-/// nothing and holds no attach generation, so it neither erases nor waits on any
-/// other client's sizing authority.
+/// An already-attached client moving between sessions is *not* resized here:
+/// `commit_attached_session_switch` owns that move end to end, and a second
+/// write from outside its lock region could not honour the same authority.
 #[derive(Clone, Copy)]
 pub(in crate::handler) struct AttachResizeClient {
-    displaced: Option<AttachGeneration>,
     geometry: Option<TerminalGeometry>,
     flags: ClientFlags,
 }
 
 impl AttachResizeClient {
-    pub(in crate::handler) fn new(
-        displaced: Option<AttachGeneration>,
-        client_size: Option<TerminalSize>,
-        flags: ClientFlags,
-    ) -> Self {
+    pub(in crate::handler) fn new(client_size: Option<TerminalSize>, flags: ClientFlags) -> Self {
         Self {
-            displaced,
             geometry: client_size.map(TerminalGeometry::from_size),
             flags,
         }
@@ -528,12 +522,10 @@ impl RequestHandler {
 
     /// Applies `client`'s geometry to `session_name`, counting the client once.
     ///
-    /// When `client` displaces a registration, that exact generation is the
-    /// authority this command speaks for: it is revalidated on every attempt and
-    /// again under the `state` -> `active_attach` lock pair that guards the
-    /// mutation. A command whose generation has been replaced by a same-pid
-    /// re-attach fails here, before it can drop the replacement's vote from the
-    /// field or write its own stale geometry over the shared window.
+    /// `client` holds no attach registration, so it displaces none: it enters the
+    /// selection beside every attached vote and erases nothing. A client that
+    /// does hold one is moved by `commit_attached_session_switch` instead, which
+    /// selects, mutates and delivers under a single lock region.
     async fn resize_session_geometry_for_attach_client(
         &self,
         session_name: &rmux_proto::SessionName,
@@ -542,16 +534,9 @@ impl RequestHandler {
         expected_switch_target: Option<&SwitchTargetSelection>,
     ) -> Result<(), RmuxError> {
         let AttachResizeClient {
-            displaced,
             geometry: client_geometry,
             flags: client_flags,
         } = client;
-        if let Some(displaced) = displaced {
-            let active_attach = self.active_attach.lock().await;
-            if !displaced.is_live(&active_attach) {
-                return Err(attached_client_required("attach-session"));
-            }
-        }
         let Some(client_geometry) =
             client_geometry.filter(|geometry| geometry.size.cols > 0 && geometry.size.rows > 0)
         else {
@@ -563,17 +548,8 @@ impl RequestHandler {
         self.wait_for_windows_deferred_all_pane_pids().await;
         let switch_window_target = expected_switch_target.map(SwitchTargetSelection::window_target);
         for _ in 0..4 {
-            if let Some(displaced) = displaced {
-                let active_attach = self.active_attach.lock().await;
-                if !displaced.is_live(&active_attach) {
-                    return Err(attached_client_required("attach-session"));
-                }
-            }
-            let incoming_client = Some(IncomingSizeClient::joining(
-                displaced,
-                client_size,
-                client_flags,
-            ));
+            let incoming_client =
+                Some(IncomingSizeClient::joining(None, client_size, client_flags));
             let selection = match switch_window_target.as_ref() {
                 Some(target) => {
                     self.selected_attached_window_size(target, incoming_client)
@@ -594,9 +570,6 @@ impl RequestHandler {
             }
             let active_attach = self.active_attach.lock().await;
             let active_control = self.active_control.lock().await;
-            if displaced.is_some_and(|displaced| !displaced.is_live(&active_attach)) {
-                return Err(attached_client_required("attach-session"));
-            }
             if !self.attached_size_selection_is_current(
                 &state,
                 &active_attach,
