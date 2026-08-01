@@ -6,7 +6,7 @@ use crate::pane_terminals::HandlerState;
 
 use super::super::super::{QueuedLifecycleEvent, RequestHandler};
 use super::{
-    attached_size_candidates, control_size_candidates, linked_session_identities,
+    attached_size_candidates, control_size_candidates, linked_session_statuses,
     policy_from_option_value, prepare_applied_window_resize_events, selected_client_size,
     AttachedSizeSelection, ATTACHED_SIZE_RECONCILE_ATTEMPTS,
 };
@@ -127,7 +127,7 @@ impl RequestHandler {
                 target.window_index(),
                 OptionName::AggressiveResize,
             ) == Some("on");
-            let linked_sessions = linked_session_identities(
+            let linked_sessions = linked_session_statuses(
                 &state,
                 target.session_name(),
                 target.window_index(),
@@ -152,12 +152,7 @@ impl RequestHandler {
             )
         };
         let selection = AttachedSizeSelection {
-            selected_size: selected_client_size(
-                policy,
-                candidates,
-                &control_candidates,
-                status.as_deref(),
-            ),
+            selected_size: selected_client_size(policy, candidates, &control_candidates),
             session_id,
             active_window_index: target.window_index(),
             active_window_id: window_id,
