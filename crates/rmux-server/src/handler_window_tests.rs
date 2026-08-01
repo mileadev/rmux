@@ -171,6 +171,21 @@ async fn create_grouped_session(handler: &RequestHandler, name: &str, group_targ
     assert!(matches!(created, Response::NewSession(_)));
 }
 
+async fn create_session_with_size(handler: &RequestHandler, name: &str, size: TerminalSize) {
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: session_name(name),
+            detached: true,
+            size: Some(size),
+            environment: None,
+        }))
+        .await;
+    assert!(
+        matches!(created, Response::NewSession(_)),
+        "expected new-session success, got {created:?}"
+    );
+}
+
 async fn enable_global_monitor_silence(handler: &RequestHandler) {
     let response = handler
         .handle(Request::SetOption(SetOptionRequest {
@@ -389,6 +404,9 @@ mod linked_window_mutations;
 
 #[path = "handler_window_tests/resize_respawn.rs"]
 mod resize_respawn;
+
+#[path = "handler_window_tests/resize_window_client_size.rs"]
+mod resize_window_client_size;
 
 #[path = "handler_window_tests/respawn_linked_refresh.rs"]
 mod respawn_linked_refresh;

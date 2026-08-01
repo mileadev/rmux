@@ -304,21 +304,6 @@ async fn resize_window_propagates_linked_slots_to_their_session_group_peers() {
     }
 }
 
-async fn create_session_with_size(handler: &RequestHandler, name: &str, size: TerminalSize) {
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name(name),
-            detached: true,
-            size: Some(size),
-            environment: None,
-        }))
-        .await;
-    assert!(
-        matches!(created, Response::NewSession(_)),
-        "expected new-session success, got {created:?}"
-    );
-}
-
 #[tokio::test]
 async fn resize_window_largest_smallest_with_attached_clients_still_use_client_sizes() {
     let handler = RequestHandler::new();
@@ -380,11 +365,14 @@ async fn resize_window_largest_smallest_with_attached_clients_still_use_client_s
             .session(&alpha)
             .and_then(|session| session.window_at(0))
             .expect("window exists");
+        // The client owns an outer 100x30 terminal and `status` defaults to
+        // `on`, so the window content is 100x29. tmux 3.7b measured with a real
+        // 100x30 PTY client: `resize-window -A` and `-a` both land on 100x29.
         assert_eq!(
             window.size(),
             TerminalSize {
                 cols: 100,
-                rows: 30
+                rows: 29
             }
         );
     }

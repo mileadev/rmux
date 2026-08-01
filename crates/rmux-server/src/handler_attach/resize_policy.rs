@@ -420,6 +420,38 @@ fn selected_client_size(
     })
 }
 
+/// The window content geometry `resize-window -A` (largest) or `-a` (smallest)
+/// must apply to `target`.
+///
+/// tmux 3.7b's `cmd_resize_window_exec` hands `-A`/`-a` straight to
+/// `default_window_size(.., WINDOW_SIZE_LARGEST | WINDOW_SIZE_SMALLEST)`, which
+/// is the walk the automatic `window-size largest`/`smallest` policies already
+/// take here: drop every client `ignore_client_size()` rejects, take that
+/// client's status rows off its outer terminal rows, then keep the extreme of
+/// each dimension on its own. Every session the window is linked into votes,
+/// because `default_window_size` asks for `current = 0`: neither
+/// `aggressive-resize` nor the window a session currently shows narrows the
+/// field.
+///
+/// `None` means no client owns a size at all, and the caller applies its own
+/// fallback the way tmux falls through to `default_window_size`'s `manual:`
+/// branch — a window-basis value that never loses status rows.
+pub(in crate::handler) fn linked_window_client_content_size(
+    state: &crate::pane_terminals::HandlerState,
+    active_attach: &super::ActiveAttachState,
+    target: &WindowTarget,
+    policy: AttachedWindowSizePolicy,
+) -> Option<TerminalSize> {
+    let session_name = target.session_name();
+    let linked_sessions =
+        linked_session_identities(state, session_name, target.window_index(), false);
+    let candidates = attached_size_candidates(active_attach, &linked_sessions, None);
+    let status = state
+        .options
+        .resolve(Some(session_name), OptionName::Status);
+    selected_client_size(policy, candidates, &[], status).map(SelectedWindowSize::content_size)
+}
+
 impl RequestHandler {
     pub(in crate::handler) async fn attached_window_size_policy_for_session(
         &self,

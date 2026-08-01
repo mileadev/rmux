@@ -10,7 +10,10 @@ use rmux_proto::{
 #[cfg(windows)]
 use super::pane_support::format_references_pane_pid;
 use super::{
-    attach_support::{surviving_attached_resize_targets, SessionDetachOnDestroy},
+    attach_support::{
+        linked_window_client_content_size, surviving_attached_resize_targets,
+        AttachedWindowSizePolicy, SessionDetachOnDestroy,
+    },
     client_environment_snapshot, client_spawn_environment,
     scripting_support::render_start_directory_template,
     PaneOutputSubscriptionKeySnapshot, RequestHandler, SelectionTransitionSnapshot,
@@ -1615,19 +1618,28 @@ impl RequestHandler {
         response
     }
 
+    /// Turns `resize-window -A` / `-a` into the explicit content geometry the
+    /// eligible clients of every linked session imply.
+    ///
+    /// `-A` is `window-size largest` applied once and `-a` is
+    /// `window-size smallest` applied once, so both go through the same
+    /// selector as the automatic policies: an `ignore-size`, read-only,
+    /// suspended or closing client owns nothing, and the winning client's outer
+    /// terminal rows lose the status rows exactly once before they land in the
+    /// window's *content* geometry.
     async fn resolve_resize_window_linked_session_size(
         &self,
         mut request: rmux_proto::ResizeWindowRequest,
     ) -> Result<rmux_proto::ResizeWindowRequest, rmux_proto::RmuxError> {
         use rmux_proto::ResizeWindowAdjustment::{LargestLinkedSession, SmallestLinkedSession};
 
-        let largest = match request.adjustment {
-            Some(LargestLinkedSession) => true,
-            Some(SmallestLinkedSession) => false,
+        let policy = match request.adjustment {
+            Some(LargestLinkedSession) => AttachedWindowSizePolicy::Largest,
+            Some(SmallestLinkedSession) => AttachedWindowSizePolicy::Smallest,
             _ => return Ok(request),
         };
 
-        let (linked_sessions, fallback_size) = {
+        let selected = {
             let state = self.state.lock().await;
             let session = state
                 .sessions
@@ -1643,43 +1655,15 @@ impl RequestHandler {
                         "window index does not exist in session",
                     )
                 })?;
-            (
-                state.window_linked_sessions_list(
-                    request.target.session_name(),
-                    request.target.window_index(),
-                ),
-                session.terminal_size(),
-            )
-        };
-        let linked_sessions = linked_sessions.into_iter().collect::<HashSet<_>>();
-        let selected = {
+            let fallback_size = session.terminal_size();
             let active_attach = self.active_attach.lock().await;
-            let sizes = active_attach
-                .by_pid
-                .values()
-                .filter(|active| {
-                    !active.suspended && linked_sessions.contains(&active.session_name)
-                })
-                .map(|active| active.client_size);
-            if largest {
-                sizes.max_by_key(resize_window_size_rank)
-            } else {
-                sizes.min_by_key(resize_window_size_rank)
-            }
-        }
-        .unwrap_or(fallback_size);
+            linked_window_client_content_size(&state, &active_attach, &request.target, policy)
+                .unwrap_or(fallback_size)
+        };
 
         request.width = Some(selected.cols);
         request.height = Some(selected.rows);
         request.adjustment = None;
         Ok(request)
     }
-}
-
-fn resize_window_size_rank(size: &rmux_proto::TerminalSize) -> (u32, u16, u16) {
-    (
-        u32::from(size.cols) * u32::from(size.rows),
-        size.cols,
-        size.rows,
-    )
 }
