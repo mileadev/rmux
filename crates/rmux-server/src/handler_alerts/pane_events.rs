@@ -484,6 +484,25 @@ impl RequestHandler {
                 session.active_window_index() != window_index
                     || session.active_pane_id() != Some(event.pane_id)
             });
+        let linked_sessions = (refresh_for_inactive_pane_output
+            || event.mouse_mode_changed
+            || event.alternate_mode_changed
+            || event.title_changed)
+            .then(|| {
+                state.window_linked_session_family_list(pane_target.session_name(), window_index)
+            });
+        // The active pane's title reaches the outer terminal only through a
+        // re-render: the attach prelude carries the expanded
+        // `set-titles-string` and no other path re-emits it, so a program that
+        // retitles itself never updated its host (issue #182). A session with
+        // `set-titles off` writes no title, so it must pay no redraw.
+        let title_refresh_required = event.title_changed
+            && linked_sessions.iter().flatten().any(|session_name| {
+                state
+                    .options
+                    .resolve(Some(session_name), OptionName::SetTitles)
+                    == Some("on")
+            });
         // A pane toggling its mouse-tracking mode must refresh attached
         // clients even when it is the active pane: the refresh rebuilds the
         // outer terminal, whose transition diff emits the outer mouse
@@ -491,10 +510,11 @@ impl RequestHandler {
         let inactive_refresh_sessions = if refresh_for_inactive_pane_output
             || event.mouse_mode_changed
             || event.alternate_mode_changed
+            || title_refresh_required
         {
-            state
-                .window_linked_session_family_list(pane_target.session_name(), window_index)
+            linked_sessions
                 .into_iter()
+                .flatten()
                 .filter_map(|session_name| {
                     state
                         .sessions

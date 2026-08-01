@@ -1780,6 +1780,7 @@ async fn forward_attach_emits_stop_sequence_when_processing_errors() {
         pane_output_start_sequence,
         render_frame: Vec::new(),
         outer_terminal,
+        client_title: None,
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         raw_passthrough: false,
@@ -2033,6 +2034,7 @@ fn test_attach_target_with_protocols(
             &OptionStore::default(),
             OuterTerminalContext::default(),
         ),
+        client_title: None,
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         raw_passthrough: kitty_graphics_passthrough || sixel_passthrough,
@@ -2078,12 +2080,39 @@ fn live_output_is_preserved_only_for_coalescible_same_source_refreshes() {
     assert!(!preserves_live_output(&current, &different_source));
 
     let non_coalescible_same_source =
-        test_attach_target_with_output(&session_name, b"BASE-D", None, shared_output, true);
+        test_attach_target_with_output(&session_name, b"BASE-D", None, shared_output.clone(), true);
     assert!(!non_coalescible_same_source.is_coalescible_render_refresh());
     assert!(!preserves_live_output(
         &current,
         &non_coalescible_same_source
     ));
+
+    // A frame carrying OSC 0 is kept out of the queue's replaceable slot, but
+    // it is still a re-render of the same pane: its buffered kitty/sixel
+    // passthroughs must survive. Coupling the two predicates would drop them on
+    // every title change (issue #182).
+    let mut title_carrying =
+        test_attach_target_with_output(&session_name, b"BASE-E", None, shared_output, true);
+    title_carrying.pane_master = None;
+    let terminal = OuterTerminal::resolve(
+        &OptionStore::new(),
+        OuterTerminalContext::from_pairs(&[("TERM", "tmux-256color")]),
+    );
+    title_carrying.client_title =
+        terminal.rendered_client_title(crate::outer_terminal::ClientTitleUpdate {
+            resolved: Some("LIVE-OUTPUT-TITLE"),
+            path: None,
+            previous: None,
+        });
+    assert!(
+        !title_carrying.is_coalescible_render_refresh(),
+        "a title-carrying frame must not be replaceable in the queue"
+    );
+    assert!(title_carrying.is_plain_render_refresh());
+    assert!(
+        preserves_live_output(&current, &title_carrying),
+        "a title-carrying refresh of the same pane must keep its live output"
+    );
 }
 
 #[test]
@@ -3981,6 +4010,7 @@ async fn forward_attach_emits_overlay_control_frames() {
             &OptionStore::default(),
             OuterTerminalContext::default(),
         ),
+        client_title: None,
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         raw_passthrough: false,

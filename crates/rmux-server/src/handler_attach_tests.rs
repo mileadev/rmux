@@ -185,6 +185,7 @@ async fn web_render_refreshes_are_marked_pending_before_building_switches() {
                 closing: Arc::new(AtomicBool::new(false)),
                 persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
                 terminal_context: OuterTerminalContext::default(),
+                client_title: None,
                 flags: super::attach_support::ClientFlags::default(),
                 render_stream: true,
                 uid,
@@ -239,6 +240,7 @@ async fn refresh_attached_session_removes_clients_over_backlog_limit() {
                 closing: closing.clone(),
                 persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
                 terminal_context: OuterTerminalContext::default(),
+                client_title: None,
                 flags: super::attach_support::ClientFlags::default(),
                 render_stream: false,
                 uid,
@@ -842,6 +844,9 @@ mod attach_mutations;
 
 #[path = "handler_attach_tests/attach_render.rs"]
 mod attach_render;
+
+#[path = "handler_attach_tests/set_titles.rs"]
+mod set_titles;
 
 #[path = "handler_attach_tests/attached_prefix_lifecycle.rs"]
 mod attached_prefix_lifecycle;

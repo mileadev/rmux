@@ -1,5 +1,4 @@
 use super::{CursorScope, OuterTerminal, OuterTerminalContext};
-use crate::pane_screen_state::PaneScreenState;
 use rmux_core::{OptionStore, Session};
 use rmux_proto::{
     ClientTerminalContext, OptionName, ScopeSelector, SessionName, SetOptionMode, TerminalSize,
@@ -365,17 +364,13 @@ fn focus_follows_mouse_option_upgrades_mouse_tracking_to_all_motion() {
     assert!(!button_start.contains("\u{1b}[?1003h"));
 }
 
+/// The prelude's title/path gate, exercised straight against the capability
+/// layer. `set-titles off` resolves no title, which on tmux 3.7b means the
+/// attached client writes neither OSC 0 nor OSC 7 even when the terminal
+/// advertises `title` and `osc7`.
 #[test]
-fn render_prelude_emits_title_path_and_cursor_colour() {
-    let mut options = OptionStore::new();
-    options
-        .set(
-            ScopeSelector::Global,
-            OptionName::TerminalFeatures,
-            "tmux*:osc7".to_owned(),
-            SetOptionMode::Append,
-        )
-        .expect("terminal-features append succeeds");
+fn render_prelude_without_resolved_title_writes_neither_title_nor_path() {
+    let mut options = title_capable_options();
     options
         .set(
             ScopeSelector::Window(rmux_proto::WindowTarget::with_window(
@@ -388,29 +383,313 @@ fn render_prelude_emits_title_path_and_cursor_colour() {
         )
         .expect("cursor colour set succeeds");
 
+    let terminal = title_capable_terminal(&options);
+    let prelude = render_title_prelude(
+        &terminal,
+        &options,
+        super::ClientTitleUpdate {
+            resolved: None,
+            path: Some(TITLE_PANE_PATH),
+            previous: None,
+        },
+    );
+
+    assert!(
+        !prelude.contains("\u{1b}]0;"),
+        "set-titles off must not drive the outer title, got {prelude:?}"
+    );
+    assert!(
+        !prelude.contains("\u{1b}]7;"),
+        "set-titles off must not drive OSC 7 either, got {prelude:?}"
+    );
+    // The rest of the prelude is untouched by the title gate.
+    assert!(prelude.contains("\u{1b}]12;rgb:cd/00/00\u{7}"));
+}
+
+/// A resolved title is the expanded `set-titles-string`, never the bare pane
+/// title (issue #182), and it unlocks the neighbouring OSC 7 path.
+#[test]
+fn render_prelude_writes_resolved_title_and_path() {
+    let options = title_capable_options();
+    let terminal = title_capable_terminal(&options);
+
+    let prelude = render_title_prelude(
+        &terminal,
+        &options,
+        super::ClientTitleUpdate {
+            resolved: Some("RMUXTEST alpha:0"),
+            path: Some(TITLE_PANE_PATH),
+            previous: None,
+        },
+    );
+
+    assert!(prelude.contains("\u{1b}]0;RMUXTEST alpha:0\u{7}"));
+    assert!(prelude.contains("\u{1b}]7;file:///tmp/project\u{7}"));
+}
+
+/// tmux compares each expansion against `c->title` / `c->path` and writes only
+/// what differs, so a refresh resolving the same values is silent. Measured on
+/// tmux 3.7b: a static title and path survive four forced `refresh-client`
+/// redraws with exactly one OSC 0 and one OSC 7 on the wire.
+#[test]
+fn render_prelude_skips_an_unchanged_title_and_path() {
+    let options = title_capable_options();
+    let terminal = title_capable_terminal(&options);
+    let shown = super::ClientTitleState {
+        title: Some("RMUXTEST alpha:0".to_owned()),
+        path: Some(TITLE_PANE_PATH.to_owned()),
+    };
+
+    let prelude = render_title_prelude(
+        &terminal,
+        &options,
+        super::ClientTitleUpdate {
+            resolved: Some("RMUXTEST alpha:0"),
+            path: Some(TITLE_PANE_PATH),
+            previous: Some(&shown),
+        },
+    );
+    assert!(
+        !prelude.contains("\u{1b}]0;") && !prelude.contains("\u{1b}]7;"),
+        "unchanged title and path must not be re-emitted, got {prelude:?}"
+    );
+
+    let changed = render_title_prelude(
+        &terminal,
+        &options,
+        super::ClientTitleUpdate {
+            resolved: Some("RMUXTEST alpha:1"),
+            path: Some("file:///tmp/other"),
+            previous: Some(&shown),
+        },
+    );
+    assert!(changed.contains("\u{1b}]0;RMUXTEST alpha:1\u{7}"));
+    assert!(changed.contains("\u{1b}]7;file:///tmp/other\u{7}"));
+}
+
+/// tmux 3.7b writes the expanded title verbatim, so a title carrying `ESC ] 0 ;`
+/// closes the sequence early and injects into the outer terminal. RMUX keeps
+/// its deliberate divergence: control characters are neutralised before the
+/// payload reaches the terminal.
+#[test]
+fn render_prelude_neutralises_control_characters_in_the_title() {
+    let options = title_capable_options();
+    let terminal = title_capable_terminal(&options);
+
+    let prelude = render_title_prelude(
+        &terminal,
+        &options,
+        super::ClientTitleUpdate {
+            resolved: Some("A\u{1b}]0;INJECT\u{7}B\tC"),
+            path: Some(TITLE_PANE_PATH),
+            previous: None,
+        },
+    );
+
+    let title = prelude
+        .split_once("\u{1b}]0;")
+        .expect("a title is written")
+        .1
+        .split_once('\u{7}')
+        .expect("the title terminates")
+        .0;
+    // ESC, BEL and TAB each become a space; the surviving "]0;" is inert text.
+    assert_eq!(title, "A ]0;INJECT B C");
+    assert!(
+        !title.contains('\u{1b}') && !title.contains('\u{7}'),
+        "no control character may survive into the title, got {title:?}"
+    );
+    // Exactly one OSC 0 introducer: the payload cannot open a second one.
+    assert_eq!(prelude.matches("\u{1b}]0;").count(), 1);
+}
+
+/// A terminal that never advertised TSL/FSL keeps its title untouched, exactly
+/// as tmux's `tty_set_title()` returns early without both capabilities. The
+/// value is still remembered, matching tmux assigning `c->title` regardless.
+#[test]
+fn render_prelude_leaves_a_title_incapable_terminal_alone() {
+    let options = OptionStore::new();
     let terminal = OuterTerminal::resolve(
         &options,
-        OuterTerminalContext::from_pairs(&[("TERM", "tmux-256color")]),
+        // No TERM at all: the Windows Terminal case from issue #182, where no
+        // terminal family and no XT flag supply a title capability.
+        OuterTerminalContext::default(),
     );
-    let pane_state = PaneScreenState {
-        mode: 0,
-        alternate_on: false,
-        title: "build logs".to_owned(),
-        path: "file:///tmp/project".to_owned(),
-        cursor_position: (0, 0),
-        cursor_style: 6,
-    };
-    let prelude = String::from_utf8(terminal.render_prelude(
-        &make_session(),
-        &options,
-        Some(&pane_state),
-        CursorScope::Pane,
-    ))
-    .expect("utf8");
+    assert!(
+        !terminal.features_string().contains("title"),
+        "fixture must not advertise the title capability"
+    );
 
-    assert!(prelude.contains("\u{1b}]0;build logs\u{7}"));
-    assert!(prelude.contains("\u{1b}]7;file:///tmp/project\u{7}"));
-    assert!(prelude.contains("\u{1b}]12;rgb:cd/00/00\u{7}"));
+    let update = super::ClientTitleUpdate {
+        resolved: Some("RMUXTEST alpha:0"),
+        path: Some(TITLE_PANE_PATH),
+        previous: None,
+    };
+    let prelude = render_title_prelude(&terminal, &options, update);
+
+    assert!(
+        !prelude.contains("\u{1b}]0;") && !prelude.contains("RMUXTEST"),
+        "a title-incapable terminal must receive no title, got {prelude:?}"
+    );
+    let rendered = terminal
+        .rendered_client_title(update)
+        .expect("set-titles on commits");
+    assert_eq!(
+        rendered.state().title(),
+        Some("RMUXTEST alpha:0"),
+        "tmux remembers c->title even when the tty cannot write it"
+    );
+    // Nothing reached the wire, so the frame stays replaceable in the control
+    // queue: a client with no title template must not lose render coalescing
+    // just because `set-titles` is on.
+    assert!(
+        !rendered.wrote(),
+        "a terminal with no title template emits no OSC bytes"
+    );
+}
+
+/// While `set-titles` is off nothing is committed, so the value the terminal
+/// still shows survives the option going off and back on (oracle: tmux 3.7b
+/// emits exactly one title across an on -> off -> on toggle).
+#[test]
+fn a_suppressed_title_commits_nothing_and_keeps_the_previous_path() {
+    let shown = super::ClientTitleState {
+        title: Some("STABLE".to_owned()),
+        path: Some(TITLE_PANE_PATH.to_owned()),
+    };
+    assert!(super::ClientTitleUpdate {
+        resolved: None,
+        path: Some("file:///tmp/other"),
+        previous: Some(&shown),
+    }
+    .rendered(true, true)
+    .is_none());
+
+    // A render that resolves a title but reads no pane path keeps the path the
+    // client was already given rather than forgetting it, and writes nothing.
+    let rendered = super::ClientTitleUpdate {
+        resolved: Some("STABLE"),
+        path: None,
+        previous: Some(&shown),
+    }
+    .rendered(true, true)
+    .expect("set-titles on commits");
+    assert_eq!(rendered.state(), &shown);
+    assert!(
+        !rendered.wrote(),
+        "a fully deduplicated render puts no OSC bytes in the frame"
+    );
+}
+
+/// A frame that actually carries OSC 0 / OSC 7 must stay in the control queue:
+/// its successor deduplicates against it, so replacing it would strand the
+/// outer terminal on the previous title with nothing left to correct it.
+#[test]
+fn a_title_carrying_render_is_not_a_replaceable_refresh() {
+    let shown = super::ClientTitleState {
+        title: Some("STABLE".to_owned()),
+        path: Some(TITLE_PANE_PATH.to_owned()),
+    };
+    let wrote = super::ClientTitleUpdate {
+        resolved: Some("CHANGED"),
+        path: Some(TITLE_PANE_PATH),
+        previous: Some(&shown),
+    }
+    .rendered(true, true)
+    .expect("set-titles on commits");
+    assert!(wrote.wrote(), "a changed title puts OSC 0 in the frame");
+
+    let path_only = super::ClientTitleUpdate {
+        resolved: Some("STABLE"),
+        path: Some("file:///tmp/other"),
+        previous: Some(&shown),
+    }
+    .rendered(true, true)
+    .expect("set-titles on commits");
+    assert!(path_only.wrote(), "a changed path alone still writes OSC 7");
+}
+
+/// A render only commits to the client's remembered identity what it actually
+/// put on the wire. The status tick expands under the state lock and commits
+/// under the attach lock, so a concurrent refresh can deliver a different title
+/// in between; adopting a value this render did not write would then claim the
+/// outer terminal shows something it does not, and the next expansion back to
+/// that value would be skipped — the stale title of issue #182.
+#[test]
+fn a_render_that_wrote_nothing_commits_nothing() {
+    let shown = super::ClientTitleState {
+        title: Some("STABLE".to_owned()),
+        path: Some(TITLE_PANE_PATH.to_owned()),
+    };
+
+    let deduplicated = super::ClientTitleUpdate {
+        resolved: Some("STABLE"),
+        path: Some(TITLE_PANE_PATH),
+        previous: Some(&shown),
+    }
+    .rendered(true, true)
+    .expect("set-titles on commits");
+    assert!(!deduplicated.wrote());
+    assert_eq!(
+        deduplicated.committed(),
+        None,
+        "a fully deduplicated render must not overwrite the remembered title"
+    );
+
+    let wrote = super::ClientTitleUpdate {
+        resolved: Some("CHANGED"),
+        path: Some(TITLE_PANE_PATH),
+        previous: Some(&shown),
+    }
+    .rendered(true, true)
+    .expect("set-titles on commits");
+    assert_eq!(
+        wrote.committed().and_then(super::ClientTitleState::title),
+        Some("CHANGED"),
+        "a render that wrote OSC 0 commits what the terminal now shows"
+    );
+
+    // A terminal that cannot write the sequence commits nothing either: it was
+    // never told, so the next render must still consider the title pending.
+    let incapable = super::ClientTitleUpdate {
+        resolved: Some("CHANGED"),
+        path: Some(TITLE_PANE_PATH),
+        previous: Some(&shown),
+    }
+    .rendered(false, false)
+    .expect("set-titles on commits");
+    assert_eq!(incapable.committed(), None);
+}
+
+const TITLE_PANE_PATH: &str = "file:///tmp/project";
+
+fn title_capable_options() -> OptionStore {
+    let mut options = OptionStore::new();
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::TerminalFeatures,
+            "tmux*:osc7".to_owned(),
+            SetOptionMode::Append,
+        )
+        .expect("terminal-features append succeeds");
+    options
+}
+
+fn title_capable_terminal(options: &OptionStore) -> OuterTerminal {
+    OuterTerminal::resolve(
+        options,
+        OuterTerminalContext::from_pairs(&[("TERM", "tmux-256color")]),
+    )
+}
+
+fn render_title_prelude(
+    terminal: &OuterTerminal,
+    options: &OptionStore,
+    update: super::ClientTitleUpdate<'_>,
+) -> String {
+    String::from_utf8(terminal.render_prelude(&make_session(), options, CursorScope::Pane, update))
+        .expect("utf8")
 }
 
 #[test]

@@ -11,6 +11,8 @@ use crate::pane_terminals::HandlerState;
 use crate::pane_visible_geometry::visible_pane_content_geometry;
 #[path = "renderer/borders.rs"]
 mod borders;
+#[path = "renderer/client_title.rs"]
+mod client_title;
 #[path = "renderer/clock_mode.rs"]
 mod clock_mode;
 #[path = "renderer/copy_mode_line_numbers.rs"]
@@ -39,6 +41,7 @@ use borders::{border_cells, BorderCell, BorderStyle};
 use borders::{
     render_cells, render_pane_border_status_lines as render_border_status, runtime_border_cells,
 };
+pub(crate) use client_title::{expand_client_title, ClientTitleContext};
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use clock_mode::{
     render_clock_overlay, render_clock_restore_frame, ClockPaneRenderData, ClockPaneRestoreData,

@@ -53,6 +53,7 @@ pub(super) fn open_attach_target(
         pane_output_start_sequence: _,
         render_frame,
         outer_terminal,
+        client_title: _,
         cursor_style,
         active_pane_geometry,
         raw_passthrough,

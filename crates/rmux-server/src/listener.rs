@@ -556,6 +556,14 @@ async fn serve_connection(
                     };
                     let session_name = response.session_name.clone();
                     let terminal_context = attach.target.outer_terminal.context().clone();
+                    // The attach frame about to be forwarded already carries the
+                    // client's first title, so seed the per-client memory here
+                    // rather than letting its first refresh repeat it (#182).
+                    let client_title = attach
+                        .target
+                        .client_title
+                        .as_ref()
+                        .map(|rendered| rendered.state().clone());
                     let client_name = attach_client_name
                         .expect("attach upgrade captures its client name before dispatch");
                     let attach_identity = handler
@@ -570,6 +578,7 @@ async fn serve_connection(
                                 closing: attach.closing.clone(),
                                 persistent_overlay_epoch: attach.persistent_overlay_epoch.clone(),
                                 terminal_context,
+                                client_title,
                                 flags: attach.flags,
                                 render_stream: attach.render_stream,
                                 uid: requester.uid,

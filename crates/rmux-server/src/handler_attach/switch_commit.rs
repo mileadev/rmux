@@ -289,6 +289,10 @@ impl RequestHandler {
                 &request.session_name,
                 AttachSessionSwitchRenderOptions {
                     attached_count: request.attached_count,
+                    previous_title: active_attach
+                        .by_pid
+                        .get(&attach_pid)
+                        .map(|active| &active.client_title),
                     terminal_context: &request.terminal_context,
                     socket_path: &self.socket_path(),
                     render_stream: request.render_stream,
@@ -399,6 +403,11 @@ impl RequestHandler {
 
             let render_stream_refresh =
                 request.render_stream && target.is_coalescible_render_refresh();
+            // Only a delivered switch frame actually carries the title; a
+            // coalesced render refresh drops this target and re-renders later.
+            let switched_client_title = (!render_stream_refresh)
+                .then(|| target.client_title.clone())
+                .flatten();
             let command = if render_stream_refresh {
                 AttachControl::Refresh
             } else {
@@ -467,6 +476,7 @@ impl RequestHandler {
                 .then(|| reset_interactive_attach_state_for_session_switch(active))
                 .flatten();
             active.render_generation = active.render_generation.saturating_add(1);
+            active.remember_client_title(switched_client_title.as_ref());
             if render_stream_refresh {
                 active.render_refresh_pending = true;
             }

@@ -16,7 +16,7 @@ use crate::client_flags::ClientFlags;
 use crate::control_mode::ControlModeUpgrade;
 #[cfg(any(unix, windows))]
 use crate::handler::{attach_support::ActiveAttachIdentity, RequestHandler};
-use crate::outer_terminal::OuterTerminal;
+use crate::outer_terminal::{OuterTerminal, RenderedClientTitle};
 
 use super::attach_control::AttachControl;
 use super::live_render::LivePaneRender;
@@ -160,6 +160,13 @@ pub(crate) struct AttachTarget {
     pub(crate) pane_output_start_sequence: u64,
     pub(crate) render_frame: Vec<u8>,
     pub(crate) outer_terminal: OuterTerminal,
+    /// What this render told the outer terminal, or `None` when the session
+    /// has `set-titles off` and it was left alone. Carried back so the caller
+    /// can remember it and skip an unchanged title on the next render.
+    ///
+    /// In-process only: `AttachTarget` never crosses the attach wire, and
+    /// `open_attach_target` drops this field at the transport boundary.
+    pub(crate) client_title: Option<RenderedClientTitle>,
     pub(crate) cursor_style: u32,
     pub(crate) active_pane_geometry: PaneGeometry,
     pub(crate) raw_passthrough: bool,
@@ -170,8 +177,26 @@ pub(crate) struct AttachTarget {
 }
 
 impl AttachTarget {
-    pub(crate) fn is_coalescible_render_refresh(&self) -> bool {
+    /// A plain re-render of the pane this client already watches: no pane
+    /// master handover and no persistent overlay. Live output continuity is
+    /// preserved across it, whatever the frame happens to carry.
+    pub(crate) fn is_plain_render_refresh(&self) -> bool {
         self.pane_master.is_none() && self.persistent_overlay_state_id.is_none()
+    }
+
+    /// A plain render refresh the control queue may drop in favour of a later
+    /// one, because only the newest frame is worth drawing.
+    ///
+    /// A frame carrying OSC 0 / OSC 7 is excluded: the next render
+    /// deduplicates the title against it, so dropping this one would leave the
+    /// outer terminal showing the previous title with nothing left to correct
+    /// it (issue #182).
+    pub(crate) fn is_coalescible_render_refresh(&self) -> bool {
+        self.is_plain_render_refresh()
+            && !self
+                .client_title
+                .as_ref()
+                .is_some_and(RenderedClientTitle::wrote)
     }
 }
 

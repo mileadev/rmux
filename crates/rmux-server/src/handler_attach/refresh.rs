@@ -75,6 +75,7 @@ impl RequestHandler {
                     active.mode_tree.is_some(),
                     active.key_table_name.clone(),
                     super::transient_message_render_snapshot(active),
+                    active.client_title.clone(),
                 ));
             }
             (
@@ -108,6 +109,7 @@ impl RequestHandler {
                 mode_tree_active,
                 key_table,
                 transient_message,
+                previous_title,
             ) in &refresh_contexts
             {
                 let Ok(mut target) = super::attach_render_target_for_session_with_prompt(
@@ -117,6 +119,7 @@ impl RequestHandler {
                     super::AttachRenderTargetRequest {
                         prompt: prompt.as_ref(),
                         key_table: key_table.as_deref(),
+                        previous_title: Some(previous_title),
                         terminal_context,
                         render_size: Some(*client_size),
                         socket_path: &self.socket_path(),
@@ -160,6 +163,7 @@ impl RequestHandler {
             };
             active.render_generation = active.render_generation.saturating_add(1);
             active.render_refresh_pending = false;
+            active.remember_client_title(target.client_title.as_ref());
             super::compose_transient_message_refresh(
                 active,
                 transient_message.as_ref(),
@@ -302,6 +306,7 @@ impl RequestHandler {
                         active.mode_tree.is_some(),
                         active.key_table_name.clone(),
                         super::transient_message_render_snapshot(active),
+                        active.client_title.clone(),
                     )
                 })
         };
@@ -313,6 +318,7 @@ impl RequestHandler {
             mode_tree_active,
             key_table,
             transient_message,
+            previous_title,
         )) = prompt
         else {
             return false;
@@ -328,6 +334,7 @@ impl RequestHandler {
                 super::AttachRenderTargetRequest {
                     prompt: prompt.as_ref(),
                     key_table: key_table.as_deref(),
+                    previous_title: Some(&previous_title),
                     terminal_context: &terminal_context,
                     render_size: Some(client_size),
                     socket_path: &self.socket_path(),
@@ -369,6 +376,7 @@ impl RequestHandler {
                     && !active.suspended =>
             {
                 active.render_generation = active.render_generation.saturating_add(1);
+                active.remember_client_title(target.client_title.as_ref());
                 super::compose_transient_message_refresh(
                     active,
                     transient_message.as_ref(),
@@ -490,6 +498,7 @@ impl RequestHandler {
                         active.mode_tree.is_some(),
                         active.key_table_name.clone(),
                         super::transient_message_render_snapshot(active),
+                        active.client_title.clone(),
                     )
                 })
         };
@@ -501,6 +510,7 @@ impl RequestHandler {
             mode_tree_active,
             key_table,
             transient_message,
+            previous_title,
         )) = prompt
         else {
             return;
@@ -516,6 +526,7 @@ impl RequestHandler {
                 super::AttachRenderTargetRequest {
                     prompt: prompt.as_ref(),
                     key_table: key_table.as_deref(),
+                    previous_title: Some(&previous_title),
                     terminal_context: &terminal_context,
                     render_size: Some(client_size),
                     socket_path: &self.socket_path(),
@@ -552,6 +563,7 @@ impl RequestHandler {
         let stale_client = match active_attach.by_pid.get_mut(&attach_pid) {
             Some(active) if &active.session_name == session_name && !active.suspended => {
                 active.render_generation = active.render_generation.saturating_add(1);
+                active.remember_client_title(target.client_title.as_ref());
                 super::compose_transient_message_refresh(
                     active,
                     transient_message.as_ref(),

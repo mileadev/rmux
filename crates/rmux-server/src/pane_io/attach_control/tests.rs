@@ -45,6 +45,7 @@ fn deep_coalescible_target(
             &rmux_core::OptionStore::default(),
             crate::outer_terminal::OuterTerminalContext::default(),
         ),
+        client_title: None,
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, size.cols, size.rows),
         raw_passthrough: false,
@@ -605,6 +606,7 @@ fn every_attach_control_variant_has_a_positive_backlog_cost() {
             &rmux_core::OptionStore::default(),
             crate::outer_terminal::OuterTerminalContext::default(),
         ),
+        client_title: None,
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         raw_passthrough: false,
@@ -614,4 +616,155 @@ fn every_attach_control_variant_has_a_positive_backlog_cost() {
         live_pane: None,
     };
     assert_eq!(AttachControl::switch(target).backlog_units(), 2);
+}
+
+/// A plain render refresh with no title still replaces its predecessor in the
+/// sender's coalescing slot: only the newest frame is worth drawing.
+#[test]
+fn a_titleless_switch_is_still_replaced_by_a_later_refresh() {
+    let (inner, mut receiver) = mpsc::unbounded_channel();
+    let backlog = Arc::new(AtomicUsize::new(0));
+    let sender = AttachControlSender::new(
+        inner,
+        Arc::clone(&backlog),
+        64,
+        Arc::new(AtomicBool::new(false)),
+    );
+    let output = pane_output_channel();
+
+    for marker in 0_u8..3 {
+        let mut target = deep_coalescible_target(&output, marker, 32);
+        target.live_pane = None;
+        assert!(target.is_coalescible_render_refresh());
+        sender
+            .send(AttachControl::switch(target))
+            .expect("refresh fits");
+    }
+
+    let AttachControl::Switch(queued) = receiver.try_recv().expect("one switch is queued") else {
+        panic!("expected a switch control");
+    };
+    assert_eq!(queued.into_target_with_count().0.render_frame[0], 2);
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+/// A frame carrying OSC 0 must survive the sender's coalescing slot. The render
+/// path commits the title to the client's remembered identity when it builds
+/// the frame, and the next render deduplicates against that memory — so a
+/// silently replaced frame leaves the outer terminal on the previous title with
+/// nothing left to correct it (issue #182).
+///
+/// This runs at the queue layer on purpose: every render-level test still sees
+/// the title in the frame it built, so only the queue can prove the frame is
+/// actually delivered.
+#[test]
+fn a_title_carrying_switch_is_not_replaced_by_a_later_refresh() {
+    let (inner, mut receiver) = mpsc::unbounded_channel();
+    let backlog = Arc::new(AtomicUsize::new(0));
+    let sender = AttachControlSender::new(
+        inner,
+        Arc::clone(&backlog),
+        64,
+        Arc::new(AtomicBool::new(false)),
+    );
+    let output = pane_output_channel();
+
+    let terminal = OuterTerminal::resolve(
+        &rmux_core::OptionStore::new(),
+        crate::outer_terminal::OuterTerminalContext::from_pairs(&[("TERM", "tmux-256color")]),
+    );
+    let update = crate::outer_terminal::ClientTitleUpdate {
+        resolved: Some("QUEUED-TITLE"),
+        path: None,
+        previous: None,
+    };
+    let mut carrying = deep_coalescible_target(&output, 0, 32);
+    carrying.live_pane = None;
+    carrying.render_frame = terminal.render_client_title(update);
+    carrying.client_title = terminal.rendered_client_title(update);
+    carrying.outer_terminal = terminal;
+    assert!(
+        !carrying.render_frame.is_empty(),
+        "the fixture terminal must advertise the title capability"
+    );
+    assert!(
+        !carrying.is_coalescible_render_refresh(),
+        "a frame that carries OSC 0 must not be a replaceable refresh"
+    );
+    // It is still a re-render of the same pane. Only queue replaceability is
+    // withdrawn — live-output continuity (`preserves_live_output`, exercised on
+    // Unix in pane_io::tests) must not be, or a title change would drop the
+    // pane's buffered kitty/sixel passthroughs.
+    assert!(
+        carrying.is_plain_render_refresh(),
+        "withdrawing replaceability must not make this look like a pane switch"
+    );
+
+    sender
+        .send(AttachControl::switch(carrying))
+        .expect("title switch fits");
+    // The follow-up deduplicated the title away, exactly as the next render does.
+    let mut follow_up = deep_coalescible_target(&output, 1, 32);
+    follow_up.live_pane = None;
+    sender
+        .send(AttachControl::switch(follow_up))
+        .expect("follow-up refresh fits");
+
+    let AttachControl::Switch(first) = receiver.try_recv().expect("the title switch is queued")
+    else {
+        panic!("expected a switch control");
+    };
+    let first = first.into_target_with_count().0;
+    assert_eq!(
+        String::from_utf8_lossy(&first.render_frame),
+        "\u{1b}]0;QUEUED-TITLE\u{7}",
+        "the title-carrying frame must reach the client"
+    );
+
+    let AttachControl::Switch(second) = receiver.try_recv().expect("the follow-up is queued")
+    else {
+        panic!("expected a switch control");
+    };
+    assert_eq!(second.into_target_with_count().0.render_frame[0], 1);
+}
+
+/// Withdrawing queue replaceability must not cost the pane's live output.
+///
+/// `preserves_live_output` decides whether the passthroughs buffered behind the
+/// current target (kitty graphics, sixel) are re-emitted or dropped as if the
+/// client had switched panes. A title-carrying frame re-renders the very same
+/// pane, so they must survive — coupling that decision to the queue gate would
+/// silently drop graphics on every title change (issue #182).
+///
+/// `pane_io::tests` covers the same invariant on Unix; this keeps it under
+/// Windows native authority, where that module is not compiled.
+#[test]
+fn a_title_carrying_refresh_keeps_the_pane_live_output() {
+    let output = pane_output_channel();
+    let mut current = deep_coalescible_target(&output, 0, 32);
+    current.live_pane = None;
+    let current =
+        crate::pane_io::wire::open_attach_target(current, false).expect("the current target opens");
+
+    let terminal = OuterTerminal::resolve(
+        &rmux_core::OptionStore::new(),
+        crate::outer_terminal::OuterTerminalContext::from_pairs(&[("TERM", "tmux-256color")]),
+    );
+    let mut carrying = deep_coalescible_target(&output, 1, 32);
+    carrying.live_pane = None;
+    carrying.client_title =
+        terminal.rendered_client_title(crate::outer_terminal::ClientTitleUpdate {
+            resolved: Some("LIVE-OUTPUT-TITLE"),
+            path: None,
+            previous: None,
+        });
+    assert!(!carrying.is_coalescible_render_refresh());
+
+    assert!(
+        crate::pane_io::control::preserves_live_output(&current, &carrying),
+        "a title-carrying refresh of the same pane must keep its live output"
+    );
 }

@@ -204,6 +204,7 @@ impl RequestHandler {
                         active.mode_tree.is_some(),
                         active.key_table_name.clone(),
                         super::transient_message_render_snapshot(active),
+                        active.client_title.clone(),
                     )
                 })
         };
@@ -215,6 +216,7 @@ impl RequestHandler {
             mode_tree_active,
             key_table,
             transient_message,
+            previous_title,
         )) = target
         else {
             return false;
@@ -235,6 +237,7 @@ impl RequestHandler {
                 super::AttachRenderTargetRequest {
                     prompt: prompt.as_ref(),
                     key_table: key_table.as_deref(),
+                    previous_title: Some(&previous_title),
                     terminal_context: &terminal_context,
                     render_size: Some(client_size),
                     socket_path: &self.socket_path(),
@@ -307,6 +310,7 @@ impl RequestHandler {
             return false;
         };
         active.render_generation = active.render_generation.saturating_add(1);
+        active.remember_client_title(delivery.target.client_title.as_ref());
         super::compose_transient_message_refresh(
             active,
             delivery.transient_message.as_ref(),

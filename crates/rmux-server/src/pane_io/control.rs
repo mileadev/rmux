@@ -70,7 +70,11 @@ pub(super) fn preserves_live_output(
     current_target: &OpenAttachTarget,
     next_target: &AttachTarget,
 ) -> bool {
-    next_target.is_coalescible_render_refresh()
+    // Deliberately the plain-refresh predicate, not the coalescible one: a
+    // frame carrying OSC 0 is kept out of the queue's replaceable slot, but it
+    // still re-renders the same pane, so the live passthroughs buffered behind
+    // it must survive rather than be dropped as if the pane had changed.
+    next_target.is_plain_render_refresh()
         && current_target
             .pane_output
             .as_ref()

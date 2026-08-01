@@ -222,6 +222,9 @@ impl RequestHandler {
                 &session_name,
                 attached_count,
                 &terminal_context,
+                // A fresh client's outer terminal shows nothing of ours yet, so
+                // this frame carries the first title; registration remembers it.
+                None,
                 &self.socket_path(),
             ) {
                 Ok(target) => (session_id, target),

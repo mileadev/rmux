@@ -10,7 +10,7 @@ use rmux_proto::{CommandOutput, OptionName, RmuxError};
 use crate::client_names::attached_client_tty_path;
 use crate::handler_support::attached_client_required;
 use crate::key_table::effective_client_key_table_name;
-use crate::outer_terminal::OuterTerminal;
+use crate::outer_terminal::{ClientTitleUpdate, OuterTerminal};
 use crate::pane_terminals::{session_not_found, HandlerState};
 use crate::server_access::current_owner_uid;
 use crate::terminal::{base_process_environment, base_process_environment_display_only};
@@ -213,6 +213,7 @@ impl RequestHandler {
             terminal_context,
             client_size,
             key_table,
+            previous_title,
             current_attach_id,
             current_session_id,
         ) = {
@@ -236,12 +237,13 @@ impl RequestHandler {
                 active.terminal_context.clone(),
                 active.client_size,
                 active.key_table_name.clone(),
+                active.client_title.clone(),
                 active.id,
                 active.session_id,
             )
         };
         let socket_path = self.socket_path();
-        let bytes = {
+        let (bytes, client_title) = {
             let state = self.state.lock().await;
             let session = state
                 .sessions
@@ -253,6 +255,29 @@ impl RequestHandler {
             let key_table = effective_client_key_table_name(&state, session, key_table.as_deref());
             let session = attach_support::sized_session(session, Some(client_size));
             let outer_terminal = OuterTerminal::resolve(&state.options, terminal_context);
+            // tmux re-expands `set-titles-string` on every server loop, not only
+            // when the client redraws, so a title carrying a `#(shell-command)`
+            // job, a strftime token or `#{session_alerts}` keeps up. This status
+            // tick is rmux's equivalent periodic pass; the expansion is skipped
+            // outright while `set-titles` is off (issue #182).
+            let resolved_title = crate::renderer::expand_client_title(
+                session.as_ref(),
+                &state.options,
+                &crate::renderer::ClientTitleContext {
+                    state: Some(&state),
+                    attached_count,
+                    key_table: Some(&key_table),
+                    socket_path: Some(&socket_path),
+                },
+            );
+            let title_update = ClientTitleUpdate {
+                resolved: resolved_title.as_deref(),
+                // The OSC 7 path follows the active pane's own report, which
+                // only the prelude reads; leaving it unset here keeps whatever
+                // this client was already told.
+                path: None,
+                previous: Some(&previous_title),
+            };
             let frame = crate::renderer::render_status_only_with_attached_count_and_prompt(
                 session.as_ref(),
                 &state.options,
@@ -265,7 +290,11 @@ impl RequestHandler {
                     ..crate::renderer::StatusRenderContext::default()
                 },
             );
-            outer_terminal.wrap_render_frame(&frame)
+            // The title sits outside the synchronized-update wrapper: it is an
+            // outer-terminal property, not part of the drawn frame.
+            let mut bytes = outer_terminal.render_client_title(title_update);
+            bytes.extend_from_slice(&outer_terminal.wrap_render_frame(&frame));
+            (bytes, outer_terminal.rendered_client_title(title_update))
         };
         self.send_attached_status_if_unobscured(
             attach_pid,
@@ -273,6 +302,7 @@ impl RequestHandler {
             session_name,
             current_session_id,
             bytes,
+            client_title,
         )
         .await
     }
@@ -525,6 +555,11 @@ pub(in crate::handler) fn effective_client_terminal_context(
         // an outer may ignore it. The on-only gate keeps the `external` default
         // from letting untrusted output drive the clipboard.
         push_unique_terminal_feature(&mut client_terminal.terminal_features, "clipboard");
+        // Title (TSL/FSL) on the same VT reasoning: Windows sets no TERM, so no
+        // terminal family supplies a title template and `set-titles on` would
+        // have nothing to write into (issue #182). Still emitted only when
+        // `set-titles` is on, which is off by default.
+        push_unique_terminal_feature(&mut client_terminal.terminal_features, "title");
     }
     if client_environment_is_windows_terminal(client_environment) {
         client_terminal.utf8 = true;
@@ -745,6 +780,26 @@ mod tests {
         );
     }
 
+    /// The VT feature set a Windows Terminal attach ends up advertising. On
+    /// Windows the `cfg(windows)` fallback also supplies `title` (issue #182);
+    /// elsewhere only the WT_SESSION arm runs.
+    fn windows_terminal_feature_set() -> Vec<&'static str> {
+        let mut features = vec!["sync", "bpaste", "mouse", "clipboard"];
+        if cfg!(windows) {
+            features.push("title");
+        }
+        features
+    }
+
+    /// Same set when the client already advertised sync/bpaste/mouse itself.
+    fn preadvertised_windows_terminal_feature_set() -> Vec<&'static str> {
+        let mut features = vec!["SYNC", "BPASTE", "MOUSE", "clipboard"];
+        if cfg!(windows) {
+            features.push("title");
+        }
+        features
+    }
+
     #[test]
     fn windows_terminal_environment_enables_synchronized_rendering() {
         let environment = HashMap::from([("WT_SESSION".to_owned(), "session-id".to_owned())]);
@@ -754,10 +809,7 @@ mod tests {
         );
 
         assert!(context.utf8);
-        assert_eq!(
-            context.terminal_features,
-            vec!["sync", "bpaste", "mouse", "clipboard"]
-        );
+        assert_eq!(context.terminal_features, windows_terminal_feature_set());
     }
 
     #[test]
@@ -774,7 +826,7 @@ mod tests {
         assert!(context.utf8);
         assert_eq!(
             context.terminal_features,
-            vec!["SYNC", "BPASTE", "MOUSE", "clipboard"]
+            preadvertised_windows_terminal_feature_set()
         );
     }
 
@@ -791,7 +843,7 @@ mod tests {
             &ClientTerminalContext::default(),
         );
 
-        for feature in ["sync", "bpaste", "mouse", "clipboard"] {
+        for feature in ["sync", "bpaste", "mouse", "clipboard", "title"] {
             assert!(
                 context.terminal_features.iter().any(|f| f == feature),
                 "missing {feature} for non-WT Windows outer: {:?}",

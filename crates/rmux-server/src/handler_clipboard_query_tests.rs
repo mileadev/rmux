@@ -142,6 +142,7 @@ async fn register_attach_for_uid(
                 closing: Arc::new(AtomicBool::new(false)),
                 persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
                 terminal_context: OuterTerminalContext::default(),
+                client_title: None,
                 flags: settings.flags,
                 render_stream: settings.render_stream,
                 uid,

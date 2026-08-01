@@ -19,7 +19,7 @@ use super::transient_message::TransientMessageInputState;
 use crate::client_flags::ClientFlags;
 use crate::handler_support::{ambiguous_attached_client, attached_client_required};
 use crate::mouse::ClientMouseState;
-use crate::outer_terminal::OuterTerminalContext;
+use crate::outer_terminal::{ClientTitleState, OuterTerminalContext, RenderedClientTitle};
 use crate::pane_io::{AttachControl, AttachControlSender};
 
 #[derive(Debug, Default)]
@@ -56,6 +56,9 @@ pub(in crate::handler) struct ActiveAttach {
     /// The server initiated this close without first emitting `client-detached`.
     pub(in crate::handler) emit_detached_on_finish: bool,
     pub(in crate::handler) terminal_context: OuterTerminalContext,
+    /// Expanded `set-titles-string` and OSC 7 path this client's outer terminal
+    /// was last told about, tmux's per-client `c->title` / `c->path`.
+    pub(in crate::handler) client_title: ClientTitleState,
     pub(in crate::handler) client_size: TerminalSize,
     pub(in crate::handler) client_pixels: Option<TerminalPixels>,
     pub(in crate::handler) size_sequence: u64,
@@ -154,6 +157,23 @@ impl ActiveAttach {
     pub(in crate::handler) const fn identity(&self, attach_pid: u32) -> ActiveAttachIdentity {
         ActiveAttachIdentity::new(attach_pid, self.id, self.session_id)
     }
+
+    /// Remembers what this client's outer terminal was just given.
+    ///
+    /// A render made while `set-titles` is off commits nothing and must leave
+    /// the remembered values alone: tmux keeps `c->title` across the option
+    /// going off and back on, so a title that is still current is not
+    /// re-emitted when it is switched back on. A render that resolved a title
+    /// but wrote no bytes commits nothing either — see
+    /// [`RenderedClientTitle::committed`].
+    pub(in crate::handler) fn remember_client_title(
+        &mut self,
+        rendered: Option<&RenderedClientTitle>,
+    ) {
+        if let Some(state) = rendered.and_then(RenderedClientTitle::committed) {
+            self.client_title = state.clone();
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +203,9 @@ pub(crate) struct AttachRegistration {
     pub(crate) closing: Arc<AtomicBool>,
     pub(crate) persistent_overlay_epoch: Arc<AtomicU64>,
     pub(crate) terminal_context: OuterTerminalContext,
+    /// What the attach frame this registration publishes already told the
+    /// outer terminal, so the client's first refresh does not repeat it.
+    pub(crate) client_title: Option<ClientTitleState>,
     pub(crate) flags: ClientFlags,
     pub(crate) render_stream: bool,
     pub(crate) uid: u32,
