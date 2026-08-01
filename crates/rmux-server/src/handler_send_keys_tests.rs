@@ -79,6 +79,9 @@ mod copy_mode_vi;
 #[path = "handler_send_keys_tests/key_table_precedence.rs"]
 mod key_table_precedence;
 
+#[path = "handler_send_keys_tests/combined_input_credit.rs"]
+mod combined_input_credit;
+
 async fn handle_boxed(handler: &RequestHandler, request: Request) -> Response {
     Box::pin(handler.handle(request)).await
 }

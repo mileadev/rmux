@@ -886,3 +886,9 @@ mod sizeless_geometry;
 mod switch_frame_geometry;
 #[path = "handler_attach_tests/switch_latest_recency.rs"]
 mod switch_latest_recency;
+
+#[path = "handler_attach_tests/combined_switch_recency.rs"]
+mod combined_switch_recency;
+
+#[path = "handler_attach_tests/combined_registration_recency.rs"]
+mod combined_registration_recency;
