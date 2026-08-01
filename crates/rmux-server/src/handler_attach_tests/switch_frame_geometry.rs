@@ -36,7 +36,7 @@
 
 use super::*;
 
-const CLIENT_SIZE: TerminalSize = TerminalSize {
+pub(super) const CLIENT_SIZE: TerminalSize = TerminalSize {
     cols: 100,
     rows: 40,
 };
@@ -58,10 +58,10 @@ const HELD_CLIENT_SIZE: TerminalSize = TerminalSize {
 /// The smaller geometry that paused, sized `attach-session` request carries.
 const REQUESTED_CLIENT_SIZE: TerminalSize = TerminalSize { cols: 80, rows: 24 };
 const STATUS_TWO: &str = "2";
-const STATUS_OFF: &str = "off";
-const SWITCHING_PID: u32 = 93_101;
-const SOURCE_WINDOW_INDEX: u32 = 0;
-const TARGET_WINDOW_INDEX: u32 = 1;
+pub(super) const STATUS_OFF: &str = "off";
+pub(super) const SWITCHING_PID: u32 = 93_101;
+pub(super) const SOURCE_WINDOW_INDEX: u32 = 0;
+pub(super) const TARGET_WINDOW_INDEX: u32 = 1;
 
 /// `(source status, target status, geometry the joined session implies)`.
 const SWITCH_FRAME_MATRIX: [(&str, &str, TerminalSize); 4] = [
@@ -237,6 +237,9 @@ async fn a_migrating_client_replaces_its_own_stale_registration_in_the_selection
                         Some(attach_generation(&handler, SWITCHING_PID).await),
                         CLIENT_SIZE,
                         super::super::attach_support::ClientFlags::default(),
+                        // The order the switch commit would allocate for this
+                        // client as it joins.
+                        handler.next_client_size_sequence(),
                     )),
                 )
                 .await
@@ -626,7 +629,7 @@ async fn assert_held_geometry(
 }
 
 /// The real pane PTY behind an alias, not the model geometry that drove it.
-async fn pane_pty_size(
+pub(super) async fn pane_pty_size(
     handler: &RequestHandler,
     session: &SessionName,
     window_index: u32,
@@ -648,7 +651,7 @@ async fn pane_pty_size(
 /// derived from the same rendered snapshot the frame bytes were painted from, so
 /// it is the frame's own geometry rather than whatever the stored window later
 /// reconciles to.
-fn frame_geometry(target: crate::pane_io::AttachTarget) -> TerminalSize {
+pub(super) fn frame_geometry(target: crate::pane_io::AttachTarget) -> TerminalSize {
     TerminalSize {
         cols: target.active_pane_geometry.cols(),
         rows: target.active_pane_geometry.rows(),
@@ -657,7 +660,7 @@ fn frame_geometry(target: crate::pane_io::AttachTarget) -> TerminalSize {
 
 /// `alpha:0` linked into `beta:1`, with `beta` showing the alias. Both sessions
 /// are 100x40 so the only geometry in play is the migrating client's.
-async fn linked_alias_sessions(
+pub(super) async fn linked_alias_sessions(
     handler: &RequestHandler,
     source_status: &str,
     target_status: &str,
@@ -705,7 +708,11 @@ async fn create_session(handler: &RequestHandler, session: &SessionName) {
     );
 }
 
-async fn set_session_status(handler: &RequestHandler, session: &SessionName, value: &str) {
+pub(super) async fn set_session_status(
+    handler: &RequestHandler,
+    session: &SessionName,
+    value: &str,
+) {
     let response = handler
         .handle(Request::SetOption(SetOptionRequest {
             scope: ScopeSelector::Session(session.clone()),
@@ -720,7 +727,7 @@ async fn set_session_status(handler: &RequestHandler, session: &SessionName, val
 /// tmux keys `window-size` on the window itself, so a linked window carries one
 /// policy through every alias. rmux keys window options per `(session, index)`,
 /// so both aliases are set here to reproduce the oracle's single window option.
-async fn set_window_size_policy(
+pub(super) async fn set_window_size_policy(
     handler: &RequestHandler,
     session: &SessionName,
     window_index: u32,
@@ -737,7 +744,7 @@ async fn set_window_size_policy(
     assert!(matches!(response, Response::SetOption(_)), "{response:?}");
 }
 
-async fn register_declared_attach(
+pub(super) async fn register_declared_attach(
     handler: &RequestHandler,
     requester_pid: u32,
     session: &SessionName,
@@ -792,7 +799,7 @@ async fn attach_generation_id(handler: &RequestHandler, requester_pid: u32) -> u
         .attach_id()
 }
 
-async fn active_window_index(handler: &RequestHandler, session: &SessionName) -> u32 {
+pub(super) async fn active_window_index(handler: &RequestHandler, session: &SessionName) -> u32 {
     handler
         .state
         .lock()
@@ -803,7 +810,7 @@ async fn active_window_index(handler: &RequestHandler, session: &SessionName) ->
         .active_window_index()
 }
 
-async fn window_content_size(
+pub(super) async fn window_content_size(
     handler: &RequestHandler,
     session: &SessionName,
     window_index: u32,

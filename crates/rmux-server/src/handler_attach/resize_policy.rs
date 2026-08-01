@@ -120,6 +120,8 @@ pub(in crate::handler) struct IncomingSizeClient {
     /// `None` while the client's flags leave it owning no size at all, exactly
     /// as tmux's `ignore_client_size()` skips it.
     size: Option<TerminalSize>,
+    /// The arrival order this candidate votes with under `window-size latest`.
+    size_sequence: u64,
 }
 
 impl IncomingSizeClient {
@@ -131,14 +133,25 @@ impl IncomingSizeClient {
     /// `active_control` instead. Such a candidate stands *beside* every attached
     /// vote; it must never displace one, because a matching pid number alone
     /// does not make some other live client this client.
+    ///
+    /// `size_sequence` is the arrival order the joining client votes with, and a
+    /// caller that displaces a registration owns a second obligation: it must
+    /// commit this same value to that registration. tmux 3.7b assigns
+    /// `s->curw->window->latest = c` before `recalculate_sizes()`, so the
+    /// joining client is the window's newest sizing authority from that instant
+    /// on — not only for the one selection this candidate is built for. Leaving
+    /// the registration on its original order lets the next reconcile of the
+    /// same linked family pick a different winner than the frame just sent.
     pub(in crate::handler) fn joining(
         displaced: Option<super::AttachGeneration>,
         size: TerminalSize,
         flags: super::ClientFlags,
+        size_sequence: u64,
     ) -> Self {
         Self {
             displaced,
             size: (!flags.contains(super::ClientFlags::IGNORESIZE)).then_some(size),
+            size_sequence,
         }
     }
 }
@@ -824,8 +837,10 @@ impl RequestHandler {
         incoming_client: Option<IncomingSizeClient>,
         status: Option<&str>,
     ) -> Vec<AttachedSizeCandidate> {
-        let incoming_candidate = incoming_client.and_then(|client| client.size).map(|size| {
-            AttachedSizeCandidate::from_terminal(size, self.current_client_size_sequence(), status)
+        let incoming_candidate = incoming_client.and_then(|client| {
+            client.size.map(|size| {
+                AttachedSizeCandidate::from_terminal(size, client.size_sequence, status)
+            })
         });
         attached_size_candidates(
             active_attach,

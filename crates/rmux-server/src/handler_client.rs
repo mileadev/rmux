@@ -548,8 +548,16 @@ impl RequestHandler {
         self.wait_for_windows_deferred_all_pane_pids().await;
         let switch_window_target = expected_switch_target.map(SwitchTargetSelection::window_target);
         for _ in 0..4 {
-            let incoming_client =
-                Some(IncomingSizeClient::joining(None, client_size, client_flags));
+            // This client owns no attach registration to renew, so its arrival
+            // order is simply "now": a first attach is registered moments later
+            // with the very sequence this reads, and a control client is ordered
+            // from `active_control` by `set_control_session_with_expected_identity`.
+            let incoming_client = Some(IncomingSizeClient::joining(
+                None,
+                client_size,
+                client_flags,
+                self.current_client_size_sequence(),
+            ));
             let selection = match switch_window_target.as_ref() {
                 Some(target) => {
                     self.selected_attached_window_size(target, incoming_client)

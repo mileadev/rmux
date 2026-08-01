@@ -142,10 +142,19 @@ impl RequestHandler {
         // below revalidates it under the final `state` -> `active_attach` lock
         // pair, and a same-pid replacement must keep its own vote until then.
         let displaced = AttachGeneration::new(attach_pid, expected_attach_id);
+        // tmux 3.7b's `cmd_switch_client_exec` assigns
+        // `s->curw->window->latest = c` before `recalculate_sizes()`, so a client
+        // joining a window is that window's newest sizing authority — ahead of
+        // clients that arrived after it. One order serves the whole command: the
+        // candidate below votes with it and the commit region writes it onto the
+        // registration, so the frame this switch sends, the geometry it stores
+        // and every later reconcile of the linked family rank the client alike.
+        let joined_size_sequence = self.next_client_size_sequence();
         let incoming_client = Some(IncomingSizeClient::joining(
             Some(displaced),
             request.client_geometry.size,
             request.client_flags,
+            joined_size_sequence,
         ));
         let switch_window_target = request
             .target_selection
@@ -484,6 +493,12 @@ impl RequestHandler {
             }
             active.session_name = request.session_name.clone();
             active.session_id = request.session_id;
+            // The order the selection above voted with, now owned by the
+            // registration it displaced — the second half of
+            // `IncomingSizeClient::joining`'s contract. It lands here rather
+            // than earlier so a switch that fails leaves the client's recency
+            // exactly where the rolled-back model leaves its geometry.
+            active.size_sequence = joined_size_sequence;
 
             drop(active_control);
             drop(active_attach);
