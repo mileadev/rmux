@@ -333,7 +333,10 @@ async fn copy_mode_emacs_escape_exits_active_selection_without_leak() {
     let before_capture = capture_pane_print(&handler, target.clone()).await;
     let mut pending_input = Vec::new();
 
-    send_copy_selection_key(&handler, requester_pid, &mut pending_input, b" ").await;
+    // C-Space, not Space: tmux 3.7b binds emacs copy-mode Space to page-down
+    // and C-Space to begin-selection. This seed used to rely on the removed
+    // input shim, which answered begin-selection for both.
+    send_copy_selection_key(&handler, requester_pid, &mut pending_input, b"\x00").await;
     send_copy_selection_key(&handler, requester_pid, &mut pending_input, b"\x1b[C").await;
     assert_eq!(
         copy_selection_status(&handler, target.clone()).await,

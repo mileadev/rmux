@@ -76,6 +76,9 @@ mod copy_mode_mouse_origin;
 #[path = "handler_send_keys_tests/copy_mode_vi.rs"]
 mod copy_mode_vi;
 
+#[path = "handler_send_keys_tests/key_table_precedence.rs"]
+mod key_table_precedence;
+
 async fn handle_boxed(handler: &RequestHandler, request: Request) -> Response {
     Box::pin(handler.handle(request)).await
 }

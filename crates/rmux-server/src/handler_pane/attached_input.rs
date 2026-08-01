@@ -230,17 +230,11 @@ impl RequestHandler {
             .attached_input_target_identity(identity)
             .await
             .map_err(io_other)?;
-        if self
-            .handle_attached_copy_mode_key_event_for_identity(
-                identity,
-                target.clone(),
-                decode_prompt_key(key),
-            )
-            .await
-            .map_err(io_other)?
-        {
-            return Ok(true);
-        }
+        // No copy-mode shim ahead of the tables: in copy mode the
+        // copy-mode / copy-mode-vi table is the only authority, exactly as
+        // tmux 3.7b behaves and as the detached `send-keys -X` path already
+        // did. `dispatch_attached_key_inner` resolves the binding and swallows
+        // the key when the table leaves it unbound.
         let handled = self
             .dispatch_attached_key_inner(
                 &target,
@@ -990,14 +984,21 @@ impl RequestHandler {
                 self.exit_clock_mode_for_attached_identity(&target, identity, target_session_id)
                     .await
                     .map_err(io_other)?
-            } else {
-                self.handle_attached_copy_mode_key_event_for_identity(
-                    identity,
-                    target,
-                    PromptInputEvent::Escape,
-                )
+            } else if self
+                .target_is_in_copy_mode(&target)
                 .await
                 .map_err(io_other)?
+            {
+                // A lone ESC never decodes into a key -- `decode_attached_key`
+                // answers `Partial` for it -- so copy mode has to name the key
+                // itself. Route it through the live key path so that
+                // `bind -T copy-mode Escape ...` wins, the same shape the
+                // mode-tree branch above already uses.
+                let escape = key_string_lookup_string("Escape")
+                    .ok_or_else(|| io_other("Escape key is unavailable"))?;
+                self.handle_attached_live_key(identity, escape).await?
+            } else {
+                false
             };
             if consumed_by_mode {
                 return if let Some(remaining) = bytes.get(1..).filter(|bytes| !bytes.is_empty()) {

@@ -134,7 +134,7 @@ async fn attached_copy_mode_emacs_ctrl_s_opens_search_prompt() {
 }
 
 #[tokio::test]
-async fn attached_copy_mode_gets_first_refusal_for_search_and_selection_keys() {
+async fn attached_copy_mode_vi_search_and_selection_keys_resolve_from_the_table() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");

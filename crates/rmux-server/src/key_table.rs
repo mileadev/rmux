@@ -14,14 +14,6 @@ pub(crate) const COPY_MODE_TABLE: &str = "copy-mode";
 pub(crate) const COPY_MODE_VI_TABLE: &str = "copy-mode-vi";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Step03PrefixBinding {
-    SelectPaneNext,
-    SelectPanePrevious,
-    NextWindow,
-    PreviousWindow,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AttachedKeyDecode {
     Invalid,
     Partial,
@@ -173,23 +165,6 @@ fn equivalent_key_table_alias(key: KeyCode) -> Option<KeyCode> {
     } else {
         None
     }
-}
-
-pub(crate) fn step03_prefix_binding(key: KeyCode) -> Option<Step03PrefixBinding> {
-    ["Right", "Left", "Up", "Down", "n", "p"]
-        .into_iter()
-        .filter_map(key_string_lookup_string)
-        .zip([
-            Step03PrefixBinding::SelectPaneNext,
-            Step03PrefixBinding::SelectPanePrevious,
-            Step03PrefixBinding::SelectPanePrevious,
-            Step03PrefixBinding::SelectPaneNext,
-            Step03PrefixBinding::NextWindow,
-            Step03PrefixBinding::PreviousWindow,
-        ])
-        .find_map(|(candidate, action)| {
-            (key_code_lookup_bits(candidate) == key_code_lookup_bits(key)).then_some(action)
-        })
 }
 
 pub(crate) fn should_drop_unbound_prefix_key(table_name: &str, key: KeyCode) -> bool {
