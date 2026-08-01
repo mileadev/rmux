@@ -178,8 +178,8 @@ pub(in crate::handler) use session_destroy::{
     PreparedAttachedDestroySwitches, SessionDetachOnDestroy,
 };
 pub(super) use state::{
-    ActiveAttach, ActiveAttachState, AttachedClientControlOutcome, DisplayPanesClientState,
-    DisplayPanesLabel,
+    ActiveAttach, ActiveAttachState, AttachGeneration, AttachedClientControlOutcome,
+    DisplayPanesClientState, DisplayPanesLabel,
 };
 pub(crate) use state::{ActiveAttachIdentity, AttachRegistration};
 pub(in crate::handler) use switch_commit::{

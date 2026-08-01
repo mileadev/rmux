@@ -159,15 +159,10 @@ impl RequestHandler {
             )
             .await;
         }
-        if let Err(error) = self
-            .resize_session_for_attach_client(
-                &session_name,
-                super::AttachResizeClient::new(requester_pid, request.client_size, flags),
-            )
-            .await
-        {
-            return HandleOutcome::response(Response::Error(ErrorResponse { error }));
-        }
+        // Resolved before the resize: an already-attached client is moving, so
+        // the resize displaces exactly the registration the switch below then
+        // commits. Resolving it afterwards would let the two disagree, and a
+        // stale generation would already have moved the shared geometry.
         let managed_client = match expected_attach {
             Some(identity) => Some(SwitchManagedClientIdentity::Attach {
                 pid: identity.attach_pid(),
@@ -175,6 +170,19 @@ impl RequestHandler {
             }),
             None => self.managed_client_for_pid(requester_pid).await,
         };
+        if let Err(error) = self
+            .resize_session_for_attach_client(
+                &session_name,
+                super::AttachResizeClient::new(
+                    managed_client.and_then(SwitchManagedClientIdentity::attach_generation),
+                    request.client_size,
+                    flags,
+                ),
+            )
+            .await
+        {
+            return HandleOutcome::response(Response::Error(ErrorResponse { error }));
+        }
         if let Some(client) = managed_client {
             #[cfg(test)]
             super::switching::pause_after_switch_target_identity_capture(&session_name).await;

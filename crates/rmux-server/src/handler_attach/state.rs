@@ -186,6 +186,42 @@ impl ActiveAttachIdentity {
     }
 }
 
+/// One exact attach registration: a pid *and* the generation holding it.
+///
+/// A pid on its own names whichever client owns it *now*.
+/// `register_attach_identity` replaces `by_pid[attach_pid]` in place and hands
+/// the replacement a fresh `id`, so a command that captured a registration must
+/// carry this pair to keep speaking for the one it captured — and to stop
+/// speaking at all once a replacement has taken the pid over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::handler) struct AttachGeneration {
+    attach_pid: u32,
+    attach_id: u64,
+}
+
+impl AttachGeneration {
+    pub(in crate::handler) const fn new(attach_pid: u32, attach_id: u64) -> Self {
+        Self {
+            attach_pid,
+            attach_id,
+        }
+    }
+
+    /// `true` when `active`, registered under `attach_pid`, is this exact
+    /// registration rather than a same-pid replacement of it.
+    pub(in crate::handler) fn is(self, attach_pid: u32, active: &ActiveAttach) -> bool {
+        self.attach_pid == attach_pid && self.attach_id == active.id
+    }
+
+    /// `true` while this exact registration is still the one its pid holds.
+    pub(in crate::handler) fn is_live(self, active_attach: &ActiveAttachState) -> bool {
+        active_attach
+            .by_pid
+            .get(&self.attach_pid)
+            .is_some_and(|active| self.is(self.attach_pid, active))
+    }
+}
+
 impl ActiveAttach {
     pub(in crate::handler) const fn identity(&self, attach_pid: u32) -> ActiveAttachIdentity {
         ActiveAttachIdentity::new(attach_pid, self.id, self.session_id)

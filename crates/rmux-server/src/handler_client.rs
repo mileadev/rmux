@@ -14,7 +14,7 @@ use crate::pane_io::AttachControl;
 use crate::pane_terminals::session_not_found;
 
 use super::{
-    attach_support::{ActiveAttachIdentity, ClientFlags, IncomingSizeClient},
+    attach_support::{ActiveAttachIdentity, AttachGeneration, ClientFlags, IncomingSizeClient},
     attached_client_matches_target, command_output_from_lines, control_client_target_pid,
     control_support::{current_control_queue_identity, ManagedClient},
     format_client_uid, format_client_user, format_requester_uid, normalize_target_client,
@@ -43,26 +43,30 @@ pub(in crate::handler) use switching::{
 
 /// The client a session resize is being performed for.
 ///
-/// `attach_pid` is the client performing the attach. `attach-session` from an
-/// already-attached client is a client move, and that client's live registration
-/// still names the session it is leaving, so the selection must count it through
-/// `geometry` alone. A pid holding no registration — a first attach, or a control
-/// client — displaces nothing.
+/// `displaced` is the exact attach registration this command already holds and
+/// is moving. `attach-session` from an already-attached client is a client move,
+/// and that registration still names the session it is leaving, so the selection
+/// must count it through `geometry` alone.
+///
+/// `None` means there is no previous attach to displace — a first attach, or a
+/// control client, which owns no `active_attach` entry. Such a command displaces
+/// nothing and holds no attach generation, so it neither erases nor waits on any
+/// other client's sizing authority.
 #[derive(Clone, Copy)]
 pub(in crate::handler) struct AttachResizeClient {
-    attach_pid: u32,
+    displaced: Option<AttachGeneration>,
     geometry: Option<TerminalGeometry>,
     flags: ClientFlags,
 }
 
 impl AttachResizeClient {
     pub(in crate::handler) fn new(
-        attach_pid: u32,
+        displaced: Option<AttachGeneration>,
         client_size: Option<TerminalSize>,
         flags: ClientFlags,
     ) -> Self {
         Self {
-            attach_pid,
+            displaced,
             geometry: client_size.map(TerminalGeometry::from_size),
             flags,
         }
@@ -518,31 +522,34 @@ impl RequestHandler {
         session_name: &rmux_proto::SessionName,
         client: AttachResizeClient,
     ) -> Result<(), RmuxError> {
-        self.resize_session_geometry_for_attach_client(session_name, client, None, None, None)
+        self.resize_session_geometry_for_attach_client(session_name, client, None, None)
             .await
     }
 
+    /// Applies `client`'s geometry to `session_name`, counting the client once.
+    ///
+    /// When `client` displaces a registration, that exact generation is the
+    /// authority this command speaks for: it is revalidated on every attempt and
+    /// again under the `state` -> `active_attach` lock pair that guards the
+    /// mutation. A command whose generation has been replaced by a same-pid
+    /// re-attach fails here, before it can drop the replacement's vote from the
+    /// field or write its own stale geometry over the shared window.
     async fn resize_session_geometry_for_attach_client(
         &self,
         session_name: &rmux_proto::SessionName,
         client: AttachResizeClient,
         expected_session_id: Option<rmux_proto::SessionId>,
-        expected_attach_identity: Option<(u32, u64)>,
         expected_switch_target: Option<&SwitchTargetSelection>,
     ) -> Result<(), RmuxError> {
         let AttachResizeClient {
-            attach_pid,
+            displaced,
             geometry: client_geometry,
             flags: client_flags,
         } = client;
-        if let Some((expected_pid, expected_id)) = expected_attach_identity {
+        if let Some(displaced) = displaced {
             let active_attach = self.active_attach.lock().await;
-            if active_attach
-                .by_pid
-                .get(&expected_pid)
-                .is_none_or(|active| active.id != expected_id)
-            {
-                return Err(attached_client_required("switch-client"));
+            if !displaced.is_live(&active_attach) {
+                return Err(attached_client_required("attach-session"));
             }
         }
         let Some(client_geometry) =
@@ -556,18 +563,14 @@ impl RequestHandler {
         self.wait_for_windows_deferred_all_pane_pids().await;
         let switch_window_target = expected_switch_target.map(SwitchTargetSelection::window_target);
         for _ in 0..4 {
-            if let Some((expected_pid, expected_id)) = expected_attach_identity {
+            if let Some(displaced) = displaced {
                 let active_attach = self.active_attach.lock().await;
-                if active_attach
-                    .by_pid
-                    .get(&expected_pid)
-                    .is_none_or(|active| active.id != expected_id)
-                {
-                    return Err(attached_client_required("switch-client"));
+                if !displaced.is_live(&active_attach) {
+                    return Err(attached_client_required("attach-session"));
                 }
             }
             let incoming_client = Some(IncomingSizeClient::joining(
-                attach_pid,
+                displaced,
                 client_size,
                 client_flags,
             ));
@@ -591,14 +594,8 @@ impl RequestHandler {
             }
             let active_attach = self.active_attach.lock().await;
             let active_control = self.active_control.lock().await;
-            if let Some((expected_pid, expected_id)) = expected_attach_identity {
-                if active_attach
-                    .by_pid
-                    .get(&expected_pid)
-                    .is_none_or(|active| active.id != expected_id)
-                {
-                    return Err(attached_client_required("switch-client"));
-                }
+            if displaced.is_some_and(|displaced| !displaced.is_live(&active_attach)) {
+                return Err(attached_client_required("attach-session"));
             }
             if !self.attached_size_selection_is_current(
                 &state,

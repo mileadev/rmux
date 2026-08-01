@@ -104,8 +104,7 @@ impl LinkedSessions {
     }
 }
 
-/// The client a size selection is being computed *for*, identified by the attach
-/// pid it uses.
+/// The client a size selection is being computed *for*.
 ///
 /// tmux 3.7b's `cmd_switch_client_exec` assigns `c->session = s` before it calls
 /// `recalculate_sizes()`, so a client moving between two aliases of one linked
@@ -115,25 +114,30 @@ impl LinkedSessions {
 /// therefore replaced by this candidate, never counted beside it: a linked
 /// window whose two aliases resolve different `status` values would otherwise
 /// let one client vote twice, once per session.
-///
-/// A pid that holds no registration yet — a first attach — simply adds its one
-/// vote, and the replacement is a no-op.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::handler) struct IncomingSizeClient {
-    attach_pid: u32,
+    displaced: Option<super::AttachGeneration>,
     /// `None` while the client's flags leave it owning no size at all, exactly
     /// as tmux's `ignore_client_size()` skips it.
     size: Option<TerminalSize>,
 }
 
 impl IncomingSizeClient {
+    /// `displaced` is the exact registration this candidate stands in for: the
+    /// two describe one physical client, so only one of them may vote.
+    ///
+    /// `None` means the client holds no registration for the candidate to
+    /// displace — a first attach, or a control client, which is registered in
+    /// `active_control` instead. Such a candidate stands *beside* every attached
+    /// vote; it must never displace one, because a matching pid number alone
+    /// does not make some other live client this client.
     pub(in crate::handler) fn joining(
-        attach_pid: u32,
+        displaced: Option<super::AttachGeneration>,
         size: TerminalSize,
         flags: super::ClientFlags,
     ) -> Self {
         Self {
-            attach_pid,
+            displaced,
             size: (!flags.contains(super::ClientFlags::IGNORESIZE)).then_some(size),
         }
     }
@@ -827,7 +831,7 @@ impl RequestHandler {
             active_attach,
             linked_sessions,
             incoming_candidate,
-            incoming_client.map(|client| client.attach_pid),
+            incoming_client.and_then(|client| client.displaced),
         )
     }
 
@@ -1073,21 +1077,23 @@ pub(in crate::handler) fn prepare_applied_window_resize_events(
 
 /// The attached clients that own a size for the window-size policy.
 ///
-/// `replaced_attach_pid` is the registration `incoming_client` stands in for.
-/// The two describe one physical client — the one this selection is being
-/// computed for — so counting both would give it two votes under two different
-/// sessions' `status` values.
+/// `displaced` is the exact registration `incoming_client` stands in for. The
+/// two describe one physical client — the one this selection is being computed
+/// for — so counting both would give it two votes under two different sessions'
+/// `status` values. The match is on the whole generation, never on the pid
+/// alone: a same-pid replacement is a different, legitimate sizing authority
+/// that this selection does not speak for.
 fn attached_size_candidates(
     active_attach: &super::ActiveAttachState,
     linked_sessions: &LinkedSessions,
     incoming_client: Option<AttachedSizeCandidate>,
-    replaced_attach_pid: Option<u32>,
+    displaced: Option<super::AttachGeneration>,
 ) -> Vec<AttachedSizeCandidate> {
     let mut candidates = active_attach
         .by_pid
         .iter()
         .filter(|(pid, active)| {
-            Some(**pid) != replaced_attach_pid
+            !displaced.is_some_and(|displaced| displaced.is(**pid, active))
                 && !active.suspended
                 && !active.closing.load(Ordering::Acquire)
                 && !active.flags.contains(super::ClientFlags::IGNORESIZE)

@@ -40,6 +40,14 @@ const CLIENT_SIZE: TerminalSize = TerminalSize {
     cols: 100,
     rows: 40,
 };
+/// The in-flight request of a command whose registration has been replaced.
+const STALE_CLIENT_SIZE: TerminalSize = TerminalSize { cols: 80, rows: 24 };
+/// The geometry the replacement legitimately owns. Both statuses are `off` in
+/// the replacement race, so content rows and outer rows coincide.
+const REPLACEMENT_CLIENT_SIZE: TerminalSize = TerminalSize {
+    cols: 120,
+    rows: 50,
+};
 const STATUS_TWO: &str = "2";
 const STATUS_OFF: &str = "off";
 const SWITCHING_PID: u32 = 93_101;
@@ -217,7 +225,7 @@ async fn a_migrating_client_replaces_its_own_stale_registration_in_the_selection
                 .selected_attached_session_size(
                     &beta,
                     Some(super::super::attach_support::IncomingSizeClient::joining(
-                        SWITCHING_PID,
+                        Some(attach_generation(&handler, SWITCHING_PID).await),
                         CLIENT_SIZE,
                         super::super::attach_support::ClientFlags::default(),
                     )),
@@ -237,6 +245,127 @@ async fn a_migrating_client_replaces_its_own_stale_registration_in_the_selection
     assert!(
         regressions.is_empty(),
         "the session a client is leaving must not vote for it, but {regressions:?}"
+    );
+}
+
+/// A same-pid replacement is a different client, and the command that no longer
+/// owns the pid must neither erase its vote nor move the window under it.
+///
+/// `register_attach_identity` replaces `by_pid[pid]` in place and hands the
+/// replacement a fresh generation, so an `attach-session` still in flight holds a
+/// registration it no longer owns. Displacing by pid number dropped the
+/// replacement's legitimate `120x50` vote from the field and wrote the stale
+/// `80x24` request over the shared linked window; the command only failed
+/// identity validation afterwards, in `set_attached_client_flags`, with the
+/// window already shrunk.
+///
+/// Both policies must hold, and they fail for different reasons. Under `largest`
+/// a counted replacement wins outright, so only its removal from the field can
+/// produce `80x24`. Under `smallest` the stale request would win a field it is
+/// no longer entitled to enter, so the mutation must not happen at all.
+#[tokio::test]
+async fn a_stale_attach_session_must_not_displace_a_same_pid_replacement() {
+    let mut regressions = Vec::new();
+    for policy in ["largest", "smallest"] {
+        let handler = RequestHandler::new();
+        let (alpha, beta) = linked_alias_sessions(&handler, STATUS_OFF, STATUS_OFF).await;
+        set_window_size_policy(&handler, &alpha, SOURCE_WINDOW_INDEX, policy).await;
+        set_window_size_policy(&handler, &beta, TARGET_WINDOW_INDEX, policy).await;
+
+        let mut stale_rx =
+            register_declared_attach(&handler, SWITCHING_PID, &alpha, STALE_CLIENT_SIZE).await;
+        drain_attach_controls(&mut stale_rx);
+        let stale_identity = handler.active_attach_identity_for_test(SWITCHING_PID).await;
+
+        // The pause lands after the stale command has selected its size and
+        // released every lock, which is exactly the window a re-attach uses.
+        let pause = handler.install_attached_size_selection_pause();
+        // The binding an attached client's own command carries: attached key
+        // dispatch and the command prompt run `attach-session` inside the
+        // registration that issued it, so the command keeps speaking for that
+        // exact generation and for no other.
+        let stale_attach = super::super::with_expected_attach_and_session_identity(
+            stale_identity,
+            alpha.clone(),
+            stale_identity.session_id(),
+            // A sized `attach-session`: the request carries the client's own
+            // geometry, so it reaches the session resize that selects and
+            // applies the shared window's size.
+            handler.dispatch(
+                SWITCHING_PID,
+                Request::AttachSessionExt2(Box::new(AttachSessionExt2Request {
+                    target: Some(beta.clone()),
+                    target_spec: Some(beta.to_string()),
+                    detach_other_clients: false,
+                    kill_other_clients: false,
+                    read_only: false,
+                    skip_environment_update: false,
+                    flags: None,
+                    working_directory: None,
+                    client_terminal: rmux_proto::ClientTerminalContext::default(),
+                    client_size: Some(STALE_CLIENT_SIZE),
+                })),
+            ),
+        );
+        let replace_the_registration = async {
+            pause.reached.notified().await;
+            let mut replacement_rx =
+                register_declared_attach(&handler, SWITCHING_PID, &beta, REPLACEMENT_CLIENT_SIZE)
+                    .await;
+            drain_attach_controls(&mut replacement_rx);
+            let replacement_generation = attach_generation_id(&handler, SWITCHING_PID).await;
+            let staged = window_content_size(&handler, &beta, TARGET_WINDOW_INDEX).await;
+            pause.release.notify_one();
+            (replacement_rx, replacement_generation, staged)
+        };
+        let (stale, (mut replacement_rx, replacement_generation, staged)) =
+            tokio::join!(stale_attach, replace_the_registration);
+
+        assert_ne!(
+            replacement_generation,
+            stale_identity.attach_id(),
+            "the re-attach must install a new generation under the same pid"
+        );
+        assert_eq!(
+            staged, REPLACEMENT_CLIENT_SIZE,
+            "window-size={policy}: the replacement must own the shared window \
+             before the stale command is released"
+        );
+
+        if !matches!(stale.response, Response::Error(_)) {
+            regressions.push(format!(
+                "window-size={policy}: the stale attach-session must fail, got {:?}",
+                stale.response
+            ));
+        }
+        for (alias, window_index) in [(&beta, TARGET_WINDOW_INDEX), (&alpha, SOURCE_WINDOW_INDEX)] {
+            let settled = window_content_size(&handler, alias, window_index).await;
+            if settled != REPLACEMENT_CLIENT_SIZE {
+                regressions.push(format!(
+                    "window-size={policy}: alias {alias}:{window_index} is {settled:?}, \
+                     expected the replacement's {REPLACEMENT_CLIENT_SIZE:?}"
+                ));
+            }
+        }
+        let held = attach_generation_id(&handler, SWITCHING_PID).await;
+        if held != replacement_generation {
+            regressions.push(format!(
+                "window-size={policy}: the replacement must still hold the pid"
+            ));
+        }
+        while let Ok(control) = replacement_rx.try_recv() {
+            if matches!(control, AttachControl::Switch(_)) {
+                regressions.push(format!(
+                    "window-size={policy}: the stale command must not frame the replacement"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        regressions.is_empty(),
+        "a stale command must fail before it displaces or moves a same-pid \
+         replacement, but {regressions:?}"
     );
 }
 
@@ -367,6 +496,25 @@ async fn register_declared_attach(
         .await
         .expect("declared client size is accepted");
     control_rx
+}
+
+/// The exact registration `requester_pid` holds right now.
+async fn attach_generation(
+    handler: &RequestHandler,
+    requester_pid: u32,
+) -> super::super::attach_support::AttachGeneration {
+    super::super::attach_support::AttachGeneration::new(
+        requester_pid,
+        attach_generation_id(handler, requester_pid).await,
+    )
+}
+
+/// The generation half of that registration, which a same-pid re-attach bumps.
+async fn attach_generation_id(handler: &RequestHandler, requester_pid: u32) -> u64 {
+    handler
+        .active_attach_identity_for_test(requester_pid)
+        .await
+        .attach_id()
 }
 
 async fn active_window_index(handler: &RequestHandler, session: &SessionName) -> u32 {

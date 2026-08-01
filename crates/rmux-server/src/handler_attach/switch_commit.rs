@@ -9,8 +9,9 @@ use rmux_proto::{
 use super::resize_policy::{IncomingSizeClient, ATTACHED_SIZE_RECONCILE_ATTEMPTS};
 use super::{
     attach_target_for_session_switch, reset_interactive_attach_state_for_session_switch,
-    terminate_overlay_job, ActiveAttachIdentity, AttachSessionSwitchRenderOptions,
-    AttachedClientControlOutcome, ClientFlags, RequestHandler, ATTACH_CONTROL_BACKLOG_LIMIT,
+    terminate_overlay_job, ActiveAttachIdentity, AttachGeneration,
+    AttachSessionSwitchRenderOptions, AttachedClientControlOutcome, ClientFlags, RequestHandler,
+    ATTACH_CONTROL_BACKLOG_LIMIT,
 };
 use crate::handler::client_support::SwitchTargetSelection;
 use crate::handler::{
@@ -136,10 +137,13 @@ impl RequestHandler {
         self.wait_for_windows_deferred_all_pane_pids().await;
 
         // The switching client is still registered under the session it is
-        // leaving, so it enters the selection as the incoming client and its
-        // stale registration drops out with it.
+        // leaving, so it enters the selection as the incoming client and that
+        // exact registration drops out with it. The generation matters: the loop
+        // below revalidates it under the final `state` -> `active_attach` lock
+        // pair, and a same-pid replacement must keep its own vote until then.
+        let displaced = AttachGeneration::new(attach_pid, expected_attach_id);
         let incoming_client = Some(IncomingSizeClient::joining(
-            attach_pid,
+            Some(displaced),
             request.client_geometry.size,
             request.client_flags,
         ));
@@ -165,7 +169,9 @@ impl RequestHandler {
             let mut active_attach = self.active_attach.lock().await;
             let active_control = self.active_control.lock().await;
             let active = active_attach.by_pid.get(&attach_pid).filter(|active| {
-                active.id == expected_attach_id
+                // The same generation the selection displaced, revalidated
+                // before any shared geometry moves or any frame is sent.
+                displaced.is(attach_pid, active)
                     && request
                         .expected_current_session_id
                         .is_none_or(|session_id| active.session_id == session_id)

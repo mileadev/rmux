@@ -316,6 +316,19 @@ async fn switch_client_target_capture_keeps_identity_without_a_committed_target(
 }
 
 impl SwitchManagedClientIdentity {
+    /// The exact attach registration this client is, or `None` for a control
+    /// client, which owns no `active_attach` entry to displace or hold.
+    pub(in crate::handler) const fn attach_generation(
+        self,
+    ) -> Option<super::super::attach_support::AttachGeneration> {
+        match self {
+            Self::Attach { pid, attach_id } => Some(
+                super::super::attach_support::AttachGeneration::new(pid, attach_id),
+            ),
+            Self::Control { .. } => None,
+        }
+    }
+
     const fn client(self) -> ManagedClient {
         match self {
             Self::Attach { pid, attach_id } => ManagedClient::Attach { pid, attach_id },
