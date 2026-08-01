@@ -137,6 +137,23 @@ impl ActiveAttachIdentity {
             && &active.session_name == session_name
     }
 
+    /// Whether this attach is still the published one for its client and still
+    /// owns `session_id`.
+    ///
+    /// The name a session is stored under is mutable and its id is not, so a
+    /// caller that captured a name before releasing the state lock cannot use
+    /// that name as identity: a rename keeps the same lifetime attached to the
+    /// same client under a new key.  Callers that need a name read the current
+    /// one off the attach this accepts.  A session switch does change
+    /// `active.session_id`, so it is still rejected here.
+    pub(in crate::handler) fn matches_active_lifetime(
+        self,
+        active: &ActiveAttach,
+        session_id: SessionId,
+    ) -> bool {
+        self.attach_id == active.id && active.session_id == session_id
+    }
+
     pub(in crate::handler) fn matches(
         self,
         attach_pid: u32,

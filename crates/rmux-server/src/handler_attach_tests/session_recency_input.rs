@@ -37,6 +37,10 @@ const ANCIENT_SECOND: i64 = 1_000_000_000;
 const USED: &str = "zulu";
 /// A detached session created after `USED`, so it starts out the most recent.
 const SPARE: &str = "alfa";
+/// What `USED` is renamed to mid-registration. Still alphabetically after
+/// `SPARE`, so the rename cannot hand the legacy name tiebreak the answer the
+/// renamed session's own attach is supposed to earn.
+const RENAMED_USED: &str = "renamed-used";
 
 /// Collapses every public timestamp onto one second, leaving only the internal
 /// recency order able to rank the sessions.
@@ -466,6 +470,57 @@ async fn attach_registration_must_not_credit_a_client_that_finished_first() {
 
     // The attach this registration was crediting no longer exists.
     assert_eq!(default_session(&handler).await, session_name(SPARE));
+}
+
+#[tokio::test]
+async fn attach_registration_credit_follows_a_rename_of_the_same_session_lifetime() {
+    let attach_pid = std::process::id();
+    let handler = Arc::new(RequestHandler::new());
+    create_quiet_session(&handler, &session_name(USED)).await;
+    create_quiet_session(&handler, &session_name(SPARE)).await;
+    let attached_id = session_id(&handler, USED).await;
+
+    let pause = handler.install_attach_registration_activity_pause();
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let registering_handler = Arc::clone(&handler);
+    let registering = tokio::spawn(async move {
+        registering_handler
+            .register_attach(attach_pid, session_name(USED), control_tx)
+            .await
+    });
+    tokio::time::timeout(ATTACH_LIFECYCLE_TIMEOUT, pause.reached.notified())
+        .await
+        .expect("attach registration reaches its activity commit");
+
+    // Rename the exact session this registration published its attach to. The
+    // lifetime and the attach both survive; only the key it is stored under
+    // moves, which is the one thing the captured name can no longer follow.
+    let renamed = session_name(RENAMED_USED);
+    let response = handler
+        .handle(Request::RenameSession(RenameSessionRequest {
+            target: session_name(USED),
+            new_name: renamed.clone(),
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::RenameSession(_)),
+        "{response:?}"
+    );
+    assert_eq!(
+        session_id(&handler, RENAMED_USED).await,
+        attached_id,
+        "renaming must preserve the attached session's identity"
+    );
+    touch_spare(&handler).await;
+    pin_public_seconds(&handler).await;
+    assert_eq!(default_session(&handler).await, session_name(SPARE));
+
+    pause.release.notify_one();
+    registering.await.expect("attach registration task joins");
+    pin_public_seconds(&handler).await;
+
+    // A client did attach to this session, and renaming it is not detaching.
+    assert_eq!(default_session(&handler).await, renamed);
 }
 
 #[tokio::test]
