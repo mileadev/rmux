@@ -389,6 +389,8 @@ pub(crate) struct RequestHandler {
     attached_size_selection_pause: Arc<StdMutex<Option<Arc<AttachedSizeSelectionPause>>>>,
     #[cfg(test)]
     attached_size_apply_pause: Arc<StdMutex<Option<Arc<AttachedSizeApplyPause>>>>,
+    #[cfg(test)]
+    attach_registration_activity_pause: Arc<StdMutex<Option<Arc<AttachRegistrationActivityPause>>>>,
 }
 
 pub(crate) struct ConfigLoadingGuard {
@@ -488,6 +490,8 @@ impl Clone for RequestHandler {
             attached_size_selection_pause: self.attached_size_selection_pause.clone(),
             #[cfg(test)]
             attached_size_apply_pause: self.attached_size_apply_pause.clone(),
+            #[cfg(test)]
+            attach_registration_activity_pause: self.attach_registration_activity_pause.clone(),
         }
     }
 }
@@ -640,6 +644,8 @@ impl WeakRequestHandler {
             attached_size_selection_pause: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             attached_size_apply_pause: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            attach_registration_activity_pause: Arc::new(StdMutex::new(None)),
         })
     }
 }
@@ -654,6 +660,13 @@ struct PasteBufferDeletePause {
 #[cfg(test)]
 #[derive(Debug, Default)]
 struct WindowLifecycleMutationPause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct AttachRegistrationActivityPause {
     reached: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -956,6 +969,8 @@ impl RequestHandler {
             attached_size_selection_pause: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             attached_size_apply_pause: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            attach_registration_activity_pause: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -1323,6 +1338,32 @@ impl RequestHandler {
 
     #[cfg(not(test))]
     async fn pause_before_attached_size_apply(&self) {}
+
+    #[cfg(test)]
+    fn install_attach_registration_activity_pause(&self) -> Arc<AttachRegistrationActivityPause> {
+        let pause = Arc::new(AttachRegistrationActivityPause::default());
+        *self
+            .attach_registration_activity_pause
+            .lock()
+            .expect("attach registration activity pause") = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    async fn pause_before_attach_registration_activity(&self) {
+        let pause = self
+            .attach_registration_activity_pause
+            .lock()
+            .expect("attach registration activity pause")
+            .take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(not(test))]
+    async fn pause_before_attach_registration_activity(&self) {}
 
     #[cfg(test)]
     fn install_silence_timer_apply_pause(&self) -> Arc<SilenceTimerApplyPause> {

@@ -14,12 +14,23 @@
 //! seconds equal, only the internal recency order can still separate the
 //! sessions. `used` is deliberately the alphabetically last name and `spare`
 //! the first, so the legacy name tiebreak cannot produce the expected answer.
+//!
+//! Erasing the seconds is what those fixtures need and what they must not be
+//! the only evidence of: admitting input also advances the *public*
+//! `session_activity`, which is a real change to what `list-sessions` reports.
+//! The last fixtures therefore pin that payload at the rendered boundary
+//! instead of erasing it.
 
 use super::*;
 use rmux_core::{TargetFindContext, TargetFindFlags, TargetFindType, UnresolvedTarget};
 
 /// One arbitrary but fixed second shared by every session in a fixture.
 const PINNED_SECOND: i64 = 1_785_500_000;
+
+/// A second far enough in the past that any clock reading is strictly later.
+/// The public-boundary fixtures pin this and then assert movement, so they do
+/// not depend on which second the test itself runs in.
+const ANCIENT_SECOND: i64 = 1_000_000_000;
 
 /// The session an attached client interacts with. Alphabetically last, so the
 /// legacy `activity_at`/`created_at`/name ranking can never select it.
@@ -30,6 +41,10 @@ const SPARE: &str = "alfa";
 /// Collapses every public timestamp onto one second, leaving only the internal
 /// recency order able to rank the sessions.
 async fn pin_public_seconds(handler: &RequestHandler) {
+    pin_public_seconds_to(handler, PINNED_SECOND).await;
+}
+
+async fn pin_public_seconds_to(handler: &RequestHandler, seconds: i64) {
     let mut state = handler.state.lock().await;
     let names = state
         .sessions
@@ -41,14 +56,14 @@ async fn pin_public_seconds(handler: &RequestHandler) {
             .sessions
             .session_mut(&name)
             .expect("listed session exists")
-            .pin_public_times_for_tests(PINNED_SECOND);
+            .pin_public_times_for_tests(seconds);
     }
     assert!(
         state
             .sessions
             .iter()
-            .all(|(_, session)| session.created_at() == PINNED_SECOND
-                && session.activity_at() == PINNED_SECOND),
+            .all(|(_, session)| session.created_at() == seconds
+                && session.activity_at() == seconds),
         "the fixture must leave no public second able to order the sessions"
     );
 }
@@ -236,12 +251,14 @@ async fn empty_attached_input_does_not_advance_targetless_session_recency() {
     assert_eq!(default_session(&handler).await, session_name(SPARE));
 }
 
-#[tokio::test]
-async fn read_only_client_input_does_not_advance_targetless_session_recency() {
-    let attach_pid = std::process::id();
+/// Attaches a read-only client to `USED`, then creates `SPARE` afterwards, so
+/// the fixture starts out exactly like [`interaction_fixture`].
+async fn read_only_fixture(
+    attach_pid: u32,
+) -> (RequestHandler, mpsc::UnboundedReceiver<AttachControl>) {
     let handler = RequestHandler::new();
     create_quiet_session(&handler, &session_name(USED)).await;
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
     handler
         .register_attach_with_closing(
             attach_pid,
@@ -253,6 +270,13 @@ async fn read_only_client_input_does_not_advance_targetless_session_recency() {
         )
         .await;
     create_quiet_session(&handler, &session_name(SPARE)).await;
+    (handler, control_rx)
+}
+
+#[tokio::test]
+async fn read_only_client_input_does_not_advance_targetless_session_recency() {
+    let attach_pid = std::process::id();
+    let (handler, _control_rx) = read_only_fixture(attach_pid).await;
     pin_public_seconds(&handler).await;
     assert_eq!(default_session(&handler).await, session_name(SPARE));
 
@@ -323,6 +347,128 @@ async fn input_must_not_advance_a_same_name_session_recreated_under_the_client()
 }
 
 #[tokio::test]
+async fn a_live_attach_registration_credits_the_session_it_attached_to() {
+    let attach_pid = std::process::id();
+    let handler = RequestHandler::new();
+    create_quiet_session(&handler, &session_name(USED)).await;
+    create_quiet_session(&handler, &session_name(SPARE)).await;
+    pin_public_seconds(&handler).await;
+    assert_eq!(
+        default_session(&handler).await,
+        session_name(SPARE),
+        "the fixture must start with the session nobody attached to winning"
+    );
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(attach_pid, session_name(USED), control_tx)
+        .await;
+    pin_public_seconds(&handler).await;
+
+    // Attaching is use. The identity guard the two fixtures below exercise has
+    // to reject only a registration whose session lifetime or client is gone —
+    // never the ordinary one — and nothing else pins that half: `USED` is both
+    // the older session and the alphabetically last name, so only the attach
+    // itself can make it win.
+    assert_eq!(default_session(&handler).await, session_name(USED));
+}
+
+#[tokio::test]
+async fn attach_registration_must_not_credit_a_same_name_replacement_session() {
+    let attach_pid = std::process::id();
+    let handler = Arc::new(RequestHandler::new());
+    create_quiet_session(&handler, &session_name(USED)).await;
+    create_quiet_session(&handler, &session_name(SPARE)).await;
+    let original_id = session_id(&handler, USED).await;
+
+    // Registration publishes the attach, releases the state lock, and only then
+    // credits the session. Park it inside exactly that window.
+    let pause = handler.install_attach_registration_activity_pause();
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let registering_handler = Arc::clone(&handler);
+    let registering = tokio::spawn(async move {
+        registering_handler
+            .register_attach(attach_pid, session_name(USED), control_tx)
+            .await
+    });
+    tokio::time::timeout(ATTACH_LIFECYCLE_TIMEOUT, pause.reached.notified())
+        .await
+        .expect("attach registration reaches its activity commit");
+
+    // Destroy the lifetime the registration captured and reuse its name, then
+    // make the rival the most recent session again.
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .sessions
+            .remove_session(&session_name(USED))
+            .expect("session removal succeeds");
+        state
+            .sessions
+            .create_session(session_name(USED), TerminalSize { cols: 80, rows: 24 })
+            .expect("replacement session creation succeeds");
+    }
+    assert_ne!(
+        session_id(&handler, USED).await,
+        original_id,
+        "the replacement session must be a new identity"
+    );
+    touch_spare(&handler).await;
+    pin_public_seconds(&handler).await;
+    assert_eq!(default_session(&handler).await, session_name(SPARE));
+
+    pause.release.notify_one();
+    registering.await.expect("attach registration task joins");
+    pin_public_seconds(&handler).await;
+
+    // Nobody ever attached to the replacement, so it must not inherit the
+    // attach of the destroyed session that merely shared its name.
+    assert_eq!(default_session(&handler).await, session_name(SPARE));
+}
+
+#[tokio::test]
+async fn attach_registration_must_not_credit_a_client_that_finished_first() {
+    let attach_pid = std::process::id();
+    let handler = Arc::new(RequestHandler::new());
+    create_quiet_session(&handler, &session_name(USED)).await;
+    create_quiet_session(&handler, &session_name(SPARE)).await;
+
+    let pause = handler.install_attach_registration_activity_pause();
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let registering_handler = Arc::clone(&handler);
+    let registering = tokio::spawn(async move {
+        registering_handler
+            .register_attach(attach_pid, session_name(USED), control_tx)
+            .await
+    });
+    tokio::time::timeout(ATTACH_LIFECYCLE_TIMEOUT, pause.reached.notified())
+        .await
+        .expect("attach registration reaches its activity commit");
+
+    // The attach is published, so the client can already leave through the
+    // ordinary teardown before registration reaches its own commit.
+    let attach_id = handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .get(&attach_pid)
+        .expect("the registration published its attach")
+        .id;
+    handler.finish_attach(attach_pid, attach_id).await;
+    touch_spare(&handler).await;
+    pin_public_seconds(&handler).await;
+    assert_eq!(default_session(&handler).await, session_name(SPARE));
+
+    pause.release.notify_one();
+    registering.await.expect("attach registration task joins");
+    pin_public_seconds(&handler).await;
+
+    // The attach this registration was crediting no longer exists.
+    assert_eq!(default_session(&handler).await, session_name(SPARE));
+}
+
+#[tokio::test]
 async fn detaching_does_not_advance_targetless_session_recency() {
     let attach_pid = std::process::id();
     let handler = RequestHandler::new();
@@ -362,6 +508,78 @@ async fn explicit_send_keys_to_a_detached_session_does_not_advance_its_recency()
     // tmux 3.7b measured: `send-keys` to a detached session left its
     // `session_activity` unchanged. Command input is not client interaction.
     assert_eq!(default_session(&handler).await, session_name(SPARE));
+}
+
+#[tokio::test]
+async fn accepted_input_advances_the_rendered_session_activity() {
+    let attach_pid = std::process::id();
+    let (handler, _control_rx) = interaction_fixture(attach_pid).await;
+    pin_public_seconds_to(&handler, ANCIENT_SECOND).await;
+
+    handler
+        .handle_attached_live_input_for_test(attach_pid, b"x")
+        .await
+        .expect("plain pane input succeeds");
+
+    // tmux 3.7b measured (`.rmux-audit/m39-oracle/probe3-out.txt`, probes 12,
+    // 13 and 16): a key from an attached client advances `session_activity`.
+    // The recency token is internal, but this second is not — it is the
+    // payload `list-sessions` and `#{session_activity}` publish, so admitting
+    // input is a deliberate, tmux-backed change to that output.
+    assert!(
+        rendered_session_activity(&handler, USED).await > ANCIENT_SECOND,
+        "an accepted interaction must advance the rendered #{{session_activity}}"
+    );
+    assert_eq!(
+        rendered_session_activity(&handler, SPARE).await,
+        ANCIENT_SECOND,
+        "only the session the client interacted with may advance"
+    );
+}
+
+#[tokio::test]
+async fn read_only_input_leaves_the_rendered_session_activity_alone() {
+    let attach_pid = std::process::id();
+    let (handler, _control_rx) = read_only_fixture(attach_pid).await;
+    pin_public_seconds_to(&handler, ANCIENT_SECOND).await;
+
+    let _ = handler
+        .handle_attached_live_input_for_test(attach_pid, b"x")
+        .await;
+
+    // tmux does advance activity for a read-only client's key; RMUX reuses its
+    // existing client-activity predicate instead. That divergence is visible
+    // here, at the same public boundary, rather than only in the ranking.
+    assert_eq!(
+        rendered_session_activity(&handler, USED).await,
+        ANCIENT_SECOND,
+        "rejected input must not reach the published activity second"
+    );
+}
+
+/// Reads one session's `#{session_activity}` back out of the `list-sessions`
+/// payload the CLI receives, rather than out of the in-process accessor.
+async fn rendered_session_activity(handler: &RequestHandler, name: &str) -> i64 {
+    let response = handler
+        .handle(Request::ListSessions(rmux_proto::ListSessionsRequest {
+            format: Some("#{session_name}=#{session_activity}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        }))
+        .await;
+    let Response::ListSessions(listed) = response else {
+        panic!("expected list-sessions response, got {response:?}");
+    };
+    let rendered =
+        String::from_utf8(listed.output.stdout().to_vec()).expect("list-sessions stdout is utf-8");
+    let prefix = format!("{name}=");
+    rendered
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .unwrap_or_else(|| panic!("{name} is missing from list-sessions output {rendered:?}"))
+        .parse()
+        .expect("#{session_activity} renders whole seconds")
 }
 
 async fn session_id(handler: &RequestHandler, name: &str) -> rmux_proto::SessionId {

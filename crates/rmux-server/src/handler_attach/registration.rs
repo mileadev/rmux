@@ -371,18 +371,40 @@ impl RequestHandler {
             state.key_bindings.unref_table(&table_name);
         }
 
+        let identity = ActiveAttachIdentity::new(requester_pid, attach_id, session_id);
+        self.pause_before_attach_registration_activity().await;
+
+        // Publication released the state lock, so `attached_session_name` may
+        // now address a different session: the captured one can have been
+        // renamed or destroyed and its name reused. Credit the attach only
+        // while this registration is still the live one for the client and
+        // still owns the exact session lifetime it published, which is the
+        // identity boundary `record_attached_input_activity` already enforces
+        // for the input this registration is about to start accepting.
+        // Handler lock order is state before active_attach.
         let mut state = self.state.lock().await;
-        if let Some(session) = state.sessions.session_mut(&attached_session_name) {
-            session.touch_attached();
+        let active_attach = self.active_attach.lock().await;
+        let attach_is_live = active_attach
+            .by_pid
+            .get(&requester_pid)
+            .is_some_and(|active| {
+                identity.matches_active_session(active, &attached_session_name, session_id)
+                    && !active.closing.load(Ordering::SeqCst)
+            });
+        if attach_is_live {
+            if let Some(session) = state
+                .sessions
+                .session_mut(&attached_session_name)
+                .filter(|session| session.id() == session_id)
+            {
+                session.touch_attached();
+            }
         }
+        drop(active_attach);
         drop(state);
         self.refresh_clock_overlays_for_session(&attached_session_name)
             .await;
-        Some(ActiveAttachIdentity::new(
-            requester_pid,
-            attach_id,
-            session_id,
-        ))
+        Some(identity)
     }
 
     pub(crate) async fn finish_attach(&self, requester_pid: u32, attach_id: u64) {

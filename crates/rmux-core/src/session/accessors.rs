@@ -224,8 +224,25 @@ impl Session {
     /// Callers must invoke this only once per accepted interaction, at the
     /// boundary where an attached client's input is admitted — not once per
     /// pane write, and not for input the server rejects.
+    ///
+    /// This advances the *public* `activity_at`, not only the internal recency
+    /// token: `#{session_activity}` and the `list-sessions` payload report the
+    /// new second. tmux 3.7b does the same — it calls `session_update_activity`
+    /// while admitting a key, before deciding what the key means — so a client
+    /// typing into a session is expected to change that output.
     pub fn touch_activity(&mut self) {
         self.activity_at = current_unix_timestamp();
+        self.recency = super::SessionRecency::next();
+    }
+
+    /// Moves the session to its own position at the head of the recency order,
+    /// leaving every public timestamp untouched.
+    ///
+    /// `Session` is publicly cloneable, so a session handed back to a store can
+    /// carry a token a live session already holds. The order the readers rank by
+    /// has to stay total, so the store re-mints on collision rather than letting
+    /// two sessions share a position.
+    pub(super) fn renew_recency(&mut self) {
         self.recency = super::SessionRecency::next();
     }
 

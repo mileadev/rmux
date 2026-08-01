@@ -482,7 +482,12 @@ impl SessionStore {
         Ok(result)
     }
 
-    /// Inserts an existing session back into the store without rewriting it.
+    /// Inserts an existing session back into the store, preserving its state.
+    ///
+    /// Extracting a session and handing it back leaves everything untouched.
+    /// Only the two keys that have to stay unique across stored sessions — the
+    /// session id and the internal recency position — are re-issued, and only
+    /// when the incoming session actually collides with a stored one.
     pub fn insert_existing_session(&mut self, session: Session) -> Result<(), RmuxError> {
         let mut session = session;
         let session_name = session.name().clone();
@@ -496,6 +501,20 @@ impl SessionStore {
             .any(|existing| existing.id() == session.id())
         {
             session.set_id(self.allocate_session_id());
+        }
+        // A caller may hand back a clone of a session that is still stored, so
+        // the incoming token can already belong to a live session. Targetless
+        // readers rank by that token and disagree on how to break a tie, so a
+        // shared position would put them back on the creation id or the name
+        // this order exists to replace. Re-mint instead: a session entering the
+        // store alongside the one it was copied from is a separate lifetime,
+        // exactly like the grouped peer that `clone_as_group_member` produces.
+        if self
+            .sessions
+            .values()
+            .any(|existing| existing.recency() == session.recency())
+        {
+            session.renew_recency();
         }
         session.rebind_window_id_allocator(self.next_window_id.clone());
         self.next_session_id = self

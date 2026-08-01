@@ -209,6 +209,89 @@ fn a_removed_session_cannot_keep_winning_through_a_stale_recency() {
     assert_eq!(default_session(&store), session_name("z99"));
 }
 
+/// Clones the stored `a01`, renames the copy to `zz9`, and hands it back to the
+/// store the source is still in.
+///
+/// `Session` is publicly cloneable and public rename accepts any name, so this
+/// is a reachable sequence over the published API: the clone arrives at
+/// [`SessionStore::insert_existing_session`] carrying the exact recency token
+/// its source still holds. `zz9` deliberately sorts after `a01` and receives a
+/// higher id, so a shared position resolves differently in a name tiebreak than
+/// in an id one.
+fn store_with_a_reinserted_clone_of_its_newest_session() -> (SessionStore, rmux_proto::SessionId) {
+    let mut store = same_second_store(&["m03", "z99", "a01"], &["z99", "a01"]);
+    let source_id = store
+        .session(&session_name("a01"))
+        .expect("a01 exists")
+        .id();
+    let mut clone = store
+        .session(&session_name("a01"))
+        .expect("a01 exists")
+        .clone();
+    clone.rename(session_name("zz9"));
+    store
+        .insert_existing_session(clone)
+        .expect("clone insert succeeds");
+    pin_public_seconds(&mut store);
+    (store, source_id)
+}
+
+#[test]
+fn an_inserted_clone_cannot_share_the_recency_position_of_its_source() {
+    let (store, source_id) = store_with_a_reinserted_clone_of_its_newest_session();
+
+    assert_ne!(
+        store
+            .session(&session_name("zz9"))
+            .expect("clone is stored")
+            .id(),
+        source_id,
+        "the colliding clone must have been given its own identity"
+    );
+    let mut tokens = store
+        .iter()
+        .map(|(_, session)| session.recency())
+        .collect::<Vec<_>>();
+    let stored = tokens.len();
+    tokens.sort_unstable();
+    tokens.dedup();
+    assert_eq!(
+        tokens.len(),
+        stored,
+        "no two stored sessions may occupy one recency position"
+    );
+}
+
+#[test]
+fn an_inserted_clone_does_not_leave_the_readers_on_an_identity_tiebreak() {
+    // Two sessions sharing one position put the readers back on the id or name
+    // tiebreak this order exists to replace, and they disagree about which:
+    // this reader would answer a01 on the name, while the server's targetless
+    // attach, destroy and detached-queue readers compare the id first and would
+    // answer zz9. Entering the store alongside the session it was copied from
+    // is a new lifetime, so the clone ranks ahead of its source rather than
+    // beside it, and every reader agrees.
+    let (store, _) = store_with_a_reinserted_clone_of_its_newest_session();
+
+    assert_eq!(default_session(&store), session_name("zz9"));
+}
+
+#[test]
+fn reinserting_an_extracted_session_keeps_its_recency_position() {
+    // The ordinary extract/mutate/reinsert path collides with nothing, so it
+    // must not be promoted: taking a session out of the store is not use.
+    let mut store = same_second_store(&["m03", "z99", "a01"], &["a01", "m03"]);
+    let extracted = store
+        .remove_session(&session_name("z99"))
+        .expect("session removal succeeds");
+    store
+        .insert_existing_session(extracted)
+        .expect("session reinsert succeeds");
+    pin_public_seconds(&mut store);
+
+    assert_eq!(default_session(&store), session_name("m03"));
+}
+
 #[test]
 fn a_grouped_peer_gets_its_own_lifetime() {
     let mut store = same_second_store(&["m03", "z99", "a01"], &["z99", "m03"]);
