@@ -142,7 +142,7 @@ impl RequestHandler {
         let (candidates, control_candidates, active_attach_epoch) = {
             let active_attach = self.active_attach.lock().await;
             let active_control = self.active_control.lock().await;
-            let candidates = attached_size_candidates(&active_attach, &linked_sessions, None);
+            let candidates = attached_size_candidates(&active_attach, &linked_sessions, None, None);
             let control_candidates =
                 control_size_candidates(&active_control, &linked_sessions, None);
             (
@@ -161,7 +161,7 @@ impl RequestHandler {
             aggressive_resize,
             linked_sessions,
             active_attach_epoch,
-            incoming_client_size: None,
+            incoming_client: None,
             control_candidates,
         };
         Some((target, selection))

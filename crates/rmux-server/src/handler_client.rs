@@ -14,7 +14,7 @@ use crate::pane_io::AttachControl;
 use crate::pane_terminals::session_not_found;
 
 use super::{
-    attach_support::{ActiveAttachIdentity, ClientFlags},
+    attach_support::{ActiveAttachIdentity, ClientFlags, IncomingSizeClient},
     attached_client_matches_target, command_output_from_lines, control_client_target_pid,
     control_support::{current_control_queue_identity, ManagedClient},
     format_client_uid, format_client_user, format_requester_uid, normalize_target_client,
@@ -40,6 +40,34 @@ mod switching;
 pub(in crate::handler) use switching::{
     capture_switch_client_target_identity, SwitchManagedClientIdentity, SwitchTargetSelection,
 };
+
+/// The client a session resize is being performed for.
+///
+/// `attach_pid` is the client performing the attach. `attach-session` from an
+/// already-attached client is a client move, and that client's live registration
+/// still names the session it is leaving, so the selection must count it through
+/// `geometry` alone. A pid holding no registration — a first attach, or a control
+/// client — displaces nothing.
+#[derive(Clone, Copy)]
+pub(in crate::handler) struct AttachResizeClient {
+    attach_pid: u32,
+    geometry: Option<TerminalGeometry>,
+    flags: ClientFlags,
+}
+
+impl AttachResizeClient {
+    pub(in crate::handler) fn new(
+        attach_pid: u32,
+        client_size: Option<TerminalSize>,
+        flags: ClientFlags,
+    ) -> Self {
+        Self {
+            attach_pid,
+            geometry: client_size.map(TerminalGeometry::from_size),
+            flags,
+        }
+    }
+}
 
 #[cfg(test)]
 #[derive(Debug, Default)]
@@ -488,35 +516,31 @@ impl RequestHandler {
     async fn resize_session_for_attach_client(
         &self,
         session_name: &rmux_proto::SessionName,
-        client_size: Option<TerminalSize>,
-        client_flags: ClientFlags,
+        client: AttachResizeClient,
     ) -> Result<(), RmuxError> {
-        self.resize_session_geometry_for_attach_client(
-            session_name,
-            client_size.map(TerminalGeometry::from_size),
-            client_flags,
-            None,
-            None,
-            None,
-        )
-        .await
+        self.resize_session_geometry_for_attach_client(session_name, client, None, None, None)
+            .await
     }
 
     async fn resize_session_geometry_for_attach_client(
         &self,
         session_name: &rmux_proto::SessionName,
-        client_geometry: Option<TerminalGeometry>,
-        client_flags: ClientFlags,
+        client: AttachResizeClient,
         expected_session_id: Option<rmux_proto::SessionId>,
         expected_attach_identity: Option<(u32, u64)>,
         expected_switch_target: Option<&SwitchTargetSelection>,
     ) -> Result<(), RmuxError> {
-        if let Some((attach_pid, attach_id)) = expected_attach_identity {
+        let AttachResizeClient {
+            attach_pid,
+            geometry: client_geometry,
+            flags: client_flags,
+        } = client;
+        if let Some((expected_pid, expected_id)) = expected_attach_identity {
             let active_attach = self.active_attach.lock().await;
             if active_attach
                 .by_pid
-                .get(&attach_pid)
-                .is_none_or(|active| active.id != attach_id)
+                .get(&expected_pid)
+                .is_none_or(|active| active.id != expected_id)
             {
                 return Err(attached_client_required("switch-client"));
             }
@@ -532,30 +556,29 @@ impl RequestHandler {
         self.wait_for_windows_deferred_all_pane_pids().await;
         let switch_window_target = expected_switch_target.map(SwitchTargetSelection::window_target);
         for _ in 0..4 {
-            if let Some((attach_pid, attach_id)) = expected_attach_identity {
+            if let Some((expected_pid, expected_id)) = expected_attach_identity {
                 let active_attach = self.active_attach.lock().await;
                 if active_attach
                     .by_pid
-                    .get(&attach_pid)
-                    .is_none_or(|active| active.id != attach_id)
+                    .get(&expected_pid)
+                    .is_none_or(|active| active.id != expected_id)
                 {
                     return Err(attached_client_required("switch-client"));
                 }
             }
+            let incoming_client = Some(IncomingSizeClient::joining(
+                attach_pid,
+                client_size,
+                client_flags,
+            ));
             let selection = match switch_window_target.as_ref() {
                 Some(target) => {
-                    let incoming_client_size =
-                        (!client_flags.contains(ClientFlags::IGNORESIZE)).then_some(client_size);
-                    self.selected_attached_window_size(target, incoming_client_size)
+                    self.selected_attached_window_size(target, incoming_client)
                         .await?
                 }
                 None => {
-                    self.selected_attached_session_size_for_new_client(
-                        session_name,
-                        client_size,
-                        client_flags,
-                    )
-                    .await?
+                    self.selected_attached_session_size(session_name, incoming_client)
+                        .await?
                 }
             };
             self.pause_after_attached_size_selection().await;
@@ -568,11 +591,11 @@ impl RequestHandler {
             }
             let active_attach = self.active_attach.lock().await;
             let active_control = self.active_control.lock().await;
-            if let Some((attach_pid, attach_id)) = expected_attach_identity {
+            if let Some((expected_pid, expected_id)) = expected_attach_identity {
                 if active_attach
                     .by_pid
-                    .get(&attach_pid)
-                    .is_none_or(|active| active.id != attach_id)
+                    .get(&expected_pid)
+                    .is_none_or(|active| active.id != expected_id)
                 {
                     return Err(attached_client_required("switch-client"));
                 }

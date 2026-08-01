@@ -882,3 +882,5 @@ mod session_recency;
 mod session_recency_input;
 #[path = "handler_attach_tests/sizeless_geometry.rs"]
 mod sizeless_geometry;
+#[path = "handler_attach_tests/switch_frame_geometry.rs"]
+mod switch_frame_geometry;

@@ -104,6 +104,41 @@ impl LinkedSessions {
     }
 }
 
+/// The client a size selection is being computed *for*, identified by the attach
+/// pid it uses.
+///
+/// tmux 3.7b's `cmd_switch_client_exec` assigns `c->session = s` before it calls
+/// `recalculate_sizes()`, so a client moving between two aliases of one linked
+/// window is counted exactly once, under the session it is joining. rmux selects
+/// the size *before* its atomic commit, while the client's `active_attach`
+/// registration still names the session it is leaving. That registration is
+/// therefore replaced by this candidate, never counted beside it: a linked
+/// window whose two aliases resolve different `status` values would otherwise
+/// let one client vote twice, once per session.
+///
+/// A pid that holds no registration yet — a first attach — simply adds its one
+/// vote, and the replacement is a no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::handler) struct IncomingSizeClient {
+    attach_pid: u32,
+    /// `None` while the client's flags leave it owning no size at all, exactly
+    /// as tmux's `ignore_client_size()` skips it.
+    size: Option<TerminalSize>,
+}
+
+impl IncomingSizeClient {
+    pub(in crate::handler) fn joining(
+        attach_pid: u32,
+        size: TerminalSize,
+        flags: super::ClientFlags,
+    ) -> Self {
+        Self {
+            attach_pid,
+            size: (!flags.contains(super::ClientFlags::IGNORESIZE)).then_some(size),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ControlSizeCandidate {
     pid: u32,
@@ -171,7 +206,7 @@ pub(in crate::handler) struct AttachedSizeSelection {
     aggressive_resize: bool,
     linked_sessions: LinkedSessions,
     active_attach_epoch: u64,
-    incoming_client_size: Option<TerminalSize>,
+    incoming_client: Option<IncomingSizeClient>,
     control_candidates: Vec<ControlSizeCandidate>,
 }
 
@@ -383,6 +418,9 @@ fn control_resize_selection(
         client
             .declared_size
             .map(|size| AttachedSizeCandidate::from_content(size, client.size_sequence)),
+        // A control client is registered in `active_control`; it owns no
+        // `active_attach` entry for its own candidate to displace.
+        None,
     );
     let control_candidates = control_size_candidates(
         client.active_control,
@@ -492,7 +530,7 @@ pub(in crate::handler) fn linked_window_client_content_size(
 ) -> Option<TerminalSize> {
     let linked_sessions =
         linked_session_statuses(state, target.session_name(), target.window_index(), false);
-    let candidates = attached_size_candidates(active_attach, &linked_sessions, None);
+    let candidates = attached_size_candidates(active_attach, &linked_sessions, None, None);
     selected_client_size(policy, candidates, &[]).map(SelectedWindowSize::content_size)
 }
 
@@ -687,25 +725,10 @@ impl RequestHandler {
         Ok(())
     }
 
-    pub(in crate::handler) async fn selected_attached_session_size_for_new_client(
+    pub(in crate::handler) async fn selected_attached_session_size(
         &self,
         session_name: &SessionName,
-        client_size: TerminalSize,
-        client_flags: super::ClientFlags,
-    ) -> Result<AttachedSizeSelection, RmuxError> {
-        if client_flags.contains(super::ClientFlags::IGNORESIZE) {
-            return self
-                .selected_attached_session_size(session_name, None)
-                .await;
-        }
-        self.selected_attached_session_size(session_name, Some(client_size))
-            .await
-    }
-
-    async fn selected_attached_session_size(
-        &self,
-        session_name: &SessionName,
-        incoming_client_size: Option<TerminalSize>,
+        incoming_client: Option<IncomingSizeClient>,
     ) -> Result<AttachedSizeSelection, RmuxError> {
         let (
             policy,
@@ -751,20 +774,15 @@ impl RequestHandler {
             )
         };
 
-        // An incoming client is joining the target session, so the target's own
-        // status is the one that converts it.
-        let incoming_candidate = incoming_client_size.map(|size| {
-            AttachedSizeCandidate::from_terminal(
-                size,
-                self.current_client_size_sequence(),
-                status.as_deref(),
-            )
-        });
         let (candidates, control_candidates, active_attach_epoch) = {
             let active_attach = self.active_attach.lock().await;
             let active_control = self.active_control.lock().await;
-            let candidates =
-                attached_size_candidates(&active_attach, &linked_sessions, incoming_candidate);
+            let candidates = self.incoming_client_candidates(
+                &active_attach,
+                &linked_sessions,
+                incoming_client,
+                status.as_deref(),
+            );
             let control_candidates =
                 control_size_candidates(&active_control, &linked_sessions, None);
             (
@@ -783,15 +801,40 @@ impl RequestHandler {
             aggressive_resize,
             linked_sessions,
             active_attach_epoch,
-            incoming_client_size,
+            incoming_client,
             control_candidates,
         })
+    }
+
+    /// The attached candidates, with the incoming client counted exactly once.
+    ///
+    /// `status` is the target session's own resolved value: the incoming client
+    /// is joining that session, so it is the status that converts its outer
+    /// terminal rows. Under `aggressive-resize` the target need not appear in
+    /// its own linked set when it is not currently showing the window, so this
+    /// value is resolved directly rather than looked up there.
+    fn incoming_client_candidates(
+        &self,
+        active_attach: &super::ActiveAttachState,
+        linked_sessions: &LinkedSessions,
+        incoming_client: Option<IncomingSizeClient>,
+        status: Option<&str>,
+    ) -> Vec<AttachedSizeCandidate> {
+        let incoming_candidate = incoming_client.and_then(|client| client.size).map(|size| {
+            AttachedSizeCandidate::from_terminal(size, self.current_client_size_sequence(), status)
+        });
+        attached_size_candidates(
+            active_attach,
+            linked_sessions,
+            incoming_candidate,
+            incoming_client.map(|client| client.attach_pid),
+        )
     }
 
     pub(in crate::handler) async fn selected_attached_window_size(
         &self,
         target: &WindowTarget,
-        incoming_client_size: Option<TerminalSize>,
+        incoming_client: Option<IncomingSizeClient>,
     ) -> Result<AttachedSizeSelection, RmuxError> {
         let (policy, status, aggressive_resize, linked_sessions, session_id, window_id) = {
             let state = self.state.lock().await;
@@ -832,20 +875,15 @@ impl RequestHandler {
                 window.id(),
             )
         };
-        // An incoming client is joining the target session, so the target's own
-        // status is the one that converts it.
-        let incoming_candidate = incoming_client_size.map(|size| {
-            AttachedSizeCandidate::from_terminal(
-                size,
-                self.current_client_size_sequence(),
-                status.as_deref(),
-            )
-        });
         let (candidates, control_candidates, active_attach_epoch) = {
             let active_attach = self.active_attach.lock().await;
             let active_control = self.active_control.lock().await;
-            let candidates =
-                attached_size_candidates(&active_attach, &linked_sessions, incoming_candidate);
+            let candidates = self.incoming_client_candidates(
+                &active_attach,
+                &linked_sessions,
+                incoming_client,
+                status.as_deref(),
+            );
             let control_candidates =
                 control_size_candidates(&active_control, &linked_sessions, None);
             (
@@ -864,7 +902,7 @@ impl RequestHandler {
             aggressive_resize,
             linked_sessions,
             active_attach_epoch,
-            incoming_client_size,
+            incoming_client,
             control_candidates,
         })
     }
@@ -905,9 +943,6 @@ impl RequestHandler {
         ) == Some("on");
         let current_control_candidates =
             control_size_candidates(active_control, &selection.linked_sessions, None);
-        let incoming_candidate = selection.incoming_client_size.map(|size| {
-            AttachedSizeCandidate::from_terminal(size, self.current_client_size_sequence(), status)
-        });
         policy == selection.policy
             && status == selection.status.as_deref()
             && aggressive_resize == selection.aggressive_resize
@@ -920,10 +955,11 @@ impl RequestHandler {
             && current_control_candidates == selection.control_candidates
             && selected_client_size(
                 policy,
-                attached_size_candidates(
+                self.incoming_client_candidates(
                     active_attach,
                     &selection.linked_sessions,
-                    incoming_candidate,
+                    selection.incoming_client,
+                    status,
                 ),
                 &current_control_candidates,
             ) == selection.selected_size
@@ -1035,20 +1071,28 @@ pub(in crate::handler) fn prepare_applied_window_resize_events(
     prepared
 }
 
+/// The attached clients that own a size for the window-size policy.
+///
+/// `replaced_attach_pid` is the registration `incoming_client` stands in for.
+/// The two describe one physical client — the one this selection is being
+/// computed for — so counting both would give it two votes under two different
+/// sessions' `status` values.
 fn attached_size_candidates(
     active_attach: &super::ActiveAttachState,
     linked_sessions: &LinkedSessions,
     incoming_client: Option<AttachedSizeCandidate>,
+    replaced_attach_pid: Option<u32>,
 ) -> Vec<AttachedSizeCandidate> {
     let mut candidates = active_attach
         .by_pid
-        .values()
-        .filter(|active| {
-            !active.suspended
+        .iter()
+        .filter(|(pid, active)| {
+            Some(**pid) != replaced_attach_pid
+                && !active.suspended
                 && !active.closing.load(Ordering::Acquire)
                 && !active.flags.contains(super::ClientFlags::IGNORESIZE)
         })
-        .filter_map(|active| {
+        .filter_map(|(_, active)| {
             // The lookup that admits the client also names the status that
             // converts it: `ActiveAttach.client_size` is outer terminal
             // geometry, and the rows it loses belong to the session this very

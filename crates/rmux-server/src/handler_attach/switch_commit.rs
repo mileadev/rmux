@@ -6,7 +6,7 @@ use rmux_proto::{
     PaneId, PaneTarget, RmuxError, SessionId, SessionName, TerminalGeometry, WindowId, WindowTarget,
 };
 
-use super::resize_policy::ATTACHED_SIZE_RECONCILE_ATTEMPTS;
+use super::resize_policy::{IncomingSizeClient, ATTACHED_SIZE_RECONCILE_ATTEMPTS};
 use super::{
     attach_target_for_session_switch, reset_interactive_attach_state_for_session_switch,
     terminate_overlay_job, ActiveAttachIdentity, AttachSessionSwitchRenderOptions,
@@ -135,8 +135,14 @@ impl RequestHandler {
         #[cfg(windows)]
         self.wait_for_windows_deferred_all_pane_pids().await;
 
-        let incoming_client_size = (!request.client_flags.contains(ClientFlags::IGNORESIZE))
-            .then_some(request.client_geometry.size);
+        // The switching client is still registered under the session it is
+        // leaving, so it enters the selection as the incoming client and its
+        // stale registration drops out with it.
+        let incoming_client = Some(IncomingSizeClient::joining(
+            attach_pid,
+            request.client_geometry.size,
+            request.client_flags,
+        ));
         let switch_window_target = request
             .target_selection
             .as_ref()
@@ -145,16 +151,12 @@ impl RequestHandler {
         for _ in 0..ATTACHED_SIZE_RECONCILE_ATTEMPTS {
             let size_selection = match switch_window_target.as_ref() {
                 Some(target) => {
-                    self.selected_attached_window_size(target, incoming_client_size)
+                    self.selected_attached_window_size(target, incoming_client)
                         .await?
                 }
                 None => {
-                    self.selected_attached_session_size_for_new_client(
-                        &request.session_name,
-                        request.client_geometry.size,
-                        request.client_flags,
-                    )
-                    .await?
+                    self.selected_attached_session_size(&request.session_name, incoming_client)
+                        .await?
                 }
             };
             self.pause_after_attached_size_selection().await;

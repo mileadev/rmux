@@ -172,6 +172,7 @@ pub(in crate::handler) use resize_policy::{
     linked_window_client_content_size, prepare_applied_window_resize_events,
     resize_control_session_for_client, surviving_attached_resize_targets,
     switch_control_session_for_client, AttachedWindowSizePolicy, ControlResizeClient,
+    IncomingSizeClient,
 };
 pub(in crate::handler) use session_destroy::{
     PreparedAttachedDestroySwitches, SessionDetachOnDestroy,
