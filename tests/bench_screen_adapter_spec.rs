@@ -360,17 +360,36 @@ print(json.dumps({{
 /// scrollback operation is the one whose shared socket name overflows that, and
 /// a truncated name makes the capture and the cleanup that follow it address a
 /// session that does not exist.
+///
+/// Both sides of the limit, and the uniqueness that has to survive shortening,
+/// are built from fixed pids and timestamps. A live name carries this host's
+/// pid and this host's clock: the width of the pid decides which side of the
+/// limit the name lands on, and a clock coarser than a sample hands two calls
+/// the same timestamp. Measuring those proves a different thing on every host.
 #[test]
 fn screen_session_names_fit_the_length_screen_keeps() {
     let observed = driver_json(&format!(
         "{LOAD_BENCH}
+scrollback = 'capture_pane_200x50_scrollback_10k'
+
+def named(pid, nanos):
+    real = (bench.os.getpid, bench.time.time_ns)
+    bench.os.getpid, bench.time.time_ns = (lambda: pid), (lambda: nanos)
+    try:
+        return {{
+            'unique': f'-{{pid}}-{{nanos}}',
+            'raw': bench.socket_name(scrollback, 'screen'),
+            'name': bench.screen_session_name(scrollback),
+        }}
+    finally:
+        bench.os.getpid, bench.time.time_ns = real
+
 print(json.dumps({{
     'limit': bench.SCREEN_NAME_LIMIT,
     'names': {{op: bench.screen_session_name(op) for op in bench.screen_operations('screen', 1)}},
-    'raw_scrollback': bench.socket_name('capture_pane_200x50_scrollback_10k', 'screen'),
-    'repeated': [
-        bench.screen_session_name('capture_pane_200x50_scrollback_10k') for _ in range(4)
-    ],
+    'over_the_limit': named(1234567, 1780000000000000001),
+    'next_over_the_limit': named(1234567, 1780000000000000002),
+    'at_the_limit': named(999999, 1780000000000000001),
 }}))
 "
     ));
@@ -400,27 +419,69 @@ print(json.dumps({{
         );
     }
 
-    // Vacuous unless the unguarded shared name really overflows.
-    let raw = observed["raw_scrollback"].as_str().expect("raw name");
+    // A seven-digit pid: the unguarded shared name overflows, and the guard
+    // must shorten it to exactly what screen keeps without losing what makes
+    // it unique or attributable.
+    let over = &observed["over_the_limit"];
+    assert_eq!(
+        over["unique"], "-1234567-1780000000000000001",
+        "the overflowing name must be built from a fixed pid and timestamp"
+    );
+    let overflowing = over["raw"].as_str().expect("raw name");
     assert!(
-        raw.len() > limit,
-        "the spec is vacuous unless the shared socket name really exceeds what screen keeps: \
+        overflowing.len() > limit,
+        "the spec is vacuous unless the built socket name really exceeds what screen keeps: \
          {} characters",
-        raw.len()
+        overflowing.len()
+    );
+    let shortened = over["name"].as_str().expect("shortened name");
+    assert_eq!(
+        shortened.len(),
+        limit,
+        "an overflowing name must be shortened to exactly what screen keeps: {shortened}"
+    );
+    assert!(
+        shortened.ends_with(over["unique"].as_str().expect("unique suffix")),
+        "shortening must keep the pid and timestamp that make the name unique: {shortened}"
+    );
+    assert!(
+        shortened.starts_with("rmux-bench-screen-"),
+        "a shortened name must stay attributable to this benchmark: {shortened}"
     );
 
-    // Shortening the operation must not cost the name its uniqueness.
-    let repeated: Vec<&str> = observed["repeated"]
-        .as_array()
-        .expect("repeated names")
-        .iter()
-        .map(|value| value.as_str().expect("session name"))
-        .collect();
-    let unique: std::collections::BTreeSet<&str> = repeated.iter().copied().collect();
+    // A six-digit pid: the same builder lands exactly on the limit, which
+    // screen keeps whole. Rewriting it would drop characters screen never
+    // asked for.
+    let fitting = &observed["at_the_limit"];
     assert_eq!(
-        unique.len(),
-        repeated.len(),
-        "concurrent samples must not collide: {repeated:?}"
+        fitting["unique"], "-999999-1780000000000000001",
+        "the fitting name must be built from a fixed pid and timestamp"
+    );
+    let kept = fitting["raw"].as_str().expect("raw name");
+    assert_eq!(
+        kept.len(),
+        limit,
+        "the spec must also cover the name that lands on the limit: {} characters",
+        kept.len()
+    );
+    assert_eq!(
+        fitting["name"].as_str().expect("kept name"),
+        kept,
+        "a name screen keeps whole must be left as it is: {kept}"
+    );
+
+    // Shortening the operation must not cost the name its uniqueness: two
+    // samples of one operation differ only in the timestamp, and the timestamp
+    // is the part shortening keeps.
+    let next = &observed["next_over_the_limit"];
+    assert_eq!(
+        next["unique"], "-1234567-1780000000000000002",
+        "the second overflowing name must differ from the first only in its timestamp"
+    );
+    assert_ne!(
+        next["name"], over["name"],
+        "concurrent samples must not collide once shortened: {}",
+        next["name"]
     );
 }
 
