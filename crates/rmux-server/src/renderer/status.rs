@@ -182,7 +182,7 @@ pub(super) fn status_bar_runs(
     runs
 }
 
-fn active_format_context(
+pub(super) fn active_format_context(
     session: &Session,
     attached_count: usize,
     key_table: Option<&str>,
@@ -474,7 +474,10 @@ where
     )
 }
 
-fn status_job_cache_ttl(options: &OptionStore, session_name: &rmux_proto::SessionName) -> Duration {
+pub(super) fn status_job_cache_ttl(
+    options: &OptionStore,
+    session_name: &rmux_proto::SessionName,
+) -> Duration {
     let seconds = option_usize(options, session_name, OptionName::StatusInterval).max(1);
     Duration::from_secs(u64::try_from(seconds).unwrap_or(u64::MAX))
 }

@@ -11,9 +11,13 @@ use rmux_proto::{
 use tokio::time::sleep;
 
 use super::{client_support::SwitchTargetSelection, RequestHandler};
+use crate::handler::client_runtime_support::ListClientSnapshot;
 use crate::handler_support::attached_client_required;
 use crate::key_table::effective_client_key_table_name;
-use crate::outer_terminal::{CursorScope, OuterTerminal, OuterTerminalContext};
+use crate::outer_terminal::{
+    ClientPathUpdate, ClientTitleState, ClientTitleUpdate, CursorScope, OuterTerminal,
+    OuterTerminalContext, RenderedClientTitle,
+};
 use crate::pane_io::{AttachControl, AttachTarget, LivePaneRender, OverlayFrame};
 use crate::pane_terminals::{session_not_found, HandlerState};
 use crate::renderer;
@@ -135,6 +139,57 @@ async fn pause_before_transient_restore_commit(attach_pid: u32) {
         let mut installed = TRANSIENT_RESTORE_COMMIT_PAUSE
             .lock()
             .expect("transient restore pause lock");
+        installed
+            .iter()
+            .position(|(paused_pid, _)| *paused_pid == attach_pid)
+            .map(|index| installed.swap_remove(index).1)
+    };
+    let Some(pause) = pause else {
+        return;
+    };
+    pause.reached.notify_one();
+    pause.release.notified().await;
+}
+
+/// Holds a generic redraw between rendering its frame and delivering it, so a
+/// regression can install the same-pid replacement the delivery must reject.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(in crate::handler) struct GenericRenderDeliveryPause {
+    pub(in crate::handler) reached: tokio::sync::Notify,
+    pub(in crate::handler) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static GENERIC_RENDER_DELIVERY_PAUSE: std::sync::Mutex<
+    Vec<(u32, std::sync::Arc<GenericRenderDeliveryPause>)>,
+> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(in crate::handler) fn install_generic_render_delivery_pause(
+    attach_pid: u32,
+) -> std::sync::Arc<GenericRenderDeliveryPause> {
+    let pause = std::sync::Arc::new(GenericRenderDeliveryPause::default());
+    let mut installed = GENERIC_RENDER_DELIVERY_PAUSE
+        .lock()
+        .expect("generic render delivery pause lock");
+    if let Some((_, current)) = installed
+        .iter_mut()
+        .find(|(paused_pid, _)| *paused_pid == attach_pid)
+    {
+        *current = pause.clone();
+    } else {
+        installed.push((attach_pid, pause.clone()));
+    }
+    pause
+}
+
+#[cfg(test)]
+async fn pause_before_generic_render_delivery(attach_pid: u32) {
+    let pause = {
+        let mut installed = GENERIC_RENDER_DELIVERY_PAUSE
+            .lock()
+            .expect("generic render delivery pause lock");
         installed
             .iter()
             .position(|(paused_pid, _)| *paused_pid == attach_pid)
@@ -489,6 +544,7 @@ impl RequestHandler {
         expected_session_name: &SessionName,
         expected_session_id: SessionId,
         bytes: Vec<u8>,
+        client_title: Option<RenderedClientTitle>,
     ) -> Result<(), rmux_proto::RmuxError> {
         let mut active_attach = self.active_attach.lock().await;
         let Some(active) = active_attach.by_pid.get_mut(&attach_pid) else {
@@ -504,6 +560,11 @@ impl RequestHandler {
         if active.transient_message.is_some() {
             return Ok(());
         }
+        // Remember before the send: a failed send takes the client down, and a
+        // partially written frame must not leave a title claimed as delivered
+        // that a later reconnect would then skip. The next client registers
+        // fresh with no remembered title of its own.
+        active.remember_client_title(client_title.as_ref());
         if let Err(error) = active.control_tx.send(AttachControl::Write(bytes)) {
             if error.is_full() {
                 active.closing.store(true, Ordering::SeqCst);
@@ -1182,6 +1243,8 @@ pub(super) fn attach_target_for_session(
     session_name: &rmux_proto::SessionName,
     attached_count: usize,
     terminal_context: &OuterTerminalContext,
+    previous_title: Option<&ClientTitleState>,
+    client: Option<&ListClientSnapshot>,
     socket_path: &Path,
 ) -> Result<AttachTarget, rmux_proto::RmuxError> {
     attach_target_for_session_with_prompt(
@@ -1191,6 +1254,8 @@ pub(super) fn attach_target_for_session(
         AttachTargetRenderOptions {
             prompt: None,
             key_table: None,
+            previous_title,
+            client,
             terminal_context,
             render_size: None,
             window_index: None,
@@ -1218,6 +1283,8 @@ pub(super) fn attach_target_for_web_session(
         AttachTargetRenderOptions {
             prompt: None,
             key_table: None,
+            previous_title: None,
+            client: None,
             terminal_context,
             render_size: None,
             window_index: None,
@@ -1232,6 +1299,8 @@ pub(super) fn attach_target_for_web_session(
 
 pub(super) struct AttachSessionSwitchRenderOptions<'a> {
     pub(super) attached_count: usize,
+    pub(super) previous_title: Option<&'a ClientTitleState>,
+    pub(super) client: Option<&'a ListClientSnapshot>,
     pub(super) terminal_context: &'a OuterTerminalContext,
     pub(super) socket_path: &'a Path,
     pub(super) render_stream: bool,
@@ -1267,6 +1336,8 @@ pub(super) fn attach_target_for_session_switch(
 ) -> Result<AttachTarget, rmux_proto::RmuxError> {
     let AttachSessionSwitchRenderOptions {
         attached_count,
+        previous_title,
+        client,
         terminal_context,
         socket_path,
         render_stream,
@@ -1291,6 +1362,8 @@ pub(super) fn attach_target_for_session_switch(
         AttachTargetRenderOptions {
             prompt: None,
             key_table: None,
+            previous_title,
+            client,
             terminal_context,
             render_size: None,
             window_index: None,
@@ -1319,6 +1392,8 @@ pub(super) fn attach_render_target_for_session_window(
         AttachTargetRenderOptions {
             prompt: None,
             key_table: None,
+            previous_title: None,
+            client: None,
             terminal_context,
             render_size: None,
             window_index,
@@ -1344,6 +1419,8 @@ pub(super) fn attach_render_target_for_session_with_prompt(
         AttachTargetRenderOptions {
             prompt: request.prompt,
             key_table: request.key_table,
+            previous_title: request.previous_title,
+            client: request.client,
             terminal_context: request.terminal_context,
             render_size: request.render_size,
             window_index: None,
@@ -1397,9 +1474,80 @@ fn render_status_overlay_for_attached_size(
 pub(super) struct AttachRenderTargetRequest<'a> {
     pub(super) prompt: Option<&'a renderer::RenderedPrompt>,
     pub(super) key_table: Option<&'a str>,
+    pub(super) previous_title: Option<&'a ClientTitleState>,
+    /// The client this frame is for, so `set-titles-string` expands its own
+    /// `#{client_*}` values rather than leaving them empty (issue #182).
+    pub(super) client: Option<&'a ListClientSnapshot>,
     pub(super) terminal_context: &'a OuterTerminalContext,
     pub(super) render_size: Option<TerminalSize>,
     pub(super) socket_path: &'a Path,
+}
+
+/// Everything a render needs from one attached client.
+///
+/// Taken under the client lock alone so the state lock can be acquired
+/// afterwards without holding both, which is why it owns its values.
+pub(super) struct ClientRenderSnapshot {
+    /// The exact attach generation these values were taken from.
+    ///
+    /// Registration lets a replacement take the same pid, and the render
+    /// between the two attach-lock holds runs under other locks entirely, so
+    /// delivery has to prove it is still handing the frame to the client the
+    /// frame describes (issue #182).
+    pub(super) identity: ActiveAttachIdentity,
+    pub(super) prompt: Option<renderer::RenderedPrompt>,
+    pub(super) terminal_context: OuterTerminalContext,
+    pub(super) client_size: TerminalSize,
+    pub(super) mode_tree_state_id: u64,
+    pub(super) mode_tree_active: bool,
+    pub(super) key_table: Option<String>,
+    pub(super) transient_message: Option<TransientMessageRenderSnapshot>,
+    pub(super) previous_title: ClientTitleState,
+    pub(super) client: ListClientSnapshot,
+}
+
+impl ClientRenderSnapshot {
+    pub(super) fn capture(attach_pid: u32, active: &ActiveAttach) -> Self {
+        Self {
+            identity: active.identity(attach_pid),
+            prompt: active
+                .prompt
+                .as_ref()
+                .map(super::prompt_support::ClientPromptState::rendered_prompt),
+            terminal_context: active.terminal_context.clone(),
+            client_size: active.client_size,
+            mode_tree_state_id: active.mode_tree_state_id,
+            mode_tree_active: active.mode_tree.is_some(),
+            key_table: active.key_table_name.clone(),
+            transient_message: transient_message_render_snapshot(active),
+            previous_title: active.client_title.clone(),
+            client: ListClientSnapshot::from_attached_client(attach_pid, active),
+        }
+    }
+
+    /// The render request this client's next frame is built from.
+    pub(super) fn render_request<'a>(
+        &'a self,
+        socket_path: &'a Path,
+    ) -> AttachRenderTargetRequest<'a> {
+        AttachRenderTargetRequest {
+            prompt: self.prompt.as_ref(),
+            key_table: self.key_table.as_deref(),
+            previous_title: Some(&self.previous_title),
+            client: Some(&self.client),
+            terminal_context: &self.terminal_context,
+            render_size: Some(self.client_size),
+            socket_path,
+        }
+    }
+
+    /// Stamps the persistent-overlay state a client with an open overlay
+    /// requires, so a frame rendered before a barrier is not drawn after it.
+    pub(super) fn stamp_persistent_overlay_state(&self, target: &mut AttachTarget) {
+        if self.mode_tree_active {
+            target.persistent_overlay_state_id = Some(self.mode_tree_state_id);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1411,6 +1559,12 @@ enum AttachTargetMaster {
 struct AttachTargetRenderOptions<'a> {
     prompt: Option<&'a renderer::RenderedPrompt>,
     key_table: Option<&'a str>,
+    /// What this client's outer terminal already shows, so an unchanged
+    /// expansion is not re-emitted on every refresh.
+    previous_title: Option<&'a ClientTitleState>,
+    /// The client this frame is for, source of the `#{client_*}` bindings the
+    /// title expands against.
+    client: Option<&'a ListClientSnapshot>,
     terminal_context: &'a OuterTerminalContext,
     render_size: Option<TerminalSize>,
     window_index: Option<u32>,
@@ -1495,8 +1649,42 @@ fn attach_target_for_session_with_prompt(
         pane_state.as_ref(),
         cursor_scope,
     );
+    // tmux expands the title through the format tree of the client it is about
+    // to write to, so this render's own client supplies every `#{client_*}`.
+    // The features come from the terminal just resolved for it rather than from
+    // a separate lookup, so the record cannot describe a different terminal
+    // than the one the frame is written for.
+    let client_bindings = options.client.map(|client| {
+        client
+            .clone()
+            .resolved_for_render(outer_terminal.features_string(), &key_table)
+            .format_bindings()
+    });
+    let resolved_title = renderer::expand_client_title(
+        session,
+        &state.options,
+        &renderer::ClientTitleContext {
+            state: Some(state),
+            attached_count,
+            key_table: Some(&key_table),
+            socket_path: Some(options.socket_path),
+            client: client_bindings.as_ref(),
+        },
+    );
+    let title_update = ClientTitleUpdate {
+        resolved: resolved_title.as_deref(),
+        // A pane with no screen state was not read at all; one reporting an
+        // empty OSC 7 payload is reporting that it has no directory.
+        path: pane_state
+            .as_ref()
+            .map_or(ClientPathUpdate::Unread, |pane_state| {
+                ClientPathUpdate::from_pane(pane_state.path.as_str())
+            }),
+        previous: options.previous_title,
+    };
+    let client_title = outer_terminal.rendered_client_title(title_update);
     let mut render_frame =
-        outer_terminal.render_prelude(session, &state.options, pane_state.as_ref(), cursor_scope);
+        outer_terminal.render_prelude(session, &state.options, cursor_scope, title_update);
     render_frame.extend_from_slice(
         renderer::render_with_attached_count_prompt_and_pane_title(
             session,
@@ -1694,6 +1882,7 @@ fn attach_target_for_session_with_prompt(
         pane_output_start_sequence,
         render_frame,
         outer_terminal,
+        client_title,
         cursor_style,
         active_pane_geometry,
         raw_passthrough: terminal_passthrough_allowed,
@@ -1848,7 +2037,7 @@ mod tests {
     use crate::client_flags::ClientFlags;
     use crate::handler::scripting_support::QueueExecutionContext;
     use crate::mouse::ClientMouseState;
-    use crate::outer_terminal::{OuterTerminal, OuterTerminalContext};
+    use crate::outer_terminal::{ClientTitleState, OuterTerminal, OuterTerminalContext};
     use crate::pane_io::{pane_output_channel, AttachControl, AttachTarget};
     use crate::server_access::current_owner_uid;
 
@@ -1879,6 +2068,7 @@ mod tests {
                     closing: Arc::new(AtomicBool::new(false)),
                     persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
                     terminal_context: OuterTerminalContext::default(),
+                    client_title: None,
                     flags: ClientFlags::default(),
                     render_stream: true,
                     uid,
@@ -1924,6 +2114,7 @@ mod tests {
                     closing: Arc::new(AtomicBool::new(false)),
                     persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
                     terminal_context: OuterTerminalContext::default(),
+                    client_title: None,
                     flags: ClientFlags::default(),
                     render_stream: true,
                     uid,
@@ -1947,6 +2138,7 @@ mod tests {
                 &OptionStore::default(),
                 OuterTerminalContext::default(),
             ),
+            client_title: None,
             cursor_style: 0,
             active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
             raw_passthrough: false,
@@ -2041,6 +2233,7 @@ mod tests {
                 &OptionStore::default(),
                 OuterTerminalContext::default(),
             ),
+            client_title: None,
             cursor_style: 0,
             active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
             raw_passthrough: false,
@@ -2113,6 +2306,7 @@ mod tests {
                 &OptionStore::default(),
                 OuterTerminalContext::default(),
             ),
+            client_title: None,
             cursor_style: 0,
             active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
             raw_passthrough: false,
@@ -2192,6 +2386,8 @@ mod tests {
                 &beta,
                 1,
                 &terminal_context,
+                None,
+                None,
                 &handler.socket_path(),
             )
             .expect("beta target builds");
@@ -2282,6 +2478,8 @@ mod tests {
                 &beta,
                 1,
                 &terminal_context,
+                None,
+                None,
                 &handler.socket_path(),
             )
             .expect("old beta target builds");
@@ -2358,6 +2556,7 @@ mod tests {
             closing,
             emit_detached_on_finish: false,
             terminal_context: OuterTerminalContext::default(),
+            client_title: ClientTitleState::default(),
             client_size: TerminalSize { cols: 80, rows: 24 },
             client_size_provenance: AttachClientSizeProvenance::Declared,
             client_pixels: None,

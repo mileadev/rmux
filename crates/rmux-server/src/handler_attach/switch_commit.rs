@@ -13,6 +13,7 @@ use super::{
     AttachSessionSwitchRenderOptions, AttachedClientControlOutcome, ClientFlags, RequestHandler,
     ATTACH_CONTROL_BACKLOG_LIMIT,
 };
+use crate::handler::client_runtime_support::ListClientSnapshot;
 use crate::handler::client_support::SwitchTargetSelection;
 use crate::handler::{
     update_environment_from_client, QueuedLifecycleEvent, SelectionTargetTransitionSnapshot,
@@ -301,11 +302,24 @@ impl RequestHandler {
                 ));
             }
 
+            // Captured before the render so the title expands against the
+            // client this switch is being delivered to, already carrying the
+            // destination this frame commits to: nothing but a later unrelated
+            // redraw would correct a stale `#{client_session}`.
+            let switching_client = active_attach.by_pid.get(&attach_pid).map(|active| {
+                ListClientSnapshot::from_attached_client(attach_pid, active)
+                    .switched_to_session(&request.session_name, request.session_id)
+            });
             let target = attach_target_for_session_switch(
                 &state,
                 &request.session_name,
                 AttachSessionSwitchRenderOptions {
                     attached_count: request.attached_count,
+                    previous_title: active_attach
+                        .by_pid
+                        .get(&attach_pid)
+                        .map(|active| &active.client_title),
+                    client: switching_client.as_ref(),
                     terminal_context: &request.terminal_context,
                     socket_path: &self.socket_path(),
                     render_stream: request.render_stream,
@@ -416,6 +430,11 @@ impl RequestHandler {
 
             let render_stream_refresh =
                 request.render_stream && target.is_coalescible_render_refresh();
+            // Only a delivered switch frame actually carries the title; a
+            // coalesced render refresh drops this target and re-renders later.
+            let switched_client_title = (!render_stream_refresh)
+                .then(|| target.client_title.clone())
+                .flatten();
             let command = if render_stream_refresh {
                 AttachControl::Refresh
             } else {
@@ -484,6 +503,7 @@ impl RequestHandler {
                 .then(|| reset_interactive_attach_state_for_session_switch(active))
                 .flatten();
             active.render_generation = active.render_generation.saturating_add(1);
+            active.remember_client_title(switched_client_title.as_ref());
             if render_stream_refresh {
                 active.render_refresh_pending = true;
             }

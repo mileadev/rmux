@@ -581,6 +581,7 @@ fn publish_pane_bytes(context: PanePublishContext<'_>, bytes: Vec<u8>) -> Vec<u8
                     bell_count: append_result.bell_count,
                     title_changed: append_result.title_changed,
                     title_change: append_result.title_change.clone(),
+                    path_changed: append_result.path_changed,
                     clipboard_set,
                     clipboard_writes,
                     clipboard_queries,
@@ -618,6 +619,49 @@ fn publish_pane_bytes(context: PanePublishContext<'_>, bytes: Vec<u8>) -> Vec<u8
         );
     }
     replies
+}
+
+/// Publishes bytes through the production pane-output path for one real pane
+/// and returns the alert events production built from them.
+///
+/// Tests that need the handler side of an alert drive it with these events
+/// rather than a hand-written one, so what the parser reported and what the
+/// handler acts on cannot drift apart.
+#[cfg(test)]
+pub(crate) fn publish_pane_bytes_capturing_alerts(
+    session_name: &rmux_proto::SessionName,
+    pane_id: PaneId,
+    transcript: &SharedPaneTranscript,
+    pane_output: &PaneOutputSender,
+    bytes: Vec<u8>,
+) -> Vec<super::PaneAlertEvent> {
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    {
+        let callback: super::PaneAlertCallback = Arc::new(move |event| {
+            sink.lock()
+                .expect("pane alert capture mutex must not be poisoned")
+                .push(event);
+        });
+        let _ = publish_pane_bytes(
+            PanePublishContext {
+                session_name,
+                pane_id,
+                transcript,
+                pane_output,
+                generation: None,
+                pane_alert_callback: Some(&callback),
+                emit_no_bell_alert: false,
+            },
+            bytes,
+        );
+    }
+    let captured = std::mem::take(
+        &mut *events
+            .lock()
+            .expect("pane alert capture mutex must not be poisoned"),
+    );
+    captured
 }
 
 #[cfg(test)]

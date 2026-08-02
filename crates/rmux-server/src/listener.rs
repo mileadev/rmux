@@ -17,14 +17,16 @@ use crate::client_names::attached_client_name;
 use crate::control::{self, ControlLifecycle, ControlServerEvent, ControlUpgradeInput};
 use crate::daemon::ShutdownHandle;
 use crate::handler::{
-    attach_support::AttachRegistration, with_session_lease_create_addressing,
-    ControlClientIdentity, ControlRegistration, DetachedRequestGuard, NormalRequestGuard,
-    PreparedSdkWait, RequestHandler, SessionLeaseCreateAddressing,
+    attach_support::AttachRegistration, with_authenticated_connection_peer,
+    with_session_lease_create_addressing, ControlClientIdentity, ControlRegistration,
+    DetachedRequestGuard, NormalRequestGuard, PreparedSdkWait, RequestHandler,
+    SessionLeaseCreateAddressing,
 };
 use crate::listener_options::ServeOptions;
 use crate::listener_signals::handle_server_signal;
 use crate::listener_signals::poll_server_signal;
 use crate::listener_signals::wait_server_signal;
+use crate::outer_terminal::ClientTitleState;
 use crate::pane_io;
 use crate::server_access::apply_access_policy;
 use crate::socket_cleanup::SocketCleanup;
@@ -335,8 +337,12 @@ async fn serve_connection(
                         Some(guard) => Some(guard),
                         None => return Ok(()),
                     };
+                // The scope carries the authenticated peer as well as its
+                // admission: an attach frame is rendered before the
+                // registration below publishes this client, and both must
+                // describe the same user (issue #182).
                 let _requester_access_guard = handler
-                    .begin_detached_requester_access(requester.pid, access_admission.clone());
+                    .begin_authenticated_peer_access(&requester, access_admission.clone());
                 let mut detached_request_guard = request_counts_as_detached_activity(&request)
                     .then(|| handler.begin_detached_request());
 
@@ -556,6 +562,7 @@ async fn serve_connection(
                     };
                     let session_name = response.session_name.clone();
                     let terminal_context = attach.target.outer_terminal.context().clone();
+                    let client_title = attach_frame_client_title(&attach.target);
                     let client_name = attach_client_name
                         .expect("attach upgrade captures its client name before dispatch");
                     let attach_identity = handler
@@ -570,6 +577,7 @@ async fn serve_connection(
                                 closing: attach.closing.clone(),
                                 persistent_overlay_epoch: attach.persistent_overlay_epoch.clone(),
                                 terminal_context,
+                                client_title,
                                 flags: attach.flags,
                                 render_stream: attach.render_stream,
                                 uid: requester.uid,
@@ -674,6 +682,22 @@ async fn serve_connection(
     }
 }
 
+/// The per-client outer-terminal identity a fresh registration inherits from
+/// the attach frame this listener is about to forward.
+///
+/// That frame reaches the client's terminal directly rather than through the
+/// control queue, so whatever it carries is already delivered. Without this
+/// seed the client's first refresh resolves the same title again and writes it
+/// a second time (issue #182).
+pub(crate) fn attach_frame_client_title(
+    target: &pane_io::AttachTarget,
+) -> Option<ClientTitleState> {
+    target
+        .client_title
+        .as_ref()
+        .map(|rendered| rendered.state().clone())
+}
+
 async fn write_prepared_sdk_wait(
     conn: &mut Connection,
     prepared: PreparedSdkWait,
@@ -727,13 +751,19 @@ async fn run_connection_with_cleanup(
     shutdown_handle: ShutdownHandle,
 ) -> io::Result<()> {
     let mut cleanup_guard = ConnectionCleanupGuard::new(Arc::clone(&handler), connection_id);
-    let result = serve_connection(
-        stream,
-        requester,
-        handler,
-        connection_id,
-        shutdown,
-        shutdown_handle,
+    // Everything this connection dispatches runs under the peer the OS
+    // authenticated for it, so a reused numeric pid cannot make one
+    // connection's own requests resolve to another's identity (issue #182).
+    let result = with_authenticated_connection_peer(
+        requester.clone(),
+        serve_connection(
+            stream,
+            requester,
+            handler,
+            connection_id,
+            shutdown,
+            shutdown_handle,
+        ),
     )
     .await;
     cleanup_guard.cleanup_now();
@@ -2211,8 +2241,16 @@ mod tests {
 mod web_share_tests;
 
 #[cfg(test)]
+#[path = "listener_connection_test_support.rs"]
+mod connection_test_support;
+
+#[cfg(test)]
 #[path = "listener_inflight_access_tests.rs"]
 mod inflight_access_tests;
+
+#[cfg(test)]
+#[path = "listener_attach_identity_tests.rs"]
+mod attach_identity_tests;
 
 #[cfg(all(test, windows))]
 mod windows_tests {

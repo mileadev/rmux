@@ -484,27 +484,43 @@ impl RequestHandler {
                 session.active_window_index() != window_index
                     || session.active_pane_id() != Some(event.pane_id)
             });
+        // The active pane's title and OSC 7 path reach the outer terminal only
+        // through a re-render: the attach prelude carries the expanded
+        // `set-titles-string` and the pane's path, and no other path re-emits
+        // them, so a program that retitles itself or changes directory never
+        // updated its host (issue #182).
+        let outer_identity_changed = event.title_changed || event.path_changed;
         // A pane toggling its mouse-tracking mode must refresh attached
         // clients even when it is the active pane: the refresh rebuilds the
         // outer terminal, whose transition diff emits the outer mouse
         // enable/disable for pane-driven tracking (issue #93).
-        let inactive_refresh_sessions = if refresh_for_inactive_pane_output
+        let redraws_every_linked_session = refresh_for_inactive_pane_output
             || event.mouse_mode_changed
-            || event.alternate_mode_changed
-        {
-            state
-                .window_linked_session_family_list(pane_target.session_name(), window_index)
-                .into_iter()
-                .filter_map(|session_name| {
-                    state
-                        .sessions
-                        .session(&session_name)
-                        .map(rmux_core::Session::id)
-                })
-                .collect()
+            || event.alternate_mode_changed;
+        let linked_sessions = if redraws_every_linked_session || outer_identity_changed {
+            state.window_linked_session_family_list(pane_target.session_name(), window_index)
         } else {
             Vec::new()
         };
+        let inactive_refresh_sessions = linked_sessions
+            .into_iter()
+            // A session with `set-titles off` writes neither OSC 0 nor OSC 7,
+            // so an outer-identity change alone must cost it no redraw — not
+            // even when it shares the window with a session that has it on.
+            .filter(|session_name| {
+                redraws_every_linked_session
+                    || state
+                        .options
+                        .resolve(Some(session_name), OptionName::SetTitles)
+                        == Some("on")
+            })
+            .filter_map(|session_name| {
+                state
+                    .sessions
+                    .session(&session_name)
+                    .map(rmux_core::Session::id)
+            })
+            .collect();
         let set_clipboard_on = matches!(
             state.options.resolve(None, OptionName::SetClipboard),
             Some("on")

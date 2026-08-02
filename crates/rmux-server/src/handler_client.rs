@@ -17,9 +17,8 @@ use super::{
     attach_support::{ActiveAttachIdentity, ClientFlags, IncomingSizeClient},
     attached_client_matches_target, command_output_from_lines, control_client_target_pid,
     control_support::{current_control_queue_identity, ManagedClient},
-    format_client_uid, format_client_user, format_requester_uid, normalize_target_client,
-    session_selection_prefers_live_process, sort_list_clients, validate_expected_attach_identity,
-    RequestHandler, LIST_CLIENTS_TEMPLATE,
+    format_requester_uid, normalize_target_client, session_selection_prefers_live_process,
+    sort_list_clients, validate_expected_attach_identity, RequestHandler, LIST_CLIENTS_TEMPLATE,
 };
 
 #[path = "handler_client/attach.rs"]
@@ -649,13 +648,12 @@ impl RequestHandler {
         let lines = clients
             .iter()
             .filter_map(|client| {
-                let context = RuntimeFormatContext::new(FormatContext::new())
-                    .with_state(&state)
-                    .with_socket_path(&socket_path)
-                    .with_named_value("client_name", client.name.clone())
-                    .with_named_value("client_pid", client.pid.to_string())
-                    .with_named_value("client_tty", client.tty.clone())
-                    .with_named_value("client_activity", client.activity_at.to_string())
+                let context = client.format_bindings().apply(
+                    RuntimeFormatContext::new(FormatContext::new())
+                        .with_state(&state)
+                        .with_socket_path(&socket_path),
+                );
+                let context = context
                     .with_named_value(
                         "session_id",
                         client
@@ -672,29 +670,6 @@ impl RequestHandler {
                             .map(ToString::to_string)
                             .unwrap_or_default(),
                     )
-                    .with_named_value(
-                        "client_session",
-                        client
-                            .session_name
-                            .as_ref()
-                            .map(ToString::to_string)
-                            .unwrap_or_default(),
-                    )
-                    .with_named_value("client_width", client.width.to_string())
-                    .with_named_value("client_height", client.height_value())
-                    .with_named_value("client_termfeatures", client.termfeatures.clone())
-                    .with_named_value("client_termname", client.termname.clone())
-                    .with_named_value("client_termtype", client.termtype.clone())
-                    .with_named_value("client_key_table", client.key_table_name())
-                    .with_named_value("client_prefix", client.prefix_value())
-                    .with_named_value("client_uid", format_client_uid(client.uid))
-                    .with_named_value("client_user", format_client_user(client.uid, &client.user))
-                    .with_named_value("client_utf8", if client.utf8 { "1" } else { "0" })
-                    .with_named_value(
-                        "client_control_mode",
-                        if client.control { "1" } else { "0" },
-                    )
-                    .with_named_value("client_flags", client.flags.clone())
                     .with_named_value("uid", format_requester_uid(requester_uid));
                 if let Some(filter) = request.filter.as_deref() {
                     let expanded = render_runtime_template(filter, &context, false);

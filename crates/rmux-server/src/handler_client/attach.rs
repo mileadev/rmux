@@ -6,6 +6,7 @@ use rmux_proto::{
 };
 use tokio::sync::mpsc;
 
+use super::super::client_runtime_support::{AttachingClient, ListClientSnapshot};
 use super::super::{
     attach_support::attach_target_for_session, client_environment_snapshot,
     effective_client_terminal_context, parse_client_flags, update_environment_from_client,
@@ -226,22 +227,47 @@ impl RequestHandler {
             );
         }
         let attached_count = self.attached_count(&session_name).await.saturating_add(1);
+        // The identity the listener authenticated for this connection and is
+        // about to register this client under, so the frame rendered below and
+        // that registration describe one client (issue #182). An ambiguous
+        // requester is rejected here, before any frame or registration exists.
+        let (requester_uid, requester_user) = match self.attaching_client_identity(requester_pid) {
+            Ok(identity) => identity,
+            Err(error) => return HandleOutcome::response(Response::Error(ErrorResponse { error })),
+        };
         let (session_id, target) = {
             let state = self.state.lock().await;
-            let Some(session_id) = state
-                .sessions
-                .session(&session_name)
-                .map(rmux_core::Session::id)
-            else {
+            let Some(session) = state.sessions.session(&session_name) else {
                 return HandleOutcome::response(Response::Error(ErrorResponse {
                     error: RmuxError::SessionNotFound(session_name.to_string()),
                 }));
             };
+            let session_id = session.id();
+            // Registration has not published this client yet, so its record is
+            // built from the request: the first frame's title must already
+            // resolve its own `#{client_*}` values (issue #182).
+            let attaching_client = ListClientSnapshot::for_attaching_client(AttachingClient {
+                pid: requester_pid,
+                session_name: &session_name,
+                session_id,
+                size: request
+                    .client_size
+                    .unwrap_or_else(|| session.window().size()),
+                terminal_context: &terminal_context,
+                flags,
+                uid: requester_uid,
+                user: requester_user,
+                activity_at: crate::handler::current_client_activity_timestamp(),
+            });
             match attach_target_for_session(
                 &state,
                 &session_name,
                 attached_count,
                 &terminal_context,
+                // A fresh client's outer terminal shows nothing of ours yet, so
+                // this frame carries the first title; registration remembers it.
+                None,
+                Some(&attaching_client),
                 &self.socket_path(),
             ) {
                 Ok(target) => (session_id, target),

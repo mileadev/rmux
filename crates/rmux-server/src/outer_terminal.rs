@@ -11,6 +11,7 @@ use rmux_proto::{ClientTerminalContext, OptionName};
 use crate::pane_screen_state::PaneScreenState;
 
 mod capabilities;
+mod client_title;
 mod colours;
 mod defaults;
 mod features;
@@ -18,6 +19,9 @@ mod templates;
 
 #[cfg(test)]
 use capabilities::{decode_capability_string, parse_capability_override, split_override_segments};
+pub(crate) use client_title::{
+    ClientPathUpdate, ClientTitleState, ClientTitleUpdate, RenderedClientTitle,
+};
 #[cfg(test)]
 use colours::colour_to_rgb;
 use colours::colour_to_rgb_string;
@@ -322,27 +326,45 @@ impl OuterTerminal {
         wrapped
     }
 
+    /// The OSC 0 title and OSC 7 path this client's outer terminal still owes,
+    /// gated on `set-titles` and deduplicated against what it already shows.
+    pub(crate) fn render_client_title(&self, title: ClientTitleUpdate<'_>) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        // The outer terminal's title and working directory are both driven from
+        // tmux's `set-titles` gate, and the title carries the expanded
+        // `set-titles-string` rather than the bare pane title (issue #182).
+        if let Some(pending) = title.pending_title() {
+            bytes.extend_from_slice(self.render_title(pending).as_bytes());
+        }
+        if let Some(pending) = title.pending_path() {
+            bytes.extend_from_slice(self.render_path(pending).as_bytes());
+        }
+        bytes
+    }
+
+    /// What a client-title render leaves behind: the values this outer terminal
+    /// now shows, and the OSC bytes the frame carries for them.
+    ///
+    /// A terminal that advertised no title template renders nothing, so its
+    /// frame stays replaceable in the attach-control queue even while
+    /// `set-titles` is on. The values are remembered either way, exactly as
+    /// tmux assigns `c->title` before `tty_set_title()` decides it has no
+    /// TSL/FSL to write with.
+    pub(crate) fn rendered_client_title(
+        &self,
+        title: ClientTitleUpdate<'_>,
+    ) -> Option<RenderedClientTitle> {
+        title.rendered(self.render_client_title(title))
+    }
+
     pub(crate) fn render_prelude(
         &self,
         session: &Session,
         options: &OptionStore,
-        pane_state: Option<&PaneScreenState>,
         cursor_scope: CursorScope,
+        title: ClientTitleUpdate<'_>,
     ) -> Vec<u8> {
-        let mut bytes = Vec::new();
-
-        if let Some(title) = pane_state
-            .map(|state| state.title.as_str())
-            .filter(|title| !title.is_empty())
-        {
-            bytes.extend_from_slice(self.render_title(title).as_bytes());
-        }
-        if let Some(path) = pane_state
-            .map(|state| state.path.as_str())
-            .filter(|path| !path.is_empty())
-        {
-            bytes.extend_from_slice(self.render_path(path).as_bytes());
-        }
+        let mut bytes = self.render_client_title(title);
 
         let session_name = session.name();
         let active_window = session.active_window_index();

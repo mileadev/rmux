@@ -657,6 +657,7 @@ mod tests {
             closing: Arc::new(AtomicBool::new(false)),
             persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
             terminal_context: OuterTerminalContext::default(),
+            client_title: None,
             flags: ClientFlags::default(),
             render_stream: false,
             uid,

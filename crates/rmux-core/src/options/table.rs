@@ -842,7 +842,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         DefaultValue::Scalar("off"),
         "",
         false,
-        EFFECT_NONE,
+        EFFECT_RENDER,
     ),
     option(
         OptionName::SetTitlesString,
@@ -855,7 +855,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         DefaultValue::Scalar("#S:#I:#W - \"#T\" #{session_alerts}"),
         "",
         false,
-        EFFECT_NONE,
+        EFFECT_RENDER,
     ),
     option(
         OptionName::SilenceAction,

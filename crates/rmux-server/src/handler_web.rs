@@ -403,6 +403,10 @@ impl RequestHandler {
                     closing: closing.clone(),
                     persistent_overlay_epoch: persistent_overlay_epoch.clone(),
                     terminal_context,
+                    client_title: target
+                        .client_title
+                        .as_ref()
+                        .map(|rendered| rendered.state().clone()),
                     flags,
                     render_stream: true,
                     uid: current_owner_uid(),

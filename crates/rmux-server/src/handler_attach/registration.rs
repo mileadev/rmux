@@ -139,6 +139,7 @@ impl RequestHandler {
                     closing,
                     persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
                     terminal_context,
+                    client_title: None,
                     flags,
                     render_stream: false,
                     uid: current_owner_uid(),
@@ -327,6 +328,7 @@ impl RequestHandler {
                     closing: registration.closing,
                     emit_detached_on_finish: false,
                     terminal_context: registration.terminal_context,
+                    client_title: registration.client_title.unwrap_or_default(),
                     client_size,
                     client_size_provenance,
                     client_pixels: None,
@@ -507,5 +509,22 @@ impl RequestHandler {
         self.active_attach_identity(attach_pid)
             .await
             .expect("test attach must be registered")
+    }
+
+    /// What the server believes a registered client's outer terminal shows.
+    ///
+    /// Listener-level tests live outside `crate::handler`, so this is how they
+    /// read the per-client title memory the connection loop seeded.
+    #[cfg(test)]
+    pub(crate) async fn remembered_client_title_for_test(&self, attach_pid: u32) -> Option<String> {
+        self.active_attach
+            .lock()
+            .await
+            .by_pid
+            .get(&attach_pid)
+            .expect("test attach must be registered")
+            .client_title
+            .title()
+            .map(str::to_owned)
     }
 }

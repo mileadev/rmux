@@ -13,6 +13,8 @@ mod buffer_file_io;
 #[cfg_attr(windows, allow(dead_code))]
 mod client_flags;
 #[cfg(any(unix, windows))]
+mod client_format;
+#[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod client_names;
 #[cfg(any(unix, windows))]

@@ -311,6 +311,7 @@ async fn automatic_and_manual_renames_publish_one_link_aware_event_before_the_ho
             bell_count: 0,
             title_changed: false,
             title_change: None,
+            path_changed: false,
             clipboard_set: false,
             clipboard_writes: Vec::new(),
             clipboard_queries: Vec::new(),
