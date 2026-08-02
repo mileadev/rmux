@@ -4,7 +4,7 @@ use rmux_core::input::mode;
 use rmux_proto::{PaneTarget, RmuxError};
 
 use super::{bracketed_paste, AttachedPaneForward};
-use crate::pane_terminals::HandlerState;
+use crate::pane_terminals::{HandlerState, PasteDelimiters};
 
 use super::super::pane_io_encoding::{
     encode_key_for_target, pane_input_mode, prepare_pane_bracketed_paste_write,
@@ -92,16 +92,21 @@ pub(super) fn prepare_attached_bracketed_paste_forwards(
         if bytes.is_empty() {
             continue;
         }
-        let write = if bracketed {
-            prepare_pane_bracketed_paste_write(
-                state,
-                &target,
-                &bytes,
-                PaneInputLiveness::TolerateDead,
-            )?
+        // Both dispositions are pasted content and must arrive byte for byte,
+        // so both take the paste write. The destination's mode decides what
+        // surrounds the body, never which sink carries it.
+        let delimiters = if bracketed {
+            PasteDelimiters::Wrapped
         } else {
-            prepare_pane_input_write(state, &target, &bytes, PaneInputLiveness::TolerateDead)?
+            PasteDelimiters::Bare
         };
+        let write = prepare_pane_bracketed_paste_write(
+            state,
+            &target,
+            &bytes,
+            PaneInputLiveness::TolerateDead,
+            delimiters,
+        )?;
         prepared.push(PreparedAttachedPaneForward::EncodedKey { write, bytes });
     }
     Ok(prepared)

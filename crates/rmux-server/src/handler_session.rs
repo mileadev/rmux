@@ -1153,20 +1153,32 @@ impl RequestHandler {
                     crate::pane_terminals::DeferredInitialPaneInput::Bytes(bytes) => {
                         flush.input_writer.write_all(&bytes)?;
                     }
-                    crate::pane_terminals::DeferredInitialPaneInput::BracketedPaste(bytes) => {
-                        if flush.input_writer.preserves_verbatim_input() {
+                    // A pasted body queued during startup takes the sink the
+                    // live path would have chosen for it, through the same
+                    // decision: the console records are what keep a legacy
+                    // ConPTY from parsing the pasted bytes, whether or not an
+                    // envelope surrounds them.
+                    crate::pane_terminals::DeferredInitialPaneInput::Paste {
+                        bytes,
+                        delimiters,
+                    } => match super::pane_support::windows_paste_sink(
+                        flush.input_writer.preserves_verbatim_input(),
+                        &bytes,
+                        delimiters,
+                    ) {
+                        super::pane_support::WindowsPasteSink::Pty => {
                             flush.input_writer.write_all(&bytes)?;
-                        } else {
-                            std::str::from_utf8(&bytes).map_err(|_| {
-                                std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    super::pane_support::
-                                        LEGACY_CONPTY_NON_UTF8_BRACKETED_PASTE_ERROR,
-                                )
-                            })?;
+                        }
+                        super::pane_support::WindowsPasteSink::ConsoleUtf8 => {
                             rmux_pty::write_windows_console_utf8(pane_pid, &bytes)?;
                         }
-                    }
+                        super::pane_support::WindowsPasteSink::RejectNonUtf8 => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                super::pane_support::LEGACY_CONPTY_NON_UTF8_BRACKETED_PASTE_ERROR,
+                            ));
+                        }
+                    },
                     crate::pane_terminals::DeferredInitialPaneInput::Console { action, .. } => {
                         Self::write_deferred_initial_console_input(pane_pid, action)?;
                     }

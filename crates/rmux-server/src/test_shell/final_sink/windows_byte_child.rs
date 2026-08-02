@@ -69,6 +69,10 @@ const COMPILER_ARGV_FILE: &str = "rustc-argv.txt";
 const COMPILER_IDENTITY_FILE: &str = "rustc-identity.txt";
 const SOURCE_IDENTITY_FILE: &str = "source-identity.txt";
 
+/// The one visible byte sequence every child renders, aware or not, so a
+/// Windows pseudoconsole has a frame to send its pending mode change in.
+const RENDERED_MARKER: &str = "rmux-final-sink";
+
 const BUILD_DIRECTORY_PREFIX: &str = "build-";
 /// How many candidate directories one build will create-or-skip before giving
 /// up. Only an occupied candidate costs an attempt, and in a fresh root the
@@ -189,6 +193,10 @@ fn capture(slot: &Slot, want: usize, aware: bool) -> Result<(), String> {
     if aware {
         announce_bracketed_paste()?;
     }
+    // Also established by both children, and after the announcement: a
+    // pseudoconsole carries a pending mode change only in the next frame it
+    // renders.
+    render_a_frame()?;
     std::fs::write(&slot.ready, b"1")
         .map_err(|error| format!("readiness could not be signalled: {error}"))?;
 
@@ -251,6 +259,29 @@ fn announce_bracketed_paste() -> Result<(), String> {
         .write_all(b"\x1b[?2004h")
         .and_then(|()| stdout.flush())
         .map_err(|error| format!("the capability announcement failed: {error}"))
+}
+
+/// Renders one visible marker so the pseudoconsole emits a frame at all.
+///
+/// A Windows pseudoconsole is a renderer, not a pipe: it sends bytes
+/// downstream when the client changes what is on screen, and a client that
+/// only changes a mode changes nothing on screen. Measured on this host with
+/// no RMUX involved, a child whose whole output is `ESC[?2004h` leaves the
+/// pty output pipe empty for as long as it is watched, while the same child
+/// followed by one printable byte emits a single frame whose first bytes are
+/// exactly that pending `ESC[?2004h`. A pseudoterminal carries the
+/// announcement itself, which is why the Unix sibling has no step here — the
+/// same reason it has no console modes to establish.
+///
+/// This publishes nothing about the capability. Both children render it, so a
+/// child that never announced renders the identical marker and stays unaware;
+/// only the announcement above decides what the frame carries.
+fn render_a_frame() -> Result<(), String> {
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(b"rmux-final-sink")
+        .and_then(|()| stdout.flush())
+        .map_err(|error| format!("the frame could not be rendered: {error}"))
 }
 
 /// Stays alive after capturing so the harness can still resolve this pane as a
@@ -697,6 +728,43 @@ mod tests {
         assert!(
             announcement < readiness,
             "readiness must never be signalled before the announcement it precedes"
+        );
+    }
+
+    /// The finding the eight announcement-waiting proofs were red for. A
+    /// pseudoconsole forwards a mode change only inside the next frame it
+    /// renders, and a child whose entire output is `ESC[?2004h` renders none:
+    /// natively measured, its pty output pipe stays empty, which is exactly
+    /// the "applied no output at all" boundary those proofs reported.
+    ///
+    /// The marker is rendered by both children and after the announcement, so
+    /// it forces the frame without deciding what that frame carries.
+    #[test]
+    fn the_child_renders_a_frame_after_announcing_and_before_signalling_readiness() {
+        let at = |needle: &str| {
+            CHILD_MAIN_SOURCE
+                .find(needle)
+                .unwrap_or_else(|| panic!("the child must run {needle:?}"))
+        };
+        let announcement = at("announce_bracketed_paste()?");
+        let render = at("render_a_frame()?");
+        let readiness = at("std::fs::write(&slot.ready");
+
+        assert!(
+            announcement < render,
+            "a frame rendered before the announcement could not carry it"
+        );
+        assert!(
+            render < readiness,
+            "the frame must be rendered before the harness is told to look for the mode"
+        );
+        assert!(
+            CHILD_MAIN_SOURCE.contains(&format!(".write_all(b\"{RENDERED_MARKER}\")")),
+            "the child must write the visible marker itself"
+        );
+        assert!(
+            !CHILD_MAIN_SOURCE.contains("if aware {\n        render_a_frame"),
+            "an unaware child must render exactly what an aware one renders"
         );
     }
 
