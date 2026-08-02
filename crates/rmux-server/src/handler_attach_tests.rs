@@ -845,6 +845,8 @@ mod attach_mutations;
 #[path = "handler_attach_tests/attach_render.rs"]
 mod attach_render;
 
+#[path = "handler_attach_tests/attaching_identity.rs"]
+mod attaching_identity;
 #[path = "handler_attach_tests/set_titles.rs"]
 mod set_titles;
 #[path = "handler_attach_tests/set_titles_client_context.rs"]

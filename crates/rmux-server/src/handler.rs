@@ -142,6 +142,7 @@ pub(in crate::handler) use client_environment_support::{
 };
 #[cfg(test)]
 pub(in crate::handler) use client_runtime_support::attached_client_name;
+pub(crate) use client_runtime_support::with_authenticated_connection_peer;
 pub(in crate::handler) use client_runtime_support::{
     attached_client_matches_target, client_environment_snapshot, command_output_from_lines,
     control_client_target_pid, effective_client_terminal_context, format_client_uid,
@@ -322,6 +323,21 @@ impl DetachedRequesterAccess {
             .iter()
             .all(|candidate| candidate.peer.as_ref() == Some(first))
             .then_some(first)
+    }
+
+    /// Whether two scopes on this pid were authenticated as different local
+    /// peers.
+    ///
+    /// [`Self::unambiguous_peer`] cannot say why it found nothing, and the two
+    /// reasons are not interchangeable: a pid holding no authenticated peer at
+    /// all is an in-process dispatch, while a pid holding two is a reused pid
+    /// whose requests must not borrow either peer's identity (issue #182).
+    pub(in crate::handler) fn has_conflicting_peers(&self) -> bool {
+        let mut peers = self.scopes.iter().filter_map(|scope| scope.peer.as_ref());
+        let Some(first) = peers.next() else {
+            return false;
+        };
+        peers.any(|candidate| candidate != first)
     }
 
     pub(in crate::handler) fn is_empty(&self) -> bool {

@@ -17,9 +17,10 @@ use crate::client_names::attached_client_name;
 use crate::control::{self, ControlLifecycle, ControlServerEvent, ControlUpgradeInput};
 use crate::daemon::ShutdownHandle;
 use crate::handler::{
-    attach_support::AttachRegistration, with_session_lease_create_addressing,
-    ControlClientIdentity, ControlRegistration, DetachedRequestGuard, NormalRequestGuard,
-    PreparedSdkWait, RequestHandler, SessionLeaseCreateAddressing,
+    attach_support::AttachRegistration, with_authenticated_connection_peer,
+    with_session_lease_create_addressing, ControlClientIdentity, ControlRegistration,
+    DetachedRequestGuard, NormalRequestGuard, PreparedSdkWait, RequestHandler,
+    SessionLeaseCreateAddressing,
 };
 use crate::listener_options::ServeOptions;
 use crate::listener_signals::handle_server_signal;
@@ -750,13 +751,19 @@ async fn run_connection_with_cleanup(
     shutdown_handle: ShutdownHandle,
 ) -> io::Result<()> {
     let mut cleanup_guard = ConnectionCleanupGuard::new(Arc::clone(&handler), connection_id);
-    let result = serve_connection(
-        stream,
-        requester,
-        handler,
-        connection_id,
-        shutdown,
-        shutdown_handle,
+    // Everything this connection dispatches runs under the peer the OS
+    // authenticated for it, so a reused numeric pid cannot make one
+    // connection's own requests resolve to another's identity (issue #182).
+    let result = with_authenticated_connection_peer(
+        requester.clone(),
+        serve_connection(
+            stream,
+            requester,
+            handler,
+            connection_id,
+            shutdown,
+            shutdown_handle,
+        ),
     )
     .await;
     cleanup_guard.cleanup_now();

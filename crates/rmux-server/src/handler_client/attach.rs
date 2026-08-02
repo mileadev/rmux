@@ -209,8 +209,12 @@ impl RequestHandler {
         let attached_count = self.attached_count(&session_name).await.saturating_add(1);
         // The identity the listener authenticated for this connection and is
         // about to register this client under, so the frame rendered below and
-        // that registration describe one client (issue #182).
-        let (requester_uid, requester_user) = self.attaching_client_identity(requester_pid);
+        // that registration describe one client (issue #182). An ambiguous
+        // requester is rejected here, before any frame or registration exists.
+        let (requester_uid, requester_user) = match self.attaching_client_identity(requester_pid) {
+            Ok(identity) => identity,
+            Err(error) => return HandleOutcome::response(Response::Error(ErrorResponse { error })),
+        };
         let (session_id, target) = {
             let state = self.state.lock().await;
             let Some(session) = state.sessions.session(&session_name) else {

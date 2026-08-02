@@ -1,15 +1,52 @@
+use std::future::Future;
+
 use rmux_ipc::PeerIdentity;
 use rmux_os::identity::UserIdentity;
+use rmux_proto::RmuxError;
 
 use crate::handler::attach_support::ClientFlags;
 use crate::handler::control_support::{current_control_queue_identity, ControlClientIdentity};
-use crate::handler::{DetachedRequesterAuthority, RequestHandler, RequesterOrigin};
+use crate::handler::{
+    DetachedRequesterAccess, DetachedRequesterAuthority, RequestHandler, RequesterOrigin,
+};
 use crate::server_access::{current_owner_uid, AccessMode, ServerAccessAdmission};
 
 enum DetachedAdmissionLookup {
     Absent,
     Unambiguous(ServerAccessAdmission),
     DeniedOrAmbiguous,
+}
+
+tokio::task_local! {
+    /// The peer the connection loop authenticated for the task serving one
+    /// accepted client connection.
+    static AUTHENTICATED_CONNECTION_PEER: PeerIdentity;
+}
+
+/// Serves one accepted connection under the exact peer the OS authenticated
+/// for it.
+///
+/// The pid alone cannot answer "whose request is this": the OS recycles pids,
+/// and a connection's scope stays open across `forward_attach` and
+/// `finish_attach`, so two live connections authenticated as different local
+/// peers can key the same pid entry. Binding the peer to the connection task
+/// keeps every request that connection dispatches on the identity that
+/// connection was admitted under, whatever else currently shares its pid
+/// (issue #182).
+pub(crate) async fn with_authenticated_connection_peer<T, F>(peer: PeerIdentity, future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    AUTHENTICATED_CONNECTION_PEER.scope(peer, future).await
+}
+
+/// The peer of the connection this task serves, when the request really is
+/// that connection's own.
+fn current_connection_peer(requester_pid: u32) -> Option<PeerIdentity> {
+    AUTHENTICATED_CONNECTION_PEER
+        .try_with(|peer| (peer.pid == requester_pid).then(|| peer.clone()))
+        .ok()
+        .flatten()
 }
 
 impl RequestHandler {
@@ -126,13 +163,17 @@ impl RequestHandler {
     /// The local peer the connection loop authenticated for the scope this
     /// request is running under, when there is one.
     ///
-    /// This never derives an identity from the pid: the pid only selects the
-    /// scope the listener opened from its own accepted stream, and a scope set
-    /// that disagrees resolves to nothing at all.
+    /// This never derives an identity from the pid: the connection serving this
+    /// task answers first, and otherwise the pid only selects the scopes the
+    /// listener opened from its own accepted streams, where a set that
+    /// disagrees resolves to nothing at all.
     pub(in crate::handler) fn authenticated_requester_peer(
         &self,
         requester_pid: u32,
     ) -> Option<PeerIdentity> {
+        if let Some(peer) = current_connection_peer(requester_pid) {
+            return Some(peer);
+        }
         self.active_detached_requester_access
             .lock()
             .expect("active detached requester access mutex must not be poisoned")
@@ -144,21 +185,40 @@ impl RequestHandler {
     /// The identity a client attaching on this connection will be registered
     /// under.
     ///
-    /// A fresh attach renders its first frame before the listener registers
-    /// it, and that listener registers the very peer it authenticated. Reading
-    /// the same peer back here keeps the frame's `#{client_uid}` and
+    /// A fresh attach renders its first frame before the listener registers it,
+    /// and that listener registers the very peer it authenticated. Reading the
+    /// same peer back here keeps the frame's `#{client_uid}` and
     /// `#{client_user}` on the delegated user rather than on the server owner
-    /// (issue #182). A request with no connection-authenticated peer is an
-    /// in-process dispatch and stays the owner's, exactly as before.
+    /// (issue #182).
+    ///
+    /// A request with no connection-authenticated peer at all is an in-process
+    /// dispatch and stays the owner's, exactly as before. A pid whose open
+    /// scopes name different peers is neither: substituting the owner there
+    /// would make the first frame disagree with the registration the listener
+    /// then writes, so it fails closed before either becomes observable.
     pub(in crate::handler) fn attaching_client_identity(
         &self,
         requester_pid: u32,
-    ) -> (u32, UserIdentity) {
-        self.authenticated_requester_peer(requester_pid)
-            .map_or_else(
-                || (current_owner_uid(), self.server_owner_identity()),
-                |peer| (peer.uid, peer.user),
-            )
+    ) -> Result<(u32, UserIdentity), RmuxError> {
+        if let Some(peer) = self.authenticated_requester_peer(requester_pid) {
+            return Ok((peer.uid, peer.user));
+        }
+        if self.requester_peer_scopes_conflict(requester_pid) {
+            return Err(RmuxError::Server(
+                "attaching client identity is ambiguous for this requester".to_owned(),
+            ));
+        }
+        Ok((current_owner_uid(), self.server_owner_identity()))
+    }
+
+    /// Whether this pid currently carries connections authenticated as
+    /// different local peers.
+    fn requester_peer_scopes_conflict(&self, requester_pid: u32) -> bool {
+        self.active_detached_requester_access
+            .lock()
+            .expect("active detached requester access mutex must not be poisoned")
+            .get(&requester_pid)
+            .is_some_and(DetachedRequesterAccess::has_conflicting_peers)
     }
 
     fn detached_admission_lookup(&self, requester_pid: u32) -> DetachedAdmissionLookup {

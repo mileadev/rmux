@@ -28,6 +28,7 @@ mod requester_access;
 pub(in crate::handler) use crate::client_names::attached_client_name;
 pub(in crate::handler) use crate::client_names::control_client_name;
 pub(in crate::handler) use list_clients::{AttachingClient, ListClientSnapshot};
+pub(crate) use requester_access::with_authenticated_connection_peer;
 
 pub(in crate::handler) const LIST_CLIENTS_TEMPLATE: &str = "#{client_name}: #{session_name} [#{client_width}x#{client_height} #{client_termname}]#{?#{==:#{client_uid},#{uid}},, [user #{?client_user,#{client_user},#{client_uid}}]}#{?client_flags, (#{client_flags}),}";
 
