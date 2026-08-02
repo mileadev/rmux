@@ -151,6 +151,57 @@ async fn pause_before_transient_restore_commit(attach_pid: u32) {
     pause.release.notified().await;
 }
 
+/// Holds a generic redraw between rendering its frame and delivering it, so a
+/// regression can install the same-pid replacement the delivery must reject.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(in crate::handler) struct GenericRenderDeliveryPause {
+    pub(in crate::handler) reached: tokio::sync::Notify,
+    pub(in crate::handler) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static GENERIC_RENDER_DELIVERY_PAUSE: std::sync::Mutex<
+    Vec<(u32, std::sync::Arc<GenericRenderDeliveryPause>)>,
+> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(in crate::handler) fn install_generic_render_delivery_pause(
+    attach_pid: u32,
+) -> std::sync::Arc<GenericRenderDeliveryPause> {
+    let pause = std::sync::Arc::new(GenericRenderDeliveryPause::default());
+    let mut installed = GENERIC_RENDER_DELIVERY_PAUSE
+        .lock()
+        .expect("generic render delivery pause lock");
+    if let Some((_, current)) = installed
+        .iter_mut()
+        .find(|(paused_pid, _)| *paused_pid == attach_pid)
+    {
+        *current = pause.clone();
+    } else {
+        installed.push((attach_pid, pause.clone()));
+    }
+    pause
+}
+
+#[cfg(test)]
+async fn pause_before_generic_render_delivery(attach_pid: u32) {
+    let pause = {
+        let mut installed = GENERIC_RENDER_DELIVERY_PAUSE
+            .lock()
+            .expect("generic render delivery pause lock");
+        installed
+            .iter()
+            .position(|(paused_pid, _)| *paused_pid == attach_pid)
+            .map(|index| installed.swap_remove(index).1)
+    };
+    let Some(pause) = pause else {
+        return;
+    };
+    pause.reached.notify_one();
+    pause.release.notified().await;
+}
+
 #[path = "handler_attach/key_table.rs"]
 mod key_table;
 #[path = "handler_attach/refresh.rs"]
@@ -1436,6 +1487,13 @@ pub(super) struct AttachRenderTargetRequest<'a> {
 /// Taken under the client lock alone so the state lock can be acquired
 /// afterwards without holding both, which is why it owns its values.
 pub(super) struct ClientRenderSnapshot {
+    /// The exact attach generation these values were taken from.
+    ///
+    /// Registration lets a replacement take the same pid, and the render
+    /// between the two attach-lock holds runs under other locks entirely, so
+    /// delivery has to prove it is still handing the frame to the client the
+    /// frame describes (issue #182).
+    pub(super) identity: ActiveAttachIdentity,
     pub(super) prompt: Option<renderer::RenderedPrompt>,
     pub(super) terminal_context: OuterTerminalContext,
     pub(super) client_size: TerminalSize,
@@ -1450,6 +1508,7 @@ pub(super) struct ClientRenderSnapshot {
 impl ClientRenderSnapshot {
     pub(super) fn capture(attach_pid: u32, active: &ActiveAttach) -> Self {
         Self {
+            identity: active.identity(attach_pid),
             prompt: active
                 .prompt
                 .as_ref()

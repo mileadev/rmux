@@ -116,23 +116,39 @@ impl RequestHandler {
                 };
                 targets.push((
                     *pid,
-                    (target, snapshot.transient_message.clone(), rendered_status),
+                    (
+                        snapshot.identity,
+                        target,
+                        snapshot.transient_message.clone(),
+                        rendered_status,
+                    ),
                 ));
             }
             targets
         };
 
         let mut target_by_pid = targets.into_iter().collect::<HashMap<_, _>>();
+        #[cfg(test)]
+        for (pid, _) in &refresh_contexts {
+            super::pause_before_generic_render_delivery(*pid).await;
+        }
         let mut active_attach = self.active_attach.lock().await;
         let mut stale_clients = Vec::new();
         for (pid, active) in &mut active_attach.by_pid {
             if &active.session_name != session_name || active.suspended {
                 continue;
             }
-            let Some((mut target, transient_message, rendered_status)) = target_by_pid.remove(pid)
+            let Some((identity, mut target, transient_message, rendered_status)) =
+                target_by_pid.remove(pid)
             else {
                 continue;
             };
+            // This frame describes the generation it was captured from. A
+            // replacement that took the same pid meanwhile must neither receive
+            // it nor have its title recorded as delivered (issue #182).
+            if !identity.matches(*pid, session_name, active) {
+                continue;
+            }
             active.render_generation = active.render_generation.saturating_add(1);
             active.render_refresh_pending = false;
             active.remember_client_title(target.client_title.as_ref());
@@ -307,12 +323,18 @@ impl RequestHandler {
         };
         snapshot.stamp_persistent_overlay_state(&mut target);
 
+        #[cfg(test)]
+        super::pause_before_generic_render_delivery(attach_pid).await;
         let mut active_attach = self.active_attach.lock().await;
         let (delivered, stale_client) = match active_attach.by_pid.get_mut(&attach_pid) {
+            // `expected_attach_id` is `None` for every ordinary redraw caller,
+            // so the captured generation is what keeps this frame from reaching
+            // a same-pid replacement (issue #182).
             Some(active)
-                if expected_attach_id.is_none_or(|expected| {
-                    active.id == expected && !active.closing.load(Ordering::SeqCst)
-                }) && &active.session_name == session_name
+                if snapshot.identity.matches(attach_pid, session_name, active)
+                    && expected_attach_id.is_none_or(|expected| {
+                        active.id == expected && !active.closing.load(Ordering::SeqCst)
+                    })
                     && !active.suspended =>
             {
                 active.render_generation = active.render_generation.saturating_add(1);
@@ -469,7 +491,10 @@ impl RequestHandler {
 
         let mut active_attach = self.active_attach.lock().await;
         let stale_client = match active_attach.by_pid.get_mut(&attach_pid) {
-            Some(active) if &active.session_name == session_name && !active.suspended => {
+            Some(active)
+                if snapshot.identity.matches(attach_pid, session_name, active)
+                    && !active.suspended =>
+            {
                 active.render_generation = active.render_generation.saturating_add(1);
                 active.remember_client_title(target.client_title.as_ref());
                 super::compose_transient_message_refresh(
