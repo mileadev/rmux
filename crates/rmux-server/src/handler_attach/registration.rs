@@ -467,4 +467,21 @@ impl RequestHandler {
             .await
             .expect("test attach must be registered")
     }
+
+    /// What the server believes a registered client's outer terminal shows.
+    ///
+    /// Listener-level tests live outside `crate::handler`, so this is how they
+    /// read the per-client title memory the connection loop seeded.
+    #[cfg(test)]
+    pub(crate) async fn remembered_client_title_for_test(&self, attach_pid: u32) -> Option<String> {
+        self.active_attach
+            .lock()
+            .await
+            .by_pid
+            .get(&attach_pid)
+            .expect("test attach must be registered")
+            .client_title
+            .title()
+            .map(str::to_owned)
+    }
 }

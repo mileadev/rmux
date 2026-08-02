@@ -207,8 +207,10 @@ impl RequestHandler {
             );
         }
         let attached_count = self.attached_count(&session_name).await.saturating_add(1);
-        let requester_uid = self.requester_uid(requester_pid).await;
-        let requester_user = self.server_owner_identity();
+        // The identity the listener authenticated for this connection and is
+        // about to register this client under, so the frame rendered below and
+        // that registration describe one client (issue #182).
+        let (requester_uid, requester_user) = self.attaching_client_identity(requester_pid);
         let (session_id, target) = {
             let state = self.state.lock().await;
             let Some(session) = state.sessions.session(&session_name) else {

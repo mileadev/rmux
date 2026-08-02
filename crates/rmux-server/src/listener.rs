@@ -336,8 +336,12 @@ async fn serve_connection(
                         Some(guard) => Some(guard),
                         None => return Ok(()),
                     };
+                // The scope carries the authenticated peer as well as its
+                // admission: an attach frame is rendered before the
+                // registration below publishes this client, and both must
+                // describe the same user (issue #182).
                 let _requester_access_guard = handler
-                    .begin_detached_requester_access(requester.pid, access_admission.clone());
+                    .begin_authenticated_peer_access(&requester, access_admission.clone());
                 let mut detached_request_guard = request_counts_as_detached_activity(&request)
                     .then(|| handler.begin_detached_request());
 
@@ -2230,8 +2234,16 @@ mod tests {
 mod web_share_tests;
 
 #[cfg(test)]
+#[path = "listener_connection_test_support.rs"]
+mod connection_test_support;
+
+#[cfg(test)]
 #[path = "listener_inflight_access_tests.rs"]
 mod inflight_access_tests;
+
+#[cfg(test)]
+#[path = "listener_attach_identity_tests.rs"]
+mod attach_identity_tests;
 
 #[cfg(all(test, windows))]
 mod windows_tests {

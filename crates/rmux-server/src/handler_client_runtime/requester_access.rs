@@ -1,9 +1,10 @@
+use rmux_ipc::PeerIdentity;
 use rmux_os::identity::UserIdentity;
 
 use crate::handler::attach_support::ClientFlags;
 use crate::handler::control_support::{current_control_queue_identity, ControlClientIdentity};
 use crate::handler::{DetachedRequesterAuthority, RequestHandler, RequesterOrigin};
-use crate::server_access::{AccessMode, ServerAccessAdmission};
+use crate::server_access::{current_owner_uid, AccessMode, ServerAccessAdmission};
 
 enum DetachedAdmissionLookup {
     Absent,
@@ -120,6 +121,44 @@ impl RequestHandler {
         }
 
         DetachedRequesterAuthority::Denied
+    }
+
+    /// The local peer the connection loop authenticated for the scope this
+    /// request is running under, when there is one.
+    ///
+    /// This never derives an identity from the pid: the pid only selects the
+    /// scope the listener opened from its own accepted stream, and a scope set
+    /// that disagrees resolves to nothing at all.
+    pub(in crate::handler) fn authenticated_requester_peer(
+        &self,
+        requester_pid: u32,
+    ) -> Option<PeerIdentity> {
+        self.active_detached_requester_access
+            .lock()
+            .expect("active detached requester access mutex must not be poisoned")
+            .get(&requester_pid)?
+            .unambiguous_peer()
+            .cloned()
+    }
+
+    /// The identity a client attaching on this connection will be registered
+    /// under.
+    ///
+    /// A fresh attach renders its first frame before the listener registers
+    /// it, and that listener registers the very peer it authenticated. Reading
+    /// the same peer back here keeps the frame's `#{client_uid}` and
+    /// `#{client_user}` on the delegated user rather than on the server owner
+    /// (issue #182). A request with no connection-authenticated peer is an
+    /// in-process dispatch and stays the owner's, exactly as before.
+    pub(in crate::handler) fn attaching_client_identity(
+        &self,
+        requester_pid: u32,
+    ) -> (u32, UserIdentity) {
+        self.authenticated_requester_peer(requester_pid)
+            .map_or_else(
+                || (current_owner_uid(), self.server_owner_identity()),
+                |peer| (peer.uid, peer.user),
+            )
     }
 
     fn detached_admission_lookup(&self, requester_pid: u32) -> DetachedAdmissionLookup {

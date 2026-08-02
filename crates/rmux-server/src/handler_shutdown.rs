@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
+use rmux_ipc::PeerIdentity;
 use rmux_proto::{OptionName, RmuxError};
 use tokio::sync::watch;
 
@@ -10,8 +11,8 @@ use crate::diagnostic_log::{record_shutdown_queued, record_shutdown_request};
 use crate::server_access::{AccessMode, ServerAccessAdmission};
 
 use super::{
-    DetachedRequesterAccess, DetachedRequesterAuthority, PendingShutdownReason, RequestHandler,
-    RequesterOrigin,
+    DetachedRequesterAccess, DetachedRequesterAuthority, DetachedRequesterScope,
+    PendingShutdownReason, RequestHandler, RequesterOrigin,
 };
 
 #[path = "handler_shutdown/retry.rs"]
@@ -124,9 +125,29 @@ impl RequestHandler {
         requester_pid: u32,
         admission: ServerAccessAdmission,
     ) -> DetachedRequesterAccessGuard {
-        self.begin_detached_requester_authority(
+        self.begin_detached_requester_scope(
             requester_pid,
-            DetachedRequesterAuthority::Admission(admission),
+            DetachedRequesterScope::new(DetachedRequesterAuthority::Admission(admission), None),
+        )
+    }
+
+    /// Opens the scope a connection loop runs one dispatched request under,
+    /// carrying the local peer the OS authenticated for that connection.
+    ///
+    /// An attach frame is rendered before the listener registers the client,
+    /// so this is how that render reaches the same `#{client_uid}` /
+    /// `#{client_user}` the registration then stores (issue #182).
+    pub(crate) fn begin_authenticated_peer_access(
+        &self,
+        peer: &PeerIdentity,
+        admission: ServerAccessAdmission,
+    ) -> DetachedRequesterAccessGuard {
+        self.begin_detached_requester_scope(
+            peer.pid,
+            DetachedRequesterScope::new(
+                DetachedRequesterAuthority::Admission(admission),
+                Some(peer.clone()),
+            ),
         )
     }
 
@@ -135,14 +156,24 @@ impl RequestHandler {
         requester_pid: u32,
     ) -> DetachedRequesterAccessGuard {
         let authority = self.requester_detached_authority(requester_pid).await;
-        self.begin_detached_requester_authority(requester_pid, authority)
+        // A nested scope inherits the peer with the authority, so running a
+        // hook or a shell under an authenticated connection does not turn its
+        // own requester identity ambiguous.
+        let peer = self.authenticated_requester_peer(requester_pid);
+        self.begin_detached_requester_scope(
+            requester_pid,
+            DetachedRequesterScope::new(authority, peer),
+        )
     }
 
     pub(in crate::handler) fn begin_requester_origin_access(
         &self,
         origin: &RequesterOrigin,
     ) -> DetachedRequesterAccessGuard {
-        self.begin_detached_requester_authority(origin.requester_pid, origin.authority.clone())
+        self.begin_detached_requester_scope(
+            origin.requester_pid,
+            DetachedRequesterScope::new(origin.authority.clone(), None),
+        )
     }
 
     pub(in crate::handler) async fn require_requester_origin_write(
@@ -180,20 +211,20 @@ impl RequestHandler {
         self.begin_detached_requester_access(requester_pid, admission)
     }
 
-    fn begin_detached_requester_authority(
+    fn begin_detached_requester_scope(
         &self,
         requester_pid: u32,
-        authority: DetachedRequesterAuthority,
+        scope: DetachedRequesterScope,
     ) -> DetachedRequesterAccessGuard {
         let mut access = self
             .active_detached_requester_access
             .lock()
             .expect("active detached requester access mutex must not be poisoned");
         let entry = access.entry(requester_pid).or_default();
-        entry.scopes.push(authority.clone());
+        entry.scopes.push(scope.clone());
         DetachedRequesterAccessGuard {
             requester_pid,
-            authority,
+            scope,
             active_detached_requester_access: self.active_detached_requester_access.clone(),
         }
     }
@@ -524,7 +555,7 @@ impl Drop for DetachedConnectionGuard {
 
 pub(crate) struct DetachedRequesterAccessGuard {
     requester_pid: u32,
-    authority: DetachedRequesterAuthority,
+    scope: DetachedRequesterScope,
     active_detached_requester_access: Arc<StdMutex<HashMap<u32, DetachedRequesterAccess>>>,
 }
 
@@ -540,7 +571,7 @@ impl Drop for DetachedRequesterAccessGuard {
         if let Some(position) = entry
             .scopes
             .iter()
-            .position(|candidate| candidate == &self.authority)
+            .position(|candidate| candidate == &self.scope)
         {
             entry.scopes.swap_remove(position);
         }
