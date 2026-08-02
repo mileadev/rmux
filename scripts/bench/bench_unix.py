@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""Collect local Unix RMUX/tmux benchmark measurements as JSON."""
+"""Collect local Unix RMUX/tmux benchmark measurements as JSON.
+
+Contract for anything added here:
+
+* Measure only on the machine that owns the tools; never across SSH.
+* Emit a metric only for a documented strict equivalent or an explicitly
+  approximate layout operation. A missing adapter or a failed sample is
+  omitted, never estimated.
+* Record the commit, platform, tool versions and every p50/p95 sample so a
+  reader can re-derive a published cell.
+* Keep host identity out of the artifact: no hostname, address or absolute
+  machine path is hard-coded, and binary paths are emitted repo-relative.
+"""
 
 from __future__ import annotations
 
@@ -21,7 +33,7 @@ from typing import Any
 
 ROOT = Path.cwd()
 SHELL = "/bin/sh"
-TOOLS = ["rmux", "tmux", "zellij"]
+TOOLS = ["rmux", "tmux", "zellij", "screen"]
 
 
 class Adapter:
@@ -74,6 +86,17 @@ def timed(cmd: list[str], *, timeout: float = 15.0) -> float:
     return (time.perf_counter() - start) * 1000.0
 
 
+def timed_unchecked(cmd: list[str], *, timeout: float = 15.0) -> float:
+    """Time a command whose success is not encoded in its exit status.
+
+    GNU `screen -ls` reports the session list on stdout and still exits
+    nonzero, so the listing operation cannot be timed with `timed`.
+    """
+    start = time.perf_counter()
+    quiet(cmd, check=False, timeout=timeout)
+    return (time.perf_counter() - start) * 1000.0
+
+
 def git(*args: str) -> str:
     try:
         return subprocess.check_output(
@@ -83,20 +106,35 @@ def git(*args: str) -> str:
         return "unknown"
 
 
-def version(cmd: str, *args: str) -> str | None:
+def version(cmd: str, *args: str, accept_nonzero_exit: bool = False) -> str | None:
+    """Return a tool's first version line, or None when the tool is absent.
+
+    `accept_nonzero_exit` keeps the printed banner of tools that report their
+    version through a failing exit status; GNU `screen -v` is one of them, and
+    rejecting it would degrade a real version string to the bare literal
+    "available".
+    """
     path = shutil.which(cmd)
     if not path:
         return None
     try:
-        return subprocess.check_output(
+        completed = subprocess.run(
             [path, *args],
-            text=True,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            text=True,
             env=clean_env(),
             timeout=5.0,
-        ).strip().splitlines()[0]
+            check=False,
+        )
     except Exception:
         return "available"
+    if completed.returncode != 0 and not accept_nonzero_exit:
+        return "available"
+    lines = completed.stdout.strip().splitlines()
+    if not lines:
+        return "available"
+    return lines[0]
 
 
 def stats(samples: list[float]) -> dict[str, object]:
@@ -734,6 +772,184 @@ def batched_zellij_list_panes(executable: str, iterations: int) -> MeasuredOpera
     return operation
 
 
+def screen_session_name(operation: str) -> str:
+    return socket_name(operation, "screen")
+
+
+def screen_create_command(
+    executable: str,
+    name: str,
+    *,
+    command: str | None = None,
+    scrollback: int | None = None,
+) -> list[str]:
+    """Build a detached `screen` session command.
+
+    Options precede the program, and omitting the program starts the login
+    shell, which is the payload the tmux-like adapters also measure.
+    """
+    args = [executable, "-dmS", name]
+    if scrollback is not None:
+        args.extend(["-h", str(scrollback)])
+    if command is not None:
+        args.append(command)
+    return args
+
+
+def screen_control_command(executable: str, name: str, args: list[str]) -> list[str]:
+    return [executable, "-S", name, *args]
+
+
+def screen_cleanup(executable: str, name: str) -> None:
+    quiet(screen_control_command(executable, name, ["-X", "quit"]), check=False, timeout=5.0)
+
+
+def screen_create_session(
+    executable: str,
+    name: str,
+    *,
+    command: str | None = None,
+    scrollback: int | None = None,
+) -> None:
+    quiet(
+        screen_create_command(executable, name, command=command, scrollback=scrollback),
+        timeout=10.0,
+    )
+
+
+def with_screen_session(
+    executable: str,
+    operation: str,
+    timed_args: list[str],
+    *,
+    command: str | None = None,
+    setup: Callable[[str], None] | None = None,
+    scrollback: int | None = None,
+    timeout: float = 15.0,
+) -> float:
+    name = screen_session_name(operation)
+    try:
+        screen_create_session(executable, name, command=command, scrollback=scrollback)
+        if setup is not None:
+            setup(name)
+        return timed(screen_control_command(executable, name, timed_args), timeout=timeout)
+    finally:
+        screen_cleanup(executable, name)
+
+
+def screen_new_session_cold(executable: str) -> float:
+    name = screen_session_name("new_session_cold_sh")
+    screen_cleanup(executable, name)
+    try:
+        return timed(screen_create_command(executable, name), timeout=10.0)
+    finally:
+        screen_cleanup(executable, name)
+
+
+def screen_list_sessions(executable: str) -> float:
+    name = screen_session_name("list_sessions_default")
+    try:
+        screen_create_session(executable, name)
+        return timed_unchecked([executable, "-ls"], timeout=10.0)
+    finally:
+        screen_cleanup(executable, name)
+
+
+def screen_new_window(executable: str) -> float:
+    return with_screen_session(executable, "new_window_detached_sh", ["-X", "screen"])
+
+
+def screen_send_keys(executable: str) -> float:
+    return with_screen_session(
+        executable,
+        "send_keys_detached_round_trip",
+        ["-X", "stuff", "printf rmux-bench\n"],
+    )
+
+
+def screen_capture_visible(executable: str) -> float:
+    with tempfile.NamedTemporaryFile(delete=False) as handle:
+        path = handle.name
+    try:
+        return with_screen_session(
+            executable,
+            "capture_pane_80x24",
+            ["-X", "hardcopy", path],
+            timeout=10.0,
+        )
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+
+def screen_capture_scrollback(executable: str) -> float:
+    with tempfile.NamedTemporaryFile(delete=False) as handle:
+        path = handle.name
+    try:
+        return with_screen_session(
+            executable,
+            "capture_pane_200x50_scrollback_10k",
+            ["-X", "hardcopy", "-h", path],
+            command=output_command(10000),
+            scrollback=10000,
+            timeout=30.0,
+        )
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+
+def setup_screen_list_windows(executable: str, name: str) -> None:
+    for index in range(1, 20):
+        quiet(
+            screen_control_command(executable, name, ["-X", "screen", "-t", f"w{index}"]),
+            timeout=10.0,
+        )
+
+
+def screen_list_windows(executable: str) -> float:
+    return with_screen_session(
+        executable,
+        "list_windows_20",
+        ["-Q", "windows"],
+        setup=lambda name: setup_screen_list_windows(executable, name),
+        timeout=10.0,
+    )
+
+
+def batched_screen_list_windows(executable: str, iterations: int) -> MeasuredOperation:
+    name: str | None = None
+    remaining = iterations
+
+    def operation() -> float:
+        nonlocal name, remaining
+        if name is None:
+            name = screen_session_name("list_windows_20")
+            try:
+                screen_create_session(executable, name)
+                setup_screen_list_windows(executable, name)
+            except Exception:
+                screen_cleanup(executable, name)
+                name = None
+                raise
+        try:
+            return timed(screen_control_command(executable, name, ["-Q", "windows"]), timeout=10.0)
+        finally:
+            remaining -= 1
+            if remaining <= 0 and name is not None:
+                screen_cleanup(executable, name)
+                name = None
+
+    return operation
+
+
+def screen_kill_session(executable: str) -> float:
+    name = screen_session_name("kill_session")
+    try:
+        screen_create_session(executable, name)
+        return timed(screen_control_command(executable, name, ["-X", "quit"]), timeout=10.0)
+    finally:
+        screen_cleanup(executable, name)
+
+
 OPERATIONS: list[tuple[str, AdapterOperation]] = [
     ("new_session_warm_sh", new_session_warm_sh),
     ("list_sessions_default", list_sessions_default),
@@ -795,6 +1011,24 @@ def zellij_operations(executable: str, iterations: int) -> dict[str, MeasuredOpe
     }
 
 
+def screen_operations(executable: str, iterations: int) -> dict[str, MeasuredOperation]:
+    """GNU screen equivalents for the eight operations it can express.
+
+    Splits, resizes and per-pane listing have no strict screen equivalent, so
+    those rows stay absent rather than being approximated.
+    """
+    return {
+        "new_session_cold_sh": lambda: screen_new_session_cold(executable),
+        "list_sessions_default": lambda: screen_list_sessions(executable),
+        "new_window_detached_sh": lambda: screen_new_window(executable),
+        "send_keys_detached_round_trip": lambda: screen_send_keys(executable),
+        "capture_pane_80x24": lambda: screen_capture_visible(executable),
+        "capture_pane_200x50_scrollback_10k": lambda: screen_capture_scrollback(executable),
+        "list_windows_20": batched_screen_list_windows(executable, iterations),
+        "kill_session": lambda: screen_kill_session(executable),
+    }
+
+
 def measure(
     operation: MeasuredOperation,
     iterations: int,
@@ -852,6 +1086,9 @@ def collect(
     zellij = shutil.which("zellij")
     if zellij and "zellij" in selected_tools:
         operations_by_tool["zellij"] = zellij_operations(zellij, iterations)
+    screen = shutil.which("screen")
+    if screen and "screen" in selected_tools:
+        operations_by_tool["screen"] = screen_operations(screen, iterations)
     if not operations_by_tool:
         raise SystemExit("no selected benchmark tools are available")
 
@@ -887,7 +1124,9 @@ def collect(
                 "rmux": version(str(rmux), "-V"),
                 "tmux": version("tmux", "-V"),
                 "zellij": version("zellij", "--version"),
+                "screen": version("screen", "-v", accept_nonzero_exit=True),
             },
+            "tool_environments": {tool: "native" for tool in measured_tools},
             "baseline": "tmux" if "tmux" in measured_tools else measured_tools[0],
             "units": "ms",
             "lower_is_better": True,
@@ -953,7 +1192,11 @@ def main() -> int:
     parser.add_argument("--quiet", action="store_true", help="suppress progress output")
     parser.add_argument("--sample-progress", action="store_true", help="print every measured sample")
     parser.add_argument("--only-operations", help="comma-separated operation IDs to run")
-    parser.add_argument("--only-tools", default="rmux,tmux,zellij", help="comma-separated tools to run")
+    parser.add_argument(
+        "--only-tools",
+        default="rmux,tmux,zellij,screen",
+        help="comma-separated tools to run",
+    )
     args = parser.parse_args()
     if args.iterations < 1:
         parser.error("--iterations must be a positive integer")

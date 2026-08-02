@@ -1,3 +1,18 @@
+# Collect local Windows RMUX benchmark measurements as JSON.
+#
+# Contract for anything added here:
+#
+# * Measure only on this machine; never across SSH.
+# * Emit a metric only for a documented strict equivalent or an explicitly
+#   approximate layout operation. A missing adapter or a failed sample is
+#   omitted, never estimated.
+# * Record the commit, platform, tool versions and every p50/p95 sample.
+# * Identify each tool's environment: native Windows tools and tools reached
+#   through WSL are never conflated.
+# * Keep host identity out of the artifact: no hostname, address or absolute
+#   machine path is hard-coded, version strings that contain a local path are
+#   reduced to "available", and binary paths are emitted repo-relative.
+
 param(
     [Parameter(Mandatory = $true)]
     [string] $Out,
@@ -230,15 +245,24 @@ function Convert-ToProcessArgument {
     return '"' + ($Argument -replace '\\+$', '$0$0' -replace '"', '\"') + '"'
 }
 
+# GNU screen reports its version through a failing exit status, so a version
+# probe that insists on exit 0 would report an installed screen as absent.
 function Get-Version {
-    param([string] $Command, [Parameter(ValueFromRemainingArguments = $true)] [string[]] $VersionArgs)
+    param(
+        [string] $Command,
+        [Parameter(ValueFromRemainingArguments = $true)] [string[]] $VersionArgs,
+        [switch] $AllowNonZeroExit
+    )
     $cmd = Get-Command $Command -ErrorAction SilentlyContinue
     if (-not $cmd) {
         return $null
     }
     $fullCommand = @($Command) + $VersionArgs
     $result = Invoke-Captured -Command $fullCommand
-    if ($result.ExitCode -ne 0) {
+    if ($result.ExitCode -ne 0 -and -not $AllowNonZeroExit) {
+        return $null
+    }
+    if ($result.ExitCode -eq -1) {
         return $null
     }
     $text = ([string] $result.Stdout) + " " + ([string] $result.Stderr)
@@ -1298,6 +1322,10 @@ if ($OnlyOperations.Count -gt 0) {
 $hasWslTmux = $MeasureTmux -and (Test-WslCommand "tmux")
 $hasZellij = $MeasureZellij -and (Test-Zellij)
 $hasPsmuxSessions = $MeasurePsmux -and (Test-PsmuxSession)
+# GNU screen has no native Windows build. Record whether WSL provides one so the
+# artifact states the fact, but never measure it here and never present it as a
+# native Windows tool.
+$hasWslScreen = Test-WslCommand "screen"
 
 $metricsByOperation = @{}
 foreach ($operation in $operations) {
@@ -1404,6 +1432,26 @@ $baseline = if ($tools -contains "tmux") {
     $null
 }
 
+# Every tool this artifact says anything about, and how it was reached. A tool
+# with recorded metadata but no measurements still gets an entry so no reader
+# can mistake a WSL tool for a native Windows one.
+$toolEnvironments = @{}
+if ($MeasureRmux) {
+    $toolEnvironments["rmux"] = "native"
+}
+if ($hasPsmuxSessions) {
+    $toolEnvironments["psmux"] = "native"
+}
+if ($hasZellij) {
+    $toolEnvironments["zellij"] = "native"
+}
+if ($hasWslTmux) {
+    $toolEnvironments["tmux"] = "wsl"
+}
+if ($hasWslScreen) {
+    $toolEnvironments["screen"] = "wsl"
+}
+
 $payload = @{
     schema = 1
     kind = "rmux-public-benchmark"
@@ -1419,7 +1467,9 @@ $payload = @{
         psmux = if ($hasPsmuxSessions) { Get-Version "cmd.exe" "/c" "psmux -V" } else { $null }
         zellij = if ($hasZellij) { Get-ZellijVersion } else { $null }
         tmux = if ($hasWslTmux) { Get-Version "wsl.exe" "tmux" "-V" } else { $null }
+        screen = if ($hasWslScreen) { Get-Version "wsl.exe" "screen" "-v" -AllowNonZeroExit } else { $null }
     }
+    tool_environments = $toolEnvironments
     baseline = $baseline
     units = "ms"
     lower_is_better = $true
@@ -1435,6 +1485,9 @@ $payload = @{
         }
         if ($MeasurePsmux -and $null -ne $Psmux -and -not $hasPsmuxSessions) {
             "psmux is installed but did not create benchmark sessions reproducibly on this host."
+        }
+        if ($hasWslScreen) {
+            "GNU screen is reachable through WSL only; its version is recorded as compatibility-layer metadata and no Windows screen operation is measured."
         }
     )
     operations = @($rows)

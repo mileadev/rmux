@@ -114,14 +114,22 @@ scripts/bench/run-unix.sh --out target/benchmarks/macos.json
 python3 scripts/bench/render.py target/benchmarks/*.json --output docs/benchmarks.md
 ```
 
+Each OS measures itself locally, so no number here includes SSH or remote-shell latency.
+
 Note: Scripts run safely in isolated sessions and only kill their own test processes.
 
 ## Methodology
 
 The `render.py` script updates this Markdown file and linked CSVs based on the JSON results.
 
-`-`: Operation is unavailable or not comparable.
+Each JSON artifact records the commit, platform, tool versions and every p50/p95 sample behind a cell.
 
-Zellij: Results only show exact equivalents or close approximations.
+`-`: Operation is unavailable or not comparable. Missing adapters and failed samples are omitted, never estimated.
+
+Zellij and GNU screen: results only show exact equivalents or close approximations.
+
+Tools reached through a compatibility layer are labelled as such, and the JSON records each measured tool's environment. On Windows the ratio compares RMUX against tmux under WSL, never against a native Windows multiplexer.
+
+`≈ same speed` spans 0.80x to 1.25x, the spread repeated samples actually show on these hosts; a narrower claim would publish host noise as a result.
 
 Generated at `2026-07-16T22:27:58Z` from commit `70b68ca083f6`.

@@ -9,7 +9,7 @@ layout=""
 quiet=0
 sample_progress=0
 only_operations=""
-only_tools="rmux,tmux,zellij"
+only_tools="rmux,tmux,zellij,screen"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -55,12 +55,15 @@ usage: scripts/bench/run-unix.sh --out target/benchmarks/<linux|macos>.json
                                 [--iterations N] [--layout DIR]
                                 [--binary PATH] [--skip-build]
                                 [--sample-progress] [--quiet]
-                                [--only-tools rmux,tmux,zellij]
+                                [--only-tools rmux,tmux,zellij,screen]
                                 [--only-operations OP1,OP2]
 
 Runs a local Unix benchmark and writes a JSON artifact consumed by
 scripts/bench/render.py. The script clears RMUX/TMUX/TERM_PROGRAM so benchmark
 servers do not target the orchestrating terminal.
+
+Comparators are measured only when their executable is on PATH; tmux, zellij
+and GNU screen are each omitted from the artifact when absent.
 
 By default, this builds and measures a package-like tiny release layout:
   <layout>/bin/rmux

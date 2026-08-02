@@ -1,0 +1,633 @@
+//! GNU `screen` support in the public benchmark pipeline.
+//!
+//! `screen` is the third comparator the benchmark page can publish, and it is
+//! the one whose command surface least resembles tmux: it reports its version
+//! through a failing exit status, lists sessions through a failing exit status,
+//! captures with `hardcopy` instead of `capture-pane`, and has no equivalent at
+//! all for splits, resizes or per-pane listing. Each of those is a way for the
+//! adapter to silently publish nothing, publish "available" instead of a
+//! version, or publish an estimate. These specs pin the observable contract of
+//! the adapter, of the absent-tool omission rule, and of the rendered ordering,
+//! labels and comparator band.
+//!
+//! Everything here is deterministic: the `screen` executable is a stub whose
+//! exit statuses reproduce GNU screen's, so the specs run on hosts that have no
+//! `screen` installed. They prove plumbing and contracts, never timings.
+
+#[path = "support/python3.rs"]
+mod python3;
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Output;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const SCREEN_BANNER: &str = "Screen version 4.09.01 (GNU) 20-Aug-23";
+
+/// The eight operations GNU screen can express. Splits, resizes and per-pane
+/// listing have no strict equivalent and must stay absent.
+const SCREEN_OPERATIONS: [&str; 8] = [
+    "capture_pane_200x50_scrollback_10k",
+    "capture_pane_80x24",
+    "kill_session",
+    "list_sessions_default",
+    "list_windows_20",
+    "new_session_cold_sh",
+    "new_window_detached_sh",
+    "send_keys_detached_round_trip",
+];
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn temp_dir(label: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock before epoch")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("rmux-{label}-{}-{nonce}", std::process::id()));
+    fs::create_dir_all(&path).expect("create temp directory");
+    path
+}
+
+fn describe(label: &str, output: &Output) -> String {
+    format!(
+        "{label} exited with {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+/// Run a Python driver against the benchmark sources from the repository root.
+fn run_driver(source: &str) -> Output {
+    python3::command()
+        .args(["-c", source])
+        .current_dir(repo_root())
+        .output()
+        .expect("failed to run the benchmark driver")
+}
+
+fn driver_json(source: &str) -> serde_json::Value {
+    let output = run_driver(source);
+    assert!(output.status.success(), "{}", describe("driver", &output));
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "driver did not print JSON: {error}\n{}",
+            describe("driver", &output)
+        )
+    })
+}
+
+const LOAD_BENCH: &str = "\
+import importlib.util, json, os, sys
+spec = importlib.util.spec_from_file_location('bench_unix', 'scripts/bench/bench_unix.py')
+bench = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bench)
+";
+
+const LOAD_RENDER: &str = "\
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location('render', 'scripts/bench/render.py')
+render = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(render)
+";
+
+/// A stand-in for GNU screen that reproduces the exit statuses that matter:
+/// `-v` prints its banner and fails, `-ls` prints the listing and fails, and
+/// every session command succeeds.
+fn write_screen_stub(directory: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let path = directory.join("screen.cmd");
+        fs::write(
+            &path,
+            format!(
+                "@echo off\r\n\
+                 if \"%~1\"==\"-v\" goto version\r\n\
+                 if \"%~1\"==\"-ls\" goto listing\r\n\
+                 exit /b 0\r\n\
+                 :version\r\n\
+                 echo {SCREEN_BANNER}\r\n\
+                 exit /b 1\r\n\
+                 :listing\r\n\
+                 echo There is a screen on:\r\n\
+                 exit /b 9\r\n"
+            ),
+        )
+        .expect("write screen stub");
+        path
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = directory.join("screen");
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n\
+                 case \"$1\" in\n\
+                 -v) echo '{SCREEN_BANNER}'; exit 1 ;;\n\
+                 -ls) echo 'There is a screen on:'; exit 9 ;;\n\
+                 esac\n\
+                 exit 0\n"
+            ),
+        )
+        .expect("write screen stub");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .expect("mark stub executable");
+        path
+    }
+}
+
+fn payload(platform: &str, tools: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "schema": 1,
+        "kind": "rmux-public-benchmark",
+        "complete": true,
+        "generated_at": "2026-01-01T00:00:00Z",
+        "platform": {"id": platform, "name": platform},
+        "git": {"branch": "spec", "commit": "0".repeat(40)},
+        "tools": tools,
+        "baseline": "tmux",
+        "units": "ms",
+        "lower_is_better": true,
+        "notes": [],
+        "operations": [],
+    })
+}
+
+/// Render one payload and return the generated Markdown.
+fn render_payload(label: &str, payload: &serde_json::Value) -> String {
+    let workspace = temp_dir(label);
+    let input = workspace.join("payload.json");
+    fs::write(
+        &input,
+        serde_json::to_vec_pretty(payload).expect("encode payload"),
+    )
+    .expect("write payload");
+    let output_path = workspace.join("benchmarks.md");
+    let output = python3::command()
+        .arg("scripts/bench/render.py")
+        .arg(&input)
+        .arg("--output")
+        .arg(&output_path)
+        .arg("--asset-dir")
+        .arg(workspace.join("assets"))
+        .current_dir(repo_root())
+        .output()
+        .expect("failed to run render.py");
+    assert!(
+        output.status.success(),
+        "{}",
+        describe("render.py", &output)
+    );
+    let markdown = fs::read_to_string(&output_path).expect("read rendered markdown");
+    fs::remove_dir_all(&workspace).expect("remove render workspace");
+    markdown
+}
+
+#[test]
+fn screen_commands_match_the_gnu_screen_surface() {
+    let observed = driver_json(&format!(
+        "{LOAD_BENCH}
+print(json.dumps({{
+    'default': bench.screen_create_command('screen', 'bench'),
+    'scrollback': bench.screen_create_command(
+        'screen', 'bench', command='/bin/sh -c payload', scrollback=10000
+    ),
+    'control': bench.screen_control_command('screen', 'bench', ['-X', 'hardcopy', '-h', '/tmp/f']),
+    'operations': sorted(bench.screen_operations('screen', 3)),
+    'tools': bench.TOOLS,
+}}))
+"
+    ));
+
+    // No program argument: screen starts the login shell, which is the payload
+    // the tmux-like adapters measure for the same rows.
+    assert_eq!(
+        observed["default"],
+        serde_json::json!(["screen", "-dmS", "bench"]),
+        "a default screen session must not pin an explicit shell"
+    );
+    // Options precede the program, or screen passes `-h 10000` to the shell.
+    assert_eq!(
+        observed["scrollback"],
+        serde_json::json!([
+            "screen",
+            "-dmS",
+            "bench",
+            "-h",
+            "10000",
+            "/bin/sh -c payload"
+        ]),
+        "scrollback depth must be an option, ahead of the measured payload"
+    );
+    assert_eq!(
+        observed["control"],
+        serde_json::json!(["screen", "-S", "bench", "-X", "hardcopy", "-h", "/tmp/f"]),
+        "control commands must address the session by name"
+    );
+    assert_eq!(
+        observed["operations"],
+        serde_json::json!(SCREEN_OPERATIONS),
+        "the screen adapter must expose exactly its strict equivalents"
+    );
+    assert_eq!(
+        observed["tools"],
+        serde_json::json!(["rmux", "tmux", "zellij", "screen"]),
+        "screen must be selectable through --only-tools"
+    );
+}
+
+#[test]
+fn every_screen_operation_is_a_known_benchmark_row() {
+    let observed = driver_json(&format!(
+        "{LOAD_BENCH}
+print(json.dumps({{'known': [label for label, _ in bench.OPERATIONS]}}))
+"
+    ));
+    let known: Vec<&str> = observed["known"]
+        .as_array()
+        .expect("operation list")
+        .iter()
+        .map(|value| value.as_str().expect("operation id"))
+        .collect();
+    for operation in SCREEN_OPERATIONS {
+        assert!(
+            known.contains(&operation),
+            "screen measures {operation}, which is not a benchmark row and would never be collected"
+        );
+    }
+}
+
+#[test]
+fn screen_listing_tolerates_its_failing_exit_status() {
+    let workspace = temp_dir("screen-listing");
+    let stub = write_screen_stub(&workspace);
+    let observed = driver_json(&format!(
+        "{LOAD_BENCH}
+stub = {stub:?}
+unchecked = bench.timed_unchecked([stub, '-ls'])
+try:
+    bench.timed([stub, '-ls'])
+    checked = 'accepted'
+except Exception as error:
+    checked = type(error).__name__
+print(json.dumps({{'unchecked_ms': unchecked, 'checked': checked}}))
+",
+        stub = stub.to_string_lossy()
+    ));
+
+    assert!(
+        observed["unchecked_ms"].as_f64().expect("elapsed ms") >= 0.0,
+        "screen -ls must produce a sample despite exiting nonzero"
+    );
+    assert_eq!(
+        observed["checked"], "CalledProcessError",
+        "the spec is vacuous unless the checked timer really rejects screen -ls"
+    );
+    fs::remove_dir_all(&workspace).expect("remove listing workspace");
+}
+
+#[test]
+fn screen_version_metadata_survives_a_failing_version_probe() {
+    let workspace = temp_dir("screen-version");
+    write_screen_stub(&workspace);
+    let empty = temp_dir("screen-empty-path");
+    let observed = driver_json(&format!(
+        "{LOAD_BENCH}
+os.environ['PATH'] = {dir:?} + os.pathsep + os.environ['PATH']
+tolerant = bench.version('screen', '-v', accept_nonzero_exit=True)
+strict = bench.version('screen', '-v')
+os.environ['PATH'] = {empty:?}
+absent = bench.version('screen', '-v', accept_nonzero_exit=True)
+print(json.dumps({{'tolerant': tolerant, 'strict': strict, 'absent': absent}}))
+",
+        dir = workspace.to_string_lossy(),
+        empty = empty.to_string_lossy()
+    ));
+    fs::remove_dir_all(&empty).expect("remove empty path directory");
+
+    assert_eq!(
+        observed["tolerant"], SCREEN_BANNER,
+        "an installed screen must publish its real version, not the literal \"available\""
+    );
+    assert_eq!(
+        observed["strict"], "available",
+        "the spec is vacuous unless the default probe really discards a failing exit status"
+    );
+    assert!(
+        observed["absent"].is_null(),
+        "an absent screen must report no version at all, not \"available\""
+    );
+    fs::remove_dir_all(&workspace).expect("remove version workspace");
+}
+
+#[test]
+fn an_absent_screen_is_omitted_rather_than_estimated() {
+    let workspace = temp_dir("screen-absent");
+    let observed = driver_json(&format!(
+        "{LOAD_BENCH}
+bench.shutil.which = lambda name, *args, **kwargs: None
+try:
+    bench.collect(
+        __import__('pathlib').Path({out:?}),
+        1,
+        __import__('pathlib').Path({out:?}),
+        rmux_layout='spec',
+        rmux_public_binary=None,
+        rmux_helper_binary=None,
+        rmux_daemon_binary=None,
+        progress_enabled=False,
+        sample_progress=False,
+        only_operations=None,
+        selected_tools={{'screen'}},
+    )
+    outcome = 'measured'
+except SystemExit as error:
+    outcome = str(error)
+print(json.dumps({{'outcome': outcome}}))
+",
+        out = workspace.join("out.json").to_string_lossy()
+    ));
+
+    assert_eq!(
+        observed["outcome"], "no selected benchmark tools are available",
+        "an absent screen must abort the run instead of emitting an empty or invented column"
+    );
+    assert!(
+        !workspace.join("out.json").exists(),
+        "no artifact may be written for a tool that was never measured"
+    );
+    fs::remove_dir_all(&workspace).expect("remove absent workspace");
+}
+
+#[test]
+fn screen_measurements_reach_the_rendered_table() {
+    let workspace = temp_dir("screen-pipeline");
+    let stub = write_screen_stub(&workspace);
+    let artifact = workspace.join("screen.json");
+    let path = format!(
+        "{}{}{}",
+        workspace.display(),
+        if cfg!(windows) { ";" } else { ":" },
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = python3::command()
+        .arg("scripts/bench/bench_unix.py")
+        .arg("--out")
+        .arg(&artifact)
+        .args(["--iterations", "1"])
+        .arg("--binary")
+        .arg(&stub)
+        .args(["--only-tools", "screen"])
+        .args(["--only-operations", "list_sessions_default,kill_session"])
+        .arg("--quiet")
+        .env("PATH", &path)
+        .current_dir(repo_root())
+        .output()
+        .expect("failed to run bench_unix.py");
+    assert!(
+        output.status.success(),
+        "{}",
+        describe("bench_unix.py", &output)
+    );
+
+    let collected: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&artifact).expect("read artifact"))
+            .expect("parse artifact");
+    assert_eq!(collected["tools"], serde_json::json!(["screen"]));
+    assert_eq!(collected["complete"], serde_json::json!(true));
+    assert_eq!(
+        collected["notes"],
+        serde_json::json!([]),
+        "a healthy screen run must record no omission note: {}",
+        collected["notes"]
+    );
+    assert_eq!(
+        collected["tool_versions"]["screen"], SCREEN_BANNER,
+        "the collected artifact must carry screen's own version metadata"
+    );
+    assert_eq!(
+        collected["tool_environments"]["screen"], "native",
+        "a Unix collector reaches screen natively and must say so"
+    );
+    for operation in ["list_sessions_default", "kill_session"] {
+        let row = collected["operations"]
+            .as_array()
+            .expect("operations")
+            .iter()
+            .find(|row| row["id"] == operation)
+            .unwrap_or_else(|| panic!("{operation} row is missing from the artifact"));
+        assert!(
+            row["metrics"]["screen"]["p50_ms"].is_number(),
+            "{operation} must carry a screen p50: {row}"
+        );
+        assert!(
+            row["metrics"]["screen"]["samples_ms"]
+                .as_array()
+                .is_some_and(|samples| samples.len() == 1),
+            "{operation} must retain its raw samples: {row}"
+        );
+    }
+
+    let markdown = render_payload("screen-pipeline-render", &collected);
+    assert!(
+        markdown.contains("<th align=\"right\">screen</th>"),
+        "the rendered table must publish the screen column:\n{markdown}"
+    );
+    assert!(
+        markdown.contains("List sessions"),
+        "the rendered table must publish the measured screen rows:\n{markdown}"
+    );
+    fs::remove_dir_all(&workspace).expect("remove pipeline workspace");
+}
+
+#[test]
+fn screen_is_ordered_last_and_labelled_by_its_environment() {
+    let mut linux = payload("linux", &["screen", "zellij", "tmux", "rmux"]);
+    linux["tool_environments"] = serde_json::json!({"screen": "native"});
+    let rendered = render_payload("screen-order-linux", &linux);
+    let header = rendered
+        .lines()
+        .find(|line| line.contains("<th align=\"left\">Scenario</th>"))
+        .expect("rendered header row");
+    assert_eq!(
+        header,
+        "<tr><th align=\"left\">Scenario</th><th align=\"right\">rmux</th>\
+         <th align=\"right\">tmux</th><th align=\"right\">zellij</th>\
+         <th align=\"right\">screen</th><th align=\"right\">vs tmux</th></tr>",
+        "screen must render after zellij and carry no compatibility suffix on Linux"
+    );
+
+    let mut windows = payload("windows", &["rmux", "tmux", "screen"]);
+    windows["tool_environments"] =
+        serde_json::json!({"rmux": "native", "tmux": "wsl", "screen": "wsl"});
+    let rendered = render_payload("screen-order-windows", &windows);
+    let header = rendered
+        .lines()
+        .find(|line| line.contains("<th align=\"left\">Scenario</th>"))
+        .expect("rendered header row");
+    assert_eq!(
+        header,
+        "<tr><th align=\"left\">Scenario</th><th align=\"right\">rmux</th>\
+         <th align=\"right\">tmux (WSL)</th><th align=\"right\">screen (WSL)</th>\
+         <th align=\"right\">vs tmux (WSL)</th></tr>",
+        "a WSL tool must never be presented as a native Windows one"
+    );
+
+    // Artifacts written before `tool_environments` existed must still be honest.
+    let legacy = payload("windows", &["rmux", "tmux", "screen"]);
+    let rendered = render_payload("screen-order-legacy", &legacy);
+    assert!(
+        rendered.contains("<th align=\"right\">tmux (WSL)</th>")
+            && rendered.contains("<th align=\"right\">screen (WSL)</th>"),
+        "a payload without recorded environments must keep the Windows WSL labels:\n{rendered}"
+    );
+}
+
+#[test]
+fn absent_screen_measurements_render_as_not_comparable() {
+    let mut linux = payload("linux", &["rmux", "tmux", "screen"]);
+    linux["operations"] = serde_json::json!([{
+        "id": "list_sessions_default",
+        "label": "list_sessions_default",
+        "metrics": {
+            "rmux": {"p50_ms": 4.0, "p95_ms": 4.0, "samples_ms": [4.0]},
+            "tmux": {"p50_ms": 4.0, "p95_ms": 4.0, "samples_ms": [4.0]},
+        },
+    }]);
+    let rendered = render_payload("screen-missing-cell", &linux);
+    let row = rendered
+        .lines()
+        .find(|line| line.contains("List sessions"))
+        .expect("rendered operation row");
+    assert!(
+        row.contains("<code>-</code>"),
+        "an operation screen cannot express must render as not comparable: {row}"
+    );
+}
+
+/// The comparator band is measured, not chosen. The residual pipeline used
+/// `0.95..=1.05`; across the committed `docs/benchmarks/*.csv` tables 71 of 91
+/// cells vary by more than 5% between their own fastest and slowest sample, and
+/// the one cell the tighter band would flip — Linux `list_windows_20` at ratio
+/// 1.0804 — has rmux samples spanning 161% of their median. These cases pin the
+/// published band and prove the rejected one is not in force.
+#[test]
+fn the_same_speed_band_is_the_measured_one() {
+    let observed = driver_json(&format!(
+        "{LOAD_RENDER}
+def verdict(ratio):
+    op = {{'metrics': {{
+        'rmux': {{'p50_ms': 100.0, 'p95_ms': 100.0}},
+        'tmux': {{'p50_ms': 100.0 * ratio, 'p95_ms': 100.0 * ratio}},
+    }}}}
+    return render.ratio_text(op, 'tmux')
+
+print(json.dumps({{
+    'low_edge': verdict(0.80),
+    'below_low': verdict(0.79),
+    'high_edge': verdict(1.25),
+    'above_high': verdict(1.26),
+    'observed_linux_list_windows': verdict(1.0804),
+    'band': [render.SAME_SPEED_RATIO_LOW, render.SAME_SPEED_RATIO_HIGH],
+}}))
+"
+    ));
+
+    assert_eq!(
+        observed["low_edge"], "≈ same speed",
+        "the band edges are inclusive"
+    );
+    assert_eq!(observed["below_low"], "1.3x slower");
+    assert_eq!(
+        observed["high_edge"], "≈ same speed",
+        "the band edges are inclusive"
+    );
+    assert_eq!(observed["above_high"], "1.3x faster");
+    assert_eq!(
+        observed["observed_linux_list_windows"], "≈ same speed",
+        "an 8% median gap inside 161% sample spread must not be published as a win"
+    );
+    assert_eq!(observed["band"], serde_json::json!([0.80, 1.25]));
+}
+
+#[test]
+fn the_published_page_states_the_renderers_methodology() {
+    let observed = driver_json(&format!(
+        "{LOAD_RENDER}
+print(json.dumps({{'methodology': render.methodology('GENERATED', 'COMMIT')}}))
+"
+    ));
+    let methodology = observed["methodology"].as_str().expect("methodology text");
+    let page = fs::read_to_string(repo_root().join("docs/benchmarks.md")).expect("read page");
+
+    let mut missing = Vec::new();
+    for line in methodology.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.contains("GENERATED") {
+            continue;
+        }
+        if !page.contains(line) {
+            missing.push(line.to_owned());
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "docs/benchmarks.md no longer states the renderer's own methodology; \
+         regenerate the page after changing render.py: {missing:#?}"
+    );
+}
+
+/// A published artifact must not carry the identity of the machine that
+/// produced it: in-repo binaries are recorded repo-relative, and a version
+/// banner that leaks a local path is reduced before it is written.
+#[test]
+fn collected_artifacts_do_not_carry_host_identity() {
+    let observed = driver_json(&format!(
+        "{LOAD_BENCH}
+from pathlib import Path
+inside = Path(bench.ROOT) / 'scripts' / 'bench' / 'bench_unix.py'
+outside = Path(bench.ROOT).anchor or '/'
+print(json.dumps({{
+    'inside': bench.relative_or_string(inside),
+    'absent': bench.relative_or_string(None),
+    'root': str(bench.ROOT),
+    'outside_is_absolute': bench.relative_or_string(Path(outside)) == str(Path(outside).resolve()),
+}}))
+"
+    ));
+
+    assert_eq!(
+        observed["inside"],
+        "scripts/bench/bench_unix.py".replace('/', std::path::MAIN_SEPARATOR_STR),
+        "an in-repo binary must be recorded relative to the checkout, never by absolute path"
+    );
+    assert!(
+        observed["absent"].is_null(),
+        "an unused binary slot must stay null rather than invent a path"
+    );
+    assert!(
+        observed["outside_is_absolute"]
+            .as_bool()
+            .expect("outside flag"),
+        "the spec is vacuous unless out-of-repo paths really are the fallback case"
+    );
+
+    let windows_runner =
+        fs::read_to_string(repo_root().join("scripts/bench/run-windows.ps1")).expect("read runner");
+    assert!(
+        windows_runner.contains(r#"$text -match "[A-Za-z]:\\|\\Users\\""#)
+            && windows_runner.contains(r#"return "available""#),
+        "the Windows runner must keep reducing version strings that contain a local path"
+    );
+    let probes = windows_runner.matches("Convert-ToPublicText").count();
+    assert!(
+        probes >= 4,
+        "every Windows text that reaches the artifact must pass the redaction helper, found {probes}"
+    );
+}
