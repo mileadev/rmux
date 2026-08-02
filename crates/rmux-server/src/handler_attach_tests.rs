@@ -178,7 +178,7 @@ async fn create_attached_session_in_utf8_locale(
                 session_name: session.clone(),
                 detached: true,
                 size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: Some(vec![format!("LC_ALL={}", host_utf8_locale())]),
+                environment: utf8_locale::fixture_environment(),
             }))
             .await,
         Response::NewSession(_)
@@ -188,38 +188,6 @@ async fn create_attached_session_in_utf8_locale(
         .register_attach(requester_pid, session.clone(), control_tx)
         .await;
     control_rx
-}
-
-/// Names a UTF-8 locale this host actually installs.
-///
-/// Locale names are not portable, so the value is read from the host instead of
-/// assumed. `C.UTF-8` and `en_US.UTF-8` are preferred because they are the two
-/// that carry no other regional behaviour; any other UTF-8 entry serves equally
-/// well for `LC_CTYPE`. A host that installs none leaves the fixture asserting
-/// exactly what it asserted before.
-#[cfg(not(windows))]
-fn host_utf8_locale() -> &'static str {
-    static UTF8_LOCALE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    UTF8_LOCALE
-        .get_or_init(|| {
-            let installed = std::process::Command::new("locale")
-                .arg("-a")
-                .output()
-                .ok()?;
-            let installed = String::from_utf8_lossy(&installed.stdout);
-            let names = || installed.lines().map(str::trim);
-            let is_utf8 = |name: &str| {
-                let name = name.to_ascii_lowercase();
-                name.ends_with(".utf-8") || name.ends_with(".utf8") || name == "utf-8"
-            };
-            names()
-                .find(|name| name.eq_ignore_ascii_case("C.UTF-8"))
-                .or_else(|| names().find(|name| name.eq_ignore_ascii_case("en_US.UTF-8")))
-                .or_else(|| names().find(|name| is_utf8(name)))
-                .map(str::to_owned)
-        })
-        .as_deref()
-        .unwrap_or("C.UTF-8")
 }
 
 #[tokio::test]
@@ -871,6 +839,10 @@ async fn replace_transcript_contents(
         .expect("pane transcript mutex must not be poisoned")
         .set_screen_for_test(screen);
 }
+
+#[cfg(not(windows))]
+#[path = "handler_attach_tests/utf8_locale.rs"]
+mod utf8_locale;
 
 #[path = "handler_attach_tests/lifecycle.rs"]
 mod lifecycle;
