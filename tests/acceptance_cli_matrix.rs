@@ -8,6 +8,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rmux_proto::{CONTROL_CONTROL_END, CONTROL_CONTROL_START};
 
+/// Upper bound on how long a freshly spawned interactive shell may keep
+/// `#{pane_current_path}` pointed at a startup helper's directory.
+///
+/// A non-interactive `/bin/sh` settles these seven panes in well under a
+/// second, but a framework-driven interactive login shell runs helpers out of
+/// its own configuration directory and has been measured taking over eleven
+/// seconds on a loaded host.  The bound is deliberately several times that
+/// worst case: it exists to fail with evidence, not to pace the poll.
+const CURRENT_PATH_SETTLE_TIMEOUT: Duration = Duration::from_secs(60);
+const CURRENT_PATH_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 #[test]
 fn cli_acceptance_matrix_exercises_real_daemon_state() -> Result<(), Box<dyn Error>> {
     let harness = AcceptanceHarness::new("cli-matrix")?;
@@ -951,7 +962,11 @@ fn detached_window_spawns_without_c_use_non_attached_caller_cwd() -> Result<(), 
 
     harness.success_in(&session_cwd, ["new-session", "-d", "-s", "cwd-parity"])?;
 
-    // Simple forms exercise the tiny client path.
+    // Simple forms are the ones a `tiny-cli` client dispatches directly.  That
+    // client is neither a default feature nor usable from a cargo target
+    // directory, which has no packaged `libexec/rmux` helper for the commands
+    // it does not implement, so here these forms still take the full CLI path.
+    // The caller-cwd contract is the same either way.
     harness.success_in(
         &caller_cwd,
         ["new-window", "-d", "-t", "cwd-parity", "-n", "tiny-new"],
@@ -993,29 +1008,62 @@ fn detached_window_spawns_without_c_use_non_attached_caller_cwd() -> Result<(), 
     )?;
     harness.success_in(&caller_cwd, [OsStr::new("source-file"), source.as_os_str()])?;
 
-    let panes = harness.stdout(["list-panes", "-a", "-F", "#{pane_current_path}"])?;
-    let paths = panes.lines().map(normalized_path).collect::<Vec<_>>();
-    let expected_session = normalized_path(&session_cwd.to_string_lossy());
-    let expected_caller = normalized_path(&caller_cwd.to_string_lossy());
-    assert_eq!(
-        paths
-            .iter()
-            .filter(|path| **path == expected_session)
-            .count(),
-        1,
-        "only the initial pane should keep the session cwd; paths={paths:?}"
-    );
-    assert_eq!(
-        paths
-            .iter()
-            .filter(|path| **path == expected_caller)
-            .count(),
-        6,
-        "tiny, full, and source-file new/split paths should use the caller cwd; paths={paths:?}"
-    );
-    assert_eq!(paths.len(), 7, "unexpected pane count; paths={paths:?}");
+    let expected = SpawnCwdMultiset {
+        session: normalized_path(&session_cwd.to_string_lossy()),
+        caller: normalized_path(&caller_cwd.to_string_lossy()),
+    };
+
+    // `pane_start_path` is the immutable directory each pane was spawned in, so
+    // the caller-cwd contract is decidable the moment the panes exist.
+    let start_paths = harness.normalized_pane_paths("#{pane_start_path}")?;
+    if let Some(violation) = expected.violation(&start_paths) {
+        return Err(format!("#{{pane_start_path}}: {violation}").into());
+    }
+
+    // `pane_current_path` deliberately resolves the live PTY foreground process
+    // before the spawn profile, so an interactive login shell can briefly report
+    // a startup helper's directory.  It must still converge on the same
+    // immutable multiset.
+    harness.wait_for_current_paths(&expected)?;
 
     Ok(())
+}
+
+/// Spawn directories every entry path must produce: the initial pane keeps the
+/// session cwd, and the six tiny, full-CLI, and source-file new-window and
+/// split-window panes inherit the detached caller cwd.
+struct SpawnCwdMultiset {
+    session: String,
+    caller: String,
+}
+
+impl SpawnCwdMultiset {
+    const CALLER_PANES: usize = 6;
+    const TOTAL_PANES: usize = Self::CALLER_PANES + 1;
+
+    /// Describes the first unmet expectation, or `None` when `paths` matches.
+    fn violation(&self, paths: &[String]) -> Option<String> {
+        if paths.len() != Self::TOTAL_PANES {
+            return Some(format!(
+                "unexpected pane count {}; paths={paths:?}",
+                paths.len()
+            ));
+        }
+        let session = paths.iter().filter(|path| **path == self.session).count();
+        if session != 1 {
+            return Some(format!(
+                "only the initial pane should keep the session cwd, found {session}; paths={paths:?}"
+            ));
+        }
+        let caller = paths.iter().filter(|path| **path == self.caller).count();
+        if caller != Self::CALLER_PANES {
+            return Some(format!(
+                "tiny, full, and source-file new/split paths should use the caller cwd, \
+                 found {caller}; paths={paths:?}"
+            ));
+        }
+        None
+    }
 }
 
 fn normalized_path(path: &str) -> String {
@@ -1097,6 +1145,51 @@ impl AcceptanceHarness {
             .arg(&self.label)
             .args(args);
         Ok(command.output()?)
+    }
+
+    /// Lists one normalized path per pane for `format`, in `list-panes -a`
+    /// order.
+    fn normalized_pane_paths(&self, format: &str) -> Result<Vec<String>, Box<dyn Error>> {
+        Ok(self
+            .stdout(["list-panes", "-a", "-F", format])?
+            .lines()
+            .map(normalized_path)
+            .collect())
+    }
+
+    /// Waits for `#{pane_current_path}` to settle on the spawn directories.
+    ///
+    /// Only observed daemon state ends the wait; the deadline exists to fail
+    /// with the last paths and the foreground commands still holding them.
+    fn wait_for_current_paths(&self, expected: &SpawnCwdMultiset) -> Result<(), Box<dyn Error>> {
+        let deadline = Instant::now() + CURRENT_PATH_SETTLE_TIMEOUT;
+        loop {
+            let paths = self.normalized_pane_paths("#{pane_current_path}")?;
+            let Some(violation) = expected.violation(&paths) else {
+                return Ok(());
+            };
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "#{{pane_current_path}} did not settle on the spawn directories within \
+                     {CURRENT_PATH_SETTLE_TIMEOUT:?}: {violation}\npanes:\n{}",
+                    self.pane_cwd_rows()?
+                )
+                .into());
+            }
+            thread::sleep(CURRENT_PATH_POLL_INTERVAL);
+        }
+    }
+
+    /// Renders one sanitized row per pane — identity, foreground command name,
+    /// and both paths — for settle-timeout evidence.
+    fn pane_cwd_rows(&self) -> Result<String, Box<dyn Error>> {
+        self.stdout([
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id} command=#{pane_current_command} \
+             current=#{pane_current_path} start=#{pane_start_path}",
+        ])
     }
 
     fn wait_for_capture_contains(&self, target: &str, needle: &str) -> Result<(), Box<dyn Error>> {
