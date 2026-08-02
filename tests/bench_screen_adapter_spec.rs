@@ -956,6 +956,52 @@ print(json.dumps({{
     );
 }
 
+/// Redaction is bounded by path components. The temporary root and what is
+/// under it are this host's location; a neighbour that merely shares the root's
+/// spelling is a different path, and reducing it deletes provenance the reader
+/// needs while announcing a redaction that never happened.
+#[test]
+fn redaction_stops_at_the_temporary_root_and_its_descendants() {
+    let observed = driver_json(&format!(
+        "{LOAD_BENCH}
+import tempfile, os
+root = tempfile.gettempdir()
+child = os.path.join(root, 'rmux-bench-screen-x', 'capture.txt')
+print(json.dumps({{
+    'clean_child': bench.sanitize(child),
+    'quoted_child': bench.sanitize(\"hardcopy -h '\" + child + \"'\"),
+    'starts_with_root': root + '-not-a-child',
+    'clean_starts_with_root': bench.sanitize(root + '-not-a-child'),
+    'ends_with_root': 'unrelated' + root,
+    'clean_ends_with_root': bench.sanitize('unrelated' + root),
+}}))
+"
+    ));
+
+    // Still reduced: what is under the root, including the quoted capture file
+    // a failing command records.
+    assert_eq!(
+        observed["clean_child"], "<temp>",
+        "a path under the temporary root is the host location and must be reduced"
+    );
+    assert_eq!(
+        observed["quoted_child"], "hardcopy -h '<temp>'",
+        "the capture file the failing command quotes must be reduced too"
+    );
+
+    // Left alone: neighbours that are neither the root nor under it.
+    assert_eq!(
+        observed["clean_starts_with_root"], observed["starts_with_root"],
+        "a path that only starts with the temporary root is not under it: {}",
+        observed["clean_starts_with_root"]
+    );
+    assert_eq!(
+        observed["clean_ends_with_root"], observed["ends_with_root"],
+        "a path that only ends with the temporary root is not the root: {}",
+        observed["clean_ends_with_root"]
+    );
+}
+
 #[test]
 fn screen_is_ordered_last_and_labelled_by_its_environment() {
     let mut linux = payload("linux", &["screen", "zellij", "tmux", "rmux"]);

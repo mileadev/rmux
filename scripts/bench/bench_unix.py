@@ -1113,11 +1113,20 @@ def temp_path_pattern() -> re.Pattern[str]:
 
     Both the configured and the fully resolved root are matched, longest first,
     so a resolved prefix such as macOS's `/private` cannot be left behind.
+
+    The root counts only on a path-component boundary. A neighbour that merely
+    starts with it, `/tmp-not-a-child` for `/tmp`, and a directory that merely
+    ends with it, `/var/tmp`, are neither the root nor under it; reducing them
+    would delete provenance the reader needs and announce a redaction that
+    never happened.
     """
+    character = r"[^\s'\",;)\]]"
     root = tempfile.gettempdir()
     roots = sorted({root, str(Path(root).resolve())}, key=len, reverse=True)
     alternatives = "|".join(re.escape(candidate) for candidate in roots)
-    return re.compile(rf"(?:{alternatives})(?:[/\\][^\s'\",;)\]]*)?")
+    return re.compile(
+        rf"(?<![\w.~/\\-])(?:{alternatives})(?:[/\\]{character}*)?(?!{character})"
+    )
 
 
 TEMP_PATH = temp_path_pattern()
