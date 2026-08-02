@@ -18,7 +18,7 @@ use crate::input_keys::{encode_key_with_backspace, encode_mouse_event, ExtendedK
 use crate::keys::parse_key_code;
 #[cfg(windows)]
 use crate::pane_terminals::DeferredInitialPaneConsoleInputAction;
-use crate::pane_terminals::{session_not_found, HandlerState};
+use crate::pane_terminals::{session_not_found, HandlerState, PasteDelimiters};
 
 #[cfg(unix)]
 const IMMEDIATE_PANE_INPUT_MAX_BYTES: usize = 256;
@@ -58,11 +58,16 @@ enum PaneInputSink {
 pub(in crate::handler) const LEGACY_CONPTY_NON_UTF8_BRACKETED_PASTE_ERROR: &str =
     "cannot preserve bracketed paste containing non-UTF-8 bytes on this Windows host";
 
+/// Where a pasted body is written on Windows.
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WindowsBracketedPasteSink {
+pub(in crate::handler) enum WindowsPasteSink {
+    /// The pane's ConPTY input pipe.
     Pty,
+    /// Console text records written straight into the pane's input buffer.
     ConsoleUtf8,
+    /// The payload cannot be represented as console records and would lose its
+    /// envelope on the pipe.
     RejectNonUtf8,
 }
 
@@ -127,16 +132,24 @@ pub(in crate::handler) fn prepare_pane_input_write(
     bytes: &[u8],
     liveness: PaneInputLiveness,
 ) -> Result<PaneInputWrite, RmuxError> {
-    prepare_pane_input_write_with_encoding(state, target, bytes, liveness, false)
+    prepare_pane_input_write_with_encoding(state, target, bytes, liveness, None)
 }
 
+/// Prepares a write for a pasted body, which must reach the destination byte
+/// for byte.
+///
+/// `delimiters` says whether the payload carries the bracketed-paste envelope
+/// the destination announced. It is not what selects the Windows sink — a
+/// legacy ConPTY consumes control sequences from the raw input pipe whether or
+/// not an envelope surrounds them — only what an unrepresentable payload means.
 pub(in crate::handler) fn prepare_pane_bracketed_paste_write(
     state: &mut HandlerState,
     target: &PaneTarget,
     bytes: &[u8],
     liveness: PaneInputLiveness,
+    delimiters: PasteDelimiters,
 ) -> Result<PaneInputWrite, RmuxError> {
-    prepare_pane_input_write_with_encoding(state, target, bytes, liveness, true)
+    prepare_pane_input_write_with_encoding(state, target, bytes, liveness, Some(delimiters))
 }
 
 fn prepare_pane_input_write_with_encoding(
@@ -144,7 +157,7 @@ fn prepare_pane_input_write_with_encoding(
     target: &PaneTarget,
     bytes: &[u8],
     liveness: PaneInputLiveness,
-    preserve_bracketed_paste: bool,
+    paste: Option<PasteDelimiters>,
 ) -> Result<PaneInputWrite, RmuxError> {
     let session_name = target.session_name().clone();
     let window_index = target.window_index();
@@ -170,12 +183,13 @@ fn prepare_pane_input_write_with_encoding(
         });
     }
     #[cfg(windows)]
-    if if preserve_bracketed_paste {
-        state.queue_starting_pane_bracketed_paste_input(
+    if if let Some(delimiters) = paste {
+        state.queue_starting_pane_paste_input(
             &session_name,
             window_index,
             pane_index,
             bytes,
+            delimiters,
         )?
     } else {
         state.queue_starting_pane_input(&session_name, window_index, pane_index, bytes)?
@@ -196,10 +210,10 @@ fn prepare_pane_input_write_with_encoding(
         }
     };
     #[cfg(windows)]
-    if preserve_bracketed_paste {
-        match windows_bracketed_paste_sink(master.preserves_verbatim_input(), bytes) {
-            WindowsBracketedPasteSink::Pty => {}
-            WindowsBracketedPasteSink::ConsoleUtf8 => {
+    if let Some(delimiters) = paste {
+        match windows_paste_sink(master.preserves_verbatim_input(), bytes, delimiters) {
+            WindowsPasteSink::Pty => {}
+            WindowsPasteSink::ConsoleUtf8 => {
                 let raw_pid = state.pane_pid_in_window(&session_name, window_index, pane_index)?;
                 let pid = ProcessId::new(raw_pid)
                     .map_err(|error| RmuxError::Server(error.to_string()))?;
@@ -210,7 +224,7 @@ fn prepare_pane_input_write_with_encoding(
                     sink: PaneInputSink::ConsoleUtf8(pid),
                 });
             }
-            WindowsBracketedPasteSink::RejectNonUtf8 => {
+            WindowsPasteSink::RejectNonUtf8 => {
                 return Err(RmuxError::Message(
                     LEGACY_CONPTY_NON_UTF8_BRACKETED_PASTE_ERROR.to_owned(),
                 ));
@@ -218,7 +232,7 @@ fn prepare_pane_input_write_with_encoding(
         }
     }
     #[cfg(not(windows))]
-    let _ = preserve_bracketed_paste;
+    let _ = paste;
     #[cfg(not(any(test, windows)))]
     let _ = bytes;
     Ok(PaneInputWrite {
@@ -229,17 +243,33 @@ fn prepare_pane_input_write_with_encoding(
     })
 }
 
+/// Chooses the sink a pasted body reaches its destination through.
+///
+/// The decision is the host's ConPTY capability, never the destination's own
+/// bracketed-paste mode: a legacy build's input state machine parses and
+/// consumes control sequences from the raw pipe, so an unaware destination
+/// loses a pasted `ESC[…` exactly as an aware one loses its delimiters. Only a
+/// payload the console records cannot carry still depends on `delimiters`.
 #[cfg(windows)]
-fn windows_bracketed_paste_sink(
+pub(in crate::handler) fn windows_paste_sink(
     preserves_verbatim_input: bool,
     bytes: &[u8],
-) -> WindowsBracketedPasteSink {
+    delimiters: PasteDelimiters,
+) -> WindowsPasteSink {
     if preserves_verbatim_input {
-        WindowsBracketedPasteSink::Pty
-    } else if std::str::from_utf8(bytes).is_ok() {
-        WindowsBracketedPasteSink::ConsoleUtf8
-    } else {
-        WindowsBracketedPasteSink::RejectNonUtf8
+        return WindowsPasteSink::Pty;
+    }
+    if std::str::from_utf8(bytes).is_ok() {
+        return WindowsPasteSink::ConsoleUtf8;
+    }
+    match delimiters {
+        // The console path is the only one that keeps an envelope on this
+        // host, so a paste it cannot represent must be refused rather than
+        // silently delivered to the destination as live input.
+        PasteDelimiters::Wrapped => WindowsPasteSink::RejectNonUtf8,
+        // A bare body has no envelope to lose. Refusing it would turn input
+        // that the byte-oriented path has always carried into an error.
+        PasteDelimiters::Bare => WindowsPasteSink::Pty,
     }
 }
 
@@ -1554,7 +1584,7 @@ mod tests {
 
 #[cfg(all(test, windows))]
 mod windows_tests {
-    use crate::pane_terminals::DeferredInitialPaneConsoleInputAction;
+    use crate::pane_terminals::{DeferredInitialPaneConsoleInputAction, PasteDelimiters};
     use rmux_proto::ProcessCommand;
     use rmux_pty::WindowsConsoleKeyEvent;
 
@@ -1646,18 +1676,55 @@ mod windows_tests {
         let bracketed = b"\x1b[200~alpha\r\nbeta\x1b[201~";
 
         assert_eq!(
-            super::windows_bracketed_paste_sink(false, bracketed),
-            super::WindowsBracketedPasteSink::ConsoleUtf8
+            super::windows_paste_sink(false, bracketed, PasteDelimiters::Wrapped),
+            super::WindowsPasteSink::ConsoleUtf8
         );
         assert_eq!(
-            super::windows_bracketed_paste_sink(true, bracketed),
-            super::WindowsBracketedPasteSink::Pty,
+            super::windows_paste_sink(true, bracketed, PasteDelimiters::Wrapped),
+            super::WindowsPasteSink::Pty,
             "passthrough ConPTY must retain the byte-oriented path"
         );
         assert_eq!(
-            super::windows_bracketed_paste_sink(false, b"\x1b[200~invalid \xff\x1b[201~"),
-            super::WindowsBracketedPasteSink::RejectNonUtf8,
+            super::windows_paste_sink(
+                false,
+                b"\x1b[200~invalid \xff\x1b[201~",
+                PasteDelimiters::Wrapped
+            ),
+            super::WindowsPasteSink::RejectNonUtf8,
             "legacy ConPTY must not silently strip the paste delimiters"
+        );
+    }
+
+    /// A legacy ConPTY's input state machine parses and consumes the control
+    /// sequences inside a pasted body, so a destination that never announced
+    /// `?2004h` loses `ESC[9;2u` exactly as an aware one loses its delimiters.
+    /// Selecting the sink from the destination's mode is what left the bare
+    /// body on the raw pipe.
+    #[test]
+    fn a_bare_paste_body_takes_the_same_console_sink_as_a_wrapped_one() {
+        let body = "alpha\r\n\u{1b}[9;2u \u{1b}[<64;2;2M omega".as_bytes();
+
+        assert_eq!(
+            super::windows_paste_sink(false, body, PasteDelimiters::Bare),
+            super::WindowsPasteSink::ConsoleUtf8,
+            "a bare body must not be left on the sequence-consuming raw pipe"
+        );
+        assert_eq!(
+            super::windows_paste_sink(true, body, PasteDelimiters::Bare),
+            super::WindowsPasteSink::Pty,
+            "a passthrough ConPTY already carries the body verbatim"
+        );
+    }
+
+    /// The asymmetry the disposition exists for: refusing a paste protects an
+    /// envelope this host cannot otherwise keep, and a bare body has none. It
+    /// must therefore keep the path that has always carried it rather than
+    /// become an error.
+    #[test]
+    fn a_bare_paste_body_that_is_not_utf8_keeps_the_byte_oriented_path() {
+        assert_eq!(
+            super::windows_paste_sink(false, b"invalid \xff bytes", PasteDelimiters::Bare),
+            super::WindowsPasteSink::Pty
         );
     }
 

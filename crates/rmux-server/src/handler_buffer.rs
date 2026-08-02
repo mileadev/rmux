@@ -16,7 +16,7 @@ use super::RequestHandler;
 use crate::buffer_file_io;
 use crate::outer_terminal::OuterTerminal;
 use crate::pane_io::AttachControl;
-use crate::pane_terminals::{session_not_found, PaneCaptureRequest};
+use crate::pane_terminals::{session_not_found, PaneCaptureRequest, PasteDelimiters};
 
 #[path = "handler_buffer/capture_format.rs"]
 mod capture_format;
@@ -365,8 +365,11 @@ impl RequestHandler {
                     target,
                     &payload,
                     PaneInputLiveness::RejectDead,
+                    PasteDelimiters::Wrapped,
                 )
             } else {
+                // Without an effective envelope `paste-buffer` inserts the
+                // buffer as input, which is the byte-oriented path's contract.
                 prepare_pane_input_write(
                     &mut state,
                     target,

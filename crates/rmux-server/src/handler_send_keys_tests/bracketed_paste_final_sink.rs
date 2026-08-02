@@ -295,6 +295,53 @@ async fn synchronized_mixed_panes_recompute_mode_per_child_when_the_active_pane_
 }
 
 // ---------------------------------------------------------------------------
+// Child-observed ordering
+// ---------------------------------------------------------------------------
+
+/// Ordering is what the child read, not the order the server awaited.
+///
+/// A keystroke and a pasted body do not share a transport. On Windows the
+/// keystroke is written to the pane's ConPTY input pipe while the paste is
+/// written as console records straight into that pane's input buffer, so the
+/// two reach the same console through different Win32 entry points and a
+/// correct await order alone does not settle what the child reads first. On
+/// Unix both take the pseudoterminal. Either way the child must observe
+/// `key -> paste -> key`.
+async fn assert_paste_arrives_between_the_keystrokes(label: &str, bracket_aware: bool) {
+    let handler = RequestHandler::new();
+    let session = session_name(label);
+    let body = b"yy";
+    let wrapped_body = wrapped(body);
+    let mut expected = b"x".to_vec();
+    expected.extend_from_slice(if bracket_aware { &wrapped_body } else { body });
+    expected.extend_from_slice(b"z");
+    let slot = FinalSinkSlot::new(label, &expected, bracket_aware);
+
+    started_final_sink_pane(&handler, &session, &slot, bracket_aware).await;
+    let requester_pid = attach_to(&handler, &session).await;
+    for chunk in [b"x".as_slice(), &wrapped_body, b"z".as_slice()] {
+        handler
+            .handle_attached_live_input_for_test(requester_pid, chunk)
+            .await
+            .expect("attached input");
+    }
+
+    slot.assert_application_bytes(
+        "the child must read the paste between the keystrokes that bracket it",
+    );
+}
+
+#[tokio::test]
+async fn a_paste_reaches_an_aware_child_between_the_keystrokes_that_bracket_it() {
+    assert_paste_arrives_between_the_keystrokes("final-sink-order-aware", true).await;
+}
+
+#[tokio::test]
+async fn a_paste_reaches_an_unaware_child_between_the_keystrokes_that_bracket_it() {
+    assert_paste_arrives_between_the_keystrokes("final-sink-order-unaware", false).await;
+}
+
+// ---------------------------------------------------------------------------
 // Negative controls
 // ---------------------------------------------------------------------------
 //

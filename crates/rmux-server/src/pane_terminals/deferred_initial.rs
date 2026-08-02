@@ -12,7 +12,7 @@ use super::{
     DeferredInitialPaneConsoleInputAction, DeferredInitialPaneIdentity, DeferredInitialPaneInput,
     DeferredInitialPaneInputDrain, DeferredInitialPaneInputFlush, DeferredInitialPaneSpawn,
     HandlerState, InitialPaneSpawnOptions, PaneExitMetadata, PaneLifecycleSpawn, PaneOutputSpawn,
-    StartingPane, WindowNameApplication,
+    PasteDelimiters, StartingPane, WindowNameApplication,
 };
 
 const STARTING_PANE_INPUT_MAX_BYTES: usize = 64 * 1024;
@@ -481,12 +481,13 @@ impl HandlerState {
         )
     }
 
-    pub(crate) fn queue_starting_pane_bracketed_paste_input(
+    pub(crate) fn queue_starting_pane_paste_input(
         &mut self,
         session_name: &SessionName,
         window_index: u32,
         pane_index: u32,
         bytes: &[u8],
+        delimiters: PasteDelimiters,
     ) -> Result<bool, RmuxError> {
         if bytes.is_empty() {
             return Ok(false);
@@ -495,7 +496,10 @@ impl HandlerState {
             session_name,
             window_index,
             pane_index,
-            DeferredInitialPaneInput::BracketedPaste(bytes.to_vec()),
+            DeferredInitialPaneInput::Paste {
+                bytes: bytes.to_vec(),
+                delimiters,
+            },
         )
     }
 

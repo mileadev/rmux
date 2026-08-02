@@ -4,7 +4,7 @@ use rmux_proto::{SessionName, TerminalSize};
 
 use super::{
     DeferredInitialPaneInput, DeferredInitialPaneInputDrain, DeferredInitialPaneSpawn,
-    HandlerState, InitialPaneSpawnOptions,
+    HandlerState, InitialPaneSpawnOptions, PasteDelimiters,
 };
 
 fn session_name(value: &str) -> SessionName {
@@ -123,7 +123,7 @@ fn starting_pane_keeps_bracketed_paste_distinct_from_plain_bytes() {
     let payload = b"\x1b[200~alpha\nbeta\x1b[201~";
 
     assert!(state
-        .queue_starting_pane_bracketed_paste_input(&session, 0, 0, payload)
+        .queue_starting_pane_paste_input(&session, 0, 0, payload, PasteDelimiters::Wrapped)
         .expect("bracketed paste queues while the pane starts"));
 
     let starting = state
@@ -133,7 +133,42 @@ fn starting_pane_keeps_bracketed_paste_distinct_from_plain_bytes() {
         .expect("starting pane remains registered");
     assert_eq!(
         starting.queued_input.front(),
-        Some(&DeferredInitialPaneInput::BracketedPaste(payload.to_vec()))
+        Some(&DeferredInitialPaneInput::Paste {
+            bytes: payload.to_vec(),
+            delimiters: PasteDelimiters::Wrapped,
+        })
+    );
+    assert_eq!(starting.queued_input_bytes, payload.len());
+    state.shutdown_terminals_for_test();
+}
+
+/// A body queued for a destination that never announced `?2004h` is still a
+/// paste, so it must reach the flush as one. Queuing it as plain bytes is what
+/// sent it through the raw ConPTY pipe, where a legacy input state machine
+/// parses and consumes the control sequences inside the pasted content.
+#[test]
+fn a_bare_paste_body_is_queued_as_a_paste_and_keeps_its_disposition() {
+    let mut state = HandlerState::default();
+    let session = session_name("deferred-bare-paste");
+    let job = prepare_deferred_session(&mut state, &session);
+    let payload = "alpha\r\n\u{1b}[9;2u omega".as_bytes();
+
+    assert!(state
+        .queue_starting_pane_paste_input(&session, 0, 0, payload, PasteDelimiters::Bare)
+        .expect("a bare paste body queues while the pane starts"));
+
+    let starting = state
+        .starting_panes
+        .get(&job.runtime_session_name)
+        .and_then(|panes| panes.get(&job.identity.pane_id()))
+        .expect("starting pane remains registered");
+    assert_eq!(
+        starting.queued_input.front(),
+        Some(&DeferredInitialPaneInput::Paste {
+            bytes: payload.to_vec(),
+            delimiters: PasteDelimiters::Bare,
+        }),
+        "a bare body must not be demoted to plain queued bytes"
     );
     assert_eq!(starting.queued_input_bytes, payload.len());
     state.shutdown_terminals_for_test();
@@ -154,7 +189,7 @@ fn queued_bracketed_paste_is_charged_against_the_starting_input_limit() {
     while queued + chunk.len() <= limit {
         assert!(
             state
-                .queue_starting_pane_bracketed_paste_input(&session, 0, 0, &chunk)
+                .queue_starting_pane_paste_input(&session, 0, 0, &chunk, PasteDelimiters::Wrapped)
                 .expect("a bracketed paste below the limit queues"),
             "the pane is still starting, so the paste must be queued"
         );
@@ -166,7 +201,7 @@ fn queued_bracketed_paste_is_charged_against_the_starting_input_limit() {
     );
 
     let overflow = state
-        .queue_starting_pane_bracketed_paste_input(&session, 0, 0, b"x")
+        .queue_starting_pane_paste_input(&session, 0, 0, b"x", PasteDelimiters::Wrapped)
         .expect_err("one byte past the limit must be rejected");
     assert!(
         overflow.to_string().contains("input queue is full"),

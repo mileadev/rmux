@@ -201,11 +201,31 @@ pub(crate) enum DeferredInitialPaneConsoleInputAction {
     Interrupt,
 }
 
+/// Whether a pasted payload carries the bracketed-paste delimiters.
+///
+/// A pasted body must reach its destination byte for byte either way, so both
+/// dispositions take the same Windows paste sink; a legacy ConPTY parses and
+/// consumes control sequences written through the raw input pipe whether or
+/// not an envelope surrounds them. The disposition only decides what a payload
+/// the console records cannot represent means: losing an envelope leaves a
+/// paste the destination asked for delivered as live input, while a bare body
+/// has no envelope to lose and keeps the byte-oriented path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PasteDelimiters {
+    /// The destination announced `?2004h`, so the payload is wrapped.
+    Wrapped,
+    /// The destination never announced it, so the payload is the bare body.
+    Bare,
+}
+
 #[cfg(windows)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DeferredInitialPaneInput {
     Bytes(Vec<u8>),
-    BracketedPaste(Vec<u8>),
+    Paste {
+        bytes: Vec<u8>,
+        delimiters: PasteDelimiters,
+    },
     Console {
         action: DeferredInitialPaneConsoleInputAction,
         byte_len: usize,
@@ -216,7 +236,7 @@ pub(crate) enum DeferredInitialPaneInput {
 impl DeferredInitialPaneInput {
     fn byte_len(&self) -> usize {
         match self {
-            Self::Bytes(bytes) | Self::BracketedPaste(bytes) => bytes.len(),
+            Self::Bytes(bytes) | Self::Paste { bytes, .. } => bytes.len(),
             Self::Console { byte_len, .. } => *byte_len,
         }
     }
