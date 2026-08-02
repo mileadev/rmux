@@ -156,6 +156,40 @@ async fn create_attached_session(
     control_rx
 }
 
+/// Creates the same attached session as [`create_attached_session`], with the
+/// pane shell pinned to a UTF-8 locale.
+///
+/// A fixture that types a multi-byte character into a real shell cannot inherit
+/// whatever `LC_CTYPE` the host account happens to export: a shell started in a
+/// single-byte locale discards those bytes in its own line editor, before rmux
+/// is ever observed handling them.
+#[cfg(not(windows))]
+async fn create_attached_session_in_utf8_locale(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    session: &SessionName,
+) -> mpsc::UnboundedReceiver<AttachControl> {
+    #[cfg(unix)]
+    set_unix_test_shell(handler, session).await;
+
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: session.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: utf8_locale::fixture_environment(),
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, session.clone(), control_tx)
+        .await;
+    control_rx
+}
+
 #[tokio::test]
 async fn web_render_refreshes_are_marked_pending_before_building_switches() {
     let handler = RequestHandler::new();
@@ -805,6 +839,10 @@ async fn replace_transcript_contents(
         .expect("pane transcript mutex must not be poisoned")
         .set_screen_for_test(screen);
 }
+
+#[cfg(not(windows))]
+#[path = "handler_attach_tests/utf8_locale.rs"]
+mod utf8_locale;
 
 #[path = "handler_attach_tests/lifecycle.rs"]
 mod lifecycle;
