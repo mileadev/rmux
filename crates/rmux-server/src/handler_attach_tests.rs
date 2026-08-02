@@ -156,6 +156,72 @@ async fn create_attached_session(
     control_rx
 }
 
+/// Creates the same attached session as [`create_attached_session`], with the
+/// pane shell pinned to a UTF-8 locale.
+///
+/// A fixture that types a multi-byte character into a real shell cannot inherit
+/// whatever `LC_CTYPE` the host account happens to export: a shell started in a
+/// single-byte locale discards those bytes in its own line editor, before rmux
+/// is ever observed handling them.
+#[cfg(not(windows))]
+async fn create_attached_session_in_utf8_locale(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    session: &SessionName,
+) -> mpsc::UnboundedReceiver<AttachControl> {
+    #[cfg(unix)]
+    set_unix_test_shell(handler, session).await;
+
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: session.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: Some(vec![format!("LC_ALL={}", host_utf8_locale())]),
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, session.clone(), control_tx)
+        .await;
+    control_rx
+}
+
+/// Names a UTF-8 locale this host actually installs.
+///
+/// Locale names are not portable, so the value is read from the host instead of
+/// assumed. `C.UTF-8` and `en_US.UTF-8` are preferred because they are the two
+/// that carry no other regional behaviour; any other UTF-8 entry serves equally
+/// well for `LC_CTYPE`. A host that installs none leaves the fixture asserting
+/// exactly what it asserted before.
+#[cfg(not(windows))]
+fn host_utf8_locale() -> &'static str {
+    static UTF8_LOCALE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    UTF8_LOCALE
+        .get_or_init(|| {
+            let installed = std::process::Command::new("locale")
+                .arg("-a")
+                .output()
+                .ok()?;
+            let installed = String::from_utf8_lossy(&installed.stdout);
+            let names = || installed.lines().map(str::trim);
+            let is_utf8 = |name: &str| {
+                let name = name.to_ascii_lowercase();
+                name.ends_with(".utf-8") || name.ends_with(".utf8") || name == "utf-8"
+            };
+            names()
+                .find(|name| name.eq_ignore_ascii_case("C.UTF-8"))
+                .or_else(|| names().find(|name| name.eq_ignore_ascii_case("en_US.UTF-8")))
+                .or_else(|| names().find(|name| is_utf8(name)))
+                .map(str::to_owned)
+        })
+        .as_deref()
+        .unwrap_or("C.UTF-8")
+}
+
 #[tokio::test]
 async fn web_render_refreshes_are_marked_pending_before_building_switches() {
     let handler = RequestHandler::new();

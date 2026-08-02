@@ -508,7 +508,7 @@ async fn attached_live_input_preserves_split_utf8_sequences() {
     #[cfg(windows)]
     let _control_rx = create_line_echo_attached_session(&handler, requester_pid, &alpha).await;
     #[cfg(not(windows))]
-    let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let _control_rx = create_attached_session_in_utf8_locale(&handler, requester_pid, &alpha).await;
     let target = PaneTarget::new(alpha.clone(), 0);
     #[cfg(not(windows))]
     prepare_attached_shell_prompt(&handler, &target).await;
