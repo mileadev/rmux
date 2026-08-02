@@ -14,15 +14,34 @@ async fn linked_two_pane_fixture(handler: &RequestHandler, label: &str) -> Linke
     create_session(handler, owner.as_str()).await;
     create_grouped_session(handler, grouped_peer.as_str(), &owner).await;
 
+    // The default command is an interactive shell whose startup output is
+    // unbounded in time. Split the quiet command every other fixture pane runs
+    // so this window stops producing pane activity once its panes are up.
     let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(owner.clone()),
-            direction: SplitDirection::Vertical,
-            before: false,
-            environment: None,
-        }))
+        .handle(Request::SplitWindowExt(Box::new(
+            rmux_proto::SplitWindowExtRequest {
+                target: SplitWindowTarget::Session(owner.clone()),
+                direction: SplitDirection::Vertical,
+                before: false,
+                environment: None,
+                command: Some(quiet_window_test_command()),
+                process_command: None,
+                start_directory: None,
+                keep_alive_on_exit: None,
+                detached: false,
+                size: None,
+                preserve_zoom: false,
+                full_size: false,
+                stdin_payload: None,
+            },
+        )))
         .await;
-    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
+    let Response::SplitWindow(split) = split else {
+        panic!("expected split-window response, got {split:?}");
+    };
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&split.pane)
+        .await;
 
     create_session(handler, linked_peer.as_str()).await;
     let linked = handler
@@ -60,12 +79,67 @@ async fn linked_two_pane_fixture(handler: &RequestHandler, label: &str) -> Linke
             .id()
     };
 
-    LinkedPaneFixture {
+    let fixture = LinkedPaneFixture {
         owner,
         grouped_peer,
         linked_peer,
         pane_one_id,
+    };
+    settle_linked_fixture_activity(handler, &fixture).await;
+    fixture
+}
+
+/// Waits until the fixture's shared window stops recording pane activity.
+///
+/// The fixture runs real pane processes, and output from a pane that is not its
+/// session's active pane refreshes every attached client of the linked family:
+/// `pane_alert_callback` coalesces such output for 50 ms and then calls
+/// `refresh_attached_session` once per family member, which reaches every client
+/// of those sessions. That refresh is correct and independent of the command
+/// under test, so a client's control channel only reports what a command sent
+/// once the panes behind it are quiet. Draining the channels is not enough on
+/// its own: the drain stops after a fixed idle window while pane startup can
+/// still be running.
+async fn settle_linked_fixture_activity(handler: &RequestHandler, fixture: &LinkedPaneFixture) {
+    const POLL_INTERVAL: Duration = Duration::from_millis(25);
+    const STABLE_FOR: Duration = Duration::from_millis(300);
+    const SETTLE_TIMEOUT: Duration = Duration::from_secs(15);
+
+    let target = WindowTarget::with_window(fixture.owner.clone(), 0);
+    let deadline = tokio::time::Instant::now() + SETTLE_TIMEOUT;
+    let mut previous = linked_fixture_activity(handler, &target).await;
+    let mut stable_since = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep(POLL_INTERVAL).await;
+        let current = linked_fixture_activity(handler, &target).await;
+        let now = tokio::time::Instant::now();
+        if current == previous {
+            if now.duration_since(stable_since) >= STABLE_FOR {
+                return;
+            }
+        } else {
+            previous = current;
+            stable_since = now;
+        }
+        assert!(
+            now < deadline,
+            "linked fixture pane activity did not settle for {target}: {previous:?}"
+        );
     }
+}
+
+async fn linked_fixture_activity(handler: &RequestHandler, target: &WindowTarget) -> Vec<i64> {
+    let state = handler.state.lock().await;
+    let Some(window) = state
+        .sessions
+        .session(target.session_name())
+        .and_then(|session| session.window_at(target.window_index()))
+    else {
+        return Vec::new();
+    };
+    std::iter::once(window.activity_at())
+        .chain(window.panes().iter().map(rmux_core::Pane::activity_at))
+        .collect()
 }
 
 async fn assert_linked_active_pane(
