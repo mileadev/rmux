@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::pin::Pin;
 
 use rmux_ipc::PeerIdentity;
 use rmux_os::identity::UserIdentity;
@@ -33,11 +34,26 @@ tokio::task_local! {
 /// keeps every request that connection dispatches on the identity that
 /// connection was admitted under, whatever else currently shares its pid
 /// (issue #182).
-pub(crate) async fn with_authenticated_connection_peer<T, F>(peer: PeerIdentity, future: F) -> T
+///
+/// The scope owns the connection body behind a pointer rather than inline.
+/// A connection body reaches the whole request-dispatch tree, so its state
+/// machine is one of the deepest types in the server, and `rustc` runs one
+/// layout query per level a type is nested under. Holding the body inline
+/// stacked this scope's own levels onto the accept loop's and pushed the
+/// layout of a connection task past rustc's default query-depth budget, so no
+/// ordinary debug build of `rmux` or `rmux-daemon` compiled. Erasing the body
+/// costs the caller one pointer however deep the body it guards grows, and the
+/// scope still wraps every poll of that body.
+pub(crate) fn with_authenticated_connection_peer<'body, T, F>(
+    peer: PeerIdentity,
+    future: F,
+) -> impl Future<Output = T> + Send + 'body
 where
-    F: Future<Output = T>,
+    F: Future<Output = T> + Send + 'body,
+    T: 'body,
 {
-    AUTHENTICATED_CONNECTION_PEER.scope(peer, future).await
+    let future: Pin<Box<dyn Future<Output = T> + Send + 'body>> = Box::pin(future);
+    AUTHENTICATED_CONNECTION_PEER.scope(peer, future)
 }
 
 /// The peer of the connection this task serves, when the request really is
@@ -275,5 +291,75 @@ impl RequestHandler {
             .by_pid
             .get(&identity.requester_pid())
             .map(|active| (active.user.clone(), active.can_write))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::{pending, ready};
+
+    use rmux_os::identity::UserIdentity;
+
+    use super::{current_connection_peer, with_authenticated_connection_peer, PeerIdentity};
+
+    fn test_peer(pid: u32, uid: u32) -> PeerIdentity {
+        PeerIdentity {
+            pid,
+            uid,
+            user: UserIdentity::Uid(uid),
+        }
+    }
+
+    /// The build seam: opening the scope must cost its caller a pointer, not
+    /// the guarded body's whole state machine.
+    ///
+    /// `rustc` runs one layout query per level a type is nested under, and a
+    /// connection body is deep enough that holding it inline here overflowed
+    /// the default query-depth budget for every ordinary debug build of `rmux`
+    /// and `rmux-daemon`. The falsifiable form of "this scope does not nest
+    /// its body" is that the scope's own size does not move when the body's
+    /// size does, whatever either size happens to be. The task-local is
+    /// private to this module, so no caller can open the scope another way.
+    #[test]
+    fn the_peer_scope_costs_the_same_whatever_body_it_guards() {
+        const PADDING: usize = 64 * 1024;
+
+        let small = ready(());
+        let large = async {
+            let padding = [0_u8; PADDING];
+            pending::<()>().await;
+            std::hint::black_box(padding);
+        };
+        assert!(
+            std::mem::size_of_val(&large) >= PADDING,
+            "the large probe body must really carry its padding across the await"
+        );
+
+        let scoped_small = with_authenticated_connection_peer(test_peer(1, 1), small);
+        let scoped_large = with_authenticated_connection_peer(test_peer(1, 1), large);
+        assert_eq!(
+            std::mem::size_of_val(&scoped_small),
+            std::mem::size_of_val(&scoped_large),
+            "the peer scope must hold its connection body behind a pointer"
+        );
+    }
+
+    /// Erasing the body must not narrow what it is scoped to: the connection's
+    /// peer is what the body reads on every poll, not only on its first.
+    #[tokio::test]
+    async fn every_poll_of_a_scoped_body_reads_the_connection_peer() {
+        let peer = test_peer(std::process::id().wrapping_add(18_211), 18_211);
+        let pid = peer.pid;
+
+        let read = with_authenticated_connection_peer(peer.clone(), async move {
+            let first = current_connection_peer(pid);
+            // Yielding ends the poll this scope set the peer for, so the next
+            // poll has to set it again.
+            tokio::task::yield_now().await;
+            [first, current_connection_peer(pid)]
+        })
+        .await;
+
+        assert_eq!(read, [Some(peer.clone()), Some(peer)]);
     }
 }
