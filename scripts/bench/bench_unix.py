@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import statistics
 import subprocess
@@ -1107,6 +1108,32 @@ def screen_operations(executable: str, iterations: int) -> dict[str, MeasuredOpe
     }
 
 
+def temp_path_pattern() -> re.Pattern[str]:
+    """Match this host's temporary directory, with or without a path under it.
+
+    Both the configured and the fully resolved root are matched, longest first,
+    so a resolved prefix such as macOS's `/private` cannot be left behind.
+    """
+    root = tempfile.gettempdir()
+    roots = sorted({root, str(Path(root).resolve())}, key=len, reverse=True)
+    alternatives = "|".join(re.escape(candidate) for candidate in roots)
+    return re.compile(rf"(?:{alternatives})(?:[/\\][^\s'\",;)\]]*)?")
+
+
+TEMP_PATH = temp_path_pattern()
+
+
+def sanitize(text: str) -> str:
+    """Replace absolute temporary paths with a placeholder.
+
+    A failure note quotes the command that failed, and the capture operations
+    hand that command a private temporary file. The published artifact keeps
+    which tool failed on which operation, never the host location that held
+    the capture.
+    """
+    return TEMP_PATH.sub("<temp>", text)
+
+
 def measure(
     operation: MeasuredOperation,
     iterations: int,
@@ -1134,7 +1161,7 @@ def relative_or_string(path: Path | None) -> str | None:
     try:
         return str(resolved.relative_to(ROOT))
     except ValueError:
-        return str(resolved)
+        return sanitize(str(resolved))
 
 
 def collect(
@@ -1250,7 +1277,7 @@ def collect(
                     f"    done p50={result['p50_ms']:.3f}ms p95={result['p95_ms']:.3f}ms",
                 )
             else:
-                message = error or f"{tool}/{label}: failed"
+                message = sanitize(error or f"{tool}/{label}: failed")
                 errors.append(message)
                 progress(progress_enabled, f"    {message}")
             write_json_atomic(out, payload(complete=False))

@@ -147,6 +147,50 @@ fn write_screen_stub(directory: &Path) -> PathBuf {
     }
 }
 
+/// A stand-in for GNU screen whose sessions start but whose control commands
+/// fail, which is how a capture operation reports a failure that quotes the
+/// private temporary file it was capturing into.
+fn write_capture_failing_stub(directory: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let path = directory.join("screen.cmd");
+        fs::write(
+            &path,
+            format!(
+                "@echo off\r\n\
+                 if \"%~1\"==\"-v\" goto version\r\n\
+                 if \"%~1\"==\"-dmS\" exit /b 0\r\n\
+                 exit /b 1\r\n\
+                 :version\r\n\
+                 echo {SCREEN_BANNER}\r\n\
+                 exit /b 1\r\n"
+            ),
+        )
+        .expect("write failing screen stub");
+        path
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = directory.join("screen");
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n\
+                 case \"$1\" in\n\
+                 -v) echo '{SCREEN_BANNER}'; exit 1 ;;\n\
+                 -dmS) exit 0 ;;\n\
+                 esac\n\
+                 exit 1\n"
+            ),
+        )
+        .expect("write failing screen stub");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .expect("mark stub executable");
+        path
+    }
+}
+
 /// The real GNU screen on this host, when it has one. GNU screen has no native
 /// Windows build, so these cases are Unix-only and skip rather than pretend.
 #[cfg(unix)]
@@ -728,6 +772,127 @@ fn a_real_screen_measures_all_eight_comparable_operations() {
         "all eight screen-comparable operations must carry a measurement"
     );
     fs::remove_dir_all(&workspace).expect("remove native accounting workspace");
+}
+
+/// A published artifact records which tool failed on which operation. It must
+/// not also record where this host keeps its temporary files.
+#[test]
+fn an_omission_note_does_not_publish_a_host_temporary_path() {
+    let workspace = temp_dir("screen-note-redaction");
+    let stub = write_capture_failing_stub(&workspace);
+    let artifact = workspace.join("screen.json");
+    let path = format!(
+        "{}{}{}",
+        workspace.display(),
+        if cfg!(windows) { ";" } else { ":" },
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = python3::command()
+        .arg("scripts/bench/bench_unix.py")
+        .arg("--out")
+        .arg(&artifact)
+        .args(["--iterations", "1"])
+        .arg("--binary")
+        .arg(&stub)
+        .args(["--only-tools", "screen"])
+        .args(["--only-operations", "capture_pane_80x24"])
+        .arg("--quiet")
+        .env("PATH", &path)
+        .current_dir(repo_root())
+        .output()
+        .expect("failed to run bench_unix.py");
+    assert!(
+        output.status.success(),
+        "{}",
+        describe("bench_unix.py", &output)
+    );
+
+    let collected: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&artifact).expect("read artifact"))
+            .expect("parse artifact");
+    let notes = collected["notes"].as_array().expect("notes");
+    assert_eq!(
+        notes.len(),
+        1,
+        "the spec is vacuous unless the capture really failed and was recorded: {notes:?}"
+    );
+    let note = notes[0].as_str().expect("note text");
+
+    // Provenance the reader needs.
+    assert!(
+        note.starts_with("screen/capture_pane_80x24:"),
+        "the note must still say which tool failed on which operation: {note}"
+    );
+    assert!(
+        note.contains("hardcopy"),
+        "the note must still say which command failed: {note}"
+    );
+    // The placeholder proves a temporary path really was present and replaced.
+    assert!(
+        note.contains("<temp>"),
+        "the spec is vacuous unless the failing command really quoted a temporary path: {note}"
+    );
+
+    let temp_root = std::env::temp_dir();
+    let temp_root = temp_root.to_string_lossy();
+    assert!(
+        !note.contains(temp_root.trim_end_matches(['/', '\\'])),
+        "the note must not disclose this host's temporary location: {note}"
+    );
+    fs::remove_dir_all(&workspace).expect("remove note redaction workspace");
+}
+
+/// The exact note the collector recorded when the scrollback session died: it
+/// carried the whole failing command, including the private capture file.
+#[test]
+fn the_recorded_scrollback_failure_keeps_its_provenance_without_its_path() {
+    let observed = driver_json(&format!(
+        "{LOAD_BENCH}
+import tempfile, os
+leaked = (
+    'screen/capture_pane_200x50_scrollback_10k: CalledProcessError: Command '
+    + repr(['screen', '-S', 'rmux-bench-screen', '-X', 'hardcopy', '-h',
+            os.path.join(tempfile.gettempdir(), 'tmpil47a80n')])
+    + \" returned non-zero exit status 1.\"
+)
+print(json.dumps({{
+    'leaked': leaked,
+    'clean': bench.sanitize(leaked),
+    'root': bench.sanitize(tempfile.gettempdir()),
+    'unrelated': bench.sanitize('screen/list_sessions_default: TimeoutExpired'),
+}}))
+"
+    ));
+    let leaked = observed["leaked"].as_str().expect("leaked note");
+    let clean = observed["clean"].as_str().expect("clean note");
+    let temp_root = std::env::temp_dir();
+    let temp_root = temp_root.to_string_lossy();
+    let temp_root = temp_root.trim_end_matches(['/', '\\']);
+
+    // Vacuous unless the historical note really carried the path.
+    assert!(
+        leaked.contains(temp_root),
+        "the spec is vacuous unless the recorded note really quoted a temporary path: {leaked}"
+    );
+    assert!(
+        !clean.contains(temp_root),
+        "the published note must not disclose this host's temporary location: {clean}"
+    );
+    assert!(
+        clean.starts_with("screen/capture_pane_200x50_scrollback_10k: CalledProcessError:")
+            && clean.contains("hardcopy")
+            && clean.contains("non-zero exit status 1"),
+        "redaction must keep the tool, the operation, the command and the failure: {clean}"
+    );
+    assert_eq!(
+        observed["root"], "<temp>",
+        "the temporary root alone is host identity too, not just paths under it"
+    );
+    assert_eq!(
+        observed["unrelated"], "screen/list_sessions_default: TimeoutExpired",
+        "a note with no path must survive redaction unchanged"
+    );
 }
 
 #[test]
