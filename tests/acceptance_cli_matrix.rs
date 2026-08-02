@@ -962,16 +962,21 @@ fn detached_window_spawns_without_c_use_non_attached_caller_cwd() -> Result<(), 
 
     harness.success_in(&session_cwd, ["new-session", "-d", "-s", "cwd-parity"])?;
 
-    // Simple forms are the ones a `tiny-cli` client dispatches directly.  That
-    // client is neither a default feature nor usable from a cargo target
-    // directory, which has no packaged `libexec/rmux` helper for the commands
-    // it does not implement, so here these forms still take the full CLI path.
-    // The caller-cwd contract is the same either way.
-    harness.success_in(
+    // Simple forms are the ones a `tiny-cli` client dispatches directly, from
+    // its own `env::current_dir` rather than the daemon's.  A tiny build has
+    // `debug_assertions` off, so it cannot be the binary a normal cargo test
+    // profile produces; `scripts/tiny-cli-cwd-routes.sh` builds one and names
+    // it, and these two commands then take the real tiny seams.
+    harness.success_in_tiny(
         &caller_cwd,
+        "new-window",
         ["new-window", "-d", "-t", "cwd-parity", "-n", "tiny-new"],
     )?;
-    harness.success_in(&caller_cwd, ["split-window", "-d", "-t", "cwd-parity:0.0"])?;
+    harness.success_in_tiny(
+        &caller_cwd,
+        "split-window",
+        ["split-window", "-d", "-t", "cwd-parity:0.0"],
+    )?;
 
     // Environment flags force the full CLI path while preserving the same
     // no-`-c` semantics.
@@ -1115,6 +1120,43 @@ impl AcceptanceHarness {
         assert_success(&output)
     }
 
+    /// Runs a command through the packaged tiny CLI when one is supplied.
+    ///
+    /// Without [`TINY_BINARY_ENV`] this is [`Self::success_in`]: the contract
+    /// under test is the same on both clients.  With it, the command must take
+    /// tiny's `route` seam directly — a binary that silently fell back to the
+    /// full helper, or that was never a tiny build at all, produces no such
+    /// trace and cannot be counted as tiny coverage.
+    fn success_in_tiny<I, S>(&self, cwd: &Path, route: &str, args: I) -> Result<(), Box<dyn Error>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let Some(tiny) = tiny_binary() else {
+            return self.success_in(cwd, args);
+        };
+        let output = Command::new(&tiny)
+            .current_dir(cwd)
+            .env(TINY_TRACE_ENV, "1")
+            .arg("-L")
+            .arg(&self.label)
+            .args(args)
+            .output()?;
+        assert_success(&output)?;
+
+        let trace = String::from_utf8_lossy(&output.stderr);
+        let expected = format!("rmux tiny: direct: {route}");
+        if !trace.contains(&expected) {
+            return Err(format!(
+                "{} did not dispatch {route} through the tiny seam; expected {expected:?} in its \
+                 routing trace, got {trace:?}",
+                tiny.display()
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     fn stdout<I, S>(&self, args: I) -> Result<String, Box<dyn Error>>
     where
         I: IntoIterator<Item = S>,
@@ -1235,6 +1277,18 @@ impl Drop for AcceptanceHarness {
 
 fn rmux_binary() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_rmux"))
+}
+
+/// Names a packaged tiny CLI for the commands that client dispatches directly.
+const TINY_BINARY_ENV: &str = "RMUX_ACCEPTANCE_TINY_BINARY";
+/// Makes the tiny CLI report which route it took.
+const TINY_TRACE_ENV: &str = "RMUX_TINY_TRACE";
+
+/// Tiny CLI to exercise, when the caller supplies one.
+fn tiny_binary() -> Option<PathBuf> {
+    std::env::var_os(TINY_BINARY_ENV)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
 }
 
 fn assert_success(output: &Output) -> Result<(), Box<dyn Error>> {
