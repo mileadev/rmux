@@ -166,6 +166,8 @@ use exit_log::{record_attach_error, record_attach_exit, AttachExitReason};
 pub(crate) use live_render::LivePaneRender;
 #[cfg(any(unix, windows))]
 use pending_escape::PendingEscapeFlush;
+#[cfg(test)]
+pub(crate) use persistent_overlay::replay_client_visible_payloads;
 #[cfg(any(unix, windows))]
 use persistent_overlay::{
     accept_persistent_overlay_state, advance_persistent_overlay_state, clear_then_base_frame,

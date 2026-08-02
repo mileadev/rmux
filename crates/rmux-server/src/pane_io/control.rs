@@ -17,7 +17,7 @@ use super::persistent_overlay::{
     defer_persistent_clear, discard_stale_persistent_overlays, is_stale_persistent_switch,
     persistent_overlay_replacement_pending, replacement_persistent_overlay_frame,
     switch_requires_screen_clear, take_pending_persistent_overlay_for_state,
-    update_persistent_overlay_cache,
+    undelivered_client_title_bytes, update_persistent_overlay_cache,
 };
 use super::types::{AttachTarget, OpenAttachTarget, OverlayFrame};
 use super::wire::{
@@ -310,6 +310,11 @@ pub(super) async fn apply_pending_attach_controls(
                 let drop_live_output = !preserves_live_output(current_target, &next_target);
                 if is_stale_persistent_switch(*persistent_overlay_state_id, next_target.as_ref()) {
                     *render_generation = (*render_generation).saturating_add(switch_count);
+                    // The frame is stale, but its OSC 0 / OSC 7 are not: the
+                    // next render already deduplicates against them.
+                    if let Some(bytes) = undelivered_client_title_bytes(next_target.as_ref()) {
+                        emit_attach_bytes(stream, bytes).await?;
+                    }
                     continue;
                 }
                 if drop_live_output {

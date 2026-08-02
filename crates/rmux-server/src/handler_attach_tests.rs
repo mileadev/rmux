@@ -847,6 +847,10 @@ mod attach_render;
 
 #[path = "handler_attach_tests/set_titles.rs"]
 mod set_titles;
+#[path = "handler_attach_tests/set_titles_overlay.rs"]
+mod set_titles_overlay;
+#[path = "handler_attach_tests/set_titles_support.rs"]
+mod set_titles_support;
 
 #[path = "handler_attach_tests/attached_prefix_lifecycle.rs"]
 mod attached_prefix_lifecycle;

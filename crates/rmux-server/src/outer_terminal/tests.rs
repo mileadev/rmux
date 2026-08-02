@@ -562,7 +562,7 @@ fn a_suppressed_title_commits_nothing_and_keeps_the_previous_path() {
         path: Some("file:///tmp/other"),
         previous: Some(&shown),
     }
-    .rendered(true, true)
+    .rendered_by(&title_capable_outer_terminal())
     .is_none());
 
     // A render that resolves a title but reads no pane path keeps the path the
@@ -572,7 +572,7 @@ fn a_suppressed_title_commits_nothing_and_keeps_the_previous_path() {
         path: None,
         previous: Some(&shown),
     }
-    .rendered(true, true)
+    .rendered_by(&title_capable_outer_terminal())
     .expect("set-titles on commits");
     assert_eq!(rendered.state(), &shown);
     assert!(
@@ -595,7 +595,7 @@ fn a_title_carrying_render_is_not_a_replaceable_refresh() {
         path: Some(TITLE_PANE_PATH),
         previous: Some(&shown),
     }
-    .rendered(true, true)
+    .rendered_by(&title_capable_outer_terminal())
     .expect("set-titles on commits");
     assert!(wrote.wrote(), "a changed title puts OSC 0 in the frame");
 
@@ -604,7 +604,7 @@ fn a_title_carrying_render_is_not_a_replaceable_refresh() {
         path: Some("file:///tmp/other"),
         previous: Some(&shown),
     }
-    .rendered(true, true)
+    .rendered_by(&title_capable_outer_terminal())
     .expect("set-titles on commits");
     assert!(path_only.wrote(), "a changed path alone still writes OSC 7");
 }
@@ -627,7 +627,7 @@ fn a_render_that_wrote_nothing_commits_nothing() {
         path: Some(TITLE_PANE_PATH),
         previous: Some(&shown),
     }
-    .rendered(true, true)
+    .rendered_by(&title_capable_outer_terminal())
     .expect("set-titles on commits");
     assert!(!deduplicated.wrote());
     assert_eq!(
@@ -641,7 +641,7 @@ fn a_render_that_wrote_nothing_commits_nothing() {
         path: Some(TITLE_PANE_PATH),
         previous: Some(&shown),
     }
-    .rendered(true, true)
+    .rendered_by(&title_capable_outer_terminal())
     .expect("set-titles on commits");
     assert_eq!(
         wrote.committed().and_then(super::ClientTitleState::title),
@@ -656,7 +656,7 @@ fn a_render_that_wrote_nothing_commits_nothing() {
         path: Some(TITLE_PANE_PATH),
         previous: Some(&shown),
     }
-    .rendered(false, false)
+    .rendered_by(&title_incapable_outer_terminal())
     .expect("set-titles on commits");
     assert_eq!(incapable.committed(), None);
 }
@@ -681,6 +681,18 @@ fn title_capable_terminal(options: &OptionStore) -> OuterTerminal {
         options,
         OuterTerminalContext::from_pairs(&[("TERM", "tmux-256color")]),
     )
+}
+
+/// A terminal advertising both the title and OSC 7 templates, so what a render
+/// records is what it would really put on the wire.
+fn title_capable_outer_terminal() -> OuterTerminal {
+    title_capable_terminal(&title_capable_options())
+}
+
+/// No TERM at all: the Windows Terminal case from issue #182, where no terminal
+/// family and no XT flag supply a title capability.
+fn title_incapable_outer_terminal() -> OuterTerminal {
+    OuterTerminal::resolve(&OptionStore::new(), OuterTerminalContext::default())
 }
 
 fn render_title_prelude(

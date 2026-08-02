@@ -28,7 +28,13 @@ impl ClientTitleState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RenderedClientTitle {
     state: ClientTitleState,
-    wrote: bool,
+    /// The OSC 0 / OSC 7 bytes this render put in the frame.
+    ///
+    /// They are kept apart from the frame because they are a property of the
+    /// outer terminal rather than of the drawn screen — tmux writes the title
+    /// from its server loop, not from a redraw. A frame the attach loop must
+    /// not draw still owes the client these bytes (issue #182).
+    bytes: Vec<u8>,
 }
 
 impl RenderedClientTitle {
@@ -41,7 +47,13 @@ impl RenderedClientTitle {
     /// deduplicates against them, so the frame carrying them must reach the
     /// client rather than be replaced in the control queue by that successor.
     pub(crate) const fn wrote(&self) -> bool {
-        self.wrote
+        !self.bytes.is_empty()
+    }
+
+    /// The outer-terminal sequences this render produced, which any path that
+    /// drops the carrying frame must still deliver.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
     }
 
     /// What this render actually committed to the client's remembered
@@ -53,12 +65,8 @@ impl RenderedClientTitle {
     /// value would claim the outer terminal shows something it does not — and
     /// the next expansion back to this value would then be skipped, stranding
     /// the stale title that issue #182 is about.
-    pub(crate) const fn committed(&self) -> Option<&ClientTitleState> {
-        if self.wrote {
-            Some(&self.state)
-        } else {
-            None
-        }
+    pub(crate) fn committed(&self) -> Option<&ClientTitleState> {
+        self.wrote().then_some(&self.state)
     }
 }
 
@@ -89,6 +97,7 @@ impl<'a> ClientTitleUpdate<'a> {
 
     /// The OSC 7 path to write, under the same `set-titles` gate and the same
     /// per-client comparison tmux makes against `c->path`.
+    ///
     pub(super) fn pending_path(&self) -> Option<&'a str> {
         self.resolved?;
         let path = self.path.filter(|path| !path.is_empty())?;
@@ -98,20 +107,25 @@ impl<'a> ClientTitleUpdate<'a> {
     /// What this render leaves behind, or `None` while `set-titles` is off and
     /// the outer terminal is left alone.
     ///
-    /// `writes_title` / `writes_path` report whether the terminal can actually
-    /// put those sequences on the wire. The values are remembered even when it
-    /// cannot, exactly as tmux assigns `c->title` before `tty_set_title()`
-    /// decides it has no TSL/FSL to write with — but a render that emitted
-    /// nothing is still a replaceable refresh.
-    pub(super) fn rendered(
+    /// `bytes` is what the outer terminal actually rendered for this update: it
+    /// is empty when the terminal advertised no template for the sequence. The
+    /// values are remembered even then, exactly as tmux assigns `c->title`
+    /// before `tty_set_title()` decides it has no TSL/FSL to write with — but a
+    /// render that emitted nothing is still a replaceable refresh.
+    /// What a real outer terminal makes of this update, for tests that assert
+    /// on the record rather than on the frame it came from.
+    #[cfg(test)]
+    pub(super) fn rendered_by(
         &self,
-        writes_title: bool,
-        writes_path: bool,
+        terminal: &super::OuterTerminal,
     ) -> Option<RenderedClientTitle> {
+        terminal.rendered_client_title(*self)
+    }
+
+    pub(super) fn rendered(&self, bytes: Vec<u8>) -> Option<RenderedClientTitle> {
         let resolved = self.resolved?;
         Some(RenderedClientTitle {
-            wrote: (writes_title && self.pending_title().is_some())
-                || (writes_path && self.pending_path().is_some()),
+            bytes,
             state: ClientTitleState {
                 title: Some(resolved.to_owned()),
                 path: self

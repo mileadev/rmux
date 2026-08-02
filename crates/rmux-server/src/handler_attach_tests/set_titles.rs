@@ -10,57 +10,10 @@
 //! OSC 0 nor OSC 7; `set-titles on` writes OSC 0 carrying the expanded
 //! `set-titles-string`, once per distinct value.
 
+use super::set_titles_support::{
+    client_title_of, new_detached_session, set_global, title_capable_context, titles_in, TITLE_OPEN,
+};
 use super::*;
-
-const TITLE_OPEN: &str = "\u{1b}]0;";
-const TITLE_CLOSE: char = '\u{7}';
-
-/// A terminal family that advertises the `title` capability (TSL/FSL).
-fn title_capable_context() -> OuterTerminalContext {
-    OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")])
-}
-
-async fn new_detached_session(handler: &RequestHandler, name: &rmux_proto::SessionName) {
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: name.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
-}
-
-async fn set_global(handler: &RequestHandler, option: OptionName, value: &str) {
-    let set = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option,
-            value: value.to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(set, Response::SetOption(_)), "set {option:?}");
-}
-
-/// What the render told this client's outer terminal to show.
-fn client_title_of(target: &crate::pane_io::AttachTarget) -> Option<&str> {
-    target
-        .client_title
-        .as_ref()
-        .and_then(|rendered| rendered.state().title())
-}
-
-/// The OSC 0 payloads carried by one render frame, in order.
-fn titles_in(frame: &[u8]) -> Vec<String> {
-    let text = String::from_utf8_lossy(frame);
-    text.split(TITLE_OPEN)
-        .skip(1)
-        .filter_map(|rest| rest.split_once(TITLE_CLOSE))
-        .map(|(title, _)| title.to_owned())
-        .collect()
-}
 
 /// The reporter's configuration: a custom `set-titles-string` must reach the
 /// outer terminal expanded. Before the fix the frame carried only the bare

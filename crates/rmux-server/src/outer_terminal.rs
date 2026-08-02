@@ -341,7 +341,7 @@ impl OuterTerminal {
     }
 
     /// What a client-title render leaves behind: the values this outer terminal
-    /// now shows, and whether the frame actually carries the OSC bytes.
+    /// now shows, and the OSC bytes the frame carries for them.
     ///
     /// A terminal that advertised no title template renders nothing, so its
     /// frame stays replaceable in the attach-control queue even while
@@ -352,17 +352,7 @@ impl OuterTerminal {
         &self,
         title: ClientTitleUpdate<'_>,
     ) -> Option<RenderedClientTitle> {
-        title.rendered(self.writes_title(), self.writes_path())
-    }
-
-    /// This terminal advertised both halves of the title template (TSL/FSL).
-    const fn writes_title(&self) -> bool {
-        self.title_open.is_some() && self.title_close.is_some()
-    }
-
-    /// This terminal advertised both halves of the OSC 7 path template.
-    const fn writes_path(&self) -> bool {
-        self.path_open.is_some() && self.path_close.is_some()
+        title.rendered(self.render_client_title(title))
     }
 
     pub(crate) fn render_prelude(
