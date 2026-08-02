@@ -10,9 +10,15 @@
 //! the adapter, of the absent-tool omission rule, and of the rendered ordering,
 //! labels and comparator band.
 //!
-//! Everything here is deterministic: the `screen` executable is a stub whose
-//! exit statuses reproduce GNU screen's, so the specs run on hosts that have no
+//! Most of this is deterministic: the `screen` executable is a stub whose exit
+//! statuses reproduce GNU screen's, so the specs run on hosts that have no
 //! `screen` installed. They prove plumbing and contracts, never timings.
+//!
+//! Two cases cannot be proved that way, because a stub never execs the payload
+//! and never enforces screen's own session-name length: how the measured
+//! program reaches screen, and whether the scrollback row really captures its
+//! 10,000 lines. Those run against the installed binary and are skipped, not
+//! faked, on a host without one.
 
 #[path = "support/python3.rs"]
 mod python3;
@@ -141,6 +147,16 @@ fn write_screen_stub(directory: &Path) -> PathBuf {
     }
 }
 
+/// The real GNU screen on this host, when it has one. GNU screen has no native
+/// Windows build, so these cases are Unix-only and skip rather than pretend.
+#[cfg(unix)]
+fn real_screen() -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|directory| directory.join("screen"))
+        .find(|candidate| candidate.is_file())
+}
+
 fn payload(platform: &str, tools: &[&str]) -> serde_json::Value {
     serde_json::json!({
         "schema": 1,
@@ -195,7 +211,7 @@ fn screen_commands_match_the_gnu_screen_surface() {
 print(json.dumps({{
     'default': bench.screen_create_command('screen', 'bench'),
     'scrollback': bench.screen_create_command(
-        'screen', 'bench', command='/bin/sh -c payload', scrollback=10000
+        'screen', 'bench', program=['/bin/sh', '-c', 'payload'], scrollback=10000
     ),
     'control': bench.screen_control_command('screen', 'bench', ['-X', 'hardcopy', '-h', '/tmp/f']),
     'operations': sorted(bench.screen_operations('screen', 3)),
@@ -211,17 +227,11 @@ print(json.dumps({{
         serde_json::json!(["screen", "-dmS", "bench"]),
         "a default screen session must not pin an explicit shell"
     );
-    // Options precede the program, or screen passes `-h 10000` to the shell.
+    // Options precede the program, or screen passes `-h 10000` to the shell,
+    // and the program arrives as an argv vector rather than a command line.
     assert_eq!(
         observed["scrollback"],
-        serde_json::json!([
-            "screen",
-            "-dmS",
-            "bench",
-            "-h",
-            "10000",
-            "/bin/sh -c payload"
-        ]),
+        serde_json::json!(["screen", "-dmS", "bench", "-h", "10000", "/bin/sh", "-c", "payload"]),
         "scrollback depth must be an option, ahead of the measured payload"
     );
     assert_eq!(
@@ -238,6 +248,135 @@ print(json.dumps({{
         observed["tools"],
         serde_json::json!(["rmux", "tmux", "zellij", "screen"]),
         "screen must be selectable through --only-tools"
+    );
+}
+
+/// tmux and zellij hand their trailing session argument to a shell; screen
+/// execs its program argument directly. Passing the tmux-shaped command line to
+/// screen named one non-existent executable, so the session died on startup and
+/// the scrollback row was omitted from every artifact.
+#[test]
+fn the_measured_payload_reaches_screen_as_an_argv_vector() {
+    let observed = driver_json(&format!(
+        "{LOAD_BENCH}
+print(json.dumps({{
+    'shell': bench.SHELL,
+    'argv': bench.output_argv(10000),
+    'script': bench.output_script(10000),
+    'command': bench.output_command(10000),
+    'sentinel': bench.output_sentinel(10000),
+    'create_tail': bench.screen_create_command(
+        'screen', 'bench', program=bench.output_argv(10000), scrollback=10000
+    )[3:],
+}}))
+"
+    ));
+    let shell = observed["shell"].as_str().expect("shell");
+    let script = observed["script"].as_str().expect("script");
+    let command = observed["command"].as_str().expect("command");
+
+    assert_eq!(
+        observed["argv"],
+        serde_json::json!([shell, "-c", script]),
+        "screen execs its program argument, so the payload must be split the way execvp takes it"
+    );
+    assert_eq!(
+        observed["create_tail"],
+        serde_json::json!(["-h", "10000", shell, "-c", script]),
+        "the created session must carry the payload as separate argv elements"
+    );
+
+    // The exact workload this row is named for.
+    assert!(
+        script.contains("-lt 10000"),
+        "the scrollback row must keep printing 10,000 lines: {script}"
+    );
+    assert_eq!(
+        observed["sentinel"], "rmux-bench-09999",
+        "the readiness sentinel must be the last line the 10,000-line payload prints"
+    );
+    assert!(
+        command.contains(script),
+        "screen and the tmux-like rows must measure one workload, not two: {command}"
+    );
+
+    // Vacuous unless the shell-command form really is a single quoted command
+    // line, which is what screen would have looked up as one program name.
+    assert_ne!(
+        command, script,
+        "the spec is vacuous unless the two payload forms really differ"
+    );
+    assert!(
+        command.starts_with(&format!("{shell} -c ")) && command.contains('\''),
+        "the spec is vacuous unless the tmux form really is a quoted command line: {command}"
+    );
+}
+
+/// GNU screen keeps only the first 79 characters of a session name. The
+/// scrollback operation is the one whose shared socket name overflows that, and
+/// a truncated name makes the capture and the cleanup that follow it address a
+/// session that does not exist.
+#[test]
+fn screen_session_names_fit_the_length_screen_keeps() {
+    let observed = driver_json(&format!(
+        "{LOAD_BENCH}
+print(json.dumps({{
+    'limit': bench.SCREEN_NAME_LIMIT,
+    'names': {{op: bench.screen_session_name(op) for op in bench.screen_operations('screen', 1)}},
+    'raw_scrollback': bench.socket_name('capture_pane_200x50_scrollback_10k', 'screen'),
+    'repeated': [
+        bench.screen_session_name('capture_pane_200x50_scrollback_10k') for _ in range(4)
+    ],
+}}))
+"
+    ));
+    let limit = observed["limit"].as_u64().expect("limit") as usize;
+    assert_eq!(
+        limit, 79,
+        "GNU screen 4.09.01 keeps 79 characters of a session name"
+    );
+
+    let names = observed["names"].as_object().expect("session names");
+    assert_eq!(
+        names.len(),
+        SCREEN_OPERATIONS.len(),
+        "every screen operation must name a session"
+    );
+    for (operation, name) in names {
+        let name = name.as_str().expect("session name");
+        assert!(
+            name.len() <= limit,
+            "{operation} builds a {}-character session name; screen truncates it and every later \
+             lookup, capture and cleanup then misses the session: {name}",
+            name.len()
+        );
+        assert!(
+            name.starts_with("rmux-bench-screen-"),
+            "a session name must stay attributable to this benchmark: {name}"
+        );
+    }
+
+    // Vacuous unless the unguarded shared name really overflows.
+    let raw = observed["raw_scrollback"].as_str().expect("raw name");
+    assert!(
+        raw.len() > limit,
+        "the spec is vacuous unless the shared socket name really exceeds what screen keeps: \
+         {} characters",
+        raw.len()
+    );
+
+    // Shortening the operation must not cost the name its uniqueness.
+    let repeated: Vec<&str> = observed["repeated"]
+        .as_array()
+        .expect("repeated names")
+        .iter()
+        .map(|value| value.as_str().expect("session name"))
+        .collect();
+    let unique: std::collections::BTreeSet<&str> = repeated.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        repeated.len(),
+        "concurrent samples must not collide: {repeated:?}"
     );
 }
 
@@ -444,6 +583,151 @@ fn screen_measurements_reach_the_rendered_table() {
         "the rendered table must publish the measured screen rows:\n{markdown}"
     );
     fs::remove_dir_all(&workspace).expect("remove pipeline workspace");
+}
+
+/// The blocking behaviour, measured against the real binary: the session must
+/// survive its program argument and its whole 10,000-line buffer must reach the
+/// capture. A stub cannot prove this, because a stub never execs the payload.
+#[cfg(unix)]
+#[test]
+fn a_real_screen_captures_the_whole_ten_thousand_line_scrollback() {
+    let Some(screen) = real_screen() else {
+        eprintln!(
+            "skipped a_real_screen_captures_the_whole_ten_thousand_line_scrollback: \
+             GNU screen is not installed on this host"
+        );
+        return;
+    };
+    // Read what the adapter's own timed command captured, before the adapter
+    // removes it. Anything else would prove a session this spec built rather
+    // than the operation the benchmark publishes.
+    let observed = driver_json(&format!(
+        "{LOAD_BENCH}
+import time
+from pathlib import Path
+screen = {screen:?}
+sentinel = bench.output_sentinel(10000)
+seen = {{}}
+timed = bench.timed
+
+
+def spy(cmd, **kwargs):
+    elapsed = timed(cmd, **kwargs)
+    target = Path(cmd[-1])
+    deadline = time.monotonic() + 3.0
+    while True:
+        seen['body'] = target.read_text(errors='replace')
+        if sentinel in seen['body'] or time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
+    seen['cmd'] = cmd
+    return elapsed
+
+
+bench.timed = spy
+try:
+    sample = bench.screen_capture_scrollback(screen)
+finally:
+    bench.timed = timed
+body = seen['body']
+print(json.dumps({{
+    'name_length': len(bench.screen_session_name('capture_pane_200x50_scrollback_10k')),
+    'timed_command': seen['cmd'][3:6],
+    'captured_lines': body.count('rmux-bench-'),
+    'has_first': 'rmux-bench-00000' in body,
+    'has_last': sentinel in body,
+    'sample_ms': sample,
+}}))
+",
+        screen = screen.to_string_lossy()
+    ));
+
+    assert_eq!(
+        observed["timed_command"],
+        serde_json::json!(["-X", "hardcopy", "-h"]),
+        "the timed command must be the scrollback capture itself"
+    );
+
+    assert!(
+        observed["name_length"].as_u64().expect("name length") <= 79,
+        "the session the capture addresses must be one screen can still find"
+    );
+    assert_eq!(
+        observed["captured_lines"], 10000,
+        "the scrollback row must capture its whole 10,000-line workload, not an empty \
+         or partial buffer"
+    );
+    assert_eq!(
+        observed["has_first"],
+        serde_json::json!(true),
+        "the capture must reach back to the first line the payload printed"
+    );
+    assert_eq!(
+        observed["has_last"],
+        serde_json::json!(true),
+        "the capture must include the last line the payload printed"
+    );
+    assert!(
+        observed["sample_ms"].as_f64().expect("sample") > 0.0,
+        "the adapter operation itself must produce a measurement"
+    );
+}
+
+/// Eight of eight: every operation GNU screen can express must reach the
+/// artifact as a comparable measurement, with no omission note.
+#[cfg(unix)]
+#[test]
+fn a_real_screen_measures_all_eight_comparable_operations() {
+    let Some(_) = real_screen() else {
+        eprintln!(
+            "skipped a_real_screen_measures_all_eight_comparable_operations: \
+             GNU screen is not installed on this host"
+        );
+        return;
+    };
+    let workspace = temp_dir("screen-native-accounting");
+    let artifact = workspace.join("screen.json");
+    let output = python3::command()
+        .arg("scripts/bench/bench_unix.py")
+        .arg("--out")
+        .arg(&artifact)
+        .args(["--iterations", "1"])
+        .arg("--binary")
+        .arg(repo_root().join("scripts/bench/bench_unix.py"))
+        .args(["--only-tools", "screen"])
+        .args(["--only-operations", &SCREEN_OPERATIONS.join(",")])
+        .arg("--quiet")
+        .current_dir(repo_root())
+        .output()
+        .expect("failed to run bench_unix.py");
+    assert!(
+        output.status.success(),
+        "{}",
+        describe("bench_unix.py", &output)
+    );
+
+    let collected: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&artifact).expect("read artifact"))
+            .expect("parse artifact");
+    assert_eq!(
+        collected["notes"],
+        serde_json::json!([]),
+        "a real screen run must omit nothing: {}",
+        collected["notes"]
+    );
+    let mut measured: Vec<&str> = collected["operations"]
+        .as_array()
+        .expect("operations")
+        .iter()
+        .filter(|row| row["metrics"]["screen"]["p50_ms"].is_number())
+        .map(|row| row["id"].as_str().expect("operation id"))
+        .collect();
+    measured.sort_unstable();
+    assert_eq!(
+        measured, SCREEN_OPERATIONS,
+        "all eight screen-comparable operations must carry a measurement"
+    );
+    fs::remove_dir_all(&workspace).expect("remove native accounting workspace");
 }
 
 #[test]

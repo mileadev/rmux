@@ -188,7 +188,23 @@ def session(
 
 
 def output_command(lines: int) -> str:
+    """The measured payload as a shell command line.
+
+    tmux and zellij hand their trailing session argument to a shell, so they
+    receive the workload already quoted for one.
+    """
     return f"{SHELL} -c '{output_script(lines)}'"
+
+
+def output_argv(lines: int) -> list[str]:
+    """The same measured payload as an argv vector.
+
+    GNU screen executes its program argument directly instead of through a
+    shell, so it needs the elements `execvp` receives rather than a command
+    line. Both forms wrap the same `output_script`, so the two adapters measure
+    an identical workload.
+    """
+    return [SHELL, "-c", output_script(lines)]
 
 
 def output_script(lines: int) -> str:
@@ -197,6 +213,11 @@ def output_script(lines: int) -> str:
         f"while [ $i -lt {lines} ]; do printf \"rmux-bench-%05d\\n\" \"$i\"; "
         "i=$((i+1)); done; sleep 60"
     )
+
+
+def output_sentinel(lines: int) -> str:
+    """The last line `output_script` prints, so a reader can tell it finished."""
+    return f"rmux-bench-{lines - 1:05d}"
 
 
 def with_session(
@@ -772,27 +793,49 @@ def batched_zellij_list_panes(executable: str, iterations: int) -> MeasuredOpera
     return operation
 
 
+# GNU screen keeps at most this many characters of a session name and silently
+# truncates longer ones, after which every `-S <name>` lookup misses.
+SCREEN_NAME_LIMIT = 79
+
+
 def screen_session_name(operation: str) -> str:
-    return socket_name(operation, "screen")
+    """A unique session name that survives screen's own length limit.
+
+    `capture_pane_200x50_scrollback_10k` pushes the shared socket name one
+    character past what screen keeps, and a truncated name makes the capture
+    and the cleanup that follow it address a session that does not exist.
+    Uniqueness lives in the trailing pid and timestamp, so the operation is the
+    part that gets shortened.
+    """
+    name = socket_name(operation, "screen")
+    if len(name) <= SCREEN_NAME_LIMIT:
+        return name
+    head, pid, nanos = name.rsplit("-", 2)
+    unique = f"-{pid}-{nanos}"
+    return head[: max(0, SCREEN_NAME_LIMIT - len(unique))] + unique
 
 
 def screen_create_command(
     executable: str,
     name: str,
     *,
-    command: str | None = None,
+    program: list[str] | None = None,
     scrollback: int | None = None,
 ) -> list[str]:
     """Build a detached `screen` session command.
 
     Options precede the program, and omitting the program starts the login
     shell, which is the payload the tmux-like adapters also measure.
+
+    `program` is an argv vector, never a shell command line. screen execs it
+    directly, so a whole command passed as one element is looked up as a single
+    executable name, fails, and takes the new session down with it.
     """
     args = [executable, "-dmS", name]
     if scrollback is not None:
         args.extend(["-h", str(scrollback)])
-    if command is not None:
-        args.append(command)
+    if program is not None:
+        args.extend(program)
     return args
 
 
@@ -808,11 +851,11 @@ def screen_create_session(
     executable: str,
     name: str,
     *,
-    command: str | None = None,
+    program: list[str] | None = None,
     scrollback: int | None = None,
 ) -> None:
     quiet(
-        screen_create_command(executable, name, command=command, scrollback=scrollback),
+        screen_create_command(executable, name, program=program, scrollback=scrollback),
         timeout=10.0,
     )
 
@@ -822,14 +865,14 @@ def with_screen_session(
     operation: str,
     timed_args: list[str],
     *,
-    command: str | None = None,
+    program: list[str] | None = None,
     setup: Callable[[str], None] | None = None,
     scrollback: int | None = None,
     timeout: float = 15.0,
 ) -> float:
     name = screen_session_name(operation)
     try:
-        screen_create_session(executable, name, command=command, scrollback=scrollback)
+        screen_create_session(executable, name, program=program, scrollback=scrollback)
         if setup is not None:
             setup(name)
         return timed(screen_control_command(executable, name, timed_args), timeout=timeout)
@@ -881,6 +924,38 @@ def screen_capture_visible(executable: str) -> float:
         Path(path).unlink(missing_ok=True)
 
 
+def wait_for_screen_payload(
+    executable: str,
+    name: str,
+    sentinel: str,
+    *,
+    timeout: float = 20.0,
+) -> None:
+    """Block until the session's measured payload has reached its buffer.
+
+    `screen -dmS` returns as soon as it has forked, so a control command issued
+    immediately can reach a session that is not serving yet, or one whose
+    payload has not printed. Timing the capture then measures an empty buffer
+    instead of the workload the row is named for.
+    """
+    with tempfile.NamedTemporaryFile(delete=False) as handle:
+        probe = handle.name
+    deadline = time.monotonic() + timeout
+    try:
+        while time.monotonic() < deadline:
+            quiet(
+                screen_control_command(executable, name, ["-X", "hardcopy", probe]),
+                check=False,
+                timeout=5.0,
+            )
+            if sentinel in Path(probe).read_text(encoding="utf-8", errors="replace"):
+                return
+            time.sleep(0.05)
+        raise TimeoutError(f"screen session did not print {sentinel} within {timeout:.0f}s")
+    finally:
+        Path(probe).unlink(missing_ok=True)
+
+
 def screen_capture_scrollback(executable: str) -> float:
     with tempfile.NamedTemporaryFile(delete=False) as handle:
         path = handle.name
@@ -889,8 +964,11 @@ def screen_capture_scrollback(executable: str) -> float:
             executable,
             "capture_pane_200x50_scrollback_10k",
             ["-X", "hardcopy", "-h", path],
-            command=output_command(10000),
+            program=output_argv(10000),
             scrollback=10000,
+            setup=lambda name: wait_for_screen_payload(
+                executable, name, output_sentinel(10000)
+            ),
             timeout=30.0,
         )
     finally:
