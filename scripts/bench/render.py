@@ -22,19 +22,34 @@ TOOLS = {
     "tmux": "tmux",
     "psmux": "psmux",
     "zellij": "zellij",
+    "screen": "screen",
 }
 
 PLATFORM_ORDER = {"linux": 0, "windows": 1, "macos": 2}
 
 PREFERRED_TOOL_ORDER = {
-    "linux": ["rmux", "tmux", "zellij"],
-    "macos": ["rmux", "tmux", "zellij"],
-    "windows": ["rmux", "tmux", "zellij", "psmux"],
+    "linux": ["rmux", "tmux", "zellij", "screen"],
+    "macos": ["rmux", "tmux", "zellij", "screen"],
+    "windows": ["rmux", "tmux", "zellij", "psmux", "screen"],
 }
 
 PUBLIC_TABLE_HIDDEN_TOOLS = {
     "windows": {"psmux"},
 }
+
+# Tools that only exist on Windows through a compatibility layer. Payloads
+# written by the current collectors carry `tool_environments` and do not need
+# this fallback; it keeps artifacts produced before that field render honestly.
+WINDOWS_COMPATIBILITY_TOOLS = {"tmux", "screen"}
+
+# "≈ same speed" band. Measured, not chosen: across the committed
+# docs/benchmarks/*.csv tables, 71 of 91 tool/operation cells vary by more than
+# 5% between their own fastest and slowest sample and 37 vary by more than 20%.
+# A 0.95..1.05 band would therefore publish host noise as a result — it flips
+# linux `list_windows_20` (ratio 1.0804) to "1.1x faster" although that cell's
+# own rmux samples span 161% of their median.
+SAME_SPEED_RATIO_LOW = 0.80
+SAME_SPEED_RATIO_HIGH = 1.25
 
 SCENARIO_LABELS = {
     "list_commands": "List available commands",
@@ -177,7 +192,7 @@ def ratio_text(op: dict[str, Any], baseline: str) -> str:
     if rmux is None or base is None or rmux["p50_ms"] <= 0:
         return "-"
     ratio = base["p50_ms"] / rmux["p50_ms"]
-    if 0.80 <= ratio <= 1.25:
+    if SAME_SPEED_RATIO_LOW <= ratio <= SAME_SPEED_RATIO_HIGH:
         return "≈ same speed"
     if ratio < 1:
         return f"{1 / ratio:.1f}x slower"
@@ -218,10 +233,23 @@ def baseline_tool(payload: dict[str, Any]) -> str:
     return str(payload.get("baseline", "tmux"))
 
 
-def tool_label(tool: str, platform: str) -> str:
-    if platform == "windows" and tool == "tmux":
-        return f"{TOOLS.get(tool, tool)} (WSL)"
-    return TOOLS.get(tool, tool)
+def tool_environment(payload: dict[str, Any], tool: str) -> str | None:
+    """Where the collector reached this tool: `native`, `wsl`, or unrecorded."""
+    environments = payload.get("tool_environments")
+    if isinstance(environments, dict):
+        value = environments.get(tool)
+        if isinstance(value, str) and value:
+            return value
+    if platform_id(payload) == "windows" and tool in WINDOWS_COMPATIBILITY_TOOLS:
+        return "wsl"
+    return None
+
+
+def tool_label(payload: dict[str, Any], tool: str) -> str:
+    name = TOOLS.get(tool, tool)
+    if tool_environment(payload, tool) == "wsl":
+        return f"{name} (WSL)"
+    return name
 
 
 def picture(dark: str, light: str, alt: str, width: str = "100%") -> str:
@@ -259,11 +287,10 @@ def operation_rows(payload: dict[str, Any], operations: list[dict[str, Any]]) ->
 
 def table_header(payload: dict[str, Any]) -> str:
     tools = ordered_public_tools(payload)
-    platform = platform_id(payload)
     baseline = baseline_tool(payload)
     cells = ["<th align=\"left\">Scenario</th>"]
-    cells.extend(f"<th align=\"right\">{html.escape(tool_label(tool, platform))}</th>" for tool in tools)
-    cells.append(f"<th align=\"right\">vs {html.escape(tool_label(baseline, platform))}</th>")
+    cells.extend(f"<th align=\"right\">{html.escape(tool_label(payload, tool))}</th>" for tool in tools)
+    cells.append(f"<th align=\"right\">vs {html.escape(tool_label(payload, baseline))}</th>")
     return "<tr>" + "".join(cells) + "</tr>"
 
 
@@ -419,7 +446,13 @@ def write_csv_assets(payloads: list[dict[str, Any]], asset_dir: Path) -> None:
         (asset_dir / csv_name(payload)).write_text(csv_text(payload), encoding="utf-8")
 
 
-def methodology(generated: str, commit: str) -> str:
+def methodology(
+    generated: str,
+    commit: str,
+    *,
+    low: float = SAME_SPEED_RATIO_LOW,
+    high: float = SAME_SPEED_RATIO_HIGH,
+) -> str:
     return f"""## Reproducing
 
 Run the scripts locally on each OS, gather the JSON files, and generate the Markdown:
@@ -431,15 +464,23 @@ scripts/bench/run-unix.sh --out target/benchmarks/macos.json
 python3 scripts/bench/render.py target/benchmarks/*.json --output docs/benchmarks.md
 ```
 
+Each OS measures itself locally, so no number here includes SSH or remote-shell latency.
+
 Note: Scripts run safely in isolated sessions and only kill their own test processes.
 
 ## Methodology
 
 The `render.py` script updates this Markdown file and linked CSVs based on the JSON results.
 
-`-`: Operation is unavailable or not comparable.
+Each JSON artifact records the commit, platform, tool versions and every p50/p95 sample behind a cell.
 
-Zellij: Results only show exact equivalents or close approximations.
+`-`: Operation is unavailable or not comparable. Missing adapters and failed samples are omitted, never estimated.
+
+Zellij and GNU screen: results only show exact equivalents or close approximations.
+
+Tools reached through a compatibility layer are labelled as such, and the JSON records each measured tool's environment. On Windows the ratio compares RMUX against tmux under WSL, never against a native Windows multiplexer.
+
+`≈ same speed` spans {low:.2f}x to {high:.2f}x, the spread repeated samples actually show on these hosts; a narrower claim would publish host noise as a result.
 
 Generated at `{generated}` from commit `{commit}`.
 """
