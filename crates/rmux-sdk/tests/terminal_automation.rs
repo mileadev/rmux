@@ -10,7 +10,9 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use rmux_proto::{encode_frame, FrameDecoder, HasSessionRequest, Request, Response};
-use rmux_sdk::{EnsureSession, LocatorFilter, Rect, RmuxBuilder, SessionName, TerminalLoadState};
+use rmux_sdk::{
+    EnsureSession, LocatorFilter, Pane, Rect, RmuxBuilder, SessionName, TerminalLoadState,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::time::Instant;
@@ -32,6 +34,11 @@ async fn terminal_automation_layer_drives_the_p3_user_flow() -> TestResult {
         .await?;
     let pane = session.pane(0, 0);
     pane.set_title("rmux:automation").await?;
+
+    // `Ready` and `Hello` are part of the command the pty echoes back, so
+    // neither word proves the shell ran anything.  Establish readiness first
+    // with a marker only `printf` can render.
+    wait_for_shell_ready(&pane).await?;
 
     pane.keyboard()
         .type_text("printf 'Ready multiplexer Ready Hello from rmux\\n'")
@@ -231,6 +238,121 @@ async fn terminal_automation_layer_drives_the_p3_user_flow() -> TestResult {
         .await?;
 
     harness.finish().await
+}
+
+/// Marker the readiness sentinel prints.  Its literal bytes must never occur in
+/// the typed command, so a wait for it cannot match the pty echo.
+const SHELL_READY_MARKER: &str = "RmuxShellUp";
+/// `printf` invocation that decodes to [`SHELL_READY_MARKER`]; every marker byte
+/// is octal-escaped so the echoed input carries none of them.
+const SHELL_READY_COMMAND: &str =
+    "printf '\\122\\155\\165\\170\\123\\150\\145\\154\\154\\125\\160\\n'";
+/// Bound on becoming interactive, which is not the bound on producing output.
+///
+/// `Harness::start` sets `SHELL` on the daemon process, but a pane shell is
+/// resolved from the `default-shell` option, then the *session* environment,
+/// then the login shell in the password database -- so that variable never
+/// reaches the spawn and the pane runs whichever login shell the host account
+/// has. A framework-driven one has been measured needing well over five
+/// seconds here. Absorbing that startup is precisely what this stage is for:
+/// every later stage then measures output latency on an already-interactive
+/// shell, which is what their five-second bounds were written for.
+const SHELL_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Waits until the pane shell has executed a command, not merely echoed one.
+async fn wait_for_shell_ready(pane: &Pane) -> TestResult {
+    pane.keyboard().type_text(SHELL_READY_COMMAND).await?;
+    pane.keyboard().press("Enter").await?;
+    if let Err(error) = pane
+        .get_by_text(SHELL_READY_MARKER)
+        .wait_for()
+        .timeout(SHELL_READY_TIMEOUT)
+        .await
+    {
+        return Err(format!(
+            "pane shell did not run the readiness sentinel within {SHELL_READY_TIMEOUT:?}: \
+             {error}\n{}",
+            shell_readiness_diagnostics(pane).await
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Sanitized readiness-timeout evidence: what the daemon knows about the pane
+/// process, what the OS reports for that pid, and what the pane renders.
+async fn shell_readiness_diagnostics(pane: &Pane) -> String {
+    let mut report = String::new();
+
+    let foreground_pid = match pane.foreground_state().await {
+        Ok(Some(state)) => {
+            report.push_str(&format!(
+                "foreground: pid={:?} command={:?}\n",
+                state.pid, state.command
+            ));
+            state.pid
+        }
+        Ok(None) => {
+            report.push_str("foreground: pane is not resolvable\n");
+            None
+        }
+        Err(error) => {
+            report.push_str(&format!("foreground: query failed: {error}\n"));
+            None
+        }
+    };
+
+    match pane.info().await {
+        Ok(info) => match info.panes.first() {
+            Some(pane_info) => report.push_str(&format!(
+                "daemon pane: id={:?} process={:?} exit={:?}\n",
+                pane_info.id, pane_info.process, pane_info.exit_state
+            )),
+            None => report.push_str("daemon pane: no pane in snapshot\n"),
+        },
+        Err(error) => report.push_str(&format!("daemon pane: query failed: {error}\n")),
+    }
+
+    report.push_str(&process_state_and_group(foreground_pid));
+
+    match pane.snapshot().await {
+        Ok(snapshot) => report.push_str(&format!(
+            "snapshot: revision={} cursor={},{} visible_text={:?}\n",
+            snapshot.revision,
+            snapshot.cursor.row,
+            snapshot.cursor.col,
+            snapshot.visible_text()
+        )),
+        Err(error) => report.push_str(&format!("snapshot: query failed: {error}\n")),
+    }
+
+    report
+}
+
+/// Reports the OS process state and group for `pid`, which distinguishes an
+/// unscheduled shell from a stopped one.
+fn process_state_and_group(pid: Option<u32>) -> String {
+    let Some(pid) = pid else {
+        return "process: no pid to inspect\n".to_owned();
+    };
+    match Command::new("/bin/ps")
+        .args(["-o", "state=,pgid=,comm=", "-p", &pid.to_string()])
+        .output()
+    {
+        Ok(output) => format!(
+            "process: pid={pid} state/pgid/comm={:?}\n",
+            String::from_utf8_lossy(&output.stdout).trim()
+        ),
+        Err(error) => format!("process: pid={pid} inspection failed: {error}\n"),
+    }
+}
+
+#[test]
+fn the_readiness_command_cannot_echo_its_own_marker() {
+    assert!(
+        !SHELL_READY_COMMAND.contains(SHELL_READY_MARKER),
+        "the readiness command must encode the marker so the pty echo cannot match it"
+    );
 }
 
 fn session_name(value: &str) -> SessionName {
