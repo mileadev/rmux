@@ -389,7 +389,7 @@ fn render_prelude_without_resolved_title_writes_neither_title_nor_path() {
         &options,
         super::ClientTitleUpdate {
             resolved: None,
-            path: Some(TITLE_PANE_PATH),
+            path: super::ClientPathUpdate::Reported(TITLE_PANE_PATH),
             previous: None,
         },
     );
@@ -418,7 +418,7 @@ fn render_prelude_writes_resolved_title_and_path() {
         &options,
         super::ClientTitleUpdate {
             resolved: Some("RMUXTEST alpha:0"),
-            path: Some(TITLE_PANE_PATH),
+            path: super::ClientPathUpdate::Reported(TITLE_PANE_PATH),
             previous: None,
         },
     );
@@ -445,7 +445,7 @@ fn render_prelude_skips_an_unchanged_title_and_path() {
         &options,
         super::ClientTitleUpdate {
             resolved: Some("RMUXTEST alpha:0"),
-            path: Some(TITLE_PANE_PATH),
+            path: super::ClientPathUpdate::Reported(TITLE_PANE_PATH),
             previous: Some(&shown),
         },
     );
@@ -459,7 +459,7 @@ fn render_prelude_skips_an_unchanged_title_and_path() {
         &options,
         super::ClientTitleUpdate {
             resolved: Some("RMUXTEST alpha:1"),
-            path: Some("file:///tmp/other"),
+            path: super::ClientPathUpdate::Reported("file:///tmp/other"),
             previous: Some(&shown),
         },
     );
@@ -481,7 +481,7 @@ fn render_prelude_neutralises_control_characters_in_the_title() {
         &options,
         super::ClientTitleUpdate {
             resolved: Some("A\u{1b}]0;INJECT\u{7}B\tC"),
-            path: Some(TITLE_PANE_PATH),
+            path: super::ClientPathUpdate::Reported(TITLE_PANE_PATH),
             previous: None,
         },
     );
@@ -522,7 +522,7 @@ fn render_prelude_leaves_a_title_incapable_terminal_alone() {
 
     let update = super::ClientTitleUpdate {
         resolved: Some("RMUXTEST alpha:0"),
-        path: Some(TITLE_PANE_PATH),
+        path: super::ClientPathUpdate::Reported(TITLE_PANE_PATH),
         previous: None,
     };
     let prelude = render_title_prelude(&terminal, &options, update);
@@ -559,7 +559,7 @@ fn a_suppressed_title_commits_nothing_and_keeps_the_previous_path() {
     };
     assert!(super::ClientTitleUpdate {
         resolved: None,
-        path: Some("file:///tmp/other"),
+        path: super::ClientPathUpdate::Reported("file:///tmp/other"),
         previous: Some(&shown),
     }
     .rendered_by(&title_capable_outer_terminal())
@@ -569,7 +569,7 @@ fn a_suppressed_title_commits_nothing_and_keeps_the_previous_path() {
     // client was already given rather than forgetting it, and writes nothing.
     let rendered = super::ClientTitleUpdate {
         resolved: Some("STABLE"),
-        path: None,
+        path: super::ClientPathUpdate::Unread,
         previous: Some(&shown),
     }
     .rendered_by(&title_capable_outer_terminal())
@@ -592,7 +592,7 @@ fn a_title_carrying_render_is_not_a_replaceable_refresh() {
     };
     let wrote = super::ClientTitleUpdate {
         resolved: Some("CHANGED"),
-        path: Some(TITLE_PANE_PATH),
+        path: super::ClientPathUpdate::Reported(TITLE_PANE_PATH),
         previous: Some(&shown),
     }
     .rendered_by(&title_capable_outer_terminal())
@@ -601,7 +601,7 @@ fn a_title_carrying_render_is_not_a_replaceable_refresh() {
 
     let path_only = super::ClientTitleUpdate {
         resolved: Some("STABLE"),
-        path: Some("file:///tmp/other"),
+        path: super::ClientPathUpdate::Reported("file:///tmp/other"),
         previous: Some(&shown),
     }
     .rendered_by(&title_capable_outer_terminal())
@@ -624,7 +624,7 @@ fn a_render_that_wrote_nothing_commits_nothing() {
 
     let deduplicated = super::ClientTitleUpdate {
         resolved: Some("STABLE"),
-        path: Some(TITLE_PANE_PATH),
+        path: super::ClientPathUpdate::Reported(TITLE_PANE_PATH),
         previous: Some(&shown),
     }
     .rendered_by(&title_capable_outer_terminal())
@@ -638,7 +638,7 @@ fn a_render_that_wrote_nothing_commits_nothing() {
 
     let wrote = super::ClientTitleUpdate {
         resolved: Some("CHANGED"),
-        path: Some(TITLE_PANE_PATH),
+        path: super::ClientPathUpdate::Reported(TITLE_PANE_PATH),
         previous: Some(&shown),
     }
     .rendered_by(&title_capable_outer_terminal())
@@ -653,7 +653,7 @@ fn a_render_that_wrote_nothing_commits_nothing() {
     // never told, so the next render must still consider the title pending.
     let incapable = super::ClientTitleUpdate {
         resolved: Some("CHANGED"),
-        path: Some(TITLE_PANE_PATH),
+        path: super::ClientPathUpdate::Reported(TITLE_PANE_PATH),
         previous: Some(&shown),
     }
     .rendered_by(&title_incapable_outer_terminal())

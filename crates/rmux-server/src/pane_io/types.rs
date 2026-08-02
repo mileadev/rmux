@@ -78,6 +78,10 @@ pub(crate) struct PaneAlertEvent {
     pub(crate) bell_count: u64,
     pub(crate) title_changed: bool,
     pub(crate) title_change: Option<(String, String)>,
+    /// The pane reported a different OSC 7 working directory in this batch.
+    /// Attached clients must re-render for it to reach their outer terminal,
+    /// the same way a title change does (issue #182).
+    pub(crate) path_changed: bool,
     pub(crate) clipboard_set: bool,
     /// Decoded payloads of the inbound OSC 52 clipboard writes in this batch, in
     /// arrival order. Each becomes a paste buffer under `set-clipboard on`

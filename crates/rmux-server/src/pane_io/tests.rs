@@ -2101,7 +2101,7 @@ fn live_output_is_preserved_only_for_coalescible_same_source_refreshes() {
     title_carrying.client_title =
         terminal.rendered_client_title(crate::outer_terminal::ClientTitleUpdate {
             resolved: Some("LIVE-OUTPUT-TITLE"),
-            path: None,
+            path: crate::outer_terminal::ClientPathUpdate::Unread,
             previous: None,
         });
     assert!(

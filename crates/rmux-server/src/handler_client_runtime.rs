@@ -265,9 +265,9 @@ impl RequestHandler {
             let title_update = ClientTitleUpdate {
                 resolved: resolved_title.as_deref(),
                 // The OSC 7 path follows the active pane's own report, which
-                // only the prelude reads; leaving it unset here keeps whatever
-                // this client was already told.
-                path: None,
+                // only the prelude reads; the tick draws no prelude, so this
+                // client keeps whatever it was already told.
+                path: crate::outer_terminal::ClientPathUpdate::Unread,
                 previous: Some(&previous_title),
             };
             let frame = crate::renderer::render_status_only_with_attached_count_and_prompt(

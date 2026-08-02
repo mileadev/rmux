@@ -66,6 +66,10 @@ pub(crate) struct PaneAppendResult {
     pub(crate) bell_count: u64,
     pub(crate) title_changed: bool,
     pub(crate) title_change: Option<(String, String)>,
+    /// The pane reported a different OSC 7 working directory. It reaches the
+    /// outer terminal only through a client re-render, exactly like the title
+    /// (issue #182).
+    pub(crate) path_changed: bool,
     pub(crate) passthroughs: Vec<TerminalPassthrough>,
     pub(crate) dropped_passthrough_count: u64,
     pub(crate) replies: Vec<u8>,
@@ -138,12 +142,14 @@ impl PaneTranscript {
             self.output_sequence = self.output_sequence.saturating_add(1);
         }
         let title_before = self.terminal.screen().title().to_owned();
+        let path_before = self.terminal.screen().path().to_owned();
         let alternate_before = self.terminal.screen().is_alternate();
         self.terminal.feed(bytes);
         let recovery_rebase_required =
             ground_timer_expired || self.terminal.take_recovery_rebase_required();
         let title_after = self.terminal.screen().title().to_owned();
         let title_changed = title_after != title_before;
+        let path_changed = self.terminal.screen().path() != path_before;
         let passthroughs = self.terminal.take_terminal_passthrough();
         self.pending_palette_queries.register(&passthroughs, now);
         let dropped_passthrough_count = self.terminal.take_terminal_passthrough_dropped_count();
@@ -153,6 +159,7 @@ impl PaneTranscript {
             bell_count: self.terminal.screen_mut().take_bell_count(),
             title_changed,
             title_change: title_changed.then_some((title_before, title_after)),
+            path_changed,
             passthroughs,
             dropped_passthrough_count,
             replies,

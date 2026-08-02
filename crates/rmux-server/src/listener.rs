@@ -25,6 +25,7 @@ use crate::listener_options::ServeOptions;
 use crate::listener_signals::handle_server_signal;
 use crate::listener_signals::poll_server_signal;
 use crate::listener_signals::wait_server_signal;
+use crate::outer_terminal::ClientTitleState;
 use crate::pane_io;
 use crate::server_access::apply_access_policy;
 use crate::socket_cleanup::SocketCleanup;
@@ -556,14 +557,7 @@ async fn serve_connection(
                     };
                     let session_name = response.session_name.clone();
                     let terminal_context = attach.target.outer_terminal.context().clone();
-                    // The attach frame about to be forwarded already carries the
-                    // client's first title, so seed the per-client memory here
-                    // rather than letting its first refresh repeat it (#182).
-                    let client_title = attach
-                        .target
-                        .client_title
-                        .as_ref()
-                        .map(|rendered| rendered.state().clone());
+                    let client_title = attach_frame_client_title(&attach.target);
                     let client_name = attach_client_name
                         .expect("attach upgrade captures its client name before dispatch");
                     let attach_identity = handler
@@ -681,6 +675,22 @@ async fn serve_connection(
             }
         }
     }
+}
+
+/// The per-client outer-terminal identity a fresh registration inherits from
+/// the attach frame this listener is about to forward.
+///
+/// That frame reaches the client's terminal directly rather than through the
+/// control queue, so whatever it carries is already delivered. Without this
+/// seed the client's first refresh resolves the same title again and writes it
+/// a second time (issue #182).
+pub(crate) fn attach_frame_client_title(
+    target: &pane_io::AttachTarget,
+) -> Option<ClientTitleState> {
+    target
+        .client_title
+        .as_ref()
+        .map(|rendered| rendered.state().clone())
 }
 
 async fn write_prepared_sdk_wait(

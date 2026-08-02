@@ -19,7 +19,9 @@ mod templates;
 
 #[cfg(test)]
 use capabilities::{decode_capability_string, parse_capability_override, split_override_segments};
-pub(crate) use client_title::{ClientTitleState, ClientTitleUpdate, RenderedClientTitle};
+pub(crate) use client_title::{
+    ClientPathUpdate, ClientTitleState, ClientTitleUpdate, RenderedClientTitle,
+};
 #[cfg(test)]
 use colours::colour_to_rgb;
 use colours::colour_to_rgb_string;

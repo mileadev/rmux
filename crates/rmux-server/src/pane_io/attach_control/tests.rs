@@ -678,7 +678,7 @@ fn a_title_carrying_switch_is_not_replaced_by_a_later_refresh() {
     );
     let update = crate::outer_terminal::ClientTitleUpdate {
         resolved: Some("QUEUED-TITLE"),
-        path: None,
+        path: crate::outer_terminal::ClientPathUpdate::Unread,
         previous: None,
     };
     let mut carrying = deep_coalescible_target(&output, 0, 32);
@@ -758,7 +758,7 @@ fn a_title_carrying_refresh_keeps_the_pane_live_output() {
     carrying.client_title =
         terminal.rendered_client_title(crate::outer_terminal::ClientTitleUpdate {
             resolved: Some("LIVE-OUTPUT-TITLE"),
-            path: None,
+            path: crate::outer_terminal::ClientPathUpdate::Unread,
             previous: None,
         });
     assert!(!carrying.is_coalescible_render_refresh());

@@ -70,6 +70,47 @@ impl RenderedClientTitle {
     }
 }
 
+/// What a render learned about the pane's reported working directory.
+///
+/// Three states an `Option<&str>` cannot keep apart: this render did not look
+/// at the pane, the pane reports a directory, or the pane reports none. tmux
+/// writes an OSC 7 with an empty payload for the last one, so a client that was
+/// given a directory can be told it no longer has one; conflating that with
+/// "did not look" makes a path impossible to clear (issue #182).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ClientPathUpdate<'a> {
+    /// This render did not read a pane path, so the client keeps what it was
+    /// last told. The periodic status tick draws no prelude and works this way.
+    #[default]
+    Unread,
+    /// The pane reports this working directory.
+    Reported(&'a str),
+    /// The pane reports no working directory.
+    Cleared,
+}
+
+impl<'a> ClientPathUpdate<'a> {
+    /// What a pane's screen state reports: an empty OSC 7 payload is a clear,
+    /// not an absence of information.
+    pub(crate) fn from_pane(path: &'a str) -> Self {
+        if path.is_empty() {
+            Self::Cleared
+        } else {
+            Self::Reported(path)
+        }
+    }
+
+    /// The payload the outer terminal would be told, or `None` when this render
+    /// read no pane path at all.
+    const fn payload(self) -> Option<&'a str> {
+        match self {
+            Self::Unread => None,
+            Self::Reported(path) => Some(path),
+            Self::Cleared => Some(""),
+        }
+    }
+}
+
 /// What one client's outer terminal should now be told.
 ///
 /// `resolved` is the expanded `set-titles-string`, or `None` when the session
@@ -79,7 +120,7 @@ impl RenderedClientTitle {
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ClientTitleUpdate<'a> {
     pub(crate) resolved: Option<&'a str>,
-    pub(crate) path: Option<&'a str>,
+    pub(crate) path: ClientPathUpdate<'a>,
     pub(crate) previous: Option<&'a ClientTitleState>,
 }
 
@@ -98,9 +139,11 @@ impl<'a> ClientTitleUpdate<'a> {
     /// The OSC 7 path to write, under the same `set-titles` gate and the same
     /// per-client comparison tmux makes against `c->path`.
     ///
+    /// An empty payload is a value like any other: tmux emits it when the pane
+    /// reports no directory, and a client already showing one must be told.
     pub(super) fn pending_path(&self) -> Option<&'a str> {
         self.resolved?;
-        let path = self.path.filter(|path| !path.is_empty())?;
+        let path = self.path.payload()?;
         (self.previous.and_then(|previous| previous.path.as_deref()) != Some(path)).then_some(path)
     }
 
@@ -128,15 +171,13 @@ impl<'a> ClientTitleUpdate<'a> {
             bytes,
             state: ClientTitleState {
                 title: Some(resolved.to_owned()),
-                path: self
-                    .path
-                    .filter(|path| !path.is_empty())
-                    .map(str::to_owned)
-                    .or_else(|| {
-                        self.previous
-                            .and_then(|previous| previous.path.as_ref())
-                            .cloned()
-                    }),
+                // A render that read no pane path keeps whatever the client was
+                // already told; one that read a cleared path adopts it.
+                path: self.path.payload().map(str::to_owned).or_else(|| {
+                    self.previous
+                        .and_then(|previous| previous.path.as_ref())
+                        .cloned()
+                }),
             },
         })
     }

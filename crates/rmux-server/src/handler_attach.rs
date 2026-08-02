@@ -15,8 +15,8 @@ use crate::handler::client_runtime_support::ListClientSnapshot;
 use crate::handler_support::attached_client_required;
 use crate::key_table::effective_client_key_table_name;
 use crate::outer_terminal::{
-    ClientTitleState, ClientTitleUpdate, CursorScope, OuterTerminal, OuterTerminalContext,
-    RenderedClientTitle,
+    ClientPathUpdate, ClientTitleState, ClientTitleUpdate, CursorScope, OuterTerminal,
+    OuterTerminalContext, RenderedClientTitle,
 };
 use crate::pane_io::{AttachControl, AttachTarget, LivePaneRender, OverlayFrame};
 use crate::pane_terminals::{session_not_found, HandlerState};
@@ -1613,9 +1613,13 @@ fn attach_target_for_session_with_prompt(
     );
     let title_update = ClientTitleUpdate {
         resolved: resolved_title.as_deref(),
+        // A pane with no screen state was not read at all; one reporting an
+        // empty OSC 7 payload is reporting that it has no directory.
         path: pane_state
             .as_ref()
-            .map(|pane_state| pane_state.path.as_str()),
+            .map_or(ClientPathUpdate::Unread, |pane_state| {
+                ClientPathUpdate::from_pane(pane_state.path.as_str())
+            }),
         previous: options.previous_title,
     };
     let client_title = outer_terminal.rendered_client_title(title_update);

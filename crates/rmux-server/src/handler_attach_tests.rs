@@ -851,6 +851,8 @@ mod set_titles;
 mod set_titles_client_context;
 #[path = "handler_attach_tests/set_titles_overlay.rs"]
 mod set_titles_overlay;
+#[path = "handler_attach_tests/set_titles_path.rs"]
+mod set_titles_path;
 #[path = "handler_attach_tests/set_titles_support.rs"]
 mod set_titles_support;
 

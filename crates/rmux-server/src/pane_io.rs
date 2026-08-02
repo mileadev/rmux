@@ -176,8 +176,6 @@ use persistent_overlay::{
     replacement_persistent_overlay_frame, switch_requires_screen_clear,
     take_pending_persistent_overlay_for_state, update_persistent_overlay_cache,
 };
-#[cfg(test)]
-pub(crate) use reader::publish_pane_bytes_for_test;
 #[cfg(windows)]
 pub(crate) use reader::spawn_pane_exit_watcher;
 pub(crate) use reader::spawn_pane_output_reader;
@@ -185,6 +183,8 @@ pub(crate) use reader::spawn_pane_output_reader;
 pub(crate) use reader::PaneOutputEofState;
 #[cfg(unix)]
 pub(crate) use reader::PaneOutputReaderTask;
+#[cfg(test)]
+pub(crate) use reader::{publish_pane_bytes_capturing_alerts, publish_pane_bytes_for_test};
 #[cfg(any(unix, windows))]
 use refresh_scheduler::{
     wait_for_refresh_deadline, AttachRefreshScheduler, AttachStatusRefreshScheduler,

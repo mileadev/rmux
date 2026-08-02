@@ -308,6 +308,7 @@ async fn an_active_pane_title_change_carries_the_new_title_to_the_client() {
         bell_count: 0,
         title_changed: true,
         title_change: None,
+        path_changed: false,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
         clipboard_queries: Vec::new(),
@@ -366,6 +367,7 @@ async fn an_active_pane_title_change_does_not_refresh_when_set_titles_is_off() {
         bell_count: 0,
         title_changed: true,
         title_change: None,
+        path_changed: false,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
         clipboard_queries: Vec::new(),
@@ -503,13 +505,12 @@ async fn the_attach_frame_title_is_not_repeated_by_the_first_refresh() {
         "the attach frame itself carries the first title"
     );
 
+    // The listener's own seam, not a copy of it: removing the seed makes this
+    // client's first refresh repeat the title and this test red.
     let seeded = attach_with_initial_title(
         &handler,
         &alpha,
-        target
-            .client_title
-            .as_ref()
-            .map(|rendered| rendered.state().clone()),
+        crate::listener::attach_frame_client_title(&target),
     )
     .await;
     let unseeded = attach_with_initial_title(&handler, &alpha, None).await;
