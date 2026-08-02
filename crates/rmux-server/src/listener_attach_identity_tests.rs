@@ -232,3 +232,41 @@ async fn the_first_attach_frame_describes_the_authenticated_peer() -> io::Result
 
     attached.finish().await
 }
+
+/// The listener seam the direct unit test cannot reach: the title the frame
+/// already delivered has to arrive in the registration, or the client's next
+/// redraw writes it a second time.
+#[tokio::test]
+async fn the_listener_seeds_registration_with_the_title_it_forwarded() -> io::Result<()> {
+    let mut attached = attach_delegated_peer("listener-attach-seed").await;
+
+    // Force a redraw that changes no title. A client whose registration missed
+    // the seed repeats its first title here.
+    set_global(&attached.handler, OptionName::StatusInterval, "13").await;
+    // Then a real title change, so the wait below is bounded by a value that
+    // must arrive rather than by a timeout.
+    let second = "SECOND-TITLE";
+    set_global(&attached.handler, OptionName::SetTitlesString, second).await;
+
+    let observed = read_until_title(&mut attached.client, second).await;
+    let titles = titles_in(&observed);
+    assert!(
+        !titles.contains(&attached.first_title),
+        "the seeded title must not be written twice, got {titles:?}"
+    );
+    assert_eq!(
+        titles.last().map(String::as_str),
+        Some(second),
+        "the changed title still reaches the client, got {titles:?}"
+    );
+    assert_eq!(
+        attached
+            .handler
+            .remembered_client_title_for_test(attached.peer_pid)
+            .await,
+        Some(second.to_owned()),
+        "the memory follows what this client was last told"
+    );
+
+    attached.finish().await
+}
