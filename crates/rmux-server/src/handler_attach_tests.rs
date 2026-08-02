@@ -847,6 +847,8 @@ mod attach_render;
 
 #[path = "handler_attach_tests/set_titles.rs"]
 mod set_titles;
+#[path = "handler_attach_tests/set_titles_client_context.rs"]
+mod set_titles_client_context;
 #[path = "handler_attach_tests/set_titles_overlay.rs"]
 mod set_titles_overlay;
 #[path = "handler_attach_tests/set_titles_support.rs"]

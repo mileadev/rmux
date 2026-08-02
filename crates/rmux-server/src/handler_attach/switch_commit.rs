@@ -12,6 +12,7 @@ use super::{
     terminate_overlay_job, ActiveAttachIdentity, AttachSessionSwitchRenderOptions,
     AttachedClientControlOutcome, ClientFlags, RequestHandler, ATTACH_CONTROL_BACKLOG_LIMIT,
 };
+use crate::handler::client_runtime_support::ListClientSnapshot;
 use crate::handler::client_support::SwitchTargetSelection;
 use crate::handler::{
     update_environment_from_client, QueuedLifecycleEvent, SelectionTargetTransitionSnapshot,
@@ -284,6 +285,12 @@ impl RequestHandler {
                 ));
             }
 
+            // Captured before the render so the title expands against the
+            // client this switch is being delivered to.
+            let switching_client = active_attach
+                .by_pid
+                .get(&attach_pid)
+                .map(|active| ListClientSnapshot::from_attached_client(attach_pid, active));
             let target = attach_target_for_session_switch(
                 &state,
                 &request.session_name,
@@ -293,6 +300,7 @@ impl RequestHandler {
                         .by_pid
                         .get(&attach_pid)
                         .map(|active| &active.client_title),
+                    client: switching_client.as_ref(),
                     terminal_context: &request.terminal_context,
                     socket_path: &self.socket_path(),
                     render_stream: request.render_stream,

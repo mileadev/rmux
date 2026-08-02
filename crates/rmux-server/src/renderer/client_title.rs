@@ -3,6 +3,7 @@ use std::path::Path;
 use rmux_core::{OptionStore, Session};
 use rmux_proto::OptionName;
 
+use crate::client_format::ClientFormatBindings;
 use crate::format_runtime::RuntimeFormatContext;
 use crate::pane_terminals::HandlerState;
 
@@ -12,11 +13,19 @@ use super::status::{
 
 /// The client-scoped bindings tmux installs with `format_defaults()` before it
 /// expands `set-titles-string`.
+///
+/// `client` carries the active client's own `#{client_*}` values. tmux
+/// initialises the title's format tree from the client it is about to write to,
+/// so without them every `#{client_width}`, `#{client_height}` and
+/// `#{client_name}` in a custom title expands empty (issue #182). It is `None`
+/// only where no single client owns the render — the web and snapshot paths,
+/// which emit no title at all.
 pub(crate) struct ClientTitleContext<'a> {
     pub(crate) state: Option<&'a HandlerState>,
     pub(crate) attached_count: usize,
     pub(crate) key_table: Option<&'a str>,
     pub(crate) socket_path: Option<&'a Path>,
+    pub(crate) client: Option<&'a ClientFormatBindings>,
 }
 
 /// Expands `set-titles-string` for one attached client.
@@ -55,6 +64,9 @@ pub(crate) fn expand_client_title(
     }
     if let Some(pane) = session.window().active_pane() {
         runtime = runtime.with_pane(pane);
+    }
+    if let Some(client) = context.client {
+        runtime = client.apply(runtime);
     }
 
     // tmux expands the title through format_expand_time(), so strftime tokens

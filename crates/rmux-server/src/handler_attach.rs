@@ -11,6 +11,7 @@ use rmux_proto::{
 use tokio::time::sleep;
 
 use super::{client_support::SwitchTargetSelection, RequestHandler};
+use crate::handler::client_runtime_support::ListClientSnapshot;
 use crate::handler_support::attached_client_required;
 use crate::key_table::effective_client_key_table_name;
 use crate::outer_terminal::{
@@ -1191,6 +1192,7 @@ pub(super) fn attach_target_for_session(
     attached_count: usize,
     terminal_context: &OuterTerminalContext,
     previous_title: Option<&ClientTitleState>,
+    client: Option<&ListClientSnapshot>,
     socket_path: &Path,
 ) -> Result<AttachTarget, rmux_proto::RmuxError> {
     attach_target_for_session_with_prompt(
@@ -1201,6 +1203,7 @@ pub(super) fn attach_target_for_session(
             prompt: None,
             key_table: None,
             previous_title,
+            client,
             terminal_context,
             render_size: None,
             window_index: None,
@@ -1229,6 +1232,7 @@ pub(super) fn attach_target_for_web_session(
             prompt: None,
             key_table: None,
             previous_title: None,
+            client: None,
             terminal_context,
             render_size: None,
             window_index: None,
@@ -1244,6 +1248,7 @@ pub(super) fn attach_target_for_web_session(
 pub(super) struct AttachSessionSwitchRenderOptions<'a> {
     pub(super) attached_count: usize,
     pub(super) previous_title: Option<&'a ClientTitleState>,
+    pub(super) client: Option<&'a ListClientSnapshot>,
     pub(super) terminal_context: &'a OuterTerminalContext,
     pub(super) socket_path: &'a Path,
     pub(super) render_stream: bool,
@@ -1280,6 +1285,7 @@ pub(super) fn attach_target_for_session_switch(
     let AttachSessionSwitchRenderOptions {
         attached_count,
         previous_title,
+        client,
         terminal_context,
         socket_path,
         render_stream,
@@ -1305,6 +1311,7 @@ pub(super) fn attach_target_for_session_switch(
             prompt: None,
             key_table: None,
             previous_title,
+            client,
             terminal_context,
             render_size: None,
             window_index: None,
@@ -1334,6 +1341,7 @@ pub(super) fn attach_render_target_for_session_window(
             prompt: None,
             key_table: None,
             previous_title: None,
+            client: None,
             terminal_context,
             render_size: None,
             window_index,
@@ -1360,6 +1368,7 @@ pub(super) fn attach_render_target_for_session_with_prompt(
             prompt: request.prompt,
             key_table: request.key_table,
             previous_title: request.previous_title,
+            client: request.client,
             terminal_context: request.terminal_context,
             render_size: request.render_size,
             window_index: None,
@@ -1414,9 +1423,71 @@ pub(super) struct AttachRenderTargetRequest<'a> {
     pub(super) prompt: Option<&'a renderer::RenderedPrompt>,
     pub(super) key_table: Option<&'a str>,
     pub(super) previous_title: Option<&'a ClientTitleState>,
+    /// The client this frame is for, so `set-titles-string` expands its own
+    /// `#{client_*}` values rather than leaving them empty (issue #182).
+    pub(super) client: Option<&'a ListClientSnapshot>,
     pub(super) terminal_context: &'a OuterTerminalContext,
     pub(super) render_size: Option<TerminalSize>,
     pub(super) socket_path: &'a Path,
+}
+
+/// Everything a render needs from one attached client.
+///
+/// Taken under the client lock alone so the state lock can be acquired
+/// afterwards without holding both, which is why it owns its values.
+pub(super) struct ClientRenderSnapshot {
+    pub(super) prompt: Option<renderer::RenderedPrompt>,
+    pub(super) terminal_context: OuterTerminalContext,
+    pub(super) client_size: TerminalSize,
+    pub(super) mode_tree_state_id: u64,
+    pub(super) mode_tree_active: bool,
+    pub(super) key_table: Option<String>,
+    pub(super) transient_message: Option<TransientMessageRenderSnapshot>,
+    pub(super) previous_title: ClientTitleState,
+    pub(super) client: ListClientSnapshot,
+}
+
+impl ClientRenderSnapshot {
+    pub(super) fn capture(attach_pid: u32, active: &ActiveAttach) -> Self {
+        Self {
+            prompt: active
+                .prompt
+                .as_ref()
+                .map(super::prompt_support::ClientPromptState::rendered_prompt),
+            terminal_context: active.terminal_context.clone(),
+            client_size: active.client_size,
+            mode_tree_state_id: active.mode_tree_state_id,
+            mode_tree_active: active.mode_tree.is_some(),
+            key_table: active.key_table_name.clone(),
+            transient_message: transient_message_render_snapshot(active),
+            previous_title: active.client_title.clone(),
+            client: ListClientSnapshot::from_attached_client(attach_pid, active),
+        }
+    }
+
+    /// The render request this client's next frame is built from.
+    pub(super) fn render_request<'a>(
+        &'a self,
+        socket_path: &'a Path,
+    ) -> AttachRenderTargetRequest<'a> {
+        AttachRenderTargetRequest {
+            prompt: self.prompt.as_ref(),
+            key_table: self.key_table.as_deref(),
+            previous_title: Some(&self.previous_title),
+            client: Some(&self.client),
+            terminal_context: &self.terminal_context,
+            render_size: Some(self.client_size),
+            socket_path,
+        }
+    }
+
+    /// Stamps the persistent-overlay state a client with an open overlay
+    /// requires, so a frame rendered before a barrier is not drawn after it.
+    pub(super) fn stamp_persistent_overlay_state(&self, target: &mut AttachTarget) {
+        if self.mode_tree_active {
+            target.persistent_overlay_state_id = Some(self.mode_tree_state_id);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1431,6 +1502,9 @@ struct AttachTargetRenderOptions<'a> {
     /// What this client's outer terminal already shows, so an unchanged
     /// expansion is not re-emitted on every refresh.
     previous_title: Option<&'a ClientTitleState>,
+    /// The client this frame is for, source of the `#{client_*}` bindings the
+    /// title expands against.
+    client: Option<&'a ListClientSnapshot>,
     terminal_context: &'a OuterTerminalContext,
     render_size: Option<TerminalSize>,
     window_index: Option<u32>,
@@ -1515,6 +1589,17 @@ fn attach_target_for_session_with_prompt(
         pane_state.as_ref(),
         cursor_scope,
     );
+    // tmux expands the title through the format tree of the client it is about
+    // to write to, so this render's own client supplies every `#{client_*}`.
+    // The features come from the terminal just resolved for it rather than from
+    // a separate lookup, so the record cannot describe a different terminal
+    // than the one the frame is written for.
+    let client_bindings = options.client.map(|client| {
+        client
+            .clone()
+            .resolved_for_render(outer_terminal.features_string(), &key_table)
+            .format_bindings()
+    });
     let resolved_title = renderer::expand_client_title(
         session,
         &state.options,
@@ -1523,6 +1608,7 @@ fn attach_target_for_session_with_prompt(
             attached_count,
             key_table: Some(&key_table),
             socket_path: Some(options.socket_path),
+            client: client_bindings.as_ref(),
         },
     );
     let title_update = ClientTitleUpdate {
@@ -2236,6 +2322,7 @@ mod tests {
                 1,
                 &terminal_context,
                 None,
+                None,
                 &handler.socket_path(),
             )
             .expect("beta target builds");
@@ -2326,6 +2413,7 @@ mod tests {
                 &beta,
                 1,
                 &terminal_context,
+                None,
                 None,
                 &handler.socket_path(),
             )

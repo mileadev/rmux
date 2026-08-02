@@ -1,9 +1,11 @@
 use std::sync::atomic::Ordering;
 
-use super::super::prompt_support::ClientPromptState;
 use super::super::RequestHandler;
 use super::refresh::enqueue_tracked_render_control;
-use super::{ActiveAttachIdentity, TransientMessageRenderSnapshot, TransientMessageRestoreGuard};
+use super::{
+    ActiveAttachIdentity, ClientRenderSnapshot, TransientMessageRenderSnapshot,
+    TransientMessageRestoreGuard,
+};
 use crate::pane_io::{AttachControl, AttachTarget};
 
 struct BaseRefreshDelivery {
@@ -182,7 +184,7 @@ impl RequestHandler {
         let attached_count = self
             .attached_count_for_session_identity(session_name, session_id)
             .await;
-        let target = {
+        let snapshot = {
             let active_attach = self.active_attach.lock().await;
             active_attach
                 .by_pid
@@ -192,33 +194,9 @@ impl RequestHandler {
                         && !active.suspended
                         && !active.closing.load(Ordering::SeqCst)
                 })
-                .map(|active| {
-                    (
-                        active
-                            .prompt
-                            .as_ref()
-                            .map(ClientPromptState::rendered_prompt),
-                        active.terminal_context.clone(),
-                        active.client_size,
-                        active.mode_tree_state_id,
-                        active.mode_tree.is_some(),
-                        active.key_table_name.clone(),
-                        super::transient_message_render_snapshot(active),
-                        active.client_title.clone(),
-                    )
-                })
+                .map(|active| ClientRenderSnapshot::capture(attach_pid, active))
         };
-        let Some((
-            prompt,
-            terminal_context,
-            client_size,
-            mode_tree_state_id,
-            mode_tree_active,
-            key_table,
-            transient_message,
-            previous_title,
-        )) = target
-        else {
+        let Some(snapshot) = snapshot else {
             return false;
         };
         let target = {
@@ -234,25 +212,19 @@ impl RequestHandler {
                 &state,
                 session_name,
                 attached_count,
-                super::AttachRenderTargetRequest {
-                    prompt: prompt.as_ref(),
-                    key_table: key_table.as_deref(),
-                    previous_title: Some(&previous_title),
-                    terminal_context: &terminal_context,
-                    render_size: Some(client_size),
-                    socket_path: &self.socket_path(),
-                },
+                snapshot.render_request(&self.socket_path()),
             ) {
                 Ok(target) => target,
                 Err(_) => return false,
             };
-            let rendered_status = match transient_message
+            let rendered_status = match snapshot
+                .transient_message
                 .as_ref()
                 .map(|message| {
                     super::render_status_message_for_attached_size(
                         &state,
                         session_name,
-                        client_size,
+                        snapshot.client_size,
                         message.status_message(),
                     )
                 })
@@ -266,16 +238,14 @@ impl RequestHandler {
         let Some((mut target, rendered_status)) = target else {
             return false;
         };
-        if mode_tree_active {
-            target.persistent_overlay_state_id = Some(mode_tree_state_id);
-        }
+        snapshot.stamp_persistent_overlay_state(&mut target);
         self.deliver_base_refresh_for_session_identity(
             identity,
             session_name,
             session_id,
             BaseRefreshDelivery {
                 target,
-                transient_message,
+                transient_message: snapshot.transient_message,
                 rendered_status,
                 restore_guard,
             },

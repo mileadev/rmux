@@ -616,13 +616,16 @@ impl RequestHandler {
     }
 
     async fn render_attached_display_panes_clear_frame(&self, attach_pid: u32) -> Option<Vec<u8>> {
-        let (session_name, terminal_context, client_title) = {
+        let (session_name, terminal_context, client_title, client) = {
             let active_attach = self.active_attach.lock().await;
             let active = active_attach.by_pid.get(&attach_pid)?;
             (
                 active.session_name.clone(),
                 active.terminal_context.clone(),
                 active.client_title.clone(),
+                crate::handler::client_runtime_support::ListClientSnapshot::from_attached_client(
+                    attach_pid, active,
+                ),
             )
         };
         let attached_count = self.attached_count(&session_name).await;
@@ -636,6 +639,7 @@ impl RequestHandler {
             // Dismissing the overlay replays the base frame; the outer terminal
             // still shows this client's title, so it must not be rewritten.
             Some(&client_title),
+            Some(&client),
             &self.socket_path(),
         )
         .ok()?;

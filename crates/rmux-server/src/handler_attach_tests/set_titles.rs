@@ -492,6 +492,7 @@ async fn the_attach_frame_title_is_not_repeated_by_the_first_refresh() {
             1,
             &title_capable_context(),
             None,
+            None,
             Path::new("rmux.sock"),
         )
         .expect("attach target builds")

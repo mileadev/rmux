@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
-use super::super::prompt_support::ClientPromptState;
 use super::super::RequestHandler;
 use super::state::ActiveAttach;
+use super::ClientRenderSnapshot;
 use crate::pane_io::AttachControl;
 
 impl RequestHandler {
@@ -63,20 +63,7 @@ impl RequestHandler {
                     }
                     continue;
                 }
-                refresh_contexts.push((
-                    *pid,
-                    active
-                        .prompt
-                        .as_ref()
-                        .map(ClientPromptState::rendered_prompt),
-                    active.terminal_context.clone(),
-                    active.client_size,
-                    active.mode_tree_state_id,
-                    active.mode_tree.is_some(),
-                    active.key_table_name.clone(),
-                    super::transient_message_render_snapshot(active),
-                    active.client_title.clone(),
-                ));
+                refresh_contexts.push((*pid, ClientRenderSnapshot::capture(*pid, active)));
             }
             (
                 refresh_contexts,
@@ -99,44 +86,26 @@ impl RequestHandler {
             let state = self.state.lock().await;
             let _lock_span = crate::perf_instrument::span("state_lock_hold")
                 .with_str("site", "attach_refresh_session_targets");
+            let socket_path = self.socket_path();
             let mut targets = Vec::with_capacity(refresh_contexts.len());
-            for (
-                pid,
-                prompt,
-                terminal_context,
-                client_size,
-                mode_tree_state_id,
-                mode_tree_active,
-                key_table,
-                transient_message,
-                previous_title,
-            ) in &refresh_contexts
-            {
+            for (pid, snapshot) in &refresh_contexts {
                 let Ok(mut target) = super::attach_render_target_for_session_with_prompt(
                     &state,
                     session_name,
                     attached_count,
-                    super::AttachRenderTargetRequest {
-                        prompt: prompt.as_ref(),
-                        key_table: key_table.as_deref(),
-                        previous_title: Some(previous_title),
-                        terminal_context,
-                        render_size: Some(*client_size),
-                        socket_path: &self.socket_path(),
-                    },
+                    snapshot.render_request(&socket_path),
                 ) else {
                     return;
                 };
-                if *mode_tree_active {
-                    target.persistent_overlay_state_id = Some(*mode_tree_state_id);
-                }
-                let rendered_status = match transient_message
+                snapshot.stamp_persistent_overlay_state(&mut target);
+                let rendered_status = match snapshot
+                    .transient_message
                     .as_ref()
                     .map(|message| {
                         super::render_status_message_for_attached_size(
                             &state,
                             session_name,
-                            *client_size,
+                            snapshot.client_size,
                             message.status_message(),
                         )
                     })
@@ -145,7 +114,10 @@ impl RequestHandler {
                     Ok(rendered_status) => rendered_status,
                     Err(_) => return,
                 };
-                targets.push((*pid, (target, transient_message.clone(), rendered_status)));
+                targets.push((
+                    *pid,
+                    (target, snapshot.transient_message.clone(), rendered_status),
+                ));
             }
             targets
         };
@@ -283,7 +255,7 @@ impl RequestHandler {
         self.wait_for_windows_deferred_session_pane_pids(session_name)
             .await;
         let attached_count = self.attached_count(session_name).await;
-        let prompt = {
+        let snapshot = {
             let active_attach = self.active_attach.lock().await;
             active_attach
                 .by_pid
@@ -294,33 +266,9 @@ impl RequestHandler {
                     }) && &active.session_name == session_name
                         && !active.suspended
                 })
-                .map(|active| {
-                    (
-                        active
-                            .prompt
-                            .as_ref()
-                            .map(ClientPromptState::rendered_prompt),
-                        active.terminal_context.clone(),
-                        active.client_size,
-                        active.mode_tree_state_id,
-                        active.mode_tree.is_some(),
-                        active.key_table_name.clone(),
-                        super::transient_message_render_snapshot(active),
-                        active.client_title.clone(),
-                    )
-                })
+                .map(|active| ClientRenderSnapshot::capture(attach_pid, active))
         };
-        let Some((
-            prompt,
-            terminal_context,
-            client_size,
-            mode_tree_state_id,
-            mode_tree_active,
-            key_table,
-            transient_message,
-            previous_title,
-        )) = prompt
-        else {
+        let Some(snapshot) = snapshot else {
             return false;
         };
         let target = {
@@ -331,25 +279,19 @@ impl RequestHandler {
                 &state,
                 session_name,
                 attached_count,
-                super::AttachRenderTargetRequest {
-                    prompt: prompt.as_ref(),
-                    key_table: key_table.as_deref(),
-                    previous_title: Some(&previous_title),
-                    terminal_context: &terminal_context,
-                    render_size: Some(client_size),
-                    socket_path: &self.socket_path(),
-                },
+                snapshot.render_request(&self.socket_path()),
             ) {
                 Ok(target) => target,
                 Err(_) => return false,
             };
-            let rendered_status = match transient_message
+            let rendered_status = match snapshot
+                .transient_message
                 .as_ref()
                 .map(|message| {
                     super::render_status_message_for_attached_size(
                         &state,
                         session_name,
-                        client_size,
+                        snapshot.client_size,
                         message.status_message(),
                     )
                 })
@@ -363,9 +305,7 @@ impl RequestHandler {
         let Some((mut target, rendered_status)) = target else {
             return false;
         };
-        if mode_tree_active {
-            target.persistent_overlay_state_id = Some(mode_tree_state_id);
-        }
+        snapshot.stamp_persistent_overlay_state(&mut target);
 
         let mut active_attach = self.active_attach.lock().await;
         let (delivered, stale_client) = match active_attach.by_pid.get_mut(&attach_pid) {
@@ -379,7 +319,7 @@ impl RequestHandler {
                 active.remember_client_title(target.client_title.as_ref());
                 super::compose_transient_message_refresh(
                     active,
-                    transient_message.as_ref(),
+                    snapshot.transient_message.as_ref(),
                     rendered_status,
                     &mut target.render_frame,
                 );
@@ -480,39 +420,15 @@ impl RequestHandler {
             .with_u64("attach_pid", u64::from(attach_pid))
             .with_str("session", session_name.as_str());
         let attached_count = self.attached_count(session_name).await;
-        let prompt = {
+        let snapshot = {
             let active_attach = self.active_attach.lock().await;
             active_attach
                 .by_pid
                 .get(&attach_pid)
                 .filter(|active| &active.session_name == session_name && !active.suspended)
-                .map(|active| {
-                    (
-                        active
-                            .prompt
-                            .as_ref()
-                            .map(ClientPromptState::rendered_prompt),
-                        active.terminal_context.clone(),
-                        active.client_size,
-                        active.mode_tree_state_id,
-                        active.mode_tree.is_some(),
-                        active.key_table_name.clone(),
-                        super::transient_message_render_snapshot(active),
-                        active.client_title.clone(),
-                    )
-                })
+                .map(|active| ClientRenderSnapshot::capture(attach_pid, active))
         };
-        let Some((
-            prompt,
-            terminal_context,
-            client_size,
-            mode_tree_state_id,
-            mode_tree_active,
-            key_table,
-            transient_message,
-            previous_title,
-        )) = prompt
-        else {
+        let Some(snapshot) = snapshot else {
             return;
         };
         let target = {
@@ -523,25 +439,19 @@ impl RequestHandler {
                 &state,
                 session_name,
                 attached_count,
-                super::AttachRenderTargetRequest {
-                    prompt: prompt.as_ref(),
-                    key_table: key_table.as_deref(),
-                    previous_title: Some(&previous_title),
-                    terminal_context: &terminal_context,
-                    render_size: Some(client_size),
-                    socket_path: &self.socket_path(),
-                },
+                snapshot.render_request(&self.socket_path()),
             ) {
                 Ok(target) => target,
                 Err(_) => return,
             };
-            let rendered_status = match transient_message
+            let rendered_status = match snapshot
+                .transient_message
                 .as_ref()
                 .map(|message| {
                     super::render_status_message_for_attached_size(
                         &state,
                         session_name,
-                        client_size,
+                        snapshot.client_size,
                         message.status_message(),
                     )
                 })
@@ -555,9 +465,7 @@ impl RequestHandler {
         let Some((mut target, rendered_status)) = target else {
             return;
         };
-        if mode_tree_active {
-            target.persistent_overlay_state_id = Some(mode_tree_state_id);
-        }
+        snapshot.stamp_persistent_overlay_state(&mut target);
 
         let mut active_attach = self.active_attach.lock().await;
         let stale_client = match active_attach.by_pid.get_mut(&attach_pid) {
@@ -566,7 +474,7 @@ impl RequestHandler {
                 active.remember_client_title(target.client_title.as_ref());
                 super::compose_transient_message_refresh(
                     active,
-                    transient_message.as_ref(),
+                    snapshot.transient_message.as_ref(),
                     rendered_status,
                     &mut target.render_frame,
                 );

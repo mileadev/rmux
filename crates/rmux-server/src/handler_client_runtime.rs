@@ -7,7 +7,6 @@ use rmux_os::process;
 use rmux_proto::request::SwitchClientExt3Request;
 use rmux_proto::{CommandOutput, OptionName, RmuxError};
 
-use crate::client_names::attached_client_tty_path;
 use crate::handler_support::attached_client_required;
 use crate::key_table::effective_client_key_table_name;
 use crate::outer_terminal::{ClientTitleUpdate, OuterTerminal};
@@ -28,7 +27,7 @@ mod requester_access;
 #[cfg(test)]
 pub(in crate::handler) use crate::client_names::attached_client_name;
 pub(in crate::handler) use crate::client_names::control_client_name;
-pub(in crate::handler) use list_clients::ListClientSnapshot;
+pub(in crate::handler) use list_clients::{AttachingClient, ListClientSnapshot};
 
 pub(in crate::handler) const LIST_CLIENTS_TEMPLATE: &str = "#{client_name}: #{session_name} [#{client_width}x#{client_height} #{client_termname}]#{?#{==:#{client_uid},#{uid}},, [user #{?client_user,#{client_user},#{client_uid}}]}#{?client_flags, (#{client_flags}),}";
 
@@ -117,32 +116,18 @@ impl RequestHandler {
                 .map(|(&pid, active)| {
                     let outer_terminal =
                         OuterTerminal::resolve(&options, active.terminal_context.clone());
-                    let tty = attached_client_tty_path(pid)
-                        .map(|path| path.to_string_lossy().into_owned())
-                        .unwrap_or_default();
+                    let key_table = active
+                        .key_table_name
+                        .clone()
+                        .or_else(|| default_key_tables.get(&active.session_name).cloned());
+                    let snapshot = ListClientSnapshot::from_attached_client(pid, active)
+                        .resolved_for_render(
+                            outer_terminal.features_string(),
+                            key_table.as_deref().unwrap_or("root"),
+                        );
                     ListClientSnapshot {
-                        name: active.client_name.clone(),
-                        pid,
-                        tty,
-                        control: false,
-                        session_id: Some(active.session_id),
-                        session_name: Some(active.session_name.clone()),
-                        order: active.id,
-                        activity_at: active.activity_at,
-                        width: active.client_size.cols,
-                        height: Some(active.client_size.rows),
-                        sort_height: active.client_size.rows,
-                        termname: active.terminal_context.term_name().to_owned(),
-                        termtype: String::new(),
-                        termfeatures: outer_terminal.features_string(),
-                        utf8: active.terminal_context.utf8(),
-                        key_table: active
-                            .key_table_name
-                            .clone()
-                            .or_else(|| default_key_tables.get(&active.session_name).cloned()),
-                        uid: active.uid,
-                        user: active.user.clone(),
-                        flags: format_attached_client_flags(active),
+                        key_table,
+                        ..snapshot
                     }
                 })
                 .collect::<Vec<_>>()
@@ -214,6 +199,7 @@ impl RequestHandler {
             client_size,
             key_table,
             previous_title,
+            client,
             current_attach_id,
             current_session_id,
         ) = {
@@ -238,6 +224,7 @@ impl RequestHandler {
                 active.client_size,
                 active.key_table_name.clone(),
                 active.client_title.clone(),
+                ListClientSnapshot::from_attached_client(attach_pid, active),
                 active.id,
                 active.session_id,
             )
@@ -268,6 +255,11 @@ impl RequestHandler {
                     attached_count,
                     key_table: Some(&key_table),
                     socket_path: Some(&socket_path),
+                    client: Some(
+                        &client
+                            .resolved_for_render(outer_terminal.features_string(), &key_table)
+                            .format_bindings(),
+                    ),
                 },
             );
             let title_update = ClientTitleUpdate {
@@ -446,28 +438,37 @@ fn format_client_flags(flags: [Option<String>; 12]) -> String {
 pub(in crate::handler) fn format_attached_client_flags(
     active: &attach_support::ActiveAttach,
 ) -> String {
+    attached_client_flags(
+        active.flags,
+        active.suspended,
+        active.terminal_context.utf8(),
+    )
+}
+
+/// `#{client_flags}` for an attached client, from the three facts it depends
+/// on. A client attaching for the first time is not registered yet, so it has
+/// no `ActiveAttach` to read them from.
+pub(in crate::handler) fn attached_client_flags(
+    flags: ClientFlags,
+    suspended: bool,
+    utf8: bool,
+) -> String {
     format_client_flags([
         Some("attached".to_owned()),
-        client_flag(!active.suspended, "focused"),
+        client_flag(!suspended, "focused"),
         None,
+        client_flag(flags.contains(ClientFlags::IGNORESIZE), "ignore-size"),
         client_flag(
-            active.flags.contains(ClientFlags::IGNORESIZE),
-            "ignore-size",
-        ),
-        client_flag(
-            active.flags.contains(ClientFlags::NO_DETACH_ON_DESTROY),
+            flags.contains(ClientFlags::NO_DETACH_ON_DESTROY),
             "no-detach-on-destroy",
         ),
         None,
         None,
         None,
-        client_flag(active.flags.contains(ClientFlags::READONLY), "read-only"),
-        client_flag(
-            active.flags.contains(ClientFlags::ACTIVEPANE),
-            "active-pane",
-        ),
-        client_flag(active.suspended, "suspended"),
-        client_flag(active.terminal_context.utf8(), "UTF-8"),
+        client_flag(flags.contains(ClientFlags::READONLY), "read-only"),
+        client_flag(flags.contains(ClientFlags::ACTIVEPANE), "active-pane"),
+        client_flag(suspended, "suspended"),
+        client_flag(utf8, "UTF-8"),
     ])
 }
 
