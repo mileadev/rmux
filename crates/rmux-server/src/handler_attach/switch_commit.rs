@@ -286,11 +286,13 @@ impl RequestHandler {
             }
 
             // Captured before the render so the title expands against the
-            // client this switch is being delivered to.
-            let switching_client = active_attach
-                .by_pid
-                .get(&attach_pid)
-                .map(|active| ListClientSnapshot::from_attached_client(attach_pid, active));
+            // client this switch is being delivered to, already carrying the
+            // destination this frame commits to: nothing but a later unrelated
+            // redraw would correct a stale `#{client_session}`.
+            let switching_client = active_attach.by_pid.get(&attach_pid).map(|active| {
+                ListClientSnapshot::from_attached_client(attach_pid, active)
+                    .switched_to_session(&request.session_name, request.session_id)
+            });
             let target = attach_target_for_session_switch(
                 &state,
                 &request.session_name,

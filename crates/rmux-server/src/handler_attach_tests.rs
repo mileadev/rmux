@@ -855,6 +855,8 @@ mod set_titles_overlay;
 mod set_titles_path;
 #[path = "handler_attach_tests/set_titles_support.rs"]
 mod set_titles_support;
+#[path = "handler_attach_tests/set_titles_switch.rs"]
+mod set_titles_switch;
 
 #[path = "handler_attach_tests/attached_prefix_lifecycle.rs"]
 mod attached_prefix_lifecycle;

@@ -139,6 +139,26 @@ impl ListClientSnapshot {
         }
     }
 
+    /// The same client's record as it reads once a pending `switch-client`
+    /// commits.
+    ///
+    /// A switch renders its frame before it moves the client, so a record taken
+    /// from the live registration still names the session being left. That
+    /// frame is enqueued only after the commit confirmed this exact
+    /// destination, and the linked-family refresh that follows deliberately
+    /// excludes the switched client, so a stale `#{client_session}` would
+    /// disagree with `#S` and with `list-clients` until an unrelated redraw
+    /// happened to correct it (issue #182).
+    pub(in crate::handler) fn switched_to_session(
+        mut self,
+        session_name: &rmux_proto::SessionName,
+        session_id: SessionId,
+    ) -> Self {
+        self.session_name = Some(session_name.clone());
+        self.session_id = Some(session_id);
+        self
+    }
+
     /// Completes a record with what only a render resolves: the features this
     /// client's outer terminal advertises and its effective key table.
     pub(in crate::handler) fn resolved_for_render(
