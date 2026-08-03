@@ -2110,10 +2110,169 @@ fn packaged_artifact_metadata_never_embeds_builder_paths() {
 }
 
 #[test]
+fn linux_release_builds_pin_and_enforce_the_glibc_231_contract() {
+    let requirements = include_str!("../scripts/release/linux-glibc-build-requirements.txt");
+    for required in ["cargo-zigbuild==0.23.0", "ziglang==0.15.2"] {
+        assert!(
+            requirements.contains(required),
+            "requirements lost {required}"
+        );
+    }
+    assert_eq!(requirements.matches("--hash=sha256:").count(), 4);
+
+    let installer = include_str!("../scripts/release/install-linux-glibc-build-tools.sh");
+    for required in [
+        "--no-deps",
+        "--only-binary=:all:",
+        "--require-hashes",
+        "cargo-zigbuild 0.23.0",
+        "zig_version\" = \"0.15.2",
+    ] {
+        assert!(installer.contains(required), "installer lost {required}");
+    }
+
+    let compatible = include_str!("../scripts/release/cargo-build-compatible.sh");
+    for required in [
+        "[ \"$1\" = \"build\" ]",
+        "cargo zigbuild --target \"$target.$glibc_floor\"",
+        "cargo build --target \"$target\"",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "+crt-static",
+    ] {
+        assert!(
+            compatible.contains(required),
+            "build helper lost {required}"
+        );
+    }
+
+    let smoke = include_str!("../scripts/smoke-linux-glibc-baseline.sh");
+    for required in [
+        "ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214",
+        "--network none",
+        "--read-only",
+        "--cap-drop ALL",
+        "--security-opt no-new-privileges",
+        "glibc 2.31",
+    ] {
+        assert!(smoke.contains(required), "baseline smoke lost {required}");
+    }
+
+    for producer in [
+        include_str!("../scripts/package-unix.sh"),
+        include_str!("../scripts/package-debian.sh"),
+        include_str!("../scripts/package-rpm.sh"),
+    ] {
+        assert!(producer.contains("release/cargo-build-compatible.sh"));
+        assert!(producer.contains("RMUX_MAX_SUPPORTED_GLIBC:-2.31"));
+    }
+
+    for workflow in [
+        include_str!("../.github/actions/canonical-build/action.yml"),
+        include_str!("../.github/workflows/release.yml"),
+    ] {
+        for required in [
+            "install-linux-glibc-build-tools.sh",
+            "CARGO_ZIGBUILD_PYTHON_PATH=",
+            "RMUX_LINUX_GLIBC_FLOOR=2.31",
+            "RMUX_MAX_SUPPORTED_GLIBC=2.31",
+            "smoke-linux-glibc-baseline.sh",
+        ] {
+            assert!(
+                workflow.contains(required),
+                "release workflow lost {required}"
+            );
+        }
+    }
+    assert!(
+        include_str!("../.github/actions/canonical-build/action.yml")
+            .contains("linux-glibc-build-tools.txt\" \"$provenance/")
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn compatible_builder_routes_only_linux_gnu_through_the_pinned_floor() {
+    let root = temp_dir("compatible-builder");
+    let fake_bin = root.join("bin");
+    let cargo_log = root.join("cargo.log");
+    fs::create_dir(&fake_bin).expect("create fake bin");
+    let fake_cargo = fake_bin.join("cargo");
+    fs::write(
+        &fake_cargo,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$FAKE_CARGO_LOG\"\n",
+    )
+    .expect("write fake cargo");
+    make_executable(&fake_cargo);
+    let fake_zigbuild = fake_bin.join("cargo-zigbuild");
+    fs::write(&fake_zigbuild, "#!/bin/sh\nexit 0\n").expect("write fake cargo-zigbuild");
+    make_executable(&fake_zigbuild);
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let helper = repo_root().join("scripts/release/cargo-build-compatible.sh");
+
+    let linux = Command::new(&helper)
+        .args([
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "--",
+            "build",
+            "--locked",
+            "--release",
+        ])
+        .env("PATH", &path)
+        .env("FAKE_CARGO_LOG", &cargo_log)
+        .env("RMUX_LINUX_GLIBC_FLOOR", "2.31")
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .output()
+        .expect("run Linux compatible build");
+    assert!(linux.status.success(), "{}", stderr(&linux));
+    assert_eq!(
+        fs::read_to_string(&cargo_log).expect("read Linux cargo arguments"),
+        "zigbuild\n--target\nx86_64-unknown-linux-gnu.2.31\n--locked\n--release\n"
+    );
+
+    let macos = Command::new(&helper)
+        .args(["--target", "x86_64-apple-darwin", "--", "build", "--locked"])
+        .env("PATH", &path)
+        .env("FAKE_CARGO_LOG", &cargo_log)
+        .env("RMUX_LINUX_GLIBC_FLOOR", "2.31")
+        .output()
+        .expect("run macOS compatible build");
+    assert!(macos.status.success(), "{}", stderr(&macos));
+    assert_eq!(
+        fs::read_to_string(&cargo_log).expect("read macOS cargo arguments"),
+        "build\n--target\nx86_64-apple-darwin\n--locked\n"
+    );
+
+    let bypass = Command::new(&helper)
+        .args([
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "--",
+            "build",
+            "--release",
+        ])
+        .env("PATH", &path)
+        .env("RMUX_LINUX_GLIBC_FLOOR", "2.31")
+        .env("RUSTFLAGS", "-C linker=/usr/bin/cc")
+        .output()
+        .expect("run rejected linker bypass");
+    assert!(!bypass.status.success());
+    assert!(stderr(&bypass).contains("override cargo-zigbuild's dynamic glibc linker contract"));
+
+    fs::remove_dir_all(root).expect("remove compatible build fixture");
+}
+
+#[test]
 fn distro_package_glibc_floor_is_derived_and_verified_for_all_binaries() {
+    let unix = include_str!("../scripts/package-unix.sh");
     let deb = include_str!("../scripts/package-debian.sh");
     let rpm = include_str!("../scripts/package-rpm.sh");
-    for producer in [deb, rpm] {
+    for producer in [unix, deb, rpm] {
         for required in [
             "binary_glibc_min",
             "helper_binary_glibc_min",
@@ -2127,8 +2286,10 @@ fn distro_package_glibc_floor_is_derived_and_verified_for_all_binaries() {
     }
     assert!(deb.contains("Depends: libc6 (>= $package_glibc_min)"));
     assert!(rpm.contains("Requires: glibc >= $package_glibc_min"));
+    assert!(unix.contains("newer than supported GLIBC_"));
     assert!(deb.contains("newer than supported GLIBC_"));
     assert!(rpm.contains("newer than supported GLIBC_"));
+    assert!(include_str!("../scripts/verify-package.sh").contains("newer than supported GLIBC_"));
     assert!(
         include_str!("../scripts/verify-debian-package.sh").contains("older than imported GLIBC_")
     );
