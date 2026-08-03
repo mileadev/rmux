@@ -250,9 +250,15 @@ impl RequestHandler {
                 pid: requester_pid,
                 session_name: &session_name,
                 session_id,
+                // The same anchor `register_attach_identity` is about to store,
+                // so this frame and every later one expand `#{client_height}`
+                // to one value. The session's window size is content geometry
+                // with the status rows already off it; handing it to a sizeless
+                // client here would make its first title alone report the
+                // status-subtracted height.
                 size: request
                     .client_size
-                    .unwrap_or_else(|| session.window().size()),
+                    .unwrap_or_else(|| session.terminal_size()),
                 terminal_context: &terminal_context,
                 flags,
                 uid: requester_uid,
