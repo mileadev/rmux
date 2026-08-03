@@ -557,6 +557,7 @@
     "scripts/smoke-tiny-release-review.sh",
     "scripts/smoke-unix-deep.sh",
     "scripts/smoke-unix.sh",
+    "scripts/tiny-cli-cwd-routes.sh",
     "scripts/tmux-compat-linux-check.py",
     "scripts/toml_reader.py",
     "scripts/unsafe-check.sh",
