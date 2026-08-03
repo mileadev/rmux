@@ -120,6 +120,13 @@ impl RequestHandler {
         }
     }
 
+    /// A requester scope carrying an admission but no authenticated peer.
+    ///
+    /// Every production connection now opens its scope through
+    /// [`Self::begin_authenticated_peer_access`], which carries the peer the OS
+    /// authenticated (issue #182); this remains only for the tests that drive a
+    /// requester scope without a connection behind it.
+    #[cfg(test)]
     pub(crate) fn begin_detached_requester_access(
         &self,
         requester_pid: u32,
