@@ -12,6 +12,13 @@ use rmux_pty::TerminalSize;
 
 const FORMAT: &str = "#{session_name}:#{pane_id}";
 
+/// The `-d` delay every delayed-command fixture queues.
+const DELAYED_COMMAND_DELAY: Duration = Duration::from_millis(500);
+
+/// How many times a replacement fixture may re-run after losing the race to
+/// mutate its target before the queued command fires.
+const REPLACEMENT_ATTEMPTS: usize = 5;
+
 #[test]
 fn detached_cli_run_shell_uses_the_canonical_current_target() -> Result<(), Box<dyn Error>> {
     let (harness, _daemon) = current_target_harness("run-shell-detached-current")?;
@@ -216,23 +223,39 @@ fn delayed_command_run_shell_rejects_replacement_session_product_divergence(
     // killed, the delayed command resolves a replacement with the same name
     // and creates the requested window there. RMUX pins the stable session
     // identity and fails closed instead of mutating the replacement.
-    let (harness, _daemon) = current_target_harness("run-shell-command-context-replacement")?;
-    let mut run_shell = spawn_delayed_command_run_shell(&harness, "new-window -d -n rebound")?;
-    wait_until_delayed(&mut run_shell)?;
+    for _ in 0..REPLACEMENT_ATTEMPTS {
+        let (harness, _daemon) = current_target_harness("run-shell-command-context-replacement")?;
+        let queued = Instant::now();
+        let mut run_shell = spawn_delayed_command_run_shell(&harness, "new-window -d -n rebound")?;
+        wait_until_delayed(&mut run_shell)?;
 
-    assert_success(&harness.run(&["kill-session", "-t", "beta"])?);
-    assert_success(&harness.run(&["new-session", "-d", "-s", "beta", "sleep 30"])?);
-    let output = run_shell.wait_with_output()?;
+        assert_success(&harness.run(&["kill-session", "-t", "beta"])?);
+        assert_success(&harness.run(&["new-session", "-d", "-s", "beta", "sleep 30"])?);
+        // `-d` is wall clock, and it cannot start before the spawn: replacing
+        // the target within it proves the command was still queued. Past it
+        // the run is undecided, because a command that already ran mutated the
+        // original target and exits 0 whatever the pinning rule does.
+        let still_queued = queued.elapsed() < DELAYED_COMMAND_DELAY;
+        let output = run_shell.wait_with_output()?;
+        if !still_queued && output.status.code() == Some(0) {
+            continue;
+        }
 
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert!(stdout(&output).is_empty());
-    assert_eq!(
-        stderr(&output),
-        "queued pinned target was replaced before execution\n"
-    );
-    assert_eq!(window_names(&harness, "alpha")?, vec!["sleep"]);
-    assert_eq!(window_names(&harness, "beta")?, vec!["sleep"]);
-    Ok(())
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(stdout(&output).is_empty());
+        assert_eq!(
+            stderr(&output),
+            "queued pinned target was replaced before execution\n"
+        );
+        assert_eq!(window_names(&harness, "alpha")?, vec!["sleep"]);
+        assert_eq!(window_names(&harness, "beta")?, vec!["sleep"]);
+        return Ok(());
+    }
+    Err(format!(
+        "the replacement never landed inside the {DELAYED_COMMAND_DELAY:?} delay in \
+         {REPLACEMENT_ATTEMPTS} attempts"
+    )
+    .into())
 }
 
 fn current_target_harness(label: &str) -> Result<(CliHarness, DaemonGuard), Box<dyn Error>> {
@@ -269,9 +292,10 @@ fn spawn_delayed_command_run_shell(
     harness: &CliHarness,
     nested_command: &str,
 ) -> Result<Child, Box<dyn Error>> {
+    let delay = format!("{}", DELAYED_COMMAND_DELAY.as_secs_f64());
     let mut command = harness.base_command();
     command
-        .args(["run-shell", "-C", "-d", "0.5", nested_command])
+        .args(["run-shell", "-C", "-d", &delay, nested_command])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
