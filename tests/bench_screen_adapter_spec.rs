@@ -18,7 +18,9 @@
 //! and never enforces screen's own session-name length: how the measured
 //! program reaches screen, and whether the scrollback row really captures its
 //! 10,000 lines. Those run against the installed binary and are skipped, not
-//! faked, on a host without one.
+//! faked, on a host whose screen cannot express them -- which includes a host
+//! with no screen at all, and one whose screen predates the surface they
+//! measure.
 
 #[path = "support/python3.rs"]
 mod python3;
@@ -29,6 +31,18 @@ use std::process::Output;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SCREEN_BANNER: &str = "Screen version 4.09.01 (GNU) 20-Aug-23";
+
+/// The oldest `screen` that can express the two rows the native cases measure.
+///
+/// `-Q`, which `list_windows_20` needs to read a command's answer back, arrived
+/// in screen 4.1.0. Apple still ships 4.00.03 (FAU, 2006) as `/usr/bin/screen`,
+/// which rejects `-Q` as an unknown option and whose detached
+/// `hardcopy <file>` writes an empty file instead of the window buffer, so the
+/// scrollback row never observes its own payload either. A host can therefore
+/// have `screen` on `PATH` and still express neither row: presence is not the
+/// requirement, this surface is.
+#[cfg(unix)]
+const MINIMUM_SCREEN_SURFACE: (u32, u32) = (4, 1);
 
 /// The eight operations GNU screen can express. Splits, resizes and per-pane
 /// listing have no strict equivalent and must stay absent.
@@ -194,11 +208,73 @@ fn write_capture_failing_stub(directory: &Path) -> PathBuf {
 /// The real GNU screen on this host, when it has one. GNU screen has no native
 /// Windows build, so these cases are Unix-only and skip rather than pretend.
 #[cfg(unix)]
-fn real_screen() -> Option<PathBuf> {
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
+/// The installed `screen`, or why these native cases cannot run on this host.
+fn real_screen() -> Result<PathBuf, String> {
+    let paths = std::env::var_os("PATH").ok_or("PATH is unset")?;
+    let screen = std::env::split_paths(&paths)
         .map(|directory| directory.join("screen"))
         .find(|candidate| candidate.is_file())
+        .ok_or("GNU screen is not installed on this host")?;
+    let banner = screen_banner(&screen)?;
+    let version = screen_surface(&banner)
+        .ok_or_else(|| format!("{} did not report a version: {banner:?}", screen.display()))?;
+    if version < MINIMUM_SCREEN_SURFACE {
+        let (major, minor) = MINIMUM_SCREEN_SURFACE;
+        return Err(format!(
+            "{banner} predates the screen {major}.{minor} surface these rows measure"
+        ));
+    }
+    Ok(screen)
+}
+
+/// GNU screen prints its banner and then exits non-zero, so only the text is
+/// meaningful here, and builds differ over which stream carries it.
+#[cfg(unix)]
+fn screen_banner(screen: &Path) -> Result<String, String> {
+    let output = std::process::Command::new(screen)
+        .arg("-v")
+        .output()
+        .map_err(|error| format!("failed to run {}: {error}", screen.display()))?;
+    let streams = [output.stdout, output.stderr];
+    let banner = streams.iter().find_map(|stream| {
+        String::from_utf8_lossy(stream)
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| line.trim().to_owned())
+    });
+    banner.ok_or_else(|| format!("{} printed no version banner", screen.display()))
+}
+
+/// `Screen version 4.09.01 (GNU) 20-Aug-23` is `(4, 9)`.
+#[cfg(unix)]
+fn screen_surface(banner: &str) -> Option<(u32, u32)> {
+    let mut fields = banner.strip_prefix("Screen version ")?.split_whitespace();
+    let mut numbers = fields.next()?.split('.');
+    let major = numbers.next()?.parse().ok()?;
+    let minor = numbers.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// The gate has to separate the two generations hosts actually ship, or the
+/// native cases either lose a host that can run them or fail on one that
+/// cannot.
+#[cfg(unix)]
+#[test]
+fn the_native_screen_gate_separates_the_generations_hosts_ship() {
+    let targeted = screen_surface(SCREEN_BANNER).expect("the banner the adapter targets");
+    let apple =
+        screen_surface("Screen version 4.00.03 (FAU) 23-Oct-06").expect("the banner Apple ships");
+    assert_eq!(targeted, (4, 9));
+    assert_eq!(apple, (4, 0));
+    assert!(
+        targeted >= MINIMUM_SCREEN_SURFACE,
+        "the surface the adapter targets must still run these rows"
+    );
+    assert!(
+        apple < MINIMUM_SCREEN_SURFACE,
+        "a screen without -Q must not be asked to measure them"
+    );
+    assert_eq!(screen_surface("There is a screen on:"), None);
 }
 
 fn payload(platform: &str, tools: &[&str]) -> serde_json::Value {
@@ -696,12 +772,14 @@ fn screen_measurements_reach_the_rendered_table() {
 #[cfg(unix)]
 #[test]
 fn a_real_screen_captures_the_whole_ten_thousand_line_scrollback() {
-    let Some(screen) = real_screen() else {
-        eprintln!(
-            "skipped a_real_screen_captures_the_whole_ten_thousand_line_scrollback: \
-             GNU screen is not installed on this host"
-        );
-        return;
+    let screen = match real_screen() {
+        Ok(screen) => screen,
+        Err(reason) => {
+            eprintln!(
+                "skipped a_real_screen_captures_the_whole_ten_thousand_line_scrollback: {reason}"
+            );
+            return;
+        }
     };
     // Read what the adapter's own timed command captured, before the adapter
     // removes it. Anything else would prove a session this spec built rather
@@ -783,13 +861,10 @@ print(json.dumps({{
 #[cfg(unix)]
 #[test]
 fn a_real_screen_measures_all_eight_comparable_operations() {
-    let Some(_) = real_screen() else {
-        eprintln!(
-            "skipped a_real_screen_measures_all_eight_comparable_operations: \
-             GNU screen is not installed on this host"
-        );
+    if let Err(reason) = real_screen() {
+        eprintln!("skipped a_real_screen_measures_all_eight_comparable_operations: {reason}");
         return;
-    };
+    }
     let workspace = temp_dir("screen-native-accounting");
     let artifact = workspace.join("screen.json");
     let output = python3::command()
