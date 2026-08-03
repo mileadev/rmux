@@ -25,6 +25,7 @@ command -v docker >/dev/null 2>&1 || die "docker is required for the glibc basel
 
 image="ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/rmux-glibc-smoke.XXXXXX")"
+chmod 0755 "$work_dir"
 cleanup() {
   rm -rf "$work_dir"
 }
@@ -36,6 +37,7 @@ for source_and_name in "$1:rmux" "$2:rmux-full" "$3:rmux-daemon"; do
   [ -f "$source" ] || die "release binary not found: $source"
   [ -x "$source" ] || die "release binary is not executable: $source"
   cp -- "$source" "$work_dir/$name"
+  chmod 0555 "$work_dir/$name"
 done
 
 docker run --rm \

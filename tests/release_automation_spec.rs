@@ -2152,6 +2152,7 @@ fn linux_release_builds_pin_and_enforce_the_glibc_231_contract() {
         "--read-only",
         "--cap-drop ALL",
         "--security-opt no-new-privileges",
+        "chmod 0755 \"$work_dir\"",
         "glibc 2.31",
     ] {
         assert!(smoke.contains(required), "baseline smoke lost {required}");
