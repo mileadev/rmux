@@ -1109,10 +1109,18 @@ def screen_operations(executable: str, iterations: int) -> dict[str, MeasuredOpe
 
 
 def temp_path_pattern() -> re.Pattern[str]:
-    """Match this host's temporary directory, with or without a path under it.
+    r"""Match this host's temporary directory, with or without a path under it.
 
     Both the configured and the fully resolved root are matched, longest first,
     so a resolved prefix such as macOS's `/private` cannot be left behind.
+
+    A backslash in the root is matched written plainly or written escaped. The
+    note a failure records quotes the command through `repr`, which doubles
+    every backslash, so a root spelled with them reaches the note as
+    `C:\\Users\\...`; matching only the plain spelling would publish the very
+    location this redaction exists to remove. A root spelled without them, so
+    every Unix root, is escaped exactly as before and matches exactly as
+    before.
 
     The root counts only on a path-component boundary. A neighbour that merely
     starts with it, `/tmp-not-a-child` for `/tmp`, and a directory that merely
@@ -1121,9 +1129,13 @@ def temp_path_pattern() -> re.Pattern[str]:
     never happened.
     """
     character = r"[^\s'\",;)\]]"
+    escapable = r"\\{1,2}"
     root = tempfile.gettempdir()
     roots = sorted({root, str(Path(root).resolve())}, key=len, reverse=True)
-    alternatives = "|".join(re.escape(candidate) for candidate in roots)
+    alternatives = "|".join(
+        escapable.join(re.escape(part) for part in candidate.split("\\"))
+        for candidate in roots
+    )
     return re.compile(
         rf"(?<![\w.~/\\-])(?:{alternatives})(?:[/\\]{character}*)?(?!{character})"
     )

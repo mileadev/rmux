@@ -910,6 +910,18 @@ fn a_real_screen_measures_all_eight_comparable_operations() {
     fs::remove_dir_all(&workspace).expect("remove native accounting workspace");
 }
 
+/// Every spelling this host's temporary root can reach a note in: written
+/// plainly, and written through the `repr` that quotes the command inside a
+/// `CalledProcessError`, which doubles each backslash. On a root whose
+/// separator never needs escaping the two spellings are the same text, so a
+/// case that checks both is exact everywhere and platform-specific nowhere.
+fn temp_root_renderings() -> [String; 2] {
+    let root = std::env::temp_dir().to_string_lossy().into_owned();
+    let root = root.trim_end_matches(['/', '\\']).to_owned();
+    let escaped = root.replace('\\', r"\\");
+    [root, escaped]
+}
+
 /// A published artifact records which tool failed on which operation. It must
 /// not also record where this host keeps its temporary files.
 #[test]
@@ -970,12 +982,12 @@ fn an_omission_note_does_not_publish_a_host_temporary_path() {
         "the spec is vacuous unless the failing command really quoted a temporary path: {note}"
     );
 
-    let temp_root = std::env::temp_dir();
-    let temp_root = temp_root.to_string_lossy();
-    assert!(
-        !note.contains(temp_root.trim_end_matches(['/', '\\'])),
-        "the note must not disclose this host's temporary location: {note}"
-    );
+    for rendering in temp_root_renderings() {
+        assert!(
+            !note.contains(&rendering),
+            "the note must not disclose this host's temporary location as {rendering}: {note}"
+        );
+    }
     fs::remove_dir_all(&workspace).expect("remove note redaction workspace");
 }
 
@@ -1002,19 +1014,23 @@ print(json.dumps({{
     ));
     let leaked = observed["leaked"].as_str().expect("leaked note");
     let clean = observed["clean"].as_str().expect("clean note");
-    let temp_root = std::env::temp_dir();
-    let temp_root = temp_root.to_string_lossy();
-    let temp_root = temp_root.trim_end_matches(['/', '\\']);
+    let renderings = temp_root_renderings();
 
-    // Vacuous unless the historical note really carried the path.
+    // Vacuous unless the historical note really carried the path, in whichever
+    // spelling `repr` gave it on this host.
     assert!(
-        leaked.contains(temp_root),
+        renderings
+            .iter()
+            .any(|rendering| leaked.contains(rendering)),
         "the spec is vacuous unless the recorded note really quoted a temporary path: {leaked}"
     );
-    assert!(
-        !clean.contains(temp_root),
-        "the published note must not disclose this host's temporary location: {clean}"
-    );
+    for rendering in &renderings {
+        assert!(
+            !clean.contains(rendering),
+            "the published note must not disclose this host's temporary location \
+             as {rendering}: {clean}"
+        );
+    }
     assert!(
         clean.starts_with("screen/capture_pane_200x50_scrollback_10k: CalledProcessError:")
             && clean.contains("hardcopy")
@@ -1074,6 +1090,73 @@ print(json.dumps({{
         observed["clean_ends_with_root"], observed["ends_with_root"],
         "a path that only ends with the temporary root is not the root: {}",
         observed["clean_ends_with_root"]
+    );
+}
+
+/// Redaction is defined on the temporary root, not on one spelling of it. A
+/// failure note quotes its command through `repr`, which doubles every
+/// backslash, so a root spelled with them arrives here as `C:\\Users\\...` and
+/// a redaction that only knew the plain spelling would publish the host
+/// location it exists to remove. The root is pinned so this case is exact on a
+/// host whose own separator is never escaped.
+#[test]
+fn redaction_reduces_a_temporary_root_whose_separators_are_escaped() {
+    let observed = driver_json(&format!(
+        "\
+import tempfile
+pinned = r'C:\\Users\\bench\\AppData\\Local\\Temp'
+tempfile.tempdir = pinned
+{LOAD_BENCH}
+tempfile.tempdir = None
+capture = pinned + r'\\tmpil47a80n'
+note = (
+    'screen/capture_pane_80x24: CalledProcessError: Command '
+    + repr(['screen', '-S', 'rmux-bench-screen', '-X', 'hardcopy', capture])
+    + ' returned non-zero exit status 1.'
+)
+neighbour = repr(pinned + '-not-a-child')
+print(json.dumps({{
+    'escaped_capture': repr(capture)[1:-1],
+    'note': note,
+    'clean_escaped': bench.sanitize(note),
+    'clean_plain': bench.sanitize('hardcopy ' + capture),
+    'clean_root': bench.sanitize(repr(pinned)),
+    'neighbour': neighbour,
+    'clean_neighbour': bench.sanitize(neighbour),
+}}))
+"
+    ));
+
+    // Vacuous unless the quoted command really doubled the separators.
+    let note = observed["note"].as_str().expect("note text");
+    let escaped_capture = observed["escaped_capture"]
+        .as_str()
+        .expect("escaped capture path");
+    assert!(
+        note.contains(escaped_capture),
+        "the spec is vacuous unless the quoted command really escaped its separators: {note}"
+    );
+
+    assert_eq!(
+        observed["clean_escaped"],
+        "screen/capture_pane_80x24: CalledProcessError: Command \
+         ['screen', '-S', 'rmux-bench-screen', '-X', 'hardcopy', '<temp>'] \
+         returned non-zero exit status 1.",
+        "an escaped capture path is the same host location and must be reduced, \
+         keeping the tool, the operation, the command and the failure"
+    );
+    assert_eq!(
+        observed["clean_plain"], "hardcopy <temp>",
+        "the plain spelling of the same root must keep being reduced"
+    );
+    assert_eq!(
+        observed["clean_root"], "'<temp>'",
+        "an escaped temporary root alone is host identity too, not just paths under it"
+    );
+    assert_eq!(
+        observed["clean_neighbour"], observed["neighbour"],
+        "an escaped neighbour of the root is still not under it: {}",
+        observed["clean_neighbour"]
     );
 }
 
@@ -1221,12 +1304,15 @@ print(json.dumps({{'methodology': render.methodology('GENERATED', 'COMMIT')}}))
 fn collected_artifacts_do_not_carry_host_identity() {
     let observed = driver_json(&format!(
         "{LOAD_BENCH}
+import tempfile
 from pathlib import Path
 inside = Path(bench.ROOT) / 'scripts' / 'bench' / 'bench_unix.py'
 outside = Path(bench.ROOT).anchor or '/'
+temporary = Path(tempfile.gettempdir()) / 'rmux-bench-binary' / 'rmux'
 print(json.dumps({{
     'inside': bench.relative_or_string(inside),
     'absent': bench.relative_or_string(None),
+    'temporary': bench.relative_or_string(temporary),
     'root': str(bench.ROOT),
     'outside_is_absolute': bench.relative_or_string(Path(outside)) == str(Path(outside).resolve()),
 }}))
@@ -1241,6 +1327,13 @@ print(json.dumps({{
     assert!(
         observed["absent"].is_null(),
         "an unused binary slot must stay null rather than invent a path"
+    );
+    // The other path an artifact records reaches the same redaction as a note.
+    assert_eq!(
+        observed["temporary"], "<temp>",
+        "a binary under the temporary root must be reduced, not recorded by \
+         absolute path (checkout root {})",
+        observed["root"]
     );
     assert!(
         observed["outside_is_absolute"]
