@@ -763,6 +763,7 @@ pub(super) async fn register_declared_attach(
                 closing: Arc::new(AtomicBool::new(false)),
                 persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
                 terminal_context: OuterTerminalContext::default(),
+                client_title: None,
                 flags: super::super::attach_support::ClientFlags::default(),
                 render_stream: false,
                 uid,

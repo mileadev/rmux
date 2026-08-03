@@ -508,6 +508,7 @@ async fn register_flagged_attach(
                 closing: Arc::new(AtomicBool::new(false)),
                 persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
                 terminal_context: OuterTerminalContext::default(),
+                client_title: None,
                 flags,
                 render_stream: false,
                 uid,

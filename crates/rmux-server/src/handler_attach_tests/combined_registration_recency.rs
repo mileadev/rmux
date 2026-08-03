@@ -150,6 +150,7 @@ async fn promoting_an_inferred_client_size_does_not_touch_session_recency() {
                 closing: Arc::new(AtomicBool::new(false)),
                 persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
                 terminal_context: OuterTerminalContext::default(),
+                client_title: None,
                 flags: super::super::attach_support::ClientFlags::default(),
                 render_stream: false,
                 uid,
