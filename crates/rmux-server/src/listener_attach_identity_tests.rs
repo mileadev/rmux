@@ -12,8 +12,8 @@
 use rmux_os::identity::UserIdentity;
 use rmux_proto::request::AttachSessionExt3Request;
 use rmux_proto::{
-    ClientTerminalContext, ListClientsRequest, OptionName, ScopeSelector, SetOptionMode,
-    SetOptionRequest, TerminalSize,
+    ClientTerminalContext, ListClientsRequest, ListWindowsRequest, OptionName, ScopeSelector,
+    SetOptionMode, SetOptionRequest, TerminalSize,
 };
 
 use super::connection_test_support::{
@@ -27,6 +27,17 @@ const TITLE_OPEN: &str = "\u{1b}]0;";
 const TITLE_CLOSE: char = '\u{7}';
 const IDENTITY_TITLE_FORMAT: &str = "U=#{client_user}|ID=#{client_uid}|N=#{client_name}";
 const CLIENT_SIZE: TerminalSize = TerminalSize { cols: 40, rows: 10 };
+
+/// The outer terminal geometry of the sizeless-title fixture, and the content
+/// geometry two status rows leave under it.
+const OUTER_SIZE: TerminalSize = TerminalSize { cols: 80, rows: 24 };
+const GEOMETRY_TITLE_FORMAT: &str = "#{client_width}x#{client_height}";
+const OUTER_GEOMETRY: &str = "80x24";
+const CONTENT_GEOMETRY: &str = "80x22";
+/// A second geometry template, so waiting for the frame after an unchanged
+/// refresh is bounded by a title that must arrive rather than by a timeout.
+const LATER_GEOMETRY_TITLE_FORMAT: &str = "later #{client_width}x#{client_height}";
+const LATER_OUTER_GEOMETRY: &str = "later 80x24";
 
 /// A local identity that is neither the server owner nor a reserved
 /// superuser, so granting it access models a delegated peer.
@@ -58,7 +69,9 @@ fn titles_in(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
-fn attach_request(session: &rmux_proto::SessionName) -> Request {
+/// `client_size` is `None` for the ordinary sizeless `attach-session`, which
+/// declares no geometry and leaves the server to anchor the client itself.
+fn attach_request(session: &rmux_proto::SessionName, client_size: Option<TerminalSize>) -> Request {
     Request::AttachSessionExt3(Box::new(AttachSessionExt3Request {
         target: Some(session.clone()),
         target_spec: None,
@@ -74,7 +87,7 @@ fn attach_request(session: &rmux_proto::SessionName) -> Request {
             terminal_features: vec!["title".to_owned()],
             utf8: true,
         },
-        client_size: Some(CLIENT_SIZE),
+        client_size,
         attach_capabilities: Vec::new(),
     }))
 }
@@ -94,10 +107,20 @@ async fn set_global(handler: &Arc<RequestHandler>, option: OptionName, value: &s
 /// The same bindings, resolved through the independent `list-clients` path.
 /// This is the oracle the first frame must already agree with.
 async fn listed_identity(handler: &Arc<RequestHandler>, attach_pid: u32) -> String {
+    listed_client_bindings(handler, attach_pid, IDENTITY_TITLE_FORMAT).await
+}
+
+/// `template`, expanded for the registered client `attach_pid` by
+/// `list-clients` rather than by the attach render.
+async fn listed_client_bindings(
+    handler: &Arc<RequestHandler>,
+    attach_pid: u32,
+    template: &str,
+) -> String {
     let response = handler
         .handle(Request::ListClients(Box::new(ListClientsRequest {
             target_session: None,
-            format: Some(format!("#{{client_pid}}\t{IDENTITY_TITLE_FORMAT}")),
+            format: Some(format!("#{{client_pid}}\t{template}")),
             filter: None,
             sort_order: None,
             reversed: false,
@@ -114,12 +137,37 @@ async fn listed_identity(handler: &Arc<RequestHandler>, attach_pid: u32) -> Stri
         .expect("the attached client is listed")
 }
 
+/// The session's content geometry, with the status rows already subtracted.
+/// A client's outer geometry is never this.
+async fn listed_content_geometry(
+    handler: &Arc<RequestHandler>,
+    session: &rmux_proto::SessionName,
+) -> String {
+    let response = handler
+        .handle(Request::ListWindows(Box::new(ListWindowsRequest {
+            target: session.clone(),
+            format: Some("#{window_width}x#{window_height}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
+        .await;
+    let Response::ListWindows(list) = response else {
+        panic!("list-windows must answer, got {response:?}");
+    };
+    String::from_utf8_lossy(list.output.stdout())
+        .lines()
+        .next()
+        .expect("the session has a window")
+        .to_owned()
+}
+
 /// Reads upgraded attach bytes until this client's outer terminal has been
-/// given a title, and returns that first title.
+/// given a title, and returns everything read up to and including it.
 ///
 /// Waiting for one expected value instead would turn a wrong first frame into a
-/// timeout; the identity the frame actually carried is the evidence.
-async fn read_first_title(client: &mut TestClientStream) -> String {
+/// timeout; what the frame actually carried is the evidence.
+async fn read_first_titled_frame(client: &mut TestClientStream) -> Vec<u8> {
     let mut seen = Vec::new();
     let mut buffer = [0_u8; 4096];
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -130,8 +178,8 @@ async fn read_first_title(client: &mut TestClientStream) -> String {
                 .expect("the upgraded attach stream stays readable");
             assert_ne!(bytes_read, 0, "the attach stream closed early");
             seen.extend_from_slice(&buffer[..bytes_read]);
-            if let Some(title) = titles_in(&seen).into_iter().next() {
-                return title;
+            if !titles_in(&seen).is_empty() {
+                return seen;
             }
         }
     })
@@ -176,8 +224,18 @@ struct AttachedPeer {
 /// A server with one quiet session, the identity title armed and the delegated
 /// peer allowed in.
 async fn armed_handler(label: &str) -> (Arc<RequestHandler>, rmux_proto::SessionName) {
+    armed_handler_with(label, CLIENT_SIZE, IDENTITY_TITLE_FORMAT).await
+}
+
+/// The same server, with the session created at `session_size` and `template`
+/// armed as the outer title.
+async fn armed_handler_with(
+    label: &str,
+    session_size: TerminalSize,
+    template: &str,
+) -> (Arc<RequestHandler>, rmux_proto::SessionName) {
     let handler = Arc::new(RequestHandler::new());
-    let target = start_quiet_pane_sized(&handler, label, CLIENT_SIZE).await;
+    let target = start_quiet_pane_sized(&handler, label, session_size).await;
     let session = target.session_name().clone();
 
     handler
@@ -185,7 +243,7 @@ async fn armed_handler(label: &str) -> (Arc<RequestHandler>, rmux_proto::Session
         .expect("the delegated peer can be granted access");
     // No periodic tick may repair or repeat what the attach frame carries.
     set_global(&handler, OptionName::StatusInterval, "0").await;
-    set_global(&handler, OptionName::SetTitlesString, IDENTITY_TITLE_FORMAT).await;
+    set_global(&handler, OptionName::SetTitlesString, template).await;
     set_global(&handler, OptionName::SetTitles, "on").await;
 
     (handler, session)
@@ -208,7 +266,7 @@ async fn attach_delegated_peer(label: &str) -> AttachedPeer {
         .expect("a connected stream pair");
     let (shutdown_tx, connection) = spawn_connection(&handler, peer, server);
 
-    write_test_request(&mut client, attach_request(&session))
+    write_test_request(&mut client, attach_request(&session, Some(CLIENT_SIZE)))
         .await
         .expect("the attach request reaches the listener");
     let response = read_response_leaving_raw_bytes(&mut client)
@@ -272,16 +330,28 @@ async fn the_first_attach_frame_describes_the_authenticated_peer() -> io::Result
     attached.finish().await
 }
 
-/// One authenticated connection, still live, plus the first title its outer
-/// terminal was given.
+/// One authenticated connection, still live, plus the upgraded bytes read up
+/// to and including the first title its outer terminal was given.
 struct ListenerPeer {
     client: TestClientStream,
-    first_title: String,
+    first_frame: Vec<u8>,
     shutdown_tx: watch::Sender<()>,
     connection: tokio::task::JoinHandle<io::Result<()>>,
 }
 
 impl ListenerPeer {
+    /// Every title that frame carried, in order.
+    fn first_frame_titles(&self) -> Vec<String> {
+        titles_in(&self.first_frame)
+    }
+
+    fn first_title(&self) -> String {
+        self.first_frame_titles()
+            .into_iter()
+            .next()
+            .expect("the attach frame carries a title")
+    }
+
     async fn finish(self) -> io::Result<()> {
         drop(self.client);
         let _ = self.shutdown_tx.send(());
@@ -297,13 +367,14 @@ async fn attach_peer_through_listener(
     label: &str,
     peer: PeerIdentity,
     session: &rmux_proto::SessionName,
+    client_size: Option<TerminalSize>,
 ) -> ListenerPeer {
     let (server, mut client) = connected_streams(label)
         .await
         .expect("a connected stream pair");
     let (shutdown_tx, connection) = spawn_connection(handler, peer, server);
 
-    write_test_request(&mut client, attach_request(session))
+    write_test_request(&mut client, attach_request(session, client_size))
         .await
         .expect("the attach request reaches the listener");
     let response = read_response_leaving_raw_bytes(&mut client)
@@ -313,11 +384,11 @@ async fn attach_peer_through_listener(
         matches!(&response, Response::AttachSession(attached) if &attached.session_name == session),
         "the delegated peer must be allowed to attach, got {response:?}"
     );
-    let first_title = read_first_title(&mut client).await;
+    let first_frame = read_first_titled_frame(&mut client).await;
 
     ListenerPeer {
         client,
-        first_title,
+        first_frame,
         shutdown_tx,
         connection,
     }
@@ -374,9 +445,12 @@ async fn a_reused_pid_never_renders_the_owner_into_a_new_peer_s_first_frame() ->
         delegated_peer(shared_pid, delegated_peer_uid()),
         first_server,
     );
-    write_test_request(&mut first_client, attach_request(&session))
-        .await
-        .expect("the first attach request reaches the listener");
+    write_test_request(
+        &mut first_client,
+        attach_request(&session, Some(CLIENT_SIZE)),
+    )
+    .await
+    .expect("the first attach request reaches the listener");
     tokio::time::timeout(
         Duration::from_secs(20),
         registration_pause.reached.notified(),
@@ -391,6 +465,7 @@ async fn a_reused_pid_never_renders_the_owner_into_a_new_peer_s_first_frame() ->
         "listener-attach-reused-pid-successor",
         delegated_peer(shared_pid, successor_uid),
         &session,
+        Some(CLIENT_SIZE),
     )
     .await;
 
@@ -400,12 +475,13 @@ async fn a_reused_pid_never_renders_the_owner_into_a_new_peer_s_first_frame() ->
         "registration must publish the successor's authenticated identity, got {listed:?}"
     );
     assert_eq!(
-        successor.first_title, listed,
+        successor.first_title(),
+        listed,
         "the successor's first frame and its registration must report one identity"
     );
     assert_eq!(
         handler.remembered_client_title_for_test(shared_pid).await,
-        Some(successor.first_title.clone()),
+        Some(successor.first_title()),
         "registration must remember the title the successor was actually shown"
     );
 
@@ -452,4 +528,105 @@ async fn the_listener_seeds_registration_with_the_title_it_forwarded() -> io::Re
     );
 
     attached.finish().await
+}
+
+/// The integration seam between issue #182's pre-registration frame and the
+/// accepted sizeless-geometry anchor: a client that declares no size owns
+/// *outer* terminal geometry, so its very first title must already report it.
+///
+/// tmux 3.7b, measured 2026-07-31 for the sizeless-geometry socle: an 80x24
+/// client on a session created `-x 80 -y 24` with `status 2` renders
+/// `window=80x22` while `client_height` stays 24. Falling back to the session's
+/// window size here makes this one frame — and only this one — say 22, while
+/// registration, `list-clients` and every later frame say 24.
+#[tokio::test]
+async fn a_sizeless_client_s_first_title_reports_outer_terminal_geometry() -> io::Result<()> {
+    let (handler, session) = armed_handler_with(
+        "listener-attach-sizeless-title",
+        OUTER_SIZE,
+        GEOMETRY_TITLE_FORMAT,
+    )
+    .await;
+    set_global(&handler, OptionName::Status, "2").await;
+    // A declared 80x24 client is what reserves the two status rows, so the
+    // session's content geometry is the wrong-but-plausible 80x22 before the
+    // sizeless peer arrives. Without it both anchors would read 80x24 and the
+    // frame under test could not tell them apart.
+    let declared = attach_peer_through_listener(
+        &handler,
+        "listener-attach-sizeless-title-declared",
+        delegated_peer(
+            std::process::id().wrapping_add(18_211),
+            delegated_peer_uid(),
+        ),
+        &session,
+        Some(OUTER_SIZE),
+    )
+    .await;
+    assert_eq!(
+        listed_content_geometry(&handler, &session).await,
+        CONTENT_GEOMETRY,
+        "the fixture needs the status rows already off the content geometry"
+    );
+
+    let sizeless_uid = successor_peer_uid();
+    handler
+        .set_test_access_mode_for_uid(sizeless_uid, AccessMode::ReadWrite)
+        .expect("the sizeless peer can be granted access");
+    let sizeless_pid = std::process::id().wrapping_add(18_212);
+    let mut sizeless = attach_peer_through_listener(
+        &handler,
+        "listener-attach-sizeless-title-sizeless",
+        delegated_peer(sizeless_pid, sizeless_uid),
+        &session,
+        None,
+    )
+    .await;
+
+    let titles = sizeless.first_frame_titles();
+    assert_eq!(
+        titles,
+        vec![OUTER_GEOMETRY.to_owned()],
+        "the sizeless client's first frame must carry exactly one title, \
+         reporting its outer terminal geometry and never the \
+         status-subtracted content geometry {CONTENT_GEOMETRY}"
+    );
+    assert_eq!(
+        listed_client_bindings(&handler, sizeless_pid, GEOMETRY_TITLE_FORMAT).await,
+        OUTER_GEOMETRY,
+        "the registered client must report the geometry its first frame did"
+    );
+    assert_eq!(
+        handler
+            .remembered_client_title_for_test(sizeless_pid)
+            .await
+            .as_deref(),
+        Some(OUTER_GEOMETRY),
+        "registration must remember the title the listener already forwarded"
+    );
+
+    // A redraw that changes no title, then a real change bounding the wait: the
+    // sizeless client must neither be told its geometry twice nor be told a
+    // different one once its registration exists.
+    set_global(&handler, OptionName::StatusInterval, "13").await;
+    set_global(
+        &handler,
+        OptionName::SetTitlesString,
+        LATER_GEOMETRY_TITLE_FORMAT,
+    )
+    .await;
+    let observed = read_until_title(&mut sizeless.client, LATER_OUTER_GEOMETRY).await;
+    let later = titles_in(&observed);
+    assert!(
+        !later.contains(&OUTER_GEOMETRY.to_owned()),
+        "the seeded title must not be written twice, got {later:?}"
+    );
+    assert_eq!(
+        later.last().map(String::as_str),
+        Some(LATER_OUTER_GEOMETRY),
+        "a later frame must report the same outer geometry, got {later:?}"
+    );
+
+    sizeless.finish().await?;
+    declared.finish().await
 }
