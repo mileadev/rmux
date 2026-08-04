@@ -207,6 +207,9 @@ fn capture(slot: &Slot, want: usize, aware: bool) -> Result<(), String> {
 }
 
 fn set_raw_console_input() -> Result<(), String> {
+    // SAFETY: `mode` is valid writable storage for the duration of
+    // `GetConsoleMode`; Windows validates the opaque standard handle, and no
+    // pointer or borrowed handle escapes this block.
     let mode = unsafe {
         let handle = GetStdHandle(STD_INPUT_HANDLE);
         let mut mode = 0_u32;
@@ -232,6 +235,9 @@ fn set_raw_console_input() -> Result<(), String> {
 /// decision. Establishing it is what makes the announcement mean the same thing
 /// on every Windows build.
 fn set_virtual_terminal_output() -> Result<(), String> {
+    // SAFETY: `mode` is valid writable storage for the duration of
+    // `GetConsoleMode`; Windows validates the opaque standard handle, and no
+    // pointer or borrowed handle escapes this block.
     unsafe {
         let handle = GetStdHandle(STD_OUTPUT_HANDLE);
         let mut mode = 0_u32;
