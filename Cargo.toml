@@ -85,6 +85,7 @@ include = [
     "/docs/man/rmux.1",
     "/src/**",
     "/tests/**",
+    "!/tests/xterm-oracle/node_modules/**",
 ]
 
 [dependencies]

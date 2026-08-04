@@ -226,6 +226,16 @@ fn canonical_payload_helpers_remain_non_publishing_and_bounded() {
     }
 }
 
+#[test]
+fn root_crate_excludes_installed_xterm_dependencies() {
+    let manifest =
+        fs::read_to_string(repo_root().join("Cargo.toml")).expect("read root Cargo manifest");
+    assert!(
+        manifest.contains("\"!/tests/xterm-oracle/node_modules/**\""),
+        "the published root crate must not include npm-installed oracle dependencies"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn canonical_payload_helpers_are_executable() {
