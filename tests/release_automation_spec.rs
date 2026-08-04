@@ -769,6 +769,8 @@ fn ci_builds_windows_tests_once_and_runs_eighteen_hosted_shards() {
         "name: Windows build, lint, docs, and smoke",
         "runs-on: windows-latest",
         "cargo test --workspace --doc --locked",
+        "name: cargo test downstream public API contracts",
+        "cargo test --locked -p rmux-proto -p rmux-sdk --test public_api_extensibility -- --test-threads=1",
         "cargo clippy --workspace --all-targets --locked -- -D warnings",
         "key: cargo-windows-latest-platform-runtime-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}",
     ] {
@@ -784,6 +786,7 @@ fn ci_builds_windows_tests_once_and_runs_eighteen_hosted_shards() {
         "shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]",
         "--extract-to \"$env:GITHUB_WORKSPACE\"",
         "--extract-overwrite",
+        "--filterset \"not binary(public_api_extensibility)\"",
         "--partition \"slice:${{ matrix.shard }}/18\"",
         "--retries 0",
         "--test-threads num-cpus",

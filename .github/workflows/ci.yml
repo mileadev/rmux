@@ -1079,6 +1079,12 @@ jobs:
       - name: cargo test Windows doctests
         run: cargo test --workspace --doc --locked -- --test-threads=1
 
+      # These tests launch nested offline Cargo consumers. Run them where the
+      # registry is present; extracted Nextest archives intentionally contain
+      # test binaries, not Cargo's registry.
+      - name: cargo test downstream public API contracts
+        run: cargo test --locked -p rmux-proto -p rmux-sdk --test public_api_extensibility -- --test-threads=1
+
       - name: Windows endpoint discovery and legacy shutdown smoke
         shell: pwsh
         run: ./scripts/release-review-gate-windows.ps1 -TargetDir target -EndpointSmokeOnly
@@ -1144,6 +1150,7 @@ jobs:
             --extract-to "$env:GITHUB_WORKSPACE" `
             --extract-overwrite `
             --workspace-remap "$env:GITHUB_WORKSPACE" `
+            --filterset "not binary(public_api_extensibility)" `
             --partition "slice:${{ matrix.shard }}/18" `
             --no-fail-fast `
             --retries 0 `
