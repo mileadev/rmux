@@ -407,6 +407,17 @@ fn create_platform_download(root: &Path, resolution: &serde_json::Value, platfor
         ),
     )
     .expect("write rustc evidence");
+    if platform.key.starts_with("linux-") {
+        let requirements = repo_root().join("scripts/release/linux-glibc-build-requirements.txt");
+        fs::write(
+            provenance.join("linux-glibc-build-tools.txt"),
+            format!(
+                "cargo_zigbuild=0.23.0\nzig=0.15.2\nrequirements_sha256={}\nglibc_target=2.31\n",
+                sha256(&requirements)
+            ),
+        )
+        .expect("write Linux glibc build-tools receipt");
+    }
     let record = assets_root.join("canonical-build-record.json");
     let record_create = run(
         &repo_root().join("scripts/release/canonical-build-record.py"),
@@ -617,13 +628,31 @@ fn downloaded_candidate_records_bind_every_exact_byte() {
     );
 
     let linux_provenance = metadata(&resolution, "canonical-provenance", "linux-x86_64");
-    let binding_path = downloads
-        .join(
-            linux_provenance["name"]
-                .as_str()
-                .expect("Linux provenance artifact name"),
-        )
-        .join("canonical-artifact-binding.json");
+    let linux_provenance_root = downloads.join(
+        linux_provenance["name"]
+            .as_str()
+            .expect("Linux provenance artifact name"),
+    );
+    let glibc_receipt = linux_provenance_root.join("linux-glibc-build-tools.txt");
+    let original_glibc_receipt = fs::read(&glibc_receipt).expect("read glibc receipt");
+    fs::write(
+        &glibc_receipt,
+        "cargo_zigbuild=0.23.0\nzig=0.15.2\nrequirements_sha256=0000000000000000000000000000000000000000000000000000000000000000\nglibc_target=2.31\n",
+    )
+    .expect("tamper glibc receipt");
+    let mut glibc_args = args.clone();
+    glibc_args[18] = root
+        .join("tampered-glibc-receipt.json")
+        .display()
+        .to_string();
+    let rejected_glibc_receipt = run(
+        &repo_root().join("scripts/release/verify-candidate-artifacts.py"),
+        &glibc_args,
+    );
+    assert!(!rejected_glibc_receipt.status.success());
+    fs::write(&glibc_receipt, original_glibc_receipt).expect("restore glibc receipt");
+
+    let binding_path = linux_provenance_root.join("canonical-artifact-binding.json");
     let original_binding = fs::read(&binding_path).expect("read canonical binding");
     let mut substituted_binding: serde_json::Value =
         serde_json::from_slice(&original_binding).expect("parse canonical binding");

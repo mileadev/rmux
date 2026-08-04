@@ -91,6 +91,21 @@ def run_verifier(script: str, arguments: list[str]) -> str:
     return completed.stdout.strip()
 
 
+def verify_linux_glibc_tools_receipt(path: Path) -> None:
+    requirements = ROOT / "scripts/release/linux-glibc-build-requirements.txt"
+    expected = (
+        "cargo_zigbuild=0.23.0\n"
+        "zig=0.15.2\n"
+        f"requirements_sha256={sha256_file(requirements)}\n"
+        "glibc_target=2.31\n"
+    )
+    try:
+        actual = path.read_text(encoding="ascii")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ValueError("Linux glibc build-tools receipt is not ASCII") from error
+    require_equal(actual, expected, "Linux glibc build-tools receipt")
+
+
 def verify_fast_directory(
     directory: Path,
     source_sha: str,
@@ -182,16 +197,21 @@ def verify_platform_download(
     exact_entries(
         assets_dir, {"assets", "canonical-build-record.json"}, f"{platform} assets"
     )
+    provenance_entries = {
+        "build-provenance.sigstore.json",
+        "canonical-artifact-binding.json",
+        "canonical-build-record.json",
+        "rustc-vV.txt",
+    }
+    if platform in {"linux-aarch64", "linux-x86_64"}:
+        provenance_entries.add("linux-glibc-build-tools.txt")
     exact_entries(
         provenance_dir,
-        {
-            "build-provenance.sigstore.json",
-            "canonical-artifact-binding.json",
-            "canonical-build-record.json",
-            "rustc-vV.txt",
-        },
+        provenance_entries,
         f"{platform} provenance",
     )
+    if platform in {"linux-aarch64", "linux-x86_64"}:
+        verify_linux_glibc_tools_receipt(provenance_dir / "linux-glibc-build-tools.txt")
     record = assets_dir / "canonical-build-record.json"
     provenance_record = provenance_dir / "canonical-build-record.json"
     if record.read_bytes() != provenance_record.read_bytes():
