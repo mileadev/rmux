@@ -71,13 +71,24 @@ fn sleeping_process() -> ProcessCommand {
 }
 
 #[cfg(windows)]
+fn windows_cmd() -> String {
+    let system_root =
+        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+    std::path::PathBuf::from(system_root)
+        .join("System32")
+        .join("cmd.exe")
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(windows)]
 fn sleeping_process() -> ProcessCommand {
     ProcessCommand::Argv(vec![
-        "powershell.exe".to_owned(),
-        "-NoProfile".to_owned(),
-        "-NonInteractive".to_owned(),
-        "-Command".to_owned(),
-        "Start-Sleep -Seconds 60".to_owned(),
+        windows_cmd(),
+        "/d".to_owned(),
+        "/q".to_owned(),
+        "/c".to_owned(),
+        "ping -n 120 127.0.0.1 >NUL".to_owned(),
     ])
 }
 
@@ -93,11 +104,11 @@ fn exiting_process() -> ProcessCommand {
 #[cfg(windows)]
 fn exiting_process() -> ProcessCommand {
     ProcessCommand::Argv(vec![
-        "powershell.exe".to_owned(),
-        "-NoProfile".to_owned(),
-        "-NonInteractive".to_owned(),
-        "-Command".to_owned(),
-        "exit 0".to_owned(),
+        windows_cmd(),
+        "/d".to_owned(),
+        "/q".to_owned(),
+        "/c".to_owned(),
+        "exit /b 0".to_owned(),
     ])
 }
 
