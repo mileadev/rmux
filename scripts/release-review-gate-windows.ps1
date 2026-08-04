@@ -205,6 +205,18 @@ function Check-WorktreeHygiene {
         $trackedArtifacts | ForEach-Object { Write-Error $_ }
         throw "tracked local deployment artifacts are forbidden"
     }
+    $macUser = "pingu" + "delfuego"
+    $linuxUser = "pi" + "ngu"
+    $personalPathPattern = "/Users/$macUser/|/home/$linuxUser/|[A-Za-z]:[\\/]Users[\\/]($linuxUser|$macUser)[\\/]"
+    $trackedPersonalPaths = @(& git grep -I -n -E $personalPathPattern -- .)
+    $grepExit = $LASTEXITCODE
+    if ($grepExit -gt 1) {
+        throw "git grep for tracked personal paths failed with exit code $grepExit"
+    }
+    if ($trackedPersonalPaths.Count -gt 0) {
+        $trackedPersonalPaths | ForEach-Object { Write-Error $_ }
+        throw "tracked personal filesystem paths are forbidden"
+    }
     $untrackedSockets = @(Git-LsFiles @("--others", "--exclude-standard") | Where-Object { $_ -match '\.(sock|socket)$' })
     if ($untrackedSockets.Count -gt 0) {
         $untrackedSockets | ForEach-Object { Write-Error $_ }

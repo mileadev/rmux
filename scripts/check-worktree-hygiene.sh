@@ -23,6 +23,15 @@ if [ -n "$tracked_deploy_dirs" ]; then
   printf '%s\n' "$tracked_deploy_dirs" >&2
 fi
 
+mac_user="pingu""delfuego"
+linux_user="pi""ngu"
+personal_path_pattern="/Users/${mac_user}/|/home/${linux_user}/|[A-Za-z]:[\\\\/]Users[\\\\/](${linux_user}|${mac_user})[\\\\/]"
+tracked_personal_paths="$(git grep -I -n -E "$personal_path_pattern" -- . || true)"
+if [ -n "$tracked_personal_paths" ]; then
+  report_failure "tracked personal filesystem paths are forbidden:"
+  printf '%s\n' "$tracked_personal_paths" >&2
+fi
+
 untracked_sockets="$(git ls-files --others --exclude-standard | grep -E '\.(sock|socket)$' || true)"
 if [ -n "$untracked_sockets" ]; then
   report_failure "untracked socket files are forbidden in the worktree:"

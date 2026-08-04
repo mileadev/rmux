@@ -3,11 +3,11 @@ RMUX accepted product-divergence oracle evidence
 
 All probes below were run on 2026-07-27 with the pinned executable symlink:
 
-  /Users/pingudelfuego/.local/bin/tmux
+  $HOME/.local/bin/tmux
 
 The symlink resolved to:
 
-  /Users/pingudelfuego/.local/tmux-3.7b/bin/tmux
+  $HOME/.local/tmux-3.7b/bin/tmux
 
 Observed:
 
@@ -19,7 +19,7 @@ C-D78: joined capture after alternate-screen cycles
 
 Exact command:
 
-  TMUX_BIN=/Users/pingudelfuego/.local/bin/tmux
+  TMUX_BIN="$HOME/.local/bin/tmux"
   SOCKET=rmux-alt-cycles-oracle-$$
   EVIDENCE_DIR=.rmux-audit/alt-cycles-oracle
   mkdir -p "$EVIDENCE_DIR"
@@ -70,7 +70,7 @@ C-D79: delayed command-mode display callback
 
 Exact command:
 
-  TMUX_BIN=/Users/pingudelfuego/.local/bin/tmux
+  TMUX_BIN="$HOME/.local/bin/tmux"
   SOCKET=rmux-oracle-delayed-control-$$
   "$TMUX_BIN" -L "$SOCKET" -f /dev/null new-session -d -s probe 'sleep 30'
   {
@@ -103,7 +103,7 @@ C-D80: explicit empty initial window names
 
 Exact command:
 
-  TMUX_BIN=/Users/pingudelfuego/.local/bin/tmux
+  TMUX_BIN="$HOME/.local/bin/tmux"
   SOCKET=rmux-empty-window-names-oracle-$$
   "$TMUX_BIN" -L "$SOCKET" -f /dev/null new-session -d -s empty-on -n "" "sleep 30"
   "$TMUX_BIN" -L "$SOCKET" new-window -d -t empty-on: -n "" "sleep 30"
@@ -144,7 +144,7 @@ C-D81: cursor anchor across width reflow
 
 Exact command:
 
-  TMUX_BIN=/Users/pingudelfuego/.local/bin/tmux
+  TMUX_BIN="$HOME/.local/bin/tmux"
   RMUX_BIN=.rmux-audit/target-1.96.1/debug/rmux
   probe_engine() {
     engine="$1"
@@ -208,7 +208,7 @@ C-D82: minimum tiled layout hang
 
 Exact command, run from the repository root:
 
-  TMUX_BIN=/Users/pingudelfuego/.local/bin/tmux
+  TMUX_BIN="$HOME/.local/bin/tmux"
   RMUX_BIN=.rmux-audit/target-1.96.1/debug/rmux
   run_with_two_second_timeout() {
     "$@" >/dev/null 2>&1 &
@@ -290,7 +290,7 @@ C-D83: width-deficient tiled partial rows
 
 Exact command, run from the repository root:
 
-  TMUX_BIN=/Users/pingudelfuego/.local/bin/tmux
+  TMUX_BIN="$HOME/.local/bin/tmux"
   RMUX_BIN=.rmux-audit/target-1.96.1/debug/rmux
   RUNTIME_DIR="$HOME/Projects/.rmux-c-d83-runtime"
   mkdir -p "$RUNTIME_DIR"
@@ -378,9 +378,9 @@ C-D84: width-deficient join-pane and move-pane targets
 
 Exact command, run from the repository root:
 
-  TMUX_BIN=/Users/pingudelfuego/.local/bin/tmux
+  TMUX_BIN="$HOME/.local/bin/tmux"
   RMUX_BIN=.rmux-audit/target-1.96.1/debug/rmux
-  SOCKET_ROOT=/Users/pingudelfuego/Projects/.r4-c-d84-runtime
+  SOCKET_ROOT="$HOME/Projects/.r4-c-d84-runtime"
   mkdir -p "$SOCKET_ROOT/tmux" "$SOCKET_ROOT/rmux"
   probe() {
     engine="$1"
