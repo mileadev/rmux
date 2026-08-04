@@ -915,8 +915,7 @@ fn a_real_screen_measures_all_eight_comparable_operations() {
 /// `CalledProcessError`, which doubles each backslash. On a root whose
 /// separator never needs escaping the two spellings are the same text, so a
 /// case that checks both is exact everywhere and platform-specific nowhere.
-fn temp_root_renderings() -> [String; 2] {
-    let root = std::env::temp_dir().to_string_lossy().into_owned();
+fn path_renderings(root: &str) -> [String; 2] {
     let root = root.trim_end_matches(['/', '\\']).to_owned();
     let escaped = root.replace('\\', r"\\");
     [root, escaped]
@@ -947,6 +946,9 @@ fn an_omission_note_does_not_publish_a_host_temporary_path() {
         .args(["--only-operations", "capture_pane_80x24"])
         .arg("--quiet")
         .env("PATH", &path)
+        .env("TMPDIR", &workspace)
+        .env("TEMP", &workspace)
+        .env("TMP", &workspace)
         .current_dir(repo_root())
         .output()
         .expect("failed to run bench_unix.py");
@@ -982,7 +984,7 @@ fn an_omission_note_does_not_publish_a_host_temporary_path() {
         "the spec is vacuous unless the failing command really quoted a temporary path: {note}"
     );
 
-    for rendering in temp_root_renderings() {
+    for rendering in path_renderings(&workspace.to_string_lossy()) {
         assert!(
             !note.contains(&rendering),
             "the note must not disclose this host's temporary location as {rendering}: {note}"
@@ -1007,6 +1009,7 @@ leaked = (
 print(json.dumps({{
     'leaked': leaked,
     'clean': bench.sanitize(leaked),
+    'raw_root': tempfile.gettempdir(),
     'root': bench.sanitize(tempfile.gettempdir()),
     'unrelated': bench.sanitize('screen/list_sessions_default: TimeoutExpired'),
 }}))
@@ -1014,7 +1017,10 @@ print(json.dumps({{
     ));
     let leaked = observed["leaked"].as_str().expect("leaked note");
     let clean = observed["clean"].as_str().expect("clean note");
-    let renderings = temp_root_renderings();
+    let raw_root = observed["raw_root"]
+        .as_str()
+        .expect("Python temporary root");
+    let renderings = path_renderings(raw_root);
 
     // Vacuous unless the historical note really carried the path, in whichever
     // spelling `repr` gave it on this host.

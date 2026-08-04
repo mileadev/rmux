@@ -140,6 +140,10 @@ async fn targetless_attach_ranks_a_later_creation_above_an_earlier_attach() {
             .touch_attached();
     }
     create_detached_session(&handler, "z99").await;
+    // Targetless selection prefers sessions whose deferred pane process is
+    // live before it ranks by recency. Equalize that independent precondition
+    // so this fixture measures only the lifetime order it names.
+    handler.wait_for_initial_panes_for_test().await;
     {
         let mut state = handler.state.lock().await;
         for name in ["m03", "a01", "z99"] {
