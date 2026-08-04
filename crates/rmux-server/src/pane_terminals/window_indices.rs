@@ -27,6 +27,36 @@ impl HandlerState {
         self.reindex_windows_from_base(session_name)
     }
 
+    pub(in crate::pane_terminals) fn renumber_transfer_source_sessions(
+        &mut self,
+        session_names: &[SessionName],
+    ) -> Result<(), RmuxError> {
+        let mut session_names = session_names.to_vec();
+        session_names.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        session_names.dedup();
+
+        for session_name in &session_names {
+            if self
+                .sessions
+                .session(session_name)
+                .is_some_and(|session| !session.windows().is_empty())
+            {
+                let _ = self.renumber_windows_if_enabled(session_name)?;
+            }
+        }
+        for session_name in session_names {
+            if self
+                .sessions
+                .session(&session_name)
+                .is_some_and(|session| !session.windows().is_empty())
+            {
+                self.synchronize_session_group_from(&session_name)?;
+                self.sync_pane_lifecycle_dimensions_for_session(&session_name);
+            }
+        }
+        Ok(())
+    }
+
     pub(in crate::pane_terminals) fn reindex_windows_from_base(
         &mut self,
         session_name: &SessionName,

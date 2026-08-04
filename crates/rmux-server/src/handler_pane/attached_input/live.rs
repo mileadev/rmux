@@ -6,7 +6,7 @@ use std::sync::{atomic::Ordering, Arc};
 use rmux_core::{input::mode, key_code_lookup_bits, KeyCode, LifecycleEvent, KEYC_ANY};
 #[cfg(windows)]
 use rmux_core::{key_string_lookup_string, KEYC_CTRL, KEYC_IMPLIED_META, KEYC_META, KEYC_SHIFT};
-use rmux_proto::{AttachedKeystroke, PaneTarget, Response, WindowTarget};
+use rmux_proto::{AttachedKeystroke, PaneTarget, WindowTarget};
 #[cfg(windows)]
 use rmux_pty::WindowsConsoleKeyEvent;
 
@@ -39,12 +39,18 @@ use super::{
 };
 use crate::client_flags::ClientFlags;
 use crate::handler::overlay_support::AttachedOverlayInput;
-use crate::handler::{attach_support::ActiveAttachIdentity, prepare_lifecycle_event};
+use crate::handler::{
+    attach_support::{ActiveAttachIdentity, TransientMessageInput},
+    prepare_lifecycle_event,
+};
 use crate::input_keys::{decode_extended_key, decode_mouse, ExtendedKeyDecode, MouseDecode};
 use crate::key_table::{
     decode_attached_key, default_key_table_name, lookup_attached_key_table_binding,
-    matches_prefix_key, session_option_key, AttachedKeyDecode, PREFIX_TABLE,
+    matches_prefix_key, session_option_key, AttachedKeyDecode,
 };
+
+#[path = "live/read_only_client_action.rs"]
+mod read_only_client_action;
 
 pub(crate) type ActiveClientEmitCache = Option<(u64, WindowTarget)>;
 
@@ -396,10 +402,37 @@ impl RequestHandler {
         .await
     }
 
+    /// Commits the recency of one accepted attached-client interaction.
+    ///
+    /// This is the single admission boundary for live client input, reached
+    /// before the server decides whether the bytes become a prefix, a key
+    /// binding, prompt or overlay editing, a copy/clock/mode-tree key,
+    /// display-panes selection, a bracketed paste, a clipboard or terminal
+    /// response, or a pane write. Committing here is what makes locally
+    /// consumed interaction count as session use, matching tmux, which updates
+    /// session activity immediately after admitting a key and before any
+    /// dispatch decision. Committing after pane I/O instead would silently
+    /// drop every key the server handles itself.
+    ///
+    /// Both counters are advanced under the same two guards, so client order
+    /// and session order share one policy and one linearization point:
+    /// concurrent clients are ordered by which one acquires these locks first,
+    /// not by which pane write finishes first. One logical input advances the
+    /// session once here regardless of how many panes it later reaches, so
+    /// `synchronize-panes` cannot inflate recency.
+    ///
+    /// Rejected input never reaches the commit: empty frames are filtered by
+    /// the caller, a vanished or closing attach fails, and a client that
+    /// cannot write or is read-only returns without advancing anything. That
+    /// read-only exclusion is a deliberate RMUX divergence — tmux does count
+    /// read-only keys — and is the existing client-activity policy this
+    /// boundary reuses rather than a new rule.
     async fn record_attached_input_activity(
         &self,
         identity: ActiveAttachIdentity,
     ) -> io::Result<()> {
+        // Handler lock order is state before active_attach.
+        let mut state = self.state.lock().await;
         let mut active_attach = self.active_attach.lock().await;
         let active = active_attach
             .by_pid
@@ -410,7 +443,19 @@ impl RequestHandler {
             })
             .ok_or_else(|| io_other("attached client disappeared"))?;
         if active.can_write && !active.flags.contains(ClientFlags::READONLY) {
-            let _ = active_attach.record_client_activity(identity.attach_pid());
+            // The attach owns its current session, which a switch may have
+            // changed since `identity` was captured. Requiring the session id
+            // to still match keeps a same-name session recreated underneath
+            // this client from inheriting the older session's interaction.
+            if let Some(session) = state
+                .sessions
+                .session_mut(&active.session_name)
+                .filter(|session| session.id() == active.session_id)
+            {
+                session.touch_activity();
+            }
+            let sequence = self.next_client_activity_sequence();
+            let _ = active_attach.record_client_activity(identity.attach_pid(), sequence);
         }
         Ok(())
     }
@@ -522,6 +567,11 @@ impl RequestHandler {
         let windows_console_key = windows_console_key
             .filter(|_| pending_input.is_empty() && !bytes.is_empty())
             .map(windows_console_key_event);
+        let initial_transient_prefix = self
+            .take_transient_terminal_prefix_for_identity(identity)
+            .await;
+        let mut has_transient_terminal_prefix = !initial_transient_prefix.is_empty();
+        pending_input.extend(initial_transient_prefix);
         let mut forwarded_to_pane = false;
         #[cfg(windows)]
         let try_plain_fast_path = windows_console_key.is_none();
@@ -544,10 +594,54 @@ impl RequestHandler {
             .attached_client_input_is_read_only_for_identity(identity)
             .await?
         {
-            pending_input.clear();
+            if has_transient_terminal_prefix {
+                pending_input.clear();
+            }
+            let backspace = self.attached_backspace_byte().await;
+            #[cfg(windows)]
+            let windows_key_override = windows_console_key.and_then(|key_event| {
+                let AttachedKeyDecode::Matched { size, key } =
+                    decode_live_attached_key(bytes, backspace)
+                else {
+                    return None;
+                };
+                (size == bytes.len()).then(|| windows_console_binding_key(key, key_event))
+            });
+            #[cfg(not(windows))]
+            let windows_key_override = None;
+            self.handle_read_only_client_action_input(
+                identity,
+                pending_input,
+                bytes,
+                backspace,
+                windows_key_override,
+            )
+            .await?;
             return Ok(AttachedLiveInputStep::Complete(false));
         }
         self.clear_attached_focus_alerts(identity).await;
+        match self
+            .handle_ignored_transient_message_input_for_identity(identity, pending_input, bytes)
+            .await
+        {
+            TransientMessageInput::Inactive => {}
+            TransientMessageInput::Consumed => {
+                return Ok(AttachedLiveInputStep::Complete(false));
+            }
+            TransientMessageInput::TerminalControls(controls) => {
+                return Ok(AttachedLiveInputStep::Complete(
+                    self.handle_transient_terminal_controls(identity, controls)
+                        .await?,
+                ));
+            }
+            TransientMessageInput::Dismissed(_) => {
+                debug_assert!(
+                    false,
+                    "ignore-only transient input cannot dismiss a message"
+                );
+                return Ok(AttachedLiveInputStep::Complete(false));
+            }
+        }
         if self
             .attached_modal_surface_active_for_identity(identity)
             .await
@@ -559,11 +653,53 @@ impl RequestHandler {
                     .await;
             }
         }
-        if let Some(step) = self
-            .handle_attached_modal_input_step(identity, pending_input, bytes)
-            .await?
+        let pending_was_empty = pending_input.is_empty();
+        match self
+            .handle_transient_message_input_for_identity(identity, pending_input, bytes)
+            .await
         {
-            return Ok(step);
+            // The timer may expire between the first residual-prefix drain
+            // and this identity-guarded mutation. Pull the prefix once more
+            // before ordinary decoding so a split terminal response remains
+            // contiguous across the expiry boundary.
+            TransientMessageInput::Inactive => {
+                let residual = self
+                    .take_transient_terminal_prefix_for_identity(identity)
+                    .await;
+                has_transient_terminal_prefix |= !residual.is_empty();
+                pending_input.extend(residual);
+            }
+            TransientMessageInput::Consumed => {
+                return Ok(AttachedLiveInputStep::Complete(false));
+            }
+            TransientMessageInput::TerminalControls(controls) => {
+                return Ok(AttachedLiveInputStep::Complete(
+                    self.handle_transient_terminal_controls(identity, controls)
+                        .await?,
+                ));
+            }
+            TransientMessageInput::Dismissed(rerouted)
+                if pending_was_empty && rerouted.as_slice() == bytes =>
+            {
+                // Continue in this same step. Besides avoiding a second
+                // parse, this preserves the native Windows KEY_EVENT that
+                // belongs to these exact bytes.
+                debug_assert!(pending_input.is_empty());
+            }
+            TransientMessageInput::Dismissed(bytes) => {
+                return Ok(AttachedLiveInputStep::Reroute {
+                    bytes,
+                    forwarded: false,
+                });
+            }
+        }
+        if !has_transient_terminal_prefix {
+            if let Some(step) = self
+                .handle_attached_modal_input_step(identity, pending_input, bytes)
+                .await?
+            {
+                return Ok(step);
+            }
         }
         let (target, target_session_id) = self
             .attached_input_target_identity(identity)
@@ -1253,6 +1389,35 @@ impl RequestHandler {
         pending_input: &mut Vec<u8>,
         bytes: &[u8],
     ) -> io::Result<Option<AttachedLiveInputStep>> {
+        match self
+            .handle_transient_message_input_for_identity(identity, pending_input, bytes)
+            .await
+        {
+            TransientMessageInput::Inactive => {
+                let residual = self
+                    .take_transient_terminal_prefix_for_identity(identity)
+                    .await;
+                if !residual.is_empty() {
+                    pending_input.extend(residual);
+                    return Ok(None);
+                }
+            }
+            TransientMessageInput::Consumed => {
+                return Ok(Some(AttachedLiveInputStep::Complete(false)));
+            }
+            TransientMessageInput::TerminalControls(controls) => {
+                return Ok(Some(AttachedLiveInputStep::Complete(
+                    self.handle_transient_terminal_controls(identity, controls)
+                        .await?,
+                )));
+            }
+            TransientMessageInput::Dismissed(bytes) => {
+                return Ok(Some(AttachedLiveInputStep::Reroute {
+                    bytes,
+                    forwarded: false,
+                }));
+            }
+        }
         if self.prompt_active_for_identity(identity).await {
             let remaining = self
                 .handle_attached_prompt_input(identity, pending_input, bytes)
@@ -1284,6 +1449,73 @@ impl RequestHandler {
             return Ok(Some(attached_mode_input_step(remaining)));
         }
         Ok(None)
+    }
+
+    pub(super) async fn handle_transient_terminal_controls(
+        &self,
+        identity: ActiveAttachIdentity,
+        controls: Vec<Vec<u8>>,
+    ) -> io::Result<bool> {
+        let mut forwarded = false;
+        for bytes in controls {
+            // Hooks emitted by one report may switch the client, pane, or
+            // terminal mode. Match the ordinary live path by re-resolving
+            // before every subsequent report in the same input chunk.
+            let (target, _) = self
+                .attached_input_target_identity(identity)
+                .await
+                .map_err(io_other)?;
+            let forward_focus =
+                self.target_pane_mode(&target).await.map_err(io_other)? & mode::MODE_FOCUSON != 0;
+            let decoded = decode_focus_event(&bytes).map_or_else(
+                || decode_attached_terminal_control_after_append(&bytes, false, 0),
+                |event| TerminalResponseDecode::Matched {
+                    size: bytes.len(),
+                    event: Some(event),
+                },
+            );
+            match decoded {
+                TerminalResponseDecode::PaneBound { .. } => {
+                    // Without a pane-originated outer-terminal query token,
+                    // `CSI ... R` is ambiguous with xterm modified F-keys
+                    // (for example Shift-F3 is `CSI 1;2 R`). Under `-N` it
+                    // must remain ignored like every other key press.
+                }
+                TerminalResponseDecode::PaletteResponse { index, .. } => {
+                    forwarded |= self
+                        .write_attached_palette_response_for_identity(identity, index, &bytes)
+                        .await?;
+                }
+                TerminalResponseDecode::ClipboardResponse {
+                    selection, content, ..
+                } => {
+                    forwarded |= self
+                        .handle_attached_clipboard_response(identity, selection, content)
+                        .await?;
+                }
+                TerminalResponseDecode::Matched {
+                    event: Some(event), ..
+                } => {
+                    if forward_focus
+                        && matches!(
+                            event,
+                            TerminalControlEvent::FocusIn | TerminalControlEvent::FocusOut
+                        )
+                    {
+                        self.write_attached_target_bytes_for_identity(identity, &bytes)
+                            .await?;
+                        forwarded = true;
+                    }
+                    self.handle_attached_terminal_control_event(identity, &target, event)
+                        .await;
+                }
+                TerminalResponseDecode::Matched { event: None, .. } => {}
+                TerminalResponseDecode::NotResponse | TerminalResponseDecode::Partial => {
+                    debug_assert!(false, "transient input emitted an unexpected control");
+                }
+            }
+        }
+        Ok(forwarded)
     }
 
     async fn handle_attached_modal_palette_input(
@@ -1497,6 +1729,7 @@ impl RequestHandler {
             || active.mode_tree.is_some()
             || active.overlay.is_some()
             || active.display_panes.is_some()
+            || active.transient_message.is_some()
             || active.key_table_name.is_some()
         {
             return Ok(None);
@@ -1526,7 +1759,8 @@ impl RequestHandler {
             && active.prompt.is_none()
             && active.mode_tree.is_none()
             && active.overlay.is_none()
-            && active.display_panes.is_none())
+            && active.display_panes.is_none()
+            && active.transient_message.is_none())
     }
 
     async fn attached_modal_surface_active_for_identity(
@@ -1548,6 +1782,7 @@ impl RequestHandler {
             || active.mode_tree.is_some()
             || active.overlay.is_some()
             || active.display_panes.is_some()
+            || active.transient_message.is_some()
     }
 
     async fn attached_key_table_active(&self, identity: ActiveAttachIdentity) -> bool {
@@ -1581,14 +1816,19 @@ impl RequestHandler {
             return;
         }
 
-        let (should_emit, cache_epoch) = {
+        let (should_emit, cache_epoch, client_name) = {
             let mut active_attach = self.active_attach.lock().await;
-            if !active_attach.by_pid.get(&attach_pid).is_some_and(|active| {
-                identity.matches_active(active)
-                    && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
-            }) {
+            let Some(client_name) = active_attach
+                .by_pid
+                .get(&attach_pid)
+                .filter(|active| {
+                    identity.matches_active(active)
+                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                })
+                .map(|active| active.client_name.clone())
+            else {
                 return;
-            }
+            };
             let changed = active_attach.record_active_client_for_window(attach_pid, target);
             let cache_epoch = if changed {
                 self.active_attach_epoch
@@ -1597,13 +1837,13 @@ impl RequestHandler {
             } else {
                 self.active_attach_epoch.load(Ordering::Acquire)
             };
-            (changed, cache_epoch)
+            (changed, cache_epoch, client_name)
         };
         *active_emit_cache = Some((cache_epoch, window_target));
         if should_emit {
             self.emit(LifecycleEvent::ClientActive {
                 session_name: target.session_name().clone(),
-                client_name: Some(attach_pid.to_string()),
+                client_name: Some(client_name),
             })
             .await;
         }
@@ -1615,17 +1855,17 @@ impl RequestHandler {
         target: &PaneTarget,
         event: TerminalControlEvent,
     ) {
-        let Ok((session_name, session_id)) =
-            self.attached_session_identity_for_identity(identity).await
+        let Ok((session_name, session_id, client_name)) = self
+            .attached_session_identity_and_client_name_for_identity(identity)
+            .await
         else {
             return;
         };
         if target.session_name() != &session_name {
             return;
         }
-        let attach_pid = identity.attach_pid();
         let session_name = target.session_name().clone();
-        let client_name = Some(attach_pid.to_string());
+        let client_name = Some(client_name);
         let events = match event {
             TerminalControlEvent::FocusIn => {
                 vec![
@@ -1720,75 +1960,6 @@ impl RequestHandler {
         let mut pending_input = Vec::new();
         self.handle_attached_live_input(attach_pid, &mut pending_input, bytes)
             .await
-    }
-
-    async fn dispatch_immediate_prefix_detach(
-        &self,
-        identity: ActiveAttachIdentity,
-        target: &rmux_proto::PaneTarget,
-        bytes: &[u8],
-        backspace: Option<u8>,
-    ) -> io::Result<bool> {
-        let AttachedKeyDecode::Matched {
-            size: prefix_size,
-            key: prefix_key,
-        } = decode_live_attached_key(bytes, backspace)
-        else {
-            return Ok(false);
-        };
-        if prefix_size == 0 || prefix_size >= bytes.len() {
-            return Ok(false);
-        }
-
-        let AttachedKeyDecode::Matched {
-            size: command_size,
-            key: command_key,
-        } = decode_live_attached_key(&bytes[prefix_size..], backspace)
-        else {
-            return Ok(false);
-        };
-        if prefix_size.saturating_add(command_size) != bytes.len() {
-            return Ok(false);
-        }
-
-        let is_bare_detach_binding = {
-            let state = self.state.lock().await;
-            let prefix = session_option_key(
-                &state,
-                target.session_name(),
-                rmux_proto::OptionName::Prefix,
-            );
-            let prefix2 = session_option_key(
-                &state,
-                target.session_name(),
-                rmux_proto::OptionName::Prefix2,
-            );
-            if !matches_prefix_key(prefix_key, prefix, prefix2) {
-                return Ok(false);
-            }
-            lookup_attached_key_table_binding(
-                &state,
-                PREFIX_TABLE,
-                key_code_lookup_bits(command_key),
-            )
-            .is_some_and(|binding| {
-                let commands = binding.commands().commands();
-                commands.len() == 1
-                    && commands[0].name() == "detach-client"
-                    && commands[0].arguments().is_empty()
-            })
-        };
-        if !is_bare_detach_binding {
-            return Ok(false);
-        }
-
-        if !self.current_live_attach_input(identity).await {
-            return Ok(false);
-        }
-        match self.handle_detach_client_for_identity(identity).await {
-            Response::Error(error) => Err(io_other(error.error)),
-            _ => Ok(true),
-        }
     }
 }
 

@@ -5,7 +5,7 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/release-review-gate.sh [options]
 
-Run the review-derived release gate for the RMUX 0.9 release line. This targets
+Run the review-derived release gate for the current RMUX release line. This targets
 the bug classes that manual reviews kept finding: tiny CLI fallback boundaries,
 tmux authority cases, package layout, version drift, platform-neutrality budget,
 and mutating target-action retry safety.
@@ -16,7 +16,7 @@ gate through WSL may require a healthy Linux Rust toolchain and network access.
 Options:
   --target-dir DIR     Cargo target dir. Defaults to /tmp/rmux-release-review-target.
   --layout DIR         Reuse or populate a release layout directory.
-  --section NAME       Run one section: static, perf, lint, server, cli, tmux,
+  --section NAME       Run one section: static, perf, lint, server, xterm, cli, tmux,
                        runtime-sdk, or package. Defaults to all sections.
   --evidence-mode MODE full (default) or candidate-delta. Candidate delta
                        omits checks already proven by the exact fast run.
@@ -24,6 +24,12 @@ Options:
   --skip-package-build Reuse --layout without rebuilding it.
   --no-tmux            Skip tmux authority checks inside the package smoke.
   -h, --help           Show this help.
+
+Requirements:
+  python3              CPython 3.9 or newer. Release tooling deliberately stays
+                       within the macOS system interpreter's feature set so the
+                       gate runs on the release host; scripts/toml_reader.py
+                       enforces that floor.
 
 Environment:
   RMUX_PERF_CURRENT_JSON  Required current-run perf JSON for release comparison.
@@ -127,7 +133,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$section" in
-  all|static|perf|lint|server|cli|tmux|runtime-sdk|package) ;;
+  all|static|perf|lint|server|xterm|cli|tmux|runtime-sdk|package) ;;
   *) die "unknown release review section: $section" ;;
 esac
 case "$evidence_mode" in
@@ -136,7 +142,7 @@ case "$evidence_mode" in
 esac
 if [ "$evidence_mode" = candidate-delta ]; then
   case "$section" in
-    static|perf|cli|tmux) ;;
+    static|perf|xterm|cli|tmux) ;;
     *) die "section $section is already covered by the exact fast proof" ;;
   esac
 fi
@@ -185,9 +191,13 @@ esac
 export CARGO_TARGET_DIR="$target_dir"
 export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+export RUST_MIN_STACK=8388608
 export RMUX_REQUIRE_TMUX=1
 
+printf 'rust-min-stack=%s\n' "$RUST_MIN_STACK"
+
 if section_enabled static; then
+  run_step "release TOML reader self-test" python3 scripts/toml_reader.py --self-test
   run_step "release versions" scripts/check-release-versions.sh
   run_step "changelog release audit" python3 scripts/check-changelog-release.py CHANGELOG.md
   run_step "tmux divergence ledger" python3 scripts/check-tmux-release-ledger.py
@@ -294,6 +304,20 @@ fi
 if section_enabled server; then
   run_step "server lib tests" \
     cargo test -p rmux-server --lib --locked -- --test-threads=1
+fi
+
+if section_enabled xterm; then
+  command -v npm >/dev/null 2>&1 ||
+    die "npm is required for the pinned independent xterm.js recovery oracle"
+  run_step "xterm.js oracle filter selects tests" \
+    scripts/assert-cargo-filter-nonempty.sh 1 -- test -p rmux-server --lib --locked \
+      pane_recovery::tests::keyframes_converge_in_independent_xterm_oracle
+  run_step "pinned xterm.js oracle dependencies" \
+    npm --prefix tests/xterm-oracle ci --ignore-scripts --no-audit --no-fund
+  run_step "independent xterm.js recovery oracle" \
+    cargo test -p rmux-server --lib --locked \
+      pane_recovery::tests::keyframes_converge_in_independent_xterm_oracle -- \
+      --ignored --exact --test-threads=1
 fi
 
 if section_enabled cli; then

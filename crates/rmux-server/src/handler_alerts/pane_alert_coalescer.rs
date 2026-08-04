@@ -39,6 +39,7 @@ impl PaneAlertCoalescer {
             .and_modify(|pending| {
                 pending.bell_count = pending.bell_count.saturating_add(event.bell_count);
                 pending.title_changed |= event.title_changed;
+                pending.path_changed |= event.path_changed;
                 pending.clipboard_set |= event.clipboard_set;
                 pending
                     .clipboard_writes
@@ -87,6 +88,7 @@ mod tests {
             bell_count,
             title_changed: false,
             title_change: None,
+            path_changed: false,
             clipboard_set: false,
             clipboard_writes: Vec::new(),
             clipboard_queries: Vec::new(),
@@ -101,6 +103,14 @@ mod tests {
         PaneAlertEvent {
             title_changed: true,
             title_change: None,
+            queue_activity_alert: false,
+            ..alert_event(pane_id, generation, 0)
+        }
+    }
+
+    fn path_event(pane_id: u32, generation: Option<u64>) -> PaneAlertEvent {
+        PaneAlertEvent {
+            path_changed: true,
             queue_activity_alert: false,
             ..alert_event(pane_id, generation, 0)
         }
@@ -167,6 +177,25 @@ mod tests {
             .find(|event| event.pane_id == PaneId::new(1))
             .expect("first pane event");
         assert!(first.title_changed);
+        assert!(first.queue_activity_alert);
+    }
+
+    /// A coalesced OSC 7 change must survive the same way a title change does:
+    /// dropping it would leave the outer terminal on the previous directory
+    /// with no later event to correct it (issue #182).
+    #[test]
+    fn pane_alert_callback_state_preserves_coalesced_path_changes() {
+        let mut state = PaneAlertCoalescer::default();
+
+        assert!(state.push(alert_event(1, Some(7), 0)));
+        assert!(!state.push(path_event(1, Some(7))));
+
+        let events = state.take_pending();
+        let first = events
+            .iter()
+            .find(|event| event.pane_id == PaneId::new(1))
+            .expect("first pane event");
+        assert!(first.path_changed);
         assert!(first.queue_activity_alert);
     }
 

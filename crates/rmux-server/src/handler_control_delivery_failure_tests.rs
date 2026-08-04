@@ -1,3 +1,4 @@
+use crate::client_names::control_client_name;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -180,8 +181,63 @@ async fn failed_rename_delivery_tracks_the_committed_stable_session_until_finish
         LifecycleEvent::ClientDetached {
             session_name,
             client_name: Some(client_name),
-        } if session_name == renamed && client_name == control.pid.to_string()
+        } if session_name == renamed && client_name == control_client_name(control.pid)
     ));
+}
+
+#[tokio::test]
+async fn queue_attach_without_exact_identity_commits_event_identity_and_touch() {
+    let handler = RequestHandler::new();
+    let target = session_name("queue-attach-success-target");
+    let target_id = new_session(&handler, &target).await;
+    let requester_pid = 43_019;
+    let (event_tx, mut events) = mpsc::channel(1);
+    let control_id = handler
+        .register_control_with_closing(
+            requester_pid,
+            ControlModeUpgrade {
+                initial_command_count: 0,
+                mode: ControlMode::Plain,
+                terminal_context: OuterTerminalContext::default(),
+            },
+            event_tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+
+    assert!(handler
+        .attach_control_session_for_queue(
+            ControlClientIdentity::new(requester_pid, control_id),
+            &target,
+            Some(target_id),
+        )
+        .await
+        .expect("queue attach succeeds"));
+    assert!(matches!(
+        events.try_recv(),
+        Ok(ControlServerEvent::SessionChanged(Some(ref session_name))
+            | ControlServerEvent::SessionChangedAt {
+                ref session_name,
+                ..
+            }) if session_name == &target
+    ));
+    let active_control = handler.active_control.lock().await;
+    let active = active_control
+        .by_pid
+        .get(&requester_pid)
+        .expect("queue-attached control remains registered");
+    assert_eq!(active.session_name.as_ref(), Some(&target));
+    assert_eq!(active.session_id, Some(target_id));
+    drop(active_control);
+    assert!(handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&target)
+        .expect("target survives")
+        .last_attached_at()
+        .is_some());
 }
 
 #[tokio::test]
@@ -268,7 +324,7 @@ async fn failed_queue_attach_and_destroy_switch_restore_their_source_identities(
         LifecycleEvent::ClientDetached {
             session_name,
             client_name: Some(client_name),
-        } if session_name == source && client_name == switched.pid.to_string()
+        } if session_name == source && client_name == control_client_name(switched.pid)
     ));
     assert!(matches!(
         lifecycle.try_recv(),

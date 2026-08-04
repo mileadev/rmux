@@ -1,18 +1,23 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
+use rmux_core::LifecycleEvent;
 use rmux_proto::{
     PaneId, PaneTarget, RmuxError, SessionId, SessionName, TerminalGeometry, WindowId, WindowTarget,
 };
 
-use super::resize_policy::ATTACHED_SIZE_RECONCILE_ATTEMPTS;
+use super::resize_policy::{IncomingSizeClient, ATTACHED_SIZE_RECONCILE_ATTEMPTS};
 use super::{
     attach_target_for_session_switch, reset_interactive_attach_state_for_session_switch,
-    terminate_overlay_job, ActiveAttachIdentity, AttachSessionSwitchRenderOptions, ClientFlags,
-    RequestHandler, ATTACH_CONTROL_BACKLOG_LIMIT,
+    terminate_overlay_job, ActiveAttachIdentity, AttachGeneration,
+    AttachSessionSwitchRenderOptions, AttachedClientControlOutcome, ClientFlags, RequestHandler,
+    ATTACH_CONTROL_BACKLOG_LIMIT,
 };
+use crate::handler::client_runtime_support::ListClientSnapshot;
 use crate::handler::client_support::SwitchTargetSelection;
-use crate::handler::update_environment_from_client;
+use crate::handler::{
+    update_environment_from_client, QueuedLifecycleEvent, SelectionTargetTransitionSnapshot,
+};
 use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::AttachControl;
 use crate::pane_terminals::{session_not_found, SessionTransferSnapshot};
@@ -39,8 +44,37 @@ pub(in crate::handler) struct AttachedSwitchCommittedTarget {
 }
 
 pub(in crate::handler) struct AttachedSwitchCommitOutcome {
-    pub(in crate::handler) previous_session_name: SessionName,
+    /// The session the client was attached to before the switch. Kept as a
+    /// stable identity because the source session can be renamed or destroyed
+    /// while the post-switch notifications are published.
+    pub(in crate::handler) previous_session_id: SessionId,
+    pub(in crate::handler) client_name: String,
     pub(in crate::handler) committed_target: AttachedSwitchCommittedTarget,
+    selection_events: Vec<QueuedLifecycleEvent>,
+}
+
+#[derive(Debug)]
+pub(in crate::handler) struct AttachedSwitchCommitFailure {
+    error: RmuxError,
+    detached_client: Option<AttachedClientControlOutcome>,
+}
+
+impl AttachedSwitchCommitFailure {
+    fn detached(error: RmuxError, detached_client: AttachedClientControlOutcome) -> Self {
+        Self {
+            error,
+            detached_client: Some(detached_client),
+        }
+    }
+}
+
+impl From<RmuxError> for AttachedSwitchCommitFailure {
+    fn from(error: RmuxError) -> Self {
+        Self {
+            error,
+            detached_client: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -99,12 +133,30 @@ impl RequestHandler {
         attach_pid: u32,
         expected_attach_id: u64,
         request: AttachedSwitchCommitRequest,
-    ) -> Result<AttachedSwitchCommitOutcome, RmuxError> {
+    ) -> Result<AttachedSwitchCommitOutcome, AttachedSwitchCommitFailure> {
         #[cfg(windows)]
         self.wait_for_windows_deferred_all_pane_pids().await;
 
-        let incoming_client_size = (!request.client_flags.contains(ClientFlags::IGNORESIZE))
-            .then_some(request.client_geometry.size);
+        // The switching client is still registered under the session it is
+        // leaving, so it enters the selection as the incoming client and that
+        // exact registration drops out with it. The generation matters: the loop
+        // below revalidates it under the final `state` -> `active_attach` lock
+        // pair, and a same-pid replacement must keep its own vote until then.
+        let displaced = AttachGeneration::new(attach_pid, expected_attach_id);
+        // tmux 3.7b's `cmd_switch_client_exec` assigns
+        // `s->curw->window->latest = c` before `recalculate_sizes()`, so a client
+        // joining a window is that window's newest sizing authority — ahead of
+        // clients that arrived after it. One order serves the whole command: the
+        // candidate below votes with it and the commit region writes it onto the
+        // registration, so the frame this switch sends, the geometry it stores
+        // and every later reconcile of the linked family rank the client alike.
+        let joined_size_sequence = self.next_client_size_sequence();
+        let incoming_client = Some(IncomingSizeClient::joining(
+            Some(displaced),
+            request.client_geometry.size,
+            request.client_flags,
+            joined_size_sequence,
+        ));
         let switch_window_target = request
             .target_selection
             .as_ref()
@@ -113,33 +165,32 @@ impl RequestHandler {
         for _ in 0..ATTACHED_SIZE_RECONCILE_ATTEMPTS {
             let size_selection = match switch_window_target.as_ref() {
                 Some(target) => {
-                    self.selected_attached_window_size(target, incoming_client_size)
+                    self.selected_attached_window_size(target, incoming_client)
                         .await?
                 }
                 None => {
-                    self.selected_attached_session_size_for_new_client(
-                        &request.session_name,
-                        request.client_geometry.size,
-                        request.client_flags,
-                    )
-                    .await?
+                    self.selected_attached_session_size(&request.session_name, incoming_client)
+                        .await?
                 }
             };
             self.pause_after_attached_size_selection().await;
 
             let mut state = self.state.lock().await;
             let mut active_attach = self.active_attach.lock().await;
+            let active_control = self.active_control.lock().await;
             let active = active_attach.by_pid.get(&attach_pid).filter(|active| {
-                active.id == expected_attach_id
+                // The same generation the selection displaced, revalidated
+                // before any shared geometry moves or any frame is sent.
+                displaced.is(attach_pid, active)
                     && request
                         .expected_current_session_id
                         .is_none_or(|session_id| active.session_id == session_id)
                     && !active.closing.load(Ordering::SeqCst)
             });
             let Some(active) = active else {
-                return Err(crate::handler_support::attached_client_required(
-                    "switch-client",
-                ));
+                return Err(
+                    crate::handler_support::attached_client_required("switch-client").into(),
+                );
             };
             // This value must be derived from the attach identity protected by
             // the final state -> active_attach lock pair. Another successful
@@ -147,16 +198,18 @@ impl RequestHandler {
             // during size selection.
             let switch_changes_session = active.session_name != request.session_name
                 || active.session_id != request.session_id;
+            let client_name = active.client_name.clone();
             if state
                 .sessions
                 .session(&request.session_name)
                 .is_none_or(|session| session.id() != request.session_id)
             {
-                return Err(session_not_found(&request.session_name));
+                return Err(session_not_found(&request.session_name).into());
             }
             if !self.attached_size_selection_is_current(
                 &state,
                 &active_attach,
+                &active_control,
                 &request.session_name,
                 &size_selection,
                 switch_window_target.is_none(),
@@ -208,9 +261,11 @@ impl RequestHandler {
                 self.bump_active_attach_epoch();
                 drop(active_attach);
                 drop(state);
-                terminate_overlay_job(removed.overlay);
-                return Err(crate::handler_support::attached_client_required(
-                    "switch-client",
+                let session_name = removed.session_name.clone();
+                let detached_client = Self::failed_attached_delivery_outcome(removed, session_name);
+                return Err(AttachedSwitchCommitFailure::detached(
+                    crate::handler_support::attached_client_required("switch-client"),
+                    detached_client,
                 ));
             }
             self.pause_after_attached_switch_closed_check(attach_pid)
@@ -239,26 +294,47 @@ impl RequestHandler {
                 self.bump_active_attach_epoch();
                 drop(active_attach);
                 drop(state);
-                terminate_overlay_job(removed.overlay);
-                return Err(RmuxError::Server(
-                    "attached client is not draining updates".to_owned(),
+                let session_name = removed.session_name.clone();
+                let detached_client = Self::failed_attached_delivery_outcome(removed, session_name);
+                return Err(AttachedSwitchCommitFailure::detached(
+                    RmuxError::Server("attached client is not draining updates".to_owned()),
+                    detached_client,
                 ));
             }
 
+            // Captured before the render so the title expands against the
+            // client this switch is being delivered to, already carrying the
+            // destination this frame commits to: nothing but a later unrelated
+            // redraw would correct a stale `#{client_session}`.
+            let switching_client = active_attach.by_pid.get(&attach_pid).map(|active| {
+                ListClientSnapshot::from_attached_client(attach_pid, active)
+                    .switched_to_session(&request.session_name, request.session_id)
+            });
             let target = attach_target_for_session_switch(
                 &state,
                 &request.session_name,
                 AttachSessionSwitchRenderOptions {
                     attached_count: request.attached_count,
+                    previous_title: active_attach
+                        .by_pid
+                        .get(&attach_pid)
+                        .map(|active| &active.client_title),
+                    client: switching_client.as_ref(),
                     terminal_context: &request.terminal_context,
                     socket_path: &self.socket_path(),
                     render_stream: request.render_stream,
                     selection: request.target_selection.as_ref(),
                     window_size_override: size_selection
-                        .selected_size
-                        .map(|size| (window_target.window_index(), size)),
+                        .render_override(window_target.window_index()),
                 },
             )?;
+            let selection_transition = request
+                .target_selection
+                .as_ref()
+                .map(|selection| {
+                    SelectionTargetTransitionSnapshot::capture(&state, selection.window_target())
+                })
+                .transpose()?;
             let snapshot = SessionTransferSnapshot::capture(&state);
             if let Some(client_environment) = request.client_environment.as_ref() {
                 update_environment_from_client(
@@ -278,18 +354,16 @@ impl RequestHandler {
                 window_target.window_index(),
                 |session| {
                     session.touch_attached();
-                    if let Some(selected_size) = size_selection.selected_size {
-                        session.resize_window(window_target.window_index(), selected_size)?;
-                    }
                     if let Some(selection) = request.target_selection.as_ref() {
                         selection.apply_to_session(session)?;
                     }
+                    size_selection.apply_to_window(session, window_target.window_index())?;
                     Ok(())
                 },
             );
             if let Err(error) = mutation {
                 snapshot.restore(&mut state);
-                return Err(rollback_switch_runtime(&mut state, &window_target, error));
+                return Err(rollback_switch_runtime(&mut state, &window_target, error).into());
             }
             let Some(committed_session) = state
                 .sessions
@@ -301,7 +375,8 @@ impl RequestHandler {
                     &mut state,
                     &window_target,
                     RmuxError::Server("switched attached session has no active target".to_owned()),
-                ));
+                )
+                .into());
             };
             let committed_window_index = committed_session.active_window_index();
             let Some(committed_window) = committed_session.window_at(committed_window_index) else {
@@ -310,7 +385,8 @@ impl RequestHandler {
                     &mut state,
                     &window_target,
                     RmuxError::Server("switched attached session has no active window".to_owned()),
-                ));
+                )
+                .into());
             };
             let Some(committed_pane) = committed_window.active_pane() else {
                 snapshot.restore(&mut state);
@@ -318,7 +394,8 @@ impl RequestHandler {
                     &mut state,
                     &window_target,
                     RmuxError::Server("switched attached window has no active pane".to_owned()),
-                ));
+                )
+                .into());
             };
             let committed_target = AttachedSwitchCommittedTarget {
                 target: PaneTarget::with_window(
@@ -353,6 +430,11 @@ impl RequestHandler {
 
             let render_stream_refresh =
                 request.render_stream && target.is_coalescible_render_refresh();
+            // Only a delivered switch frame actually carries the title; a
+            // coalesced render refresh drops this target and re-renders later.
+            let switched_client_title = (!render_stream_refresh)
+                .then(|| target.client_title.clone())
+                .flatten();
             let command = if render_stream_refresh {
                 AttachControl::Refresh
             } else {
@@ -380,9 +462,16 @@ impl RequestHandler {
                 let error = rollback_switch_runtime(&mut state, &window_target, delivery_error);
                 drop(active_attach);
                 drop(state);
-                terminate_overlay_job(removed.overlay);
-                return Err(error);
+                let session_name = removed.session_name.clone();
+                let detached_client = Self::failed_attached_delivery_outcome(removed, session_name);
+                return Err(AttachedSwitchCommitFailure::detached(
+                    error,
+                    detached_client,
+                ));
             }
+            let selection_events = selection_transition
+                .map(|transition| transition.prepare(&mut state))
+                .unwrap_or_default();
 
             let mode_tree_effects = mode_tree_dismiss_plan.map(|plan| {
                 self.apply_committed_mode_tree_dismissal(
@@ -396,7 +485,7 @@ impl RequestHandler {
                 .by_pid
                 .get_mut(&attach_pid)
                 .expect("committed attached identity remains present");
-            let previous_session_name = active.session_name.clone();
+            let previous_session_id = active.session_id;
             let switches_session_identity = active.session_name != request.session_name
                 || active.session_id != request.session_id;
             if switches_session_identity {
@@ -414,6 +503,7 @@ impl RequestHandler {
                 .then(|| reset_interactive_attach_state_for_session_switch(active))
                 .flatten();
             active.render_generation = active.render_generation.saturating_add(1);
+            active.remember_client_title(switched_client_title.as_ref());
             if render_stream_refresh {
                 active.render_refresh_pending = true;
             }
@@ -423,7 +513,14 @@ impl RequestHandler {
             }
             active.session_name = request.session_name.clone();
             active.session_id = request.session_id;
+            // The order the selection above voted with, now owned by the
+            // registration it displaced — the second half of
+            // `IncomingSizeClient::joining`'s contract. It lands here rather
+            // than earlier so a switch that fails leaves the client's recency
+            // exactly where the rolled-back model leaves its geometry.
+            active.size_sequence = joined_size_sequence;
 
+            drop(active_control);
             drop(active_attach);
             drop(state);
             if let Some(effects) = mode_tree_effects {
@@ -441,15 +538,70 @@ impl RequestHandler {
                 .await;
             }
             return Ok(AttachedSwitchCommitOutcome {
-                previous_session_name,
+                previous_session_id,
+                client_name,
                 committed_target,
+                selection_events,
             });
         }
 
         Err(RmuxError::Server(format!(
             "session {} active window changed during attached-size selection",
             request.session_name
-        )))
+        ))
+        .into())
+    }
+
+    pub(in crate::handler) async fn finish_attached_switch_failure(
+        &self,
+        failure: AttachedSwitchCommitFailure,
+    ) -> RmuxError {
+        if let Some(detached_client) = failure.detached_client {
+            self.emit_without_attached_refresh(LifecycleEvent::ClientDetached {
+                session_name: detached_client.session_name,
+                client_name: Some(detached_client.client_name),
+            })
+            .await;
+        }
+        failure.error
+    }
+
+    /// Publishes what tmux publishes once an attached `switch-client` has
+    /// committed.
+    ///
+    /// tmux 3.7b, measured 2026-07-25 (source session with a 101x41 PTY client
+    /// and a 60x20 control client, `window-size largest`): after the PTY client
+    /// switches away, the control client that stayed on the source session
+    /// receives
+    ///     %client-session-changed /dev/ttys007 $1 target
+    ///     %layout-change @0 a1dd,60x20,0,0,0 a1dd,60x20,0,0,0 *
+    /// in that order, and the source window really does shrink to the surviving
+    /// client's geometry. Targeted selection transitions already prepared by
+    /// the commit are published first (pane, then window), followed by this
+    /// client move. Only then is the source session reconciled, preserving the
+    /// measured client-before-layout order.
+    pub(in crate::handler) async fn finish_attached_session_switch(
+        &self,
+        outcome: AttachedSwitchCommitOutcome,
+        session_name: SessionName,
+        session_id: SessionId,
+    ) {
+        let AttachedSwitchCommitOutcome {
+            previous_session_id,
+            client_name,
+            selection_events,
+            ..
+        } = outcome;
+        for event in selection_events {
+            self.emit_prepared(event).await;
+        }
+        self.emit_client_session_changed(client_name, session_name, session_id)
+            .await;
+        if previous_session_id != session_id {
+            let _ = self
+                .reconcile_attached_session_identity_size_and_emit(previous_session_id)
+                .await;
+        }
     }
 }
 

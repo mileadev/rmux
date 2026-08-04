@@ -54,6 +54,54 @@ impl GridCellFlags {
     }
 }
 
+/// Columns a rendered grid line paints when it is replayed into a terminal.
+///
+/// A replay places the following line either by autowrap or by an explicit
+/// line break, and that choice depends on the columns the line occupies, not
+/// on the byte length of its escape-laden rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RenderedLineSpan {
+    columns: u32,
+    leading_columns: u32,
+}
+
+impl RenderedLineSpan {
+    /// Returns the columns painted by the whole line.
+    #[must_use]
+    pub const fn columns(self) -> u32 {
+        self.columns
+    }
+
+    /// Returns the columns painted by the first cell, zero when the line
+    /// paints nothing.
+    #[must_use]
+    pub const fn leading_columns(self) -> u32 {
+        self.leading_columns
+    }
+
+    /// Builds a span for a line of single-column cells.
+    const fn leading_one(columns: u32) -> Self {
+        Self {
+            columns,
+            leading_columns: if columns == 0 { 0 } else { 1 },
+        }
+    }
+
+    fn push(&mut self, width: u32) {
+        if self.columns == 0 {
+            self.leading_columns = width;
+        }
+        self.columns = self.columns.saturating_add(width);
+    }
+
+    fn pop_column(&mut self) {
+        self.columns = self.columns.saturating_sub(1);
+        if self.columns == 0 {
+            self.leading_columns = 0;
+        }
+    }
+}
+
 /// Per-line flags matching tmux `GRID_LINE_*`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct GridLineFlags(u8);
@@ -366,6 +414,9 @@ pub(crate) struct GridLine {
     pub(super) cells: Vec<GridCell>,
     plain_text: Option<CompactString>,
     width: u32,
+    /// Exclusive end of compact ASCII data, including trailing spaces omitted
+    /// from `plain_text`. The remaining physical suffix is still cleared.
+    plain_text_data_end: u16,
     pub(super) flags: GridLineFlags,
     time: i64,
     revision: u64,
@@ -379,6 +430,7 @@ impl GridLine {
             cells: Vec::new(),
             plain_text: Some(CompactString::new("")),
             width,
+            plain_text_data_end: 0,
             flags: GridLineFlags::default(),
             time: 0,
             revision: next_line_revision(),
@@ -395,6 +447,7 @@ impl GridLine {
             cells: vec![GridCell::blank_with_bg(bg); width as usize],
             plain_text: None,
             width,
+            plain_text_data_end: 0,
             flags: GridLineFlags::default(),
             time: 0,
             revision: next_line_revision(),
@@ -403,10 +456,12 @@ impl GridLine {
 
     pub(super) fn from_plain_ascii_text(width: u32, flags: GridLineFlags, text: String) -> Self {
         debug_assert!(text.is_ascii());
+        let plain_text_data_end = u16::try_from(text.len()).unwrap_or(u16::MAX);
         Self {
             cells: Vec::new(),
             plain_text: Some(CompactString::from(text)),
             width,
+            plain_text_data_end,
             flags,
             time: 0,
             revision: next_line_revision(),
@@ -530,6 +585,7 @@ impl GridLine {
             self.update_plain_text_cache(start, bytes);
         } else {
             self.plain_text = None;
+            self.plain_text_data_end = 0;
         }
         self.touch();
         true
@@ -542,8 +598,14 @@ impl GridLine {
             return None;
         }
         if let Some(text) = &self.plain_text {
-            let byte = text.as_bytes().get(x as usize).copied().unwrap_or(b' ');
-            return Some(GridCell::from_plain_ascii(byte));
+            if let Some(byte) = text.as_bytes().get(x as usize).copied() {
+                return Some(GridCell::from_plain_ascii(byte));
+            }
+            return Some(if x < u32::from(self.plain_text_data_end) {
+                GridCell::from_plain_ascii(b' ')
+            } else {
+                GridCell::default()
+            });
         }
         self.cells.get(x as usize).cloned()
     }
@@ -630,8 +692,10 @@ impl GridLine {
         if bg == COLOUR_DEFAULT {
             self.cells.clear();
             self.plain_text = Some(CompactString::new(""));
+            self.plain_text_data_end = 0;
         } else {
             self.plain_text = None;
+            self.plain_text_data_end = 0;
             self.cells
                 .resize(self.width as usize, GridCell::blank_with_bg(bg));
             self.cells.fill(GridCell::blank_with_bg(bg));
@@ -668,6 +732,9 @@ impl GridLine {
                     text.truncate(width);
                 }
             }
+            self.plain_text_data_end = self
+                .plain_text_data_end
+                .min(u16::try_from(width).unwrap_or(u16::MAX));
             self.width = u32::try_from(width).unwrap_or(u32::MAX);
             let wrapped_before = self.flags.contains(GridLineFlags::WRAPPED);
             if !preserve_wrap {
@@ -710,6 +777,47 @@ impl GridLine {
             rendered.pop();
         }
         rendered
+    }
+
+    pub(super) fn rendered_text_len(&self) -> usize {
+        if let Some(text) = &self.plain_text {
+            return text.trim_end_matches(' ').len();
+        }
+
+        let mut total = 0_usize;
+        let mut trimmed = 0_usize;
+        for cell in &self.cells {
+            if cell.flags.contains(GridCellFlags::PADDING) {
+                continue;
+            }
+            let text = cell.text.as_str();
+            total = total.saturating_add(text.len());
+            let without_trailing_spaces = text.trim_end_matches(' ').len();
+            if without_trailing_spaces > 0 {
+                trimmed = total.saturating_sub(text.len() - without_trailing_spaces);
+            }
+        }
+        trimmed
+    }
+
+    pub(super) fn recovery_clone_bytes(&self) -> usize {
+        let cell_bytes = self
+            .cells
+            .len()
+            .saturating_mul(std::mem::size_of::<GridCell>());
+        let extended_cell_text_bytes = self
+            .cells
+            .iter()
+            .filter(|cell| cell.text.extended.is_some())
+            .map(|cell| {
+                std::mem::size_of::<CompactString>().saturating_add(cell.text.as_str().len())
+            })
+            .sum::<usize>();
+        let plain_text_bytes = self.plain_text.as_ref().map_or(0, CompactString::len);
+        std::mem::size_of::<Self>()
+            .saturating_add(cell_bytes)
+            .saturating_add(extended_cell_text_bytes)
+            .saturating_add(plain_text_bytes)
     }
 
     pub(super) fn used_end(&self) -> usize {
@@ -757,6 +865,20 @@ impl GridLine {
                 cell.set_flags(flags);
             }
         }
+    }
+
+    /// Returns the unused columns a wide glyph left at the end of the line
+    /// when it did not fit and pre-wrapped onto the following row.
+    pub(super) fn trailing_reflow_gap(&self) -> u32 {
+        let width = self.width as usize;
+        let gap = self
+            .cells
+            .iter()
+            .take(width)
+            .rev()
+            .take_while(|cell| cell.is_reflow_gap())
+            .count();
+        u32::try_from(gap).unwrap_or(u32::MAX)
     }
 
     pub(super) fn reflow_logical_width(&self) -> usize {
@@ -859,12 +981,36 @@ impl GridLine {
         state: &mut GridStringState,
         hyperlinks: Option<&Hyperlinks>,
     ) -> String {
+        self.render_with_options_measured(line_width, options, state, hyperlinks)
+            .0
+    }
+
+    /// Renders the line and reports the columns the rendered text paints.
+    ///
+    /// Replaying a rendered line moves the cursor by the reported span, so
+    /// callers that place the following line by autowrap need the span rather
+    /// than the byte length.
+    pub(super) fn render_with_options_measured(
+        &self,
+        line_width: usize,
+        options: GridRenderOptions,
+        state: &mut GridStringState,
+        hyperlinks: Option<&Hyperlinks>,
+    ) -> (String, RenderedLineSpan) {
         if let Some(text) = &self.plain_text {
-            return render_plain_text_with_state(text, line_width, options, state, hyperlinks);
+            let mut rendered = String::new();
+            append_plain_text_state_prefix(options, state, hyperlinks, &mut rendered);
+            // A compacted line holds default single-column ASCII, so every
+            // rendered byte paints exactly one column.
+            let used_end = self.plain_text_render_end(text.len(), options);
+            let columns =
+                append_plain_text_with_options(text, used_end, line_width, options, &mut rendered);
+            return (rendered, RenderedLineSpan::leading_one(columns));
         }
         let mut rendered = String::new();
         let mut has_link = false;
         let end = self.render_cell_end(line_width, options);
+        let mut span = RenderedLineSpan::default();
 
         for cell in self.cells.iter().take(end) {
             if cell.flags.contains(GridCellFlags::PADDING) {
@@ -882,9 +1028,14 @@ impl GridLine {
                 state.last_cell = cell.clone();
             }
             append_cell_text(cell, &mut rendered, options.escape_sequences);
+            span.push(u32::from(cell.width.max(1)));
         }
         if options.include_empty_cells && end > self.cells.len() {
-            rendered.extend(std::iter::repeat_n(' ', end - self.cells.len()));
+            let filled = end - self.cells.len();
+            rendered.extend(std::iter::repeat_n(' ', filled));
+            for _ in 0..filled {
+                span.push(1);
+            }
         }
 
         if has_link {
@@ -893,9 +1044,10 @@ impl GridLine {
         if options.trim_spaces {
             while rendered.ends_with(' ') {
                 rendered.pop();
+                span.pop_column();
             }
         }
-        rendered
+        (rendered, span)
     }
 
     pub(super) fn render_bytes_with_options(
@@ -908,7 +1060,8 @@ impl GridLine {
             return false;
         }
         if let Some(text) = &self.plain_text {
-            append_plain_text_bytes_with_options(text, line_width, options, output);
+            let used_end = self.plain_text_render_end(text.len(), options);
+            append_plain_text_bytes_with_options(text, used_end, line_width, options, output);
             return true;
         }
 
@@ -990,6 +1143,7 @@ impl GridLine {
                 cells: Vec::new(),
                 plain_text: Some(text.clone()),
                 width: self.width,
+                plain_text_data_end: self.plain_text_data_end,
                 flags: self.flags,
                 time: self.time,
                 revision: self.revision,
@@ -1004,6 +1158,7 @@ impl GridLine {
                 cells: Vec::new(),
                 plain_text: Some(CompactString::new("")),
                 width: self.width,
+                plain_text_data_end: 0,
                 flags: self.flags,
                 time: self.time,
                 revision: self.revision,
@@ -1023,6 +1178,7 @@ impl GridLine {
             cells: Vec::new(),
             plain_text: Some(CompactString::from(text)),
             width: self.width,
+            plain_text_data_end: u16::try_from(used_end).unwrap_or(u16::MAX),
             flags: self.flags,
             time: self.time,
             revision: self.revision,
@@ -1054,6 +1210,10 @@ impl GridLine {
         while text.ends_with(' ') {
             text.pop();
         }
+        let data_end = usize::from(self.plain_text_data_end)
+            .max(end)
+            .max(text.len());
+        self.plain_text_data_end = u16::try_from(data_end).unwrap_or(u16::MAX);
     }
 
     fn materialize_plain_text(&mut self, width: usize) {
@@ -1061,13 +1221,25 @@ impl GridLine {
             return;
         };
         self.cells = text.bytes().map(GridCell::from_plain_ascii).collect();
+        let data_end = usize::from(self.plain_text_data_end).min(width);
+        self.cells
+            .resize(data_end, GridCell::from_plain_ascii(b' '));
         if self.cells.len() > width {
             self.cells.truncate(width);
         }
         if self.cells.len() < width {
             self.cells.resize(width, GridCell::default());
         }
+        self.plain_text_data_end = 0;
         self.width = u32::try_from(width).unwrap_or(u32::MAX);
+    }
+
+    fn plain_text_render_end(&self, text_len: usize, options: GridRenderOptions) -> usize {
+        if options.join_wrapped && !options.trim_spaces {
+            usize::from(self.plain_text_data_end).max(text_len)
+        } else {
+            text_len
+        }
     }
 }
 
@@ -1087,42 +1259,41 @@ fn style_colour_is_unset(colour: Colour) -> bool {
     matches!(colour, COLOUR_DEFAULT | COLOUR_TERMINAL | COLOUR_NONE)
 }
 
-fn render_plain_text_with_state(
-    text: &str,
-    line_width: usize,
+fn append_plain_text_state_prefix(
     options: GridRenderOptions,
     state: &mut GridStringState,
     hyperlinks: Option<&Hyperlinks>,
-) -> String {
-    let mut rendered = String::new();
-    if options.with_sequences {
-        let default_cell = GridCell::blank_with_bg(COLOUR_DEFAULT);
-        let mut has_link = false;
-        append_grid_string_code(
-            &state.last_cell,
-            &default_cell,
-            &mut rendered,
-            options.escape_sequences,
-            hyperlinks,
-            &mut has_link,
-        );
-        state.last_cell = default_cell;
-        if has_link {
-            append_hyperlink(&mut rendered, "", "", options.escape_sequences);
-        }
+    output: &mut String,
+) {
+    if !options.with_sequences {
+        return;
     }
-    append_plain_text_with_options(text, line_width, options, &mut rendered);
-    rendered
+    let default_cell = GridCell::blank_with_bg(COLOUR_DEFAULT);
+    let mut has_link = false;
+    append_grid_string_code(
+        &state.last_cell,
+        &default_cell,
+        output,
+        options.escape_sequences,
+        hyperlinks,
+        &mut has_link,
+    );
+    state.last_cell = default_cell;
+    if has_link {
+        append_hyperlink(output, "", "", options.escape_sequences);
+    }
 }
 
+/// Appends the compacted plain-ASCII text and returns the columns it paints.
 fn append_plain_text_with_options(
     text: &str,
+    used_end: usize,
     line_width: usize,
     options: GridRenderOptions,
     output: &mut String,
-) {
+) -> u32 {
     let start = output.len();
-    let end = plain_text_capture_end(text.len(), line_width, options);
+    let end = plain_text_capture_end(used_end, line_width, options);
     let copied_end = text.len().min(end);
     output.push_str(&text[..copied_end]);
     if text.len() < end {
@@ -1131,16 +1302,18 @@ fn append_plain_text_with_options(
     if options.trim_spaces {
         trim_trailing_spaces(output, start);
     }
+    u32::try_from(output.len().saturating_sub(start)).unwrap_or(u32::MAX)
 }
 
 fn append_plain_text_bytes_with_options(
     text: &str,
+    used_end: usize,
     line_width: usize,
     options: GridRenderOptions,
     output: &mut Vec<u8>,
 ) {
     let start = output.len();
-    let end = plain_text_capture_end(text.len(), line_width, options);
+    let end = plain_text_capture_end(used_end, line_width, options);
     let bytes = text.as_bytes();
     output.extend_from_slice(&bytes[..bytes.len().min(end)]);
     if bytes.len() < end {

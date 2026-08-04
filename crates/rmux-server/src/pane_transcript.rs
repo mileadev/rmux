@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use crate::clock_mode::{ClockModeState, CLOCK_MODE_NAME};
 use crate::copy_mode::{CopyModeRenderSnapshot, CopyModeState, CopyModeSummary};
 use rmux_core::{
-    style::Style, GridRenderOptions, Screen, ScreenCaptureRange, TerminalPaletteIndex,
-    TerminalPassthrough, TerminalScreen, Utf8Config,
+    input::OscColourSlot, style::Style, GridRenderOptions, Screen, ScreenCaptureRange,
+    TerminalPaletteIndex, TerminalPassthrough, TerminalScreen, Utf8Config,
 };
 use rmux_proto::TerminalSize;
 
@@ -66,11 +66,16 @@ pub(crate) struct PaneAppendResult {
     pub(crate) bell_count: u64,
     pub(crate) title_changed: bool,
     pub(crate) title_change: Option<(String, String)>,
+    /// The pane reported a different OSC 7 working directory. It reaches the
+    /// outer terminal only through a client re-render, exactly like the title
+    /// (issue #182).
+    pub(crate) path_changed: bool,
     pub(crate) passthroughs: Vec<TerminalPassthrough>,
     pub(crate) dropped_passthrough_count: u64,
     pub(crate) replies: Vec<u8>,
     pub(crate) ground_timer: Option<PaneGroundTimer>,
     pub(crate) alternate_mode_changed: bool,
+    pub(crate) recovery_rebase_required: bool,
 }
 
 pub(crate) struct PaneTranscriptRenderState {
@@ -132,15 +137,19 @@ impl PaneTranscript {
 
     pub(crate) fn append_bytes_with_effects(&mut self, bytes: &[u8]) -> PaneAppendResult {
         let now = Instant::now();
-        self.expire_ground_timer_if_due(now);
+        let ground_timer_expired = self.expire_ground_timer_if_due(now);
         if !bytes.is_empty() {
             self.output_sequence = self.output_sequence.saturating_add(1);
         }
         let title_before = self.terminal.screen().title().to_owned();
+        let path_before = self.terminal.screen().path().to_owned();
         let alternate_before = self.terminal.screen().is_alternate();
         self.terminal.feed(bytes);
+        let recovery_rebase_required =
+            ground_timer_expired || self.terminal.take_recovery_rebase_required();
         let title_after = self.terminal.screen().title().to_owned();
         let title_changed = title_after != title_before;
+        let path_changed = self.terminal.screen().path() != path_before;
         let passthroughs = self.terminal.take_terminal_passthrough();
         self.pending_palette_queries.register(&passthroughs, now);
         let dropped_passthrough_count = self.terminal.take_terminal_passthrough_dropped_count();
@@ -150,11 +159,13 @@ impl PaneTranscript {
             bell_count: self.terminal.screen_mut().take_bell_count(),
             title_changed,
             title_change: title_changed.then_some((title_before, title_after)),
+            path_changed,
             passthroughs,
             dropped_passthrough_count,
             replies,
             ground_timer,
             alternate_mode_changed: self.terminal.screen().is_alternate() != alternate_before,
+            recovery_rebase_required,
         }
     }
 
@@ -226,6 +237,13 @@ impl PaneTranscript {
             return false;
         }
         self.expire_ground_timer_now()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn make_ground_timer_due_for_test(&mut self) {
+        if self.ground_timer_started_at.is_some() {
+            self.ground_timer_started_at = Some(Instant::now() - PANE_INPUT_GROUND_TIMEOUT);
+        }
     }
 
     pub(crate) fn reset_terminal_state(&mut self) {
@@ -378,6 +396,38 @@ impl PaneTranscript {
         self.terminal.pending_bytes()
     }
 
+    pub(crate) fn pending_bytes_ref(&self) -> &[u8] {
+        self.terminal.pending_bytes_ref()
+    }
+
+    pub(crate) fn active_cell_state_ansi_bounded(
+        &self,
+        max_hyperlink_bytes: usize,
+    ) -> (Vec<u8>, bool) {
+        self.terminal
+            .active_cell_state_ansi_bounded(max_hyperlink_bytes)
+    }
+
+    pub(crate) fn saved_cell_state_ansi_bounded(
+        &self,
+        max_hyperlink_bytes: usize,
+    ) -> (Vec<u8>, bool) {
+        self.terminal
+            .saved_cell_state_ansi_bounded(max_hyperlink_bytes)
+    }
+
+    pub(crate) fn saved_cursor_state(&self) -> (u32, u32, bool) {
+        self.terminal.saved_cursor_state()
+    }
+
+    pub(crate) fn recovery_parser_state_ansi(&self) -> Vec<u8> {
+        self.terminal.recovery_parser_state_ansi()
+    }
+
+    pub(crate) fn dynamic_colour(&self, slot: OscColourSlot) -> Option<&str> {
+        self.terminal.dynamic_colour(slot)
+    }
+
     pub(crate) fn clear_history(&mut self, reset_hyperlinks: bool) {
         self.terminal
             .screen_mut()
@@ -476,6 +526,48 @@ impl PaneTranscript {
             // backing snapshot.
             snapshot.alternate_on = self.terminal.screen().is_alternate();
             snapshot
+        })
+    }
+
+    #[cfg(feature = "web")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn copy_mode_render_snapshot_bounded(
+        &self,
+        max_string_bytes: usize,
+        max_title_stack_bytes: usize,
+        max_hyperlink_entry_bytes: usize,
+        max_hyperlink_total_bytes: usize,
+    ) -> Option<CopyModeRenderSnapshot> {
+        self.copy_mode_state().map(|mode| {
+            let mut snapshot = mode.render_snapshot_bounded(
+                max_string_bytes,
+                max_title_stack_bytes,
+                max_hyperlink_entry_bytes,
+                max_hyperlink_total_bytes,
+            );
+            snapshot.alternate_on = self.terminal.screen().is_alternate();
+            snapshot
+        })
+    }
+
+    /// Reports whether the copy-mode backing screen's metadata fits the
+    /// bounded Web recovery budgets, or `None` when the pane is not in copy
+    /// mode.
+    #[cfg(feature = "web")]
+    pub(crate) fn copy_mode_recovery_metadata_fits(
+        &self,
+        max_string_bytes: usize,
+        max_title_stack_bytes: usize,
+        max_hyperlink_entry_bytes: usize,
+        max_hyperlink_total_bytes: usize,
+    ) -> Option<bool> {
+        self.copy_mode_state().map(|mode| {
+            mode.recovery_metadata_fits(
+                max_string_bytes,
+                max_title_stack_bytes,
+                max_hyperlink_entry_bytes,
+                max_hyperlink_total_bytes,
+            )
         })
     }
 
@@ -578,14 +670,6 @@ impl PaneTranscript {
         self.terminal.screen().mode()
     }
 
-    pub(crate) fn cursor_style(&self) -> u32 {
-        self.terminal.screen().cursor_style()
-    }
-
-    pub(crate) fn cursor_position(&self) -> (u32, u32) {
-        self.terminal.screen().cursor_position()
-    }
-
     pub(crate) fn is_alternate(&self) -> bool {
         self.terminal.screen().is_alternate()
     }
@@ -599,10 +683,6 @@ impl PaneTranscript {
         let new_title = title.into();
         self.terminal.screen_mut().set_title(new_title.clone());
         (old_title != new_title).then_some((old_title, new_title))
-    }
-
-    pub(crate) fn path(&self) -> &str {
-        self.terminal.screen().path()
     }
 
     fn absolute_line_matches(&self, absolute_y: usize, submitted_text: &str) -> bool {
@@ -740,6 +820,33 @@ mod tests {
         )
         .expect("capture is utf8");
         assert!(!capture.contains("Gf=100"));
+    }
+
+    #[test]
+    fn append_reports_rep_that_crosses_an_output_boundary() {
+        let mut transcript = transcript(8, 2, 10);
+        assert!(
+            !transcript
+                .append_bytes_with_effects("界".as_bytes())
+                .recovery_rebase_required
+        );
+
+        let result = transcript.append_bytes_with_effects(b"\x1b[2b");
+
+        assert!(result.recovery_rebase_required);
+        assert_eq!(
+            transcript.capture_main(ScreenCaptureRange::default(), GridRenderOptions::default()),
+            "界界界\n\n".as_bytes()
+        );
+    }
+
+    #[test]
+    fn append_keeps_same_boundary_rep_raw_replayable() {
+        let mut transcript = transcript(8, 2, 10);
+
+        let result = transcript.append_bytes_with_effects(b"X\x1b[2b");
+
+        assert!(!result.recovery_rebase_required);
     }
 
     #[test]

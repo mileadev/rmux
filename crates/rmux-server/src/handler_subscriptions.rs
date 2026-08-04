@@ -1,22 +1,29 @@
-use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use rmux_core::events::{
     OutputCursor, OutputCursorItem, OutputGap, PaneOutputSubscriptionKey, SubscriptionLimitError,
-    SubscriptionLimits, SubscriptionRegistry,
 };
+#[cfg(test)]
+use rmux_proto::PaneOutputSubscriptionId;
 use rmux_proto::{
     ErrorResponse, PaneOutputCursor, PaneOutputCursorRequest, PaneOutputCursorResponse,
-    PaneOutputEvent, PaneOutputLagNotice, PaneOutputLagResponse, PaneOutputSubscriptionId,
-    PaneOutputSubscriptionStart, PaneRecentOutput, PaneTarget, PaneTargetRef, Response, RmuxError,
+    PaneOutputEvent, PaneOutputLagNotice, PaneOutputLagResponse, PaneOutputSubscriptionStart,
+    PaneRecentOutput, PaneStreamEndReason, PaneTarget, PaneTargetRef, Response, RmuxError,
     SubscribePaneOutputRefRequest, SubscribePaneOutputRequest, SubscribePaneOutputResponse,
     UnsubscribePaneOutputRequest, UnsubscribePaneOutputResponse,
 };
 
-use crate::pane_io::{PaneOutputReceiver, PaneOutputSender};
+use crate::pane_io::PaneOutputSender;
 use crate::pane_terminals::{session_not_found, HandlerState};
 
 use super::{PaneOutputSubscriptionReconciliation, RequestHandler};
+
+#[path = "handler/output_subscription_state.rs"]
+mod output_subscription_state;
+pub(crate) use output_subscription_state::OutputSubscriptionState;
+pub(in crate::handler) use output_subscription_state::{
+    OutputSubscriptionAdmissionError, RawInitializationRoute, SurfaceDriverRoute,
+};
 
 // Keep lag diagnostics well below the detached RPC frame cap after bincode
 // overhead and the rest of the response envelope are added.
@@ -24,119 +31,11 @@ const MAX_LAG_RECENT_BYTES: usize = 64 * 1024;
 const EXITED_PANE_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const EXITED_PANE_DRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 
-pub(crate) struct OutputSubscriptionState {
-    registry: SubscriptionRegistry,
-    receivers: HashMap<PaneOutputSubscriptionId, PaneOutputReceiver>,
-    draining_panes: HashSet<PaneOutputSubscriptionKey>,
-}
-
-impl std::fmt::Debug for OutputSubscriptionState {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("OutputSubscriptionState")
-            .field("registry", &self.registry)
-            .field("receiver_count", &self.receivers.len())
-            .field("draining_pane_count", &self.draining_panes.len())
-            .finish()
-    }
-}
-
-impl OutputSubscriptionState {
-    pub(crate) fn new(limits: SubscriptionLimits) -> Self {
-        Self {
-            registry: SubscriptionRegistry::new(limits),
-            receivers: HashMap::new(),
-            draining_panes: HashSet::new(),
-        }
-    }
-
-    fn limits(&self) -> SubscriptionLimits {
-        self.registry.limits()
-    }
-
-    fn cleanup_stale(&mut self, now: Instant) {
-        for record in self.registry.cleanup_stale(now) {
-            self.receivers.remove(&record.id());
-            self.discard_drain_if_unused(record.pane());
-        }
-    }
-
-    fn remove_connection(&mut self, connection_id: u64) {
-        for record in self.registry.remove_connection(connection_id) {
-            self.receivers.remove(&record.id());
-            self.discard_drain_if_unused(record.pane());
-        }
-    }
-
-    fn remove_pane(&mut self, pane: &PaneOutputSubscriptionKey) -> bool {
-        let removed = self.registry.remove_pane(pane);
-        let removed_any = !removed.is_empty();
-        for record in removed {
-            self.receivers.remove(&record.id());
-        }
-        self.draining_panes.remove(pane);
-        removed_any
-    }
-
-    fn rekey_pane(
-        &mut self,
-        previous: &PaneOutputSubscriptionKey,
-        current: PaneOutputSubscriptionKey,
-    ) {
-        let was_draining = self.draining_panes.remove(previous);
-        let _ = self.registry.rekey_pane(previous, current.clone());
-        if was_draining {
-            self.draining_panes.insert(current);
-        }
-    }
-
-    fn begin_pane_drain(&mut self, pane: PaneOutputSubscriptionKey) -> bool {
-        if !self.registry.contains_pane(&pane) {
-            return false;
-        }
-        self.draining_panes.insert(pane);
-        true
-    }
-
-    fn pane_is_draining(&self, pane: &PaneOutputSubscriptionKey) -> bool {
-        self.draining_panes.contains(pane)
-    }
-
-    fn pane_drain_idle_for(
-        &self,
-        pane: &PaneOutputSubscriptionKey,
-        now: Instant,
-    ) -> Option<Duration> {
-        let last_seen = self
-            .registry
-            .ids_for_pane(pane)
-            .into_iter()
-            .filter_map(|id| self.registry.get(id).map(|record| record.last_seen()))
-            .max()?;
-        Some(now.saturating_duration_since(last_seen))
-    }
-
-    pub(in crate::handler) fn is_empty(&self) -> bool {
-        self.registry.is_empty()
-    }
-
-    fn remove_subscription(&mut self, subscription_id: PaneOutputSubscriptionId) {
-        if let Some(record) = self.registry.unsubscribe(subscription_id) {
-            self.receivers.remove(&subscription_id);
-            self.discard_drain_if_unused(record.pane());
-        }
-    }
-
-    fn discard_drain_if_unused(&mut self, pane: &PaneOutputSubscriptionKey) {
-        if !self.registry.contains_pane(pane) {
-            self.draining_panes.remove(pane);
-        }
-    }
-}
-
 impl RequestHandler {
+    // `pub(crate)` so the listener tests can assert the same stream-quota
+    // release the handler unit tests assert.
     #[cfg(test)]
-    pub(in crate::handler) fn pane_output_subscription_key_for_test(
+    pub(crate) fn pane_output_subscription_key_for_test(
         &self,
         subscription_id: PaneOutputSubscriptionId,
     ) -> Option<PaneOutputSubscriptionKey> {
@@ -250,11 +149,7 @@ impl RequestHandler {
             .subscriptions
             .lock()
             .expect("subscription registry mutex must not be poisoned");
-        subscriptions.cleanup_stale(now);
-        let record = match subscriptions
-            .registry
-            .subscribe(connection_id, pane_key.clone(), now)
-        {
+        let record = match subscriptions.subscribe(connection_id, pane_key.clone(), now) {
             Ok(record) => record,
             Err(error) => {
                 return Response::Error(ErrorResponse {
@@ -295,6 +190,11 @@ impl RequestHandler {
             return Response::Error(ErrorResponse {
                 error: RmuxError::Server("subscription is not owned by this connection".to_owned()),
             });
+        }
+        if let Err(error) =
+            validate_pane_output_subscription_kind(&subscriptions, request.subscription_id)
+        {
+            return Response::Error(ErrorResponse { error });
         }
 
         let removed = subscriptions
@@ -339,17 +239,24 @@ impl RequestHandler {
                     ),
                 });
             }
+            if let Err(error) =
+                validate_pane_output_subscription_kind(&subscriptions, request.subscription_id)
+            {
+                return Response::Error(ErrorResponse { error });
+            }
             let _ = subscriptions.registry.touch(request.subscription_id, now);
+            let pane = record.pane().clone();
 
-            let Some(receiver) = subscriptions.receivers.get_mut(&request.subscription_id) else {
-                subscriptions.remove_subscription(request.subscription_id);
-                return Response::Error(ErrorResponse {
-                    error: RmuxError::Server("subscription receiver not found".to_owned()),
-                });
-            };
+            let receiver = subscriptions
+                .receivers
+                .get_mut(&request.subscription_id)
+                .expect("validated pane-output subscription must have a receiver");
 
             let items = receiver.try_recv_batch(limit);
             let cursor = cursor_dto(receiver.cursor());
+            if !items.is_empty() {
+                subscriptions.note_pane_drain_progress(&pane, now);
+            }
             (items, cursor, limit)
         };
 
@@ -390,45 +297,84 @@ impl RequestHandler {
         let _ = self.request_shutdown_if_pending();
     }
 
-    pub(crate) async fn cleanup_pane_output_subscriptions(
+    pub(crate) async fn drain_removed_pane_output_subscriptions(
         &self,
         panes: &[PaneOutputSubscriptionKey],
     ) {
-        {
-            let mut subscriptions = self
-                .subscriptions
-                .lock()
-                .expect("subscription registry mutex must not be poisoned");
-            for pane in panes {
-                let _ = subscriptions.remove_pane(pane);
-            }
+        for pane in panes {
+            self.drain_exited_pane_output_subscriptions(pane.clone(), None)
+                .await;
         }
         let _ = self.request_shutdown_if_pending();
+    }
+
+    /// Publishes the capture handles of panes an explicit kill just removed,
+    /// keeping only the ones the kill actually removed. Callers capture the
+    /// sources with [`capture_pane_stream_sources`] before committing the kill
+    /// and stage them under that same state lock, mirroring the natural
+    /// pane-exit path, so cursor paths never observe a gap between live state
+    /// and the staged source.
+    pub(in crate::handler) fn stage_removed_pane_stream_sources(
+        &self,
+        removed: &[PaneOutputSubscriptionKey],
+        sources: Vec<super::pane_stream_support::PaneStreamSource>,
+    ) {
+        if removed.is_empty() || sources.is_empty() {
+            return;
+        }
+        let mut subscriptions = self
+            .subscriptions
+            .lock()
+            .expect("subscription registry mutex must not be poisoned");
+        for source in sources {
+            if removed.contains(&source.key) {
+                subscriptions.stage_pane_drain_source(source.key.clone(), source);
+            }
+        }
     }
 
     /// Applies the complete pane-output registry delta for one committed state
     /// mutation while the caller still owns the state lock.
     ///
-    /// Returning whether a live record was removed lets callers retry pending
-    /// idle shutdown only after both state and registry locks have been
-    /// released.
+    /// Destroyed panes start the same buffered-output drain as `kill-pane` and
+    /// natural pane exit instead of being torn down synchronously, so output a
+    /// pane already published is delivered before its subscription ends.
+    ///
+    /// Returning whether a drain started lets callers retry pending idle
+    /// shutdown only after both state and registry locks have been released.
     pub(in crate::handler) fn apply_pane_output_subscription_reconciliation(
         &self,
         reconciliation: PaneOutputSubscriptionReconciliation,
     ) -> bool {
+        let now = Instant::now();
         let (rekeys, removals) = reconciliation.into_parts();
-        let mut subscriptions = self
-            .subscriptions
-            .lock()
-            .expect("subscription registry mutex must not be poisoned");
-        for (previous, current) in rekeys {
-            subscriptions.rekey_pane(&previous, current);
+        let draining = {
+            let mut subscriptions = self
+                .subscriptions
+                .lock()
+                .expect("subscription registry mutex must not be poisoned");
+            for (previous, current) in rekeys {
+                subscriptions.rekey_pane(&previous, current);
+            }
+            let mut draining = Vec::new();
+            for removal in removals {
+                subscriptions
+                    .mark_pane_streams_ending(&removal.key, PaneStreamEndReason::PaneRemoved);
+                if subscriptions.begin_pane_drain(removal.key.clone(), removal.stream_source, now) {
+                    draining.push(removal.key);
+                } else {
+                    // Nothing left to drain for this pane: release its cached
+                    // stream state and any stranded drain bookkeeping now.
+                    subscriptions.remove_pane(&removal.key);
+                }
+            }
+            draining
+        };
+        let drained_any = !draining.is_empty();
+        for pane in draining {
+            self.watch_exited_pane_drain(pane);
         }
-        let mut removed_any = false;
-        for pane in removals {
-            removed_any = subscriptions.remove_pane(&pane) || removed_any;
-        }
-        removed_any
+        drained_any
     }
 
     pub(crate) fn rekey_pane_output_subscriptions(
@@ -444,16 +390,33 @@ impl RequestHandler {
         }
     }
 
-    pub(crate) async fn drain_exited_pane_output_subscriptions(
+    /// Makes an exited pane's immutable capture handles visible while the
+    /// caller still holds the state lock that removed the pane. Cursor paths
+    /// resolve live state first and this staged source second, so they cannot
+    /// observe a gap between those two ownership locations.
+    pub(in crate::handler) fn stage_exited_pane_stream_source(
         &self,
         pane: PaneOutputSubscriptionKey,
+        source: super::pane_stream_support::PaneStreamSource,
+    ) {
+        self.subscriptions
+            .lock()
+            .expect("subscription registry mutex must not be poisoned")
+            .stage_pane_drain_source(pane, source);
+    }
+
+    pub(in crate::handler) async fn drain_exited_pane_output_subscriptions(
+        &self,
+        pane: PaneOutputSubscriptionKey,
+        source: Option<super::pane_stream_support::PaneStreamSource>,
     ) {
         let should_watch = {
             let mut subscriptions = self
                 .subscriptions
                 .lock()
                 .expect("subscription registry mutex must not be poisoned");
-            subscriptions.begin_pane_drain(pane.clone())
+            subscriptions.mark_pane_streams_ending(&pane, PaneStreamEndReason::PaneRemoved);
+            subscriptions.begin_pane_drain(pane.clone(), source, Instant::now())
         };
         if should_watch {
             self.watch_exited_pane_drain(pane);
@@ -471,13 +434,9 @@ impl RequestHandler {
                     return;
                 }
                 if handler
-                    .pane_drain_idle_for(&pane)
+                    .cleanup_drained_pane_output_subscriptions_if_idle(&pane)
                     .await
-                    .is_some_and(|idle_for| idle_for >= EXITED_PANE_DRAIN_IDLE_TIMEOUT)
                 {
-                    handler
-                        .cleanup_pane_output_subscriptions(std::slice::from_ref(&pane))
-                        .await;
                     return;
                 }
                 tokio::time::sleep(EXITED_PANE_DRAIN_POLL_INTERVAL).await;
@@ -493,12 +452,25 @@ impl RequestHandler {
         !subscriptions.pane_is_draining(pane)
     }
 
-    async fn pane_drain_idle_for(&self, pane: &PaneOutputSubscriptionKey) -> Option<Duration> {
-        let subscriptions = self
-            .subscriptions
-            .lock()
-            .expect("subscription registry mutex must not be poisoned");
-        subscriptions.pane_drain_idle_for(pane, Instant::now())
+    async fn cleanup_drained_pane_output_subscriptions_if_idle(
+        &self,
+        pane: &PaneOutputSubscriptionKey,
+    ) -> bool {
+        let expired = {
+            let mut subscriptions = self
+                .subscriptions
+                .lock()
+                .expect("subscription registry mutex must not be poisoned");
+            subscriptions.expire_pane_drain_if_idle(
+                pane,
+                Instant::now(),
+                EXITED_PANE_DRAIN_IDLE_TIMEOUT,
+            )
+        };
+        if expired {
+            let _ = self.request_shutdown_if_pending();
+        }
+        expired
     }
 }
 
@@ -517,12 +489,11 @@ fn retained_lookup(
         PaneTargetRef::Slot(target) => Ok(handler
             .retained_exited_pane_output(target, now)
             .map(|retained| (target.clone(), retained))),
-        PaneTargetRef::Id {
-            session_name,
-            pane_id,
-        } => {
-            let pane_key = PaneOutputSubscriptionKey::new(session_name.clone(), *pane_id);
-            Ok(handler.retained_exited_pane_output_by_pane(&pane_key, now))
+        PaneTargetRef::Id { pane_id, .. } => {
+            // PaneId is daemon-global. A stable SDK handle may still carry
+            // the session name from before a rename or inter-session move,
+            // while retained output has already been rekeyed to the new name.
+            Ok(handler.retained_exited_pane_output_entry_by_id(*pane_id, now))
         }
     }
 }
@@ -563,13 +534,48 @@ fn resolve_pane_target_ref(
     }
 }
 
-fn cursor_event_limit(requested: Option<u16>, default: usize) -> Result<usize, RmuxError> {
+/// Captures the immutable stream handles of panes a state mutation may remove,
+/// while the caller still owns the state lock that will commit the mutation.
+/// Once the panes leave `state.sessions` the handles are unrecoverable, so a
+/// surface stream could no longer project the output that was already buffered
+/// when the mutation ran.
+pub(in crate::handler) fn capture_pane_stream_sources<'a>(
+    state: &HandlerState,
+    panes: impl IntoIterator<Item = &'a PaneOutputSubscriptionKey>,
+) -> Vec<super::pane_stream_support::PaneStreamSource> {
+    panes
+        .into_iter()
+        .filter_map(|pane| {
+            let target =
+                state.pane_target_for_runtime_pane(pane.runtime_session_name(), pane.pane_id())?;
+            super::pane_stream_support::stream_source_for_target(state, target).ok()
+        })
+        .collect()
+}
+
+pub(in crate::handler) fn cursor_event_limit(
+    requested: Option<u16>,
+    default: usize,
+) -> Result<usize, RmuxError> {
     match requested {
         Some(0) => Err(RmuxError::Server(
             "pane output cursor max_events must be greater than zero".to_owned(),
         )),
         Some(value) => Ok(usize::from(value).min(default)),
         None => Ok(default),
+    }
+}
+
+fn validate_pane_output_subscription_kind(
+    subscriptions: &OutputSubscriptionState,
+    subscription_id: rmux_proto::PaneOutputSubscriptionId,
+) -> Result<(), RmuxError> {
+    if subscriptions.receivers.contains_key(&subscription_id) {
+        Ok(())
+    } else {
+        Err(RmuxError::Server(
+            "subscription is not a pane-output subscription".to_owned(),
+        ))
     }
 }
 
@@ -604,8 +610,17 @@ fn lag_dto(gap: &OutputGap) -> PaneOutputLagNotice {
     }
 }
 
-pub(in crate::handler) fn subscription_limit_error(error: SubscriptionLimitError) -> RmuxError {
-    subscription_limit_error_for("pane output", error)
+pub(in crate::handler) fn subscription_limit_error(
+    error: OutputSubscriptionAdmissionError,
+) -> RmuxError {
+    match error {
+        OutputSubscriptionAdmissionError::Configured(error) => {
+            subscription_limit_error_for("pane output", error)
+        }
+        OutputSubscriptionAdmissionError::Global { limit } => RmuxError::Server(format!(
+            "pane output global subscription limit exceeded (limit {limit})"
+        )),
+    }
 }
 
 pub(in crate::handler) fn pane_state_subscription_limit_error(

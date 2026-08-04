@@ -172,15 +172,16 @@ async fn display_panes_command_rejects_a_reused_pane_slot() {
     .await;
     let label = displayed_label_for_pane(&handler, requester_pid, 1).await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::KillPane(rmux_proto::KillPaneRequest {
-                target: PaneTarget::with_window(session.clone(), 0, 1),
-                kill_all_except: false,
-            }))
-            .await,
-        Response::KillPane(_)
-    ));
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handler.handle(Request::KillPane(rmux_proto::KillPaneRequest {
+            target: PaneTarget::with_window(session.clone(), 0, 1),
+            kill_all_except: false,
+        })),
+    )
+    .await
+    .expect("kill-pane must not wait behind its prepared selection notifications");
+    assert!(matches!(response, Response::KillPane(_)));
     assert!(matches!(
         handler
             .handle(Request::SplitWindow(SplitWindowRequest {

@@ -14,26 +14,43 @@ use super::super::prompt_support::ClientPromptState;
 use super::super::scripting_support::{
     rename_pane_target_session, rename_window_target_session, QueueExecutionContext,
 };
-use super::super::{RequesterOrigin, StableTargetIdentity};
+use super::super::{current_client_activity_timestamp, RequesterOrigin, StableTargetIdentity};
+use super::transient_message::TransientMessageInputState;
 use crate::client_flags::ClientFlags;
 use crate::handler_support::{ambiguous_attached_client, attached_client_required};
 use crate::mouse::ClientMouseState;
-use crate::outer_terminal::OuterTerminalContext;
+use crate::outer_terminal::{ClientTitleState, OuterTerminalContext, RenderedClientTitle};
 use crate::pane_io::{AttachControl, AttachControlSender};
 
 #[derive(Debug, Default)]
 pub(in crate::handler) struct ActiveAttachState {
     pub(in crate::handler) next_id: u64,
-    pub(in crate::handler) next_size_sequence: u64,
-    pub(in crate::handler) next_activity_sequence: u64,
     pub(in crate::handler) by_pid: HashMap<u32, ActiveAttach>,
     pub(in crate::handler) active_client_by_window:
         HashMap<rmux_proto::SessionName, HashMap<u32, u32>>,
 }
 
+/// How an attached client's outer terminal geometry became known.
+///
+/// This is server-internal typing only; it never crosses the wire and must
+/// never be reconstructed from the numeric dimensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::handler) enum AttachClientSizeProvenance {
+    /// The client declared this outer terminal geometry itself.
+    Declared,
+    /// The client declared no size, so registration anchored it to the outer
+    /// terminal geometry of the session it joined. Anchoring to the session's
+    /// *content* geometry instead would hand an already status-subtracted row
+    /// count to every consumer that subtracts the status rows again.
+    InferredFromSession,
+}
+
 #[derive(Debug)]
 pub(in crate::handler) struct ActiveAttach {
     pub(in crate::handler) id: u64,
+    /// Canonical display identity captured while the attaching process still
+    /// exposes its tty. Never reconstruct this from the pid after registration.
+    pub(in crate::handler) client_name: String,
     pub(in crate::handler) session_name: rmux_proto::SessionName,
     pub(in crate::handler) session_id: SessionId,
     pub(in crate::handler) last_session: Option<rmux_proto::SessionName>,
@@ -54,11 +71,20 @@ pub(in crate::handler) struct ActiveAttach {
     /// The server initiated this close without first emitting `client-detached`.
     pub(in crate::handler) emit_detached_on_finish: bool,
     pub(in crate::handler) terminal_context: OuterTerminalContext,
+    /// Expanded `set-titles-string` and OSC 7 path this client's outer terminal
+    /// was last told about, tmux's per-client `c->title` / `c->path`.
+    pub(in crate::handler) client_title: ClientTitleState,
+    /// Outer terminal geometry, status rows included. Every consumer derives
+    /// content geometry from it by subtracting the status rows exactly once,
+    /// so an already-subtracted row count must never be stored here.
     pub(in crate::handler) client_size: TerminalSize,
+    pub(in crate::handler) client_size_provenance: AttachClientSizeProvenance,
     pub(in crate::handler) client_pixels: Option<TerminalPixels>,
     pub(in crate::handler) size_sequence: u64,
     /// Server-monotonic ordering of the client's latest accepted live input.
     pub(in crate::handler) last_activity_sequence: u64,
+    /// Unix timestamp of the client's latest accepted live input.
+    pub(in crate::handler) activity_at: i64,
     pub(in crate::handler) persistent_overlay_epoch: Arc<AtomicU64>,
     pub(in crate::handler) render_generation: u64,
     pub(in crate::handler) overlay_generation: u64,
@@ -77,6 +103,14 @@ pub(in crate::handler) struct ActiveAttach {
     pub(in crate::handler) mode_tree_frame: Option<Vec<u8>>,
     pub(in crate::handler) overlay: Option<ClientOverlayState>,
     pub(in crate::handler) display_panes: Option<DisplayPanesClientState>,
+    pub(in crate::handler) transient_message: Option<TransientMessageInputState>,
+    pub(in crate::handler) transient_terminal_prefix: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::handler) struct AttachedClientControlOutcome {
+    pub(in crate::handler) session_name: rmux_proto::SessionName,
+    pub(in crate::handler) client_name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +159,23 @@ impl ActiveAttachIdentity {
             && &active.session_name == session_name
     }
 
+    /// Whether this attach is still the published one for its client and still
+    /// owns `session_id`.
+    ///
+    /// The name a session is stored under is mutable and its id is not, so a
+    /// caller that captured a name before releasing the state lock cannot use
+    /// that name as identity: a rename keeps the same lifetime attached to the
+    /// same client under a new key.  Callers that need a name read the current
+    /// one off the attach this accepts.  A session switch does change
+    /// `active.session_id`, so it is still rejected here.
+    pub(in crate::handler) fn matches_active_lifetime(
+        self,
+        active: &ActiveAttach,
+        session_id: SessionId,
+    ) -> bool {
+        self.attach_id == active.id && active.session_id == session_id
+    }
+
     pub(in crate::handler) fn matches(
         self,
         attach_pid: u32,
@@ -138,9 +189,70 @@ impl ActiveAttachIdentity {
     }
 }
 
+/// One exact attach registration: a pid *and* the generation holding it.
+///
+/// A pid on its own names whichever client owns it *now*.
+/// `register_attach_identity` replaces `by_pid[attach_pid]` in place and hands
+/// the replacement a fresh `id`, so a command that captured a registration must
+/// carry this pair to keep speaking for the one it captured — and to stop
+/// speaking at all once a replacement has taken the pid over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::handler) struct AttachGeneration {
+    attach_pid: u32,
+    attach_id: u64,
+}
+
+impl AttachGeneration {
+    pub(in crate::handler) const fn new(attach_pid: u32, attach_id: u64) -> Self {
+        Self {
+            attach_pid,
+            attach_id,
+        }
+    }
+
+    /// `true` when `active`, registered under `attach_pid`, is this exact
+    /// registration rather than a same-pid replacement of it.
+    pub(in crate::handler) fn is(self, attach_pid: u32, active: &ActiveAttach) -> bool {
+        self.attach_pid == attach_pid && self.attach_id == active.id
+    }
+}
+
 impl ActiveAttach {
     pub(in crate::handler) const fn identity(&self, attach_pid: u32) -> ActiveAttachIdentity {
         ActiveAttachIdentity::new(attach_pid, self.id, self.session_id)
+    }
+
+    /// `true` while `client_size` is still the anchor registration inferred
+    /// from the session rather than geometry the client declared.
+    pub(in crate::handler) const fn client_size_is_inferred(&self) -> bool {
+        matches!(
+            self.client_size_provenance,
+            AttachClientSizeProvenance::InferredFromSession
+        )
+    }
+
+    /// Records outer terminal geometry the client itself reported, promoting an
+    /// inferred anchor even when the dimensions are numerically unchanged.
+    pub(in crate::handler) fn set_declared_client_size(&mut self, client_size: TerminalSize) {
+        self.client_size = client_size;
+        self.client_size_provenance = AttachClientSizeProvenance::Declared;
+    }
+
+    /// Remembers what this client's outer terminal was just given.
+    ///
+    /// A render made while `set-titles` is off commits nothing and must leave
+    /// the remembered values alone: tmux keeps `c->title` across the option
+    /// going off and back on, so a title that is still current is not
+    /// re-emitted when it is switched back on. A render that resolved a title
+    /// but wrote no bytes commits nothing either — see
+    /// [`RenderedClientTitle::committed`].
+    pub(in crate::handler) fn remember_client_title(
+        &mut self,
+        rendered: Option<&RenderedClientTitle>,
+    ) {
+        if let Some(state) = rendered.and_then(RenderedClientTitle::committed) {
+            self.client_title = state.clone();
+        }
     }
 }
 
@@ -171,6 +283,9 @@ pub(crate) struct AttachRegistration {
     pub(crate) closing: Arc<AtomicBool>,
     pub(crate) persistent_overlay_epoch: Arc<AtomicU64>,
     pub(crate) terminal_context: OuterTerminalContext,
+    /// What the attach frame this registration publishes already told the
+    /// outer terminal, so the client's first refresh does not repeat it.
+    pub(crate) client_title: Option<ClientTitleState>,
     pub(crate) flags: ClientFlags,
     pub(crate) render_stream: bool,
     pub(crate) uid: u32,
@@ -206,13 +321,16 @@ fn rename_display_panes_state(
 }
 
 impl ActiveAttachState {
-    pub(in crate::handler) fn record_client_activity(&mut self, attach_pid: u32) -> bool {
+    pub(in crate::handler) fn record_client_activity(
+        &mut self,
+        attach_pid: u32,
+        sequence: u64,
+    ) -> bool {
         let Some(active) = self.by_pid.get_mut(&attach_pid) else {
             return false;
         };
-        let sequence = self.next_activity_sequence;
-        self.next_activity_sequence = self.next_activity_sequence.saturating_add(1);
         active.last_activity_sequence = sequence;
+        active.activity_at = current_client_activity_timestamp();
         true
     }
 
@@ -370,22 +488,6 @@ impl ActiveAttachState {
             .get(&attach_pid)
             .map(|active| active.last_session.clone().zip(active.last_session_id))
             .ok_or_else(|| rmux_proto::RmuxError::Server("attached client disappeared".to_owned()))
-    }
-
-    pub(in crate::handler) fn session_for_attached_client(
-        &self,
-        requester_pid: u32,
-        command_name: &str,
-    ) -> Result<Option<rmux_proto::SessionName>, rmux_proto::RmuxError> {
-        if self.by_pid.is_empty() {
-            return Ok(None);
-        }
-
-        let attach_pid = self.resolve_attached_client_pid(requester_pid, command_name)?;
-        Ok(self
-            .by_pid
-            .get(&attach_pid)
-            .map(|active| active.session_name.clone()))
     }
 
     pub(in crate::handler) fn current_session_candidate(

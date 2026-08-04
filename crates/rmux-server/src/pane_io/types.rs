@@ -16,7 +16,7 @@ use crate::client_flags::ClientFlags;
 use crate::control_mode::ControlModeUpgrade;
 #[cfg(any(unix, windows))]
 use crate::handler::{attach_support::ActiveAttachIdentity, RequestHandler};
-use crate::outer_terminal::OuterTerminal;
+use crate::outer_terminal::{OuterTerminal, RenderedClientTitle};
 
 use super::attach_control::AttachControl;
 use super::live_render::LivePaneRender;
@@ -78,6 +78,10 @@ pub(crate) struct PaneAlertEvent {
     pub(crate) bell_count: u64,
     pub(crate) title_changed: bool,
     pub(crate) title_change: Option<(String, String)>,
+    /// The pane reported a different OSC 7 working directory in this batch.
+    /// Attached clients must re-render for it to reach their outer terminal,
+    /// the same way a title change does (issue #182).
+    pub(crate) path_changed: bool,
     pub(crate) clipboard_set: bool,
     /// Decoded payloads of the inbound OSC 52 clipboard writes in this batch, in
     /// arrival order. Each becomes a paste buffer under `set-clipboard on`
@@ -160,6 +164,13 @@ pub(crate) struct AttachTarget {
     pub(crate) pane_output_start_sequence: u64,
     pub(crate) render_frame: Vec<u8>,
     pub(crate) outer_terminal: OuterTerminal,
+    /// What this render told the outer terminal, or `None` when the session
+    /// has `set-titles off` and it was left alone. Carried back so the caller
+    /// can remember it and skip an unchanged title on the next render.
+    ///
+    /// In-process only: `AttachTarget` never crosses the attach wire, and
+    /// `open_attach_target` drops this field at the transport boundary.
+    pub(crate) client_title: Option<RenderedClientTitle>,
     pub(crate) cursor_style: u32,
     pub(crate) active_pane_geometry: PaneGeometry,
     pub(crate) raw_passthrough: bool,
@@ -170,8 +181,26 @@ pub(crate) struct AttachTarget {
 }
 
 impl AttachTarget {
-    pub(crate) fn is_coalescible_render_refresh(&self) -> bool {
+    /// A plain re-render of the pane this client already watches: no pane
+    /// master handover and no persistent overlay. Live output continuity is
+    /// preserved across it, whatever the frame happens to carry.
+    pub(crate) fn is_plain_render_refresh(&self) -> bool {
         self.pane_master.is_none() && self.persistent_overlay_state_id.is_none()
+    }
+
+    /// A plain render refresh the control queue may drop in favour of a later
+    /// one, because only the newest frame is worth drawing.
+    ///
+    /// A frame carrying OSC 0 / OSC 7 is excluded: the next render
+    /// deduplicates the title against it, so dropping this one would leave the
+    /// outer terminal showing the previous title with nothing left to correct
+    /// it (issue #182).
+    pub(crate) fn is_coalescible_render_refresh(&self) -> bool {
+        self.is_plain_render_refresh()
+            && !self
+                .client_title
+                .as_ref()
+                .is_some_and(RenderedClientTitle::wrote)
     }
 }
 
@@ -330,12 +359,38 @@ pub(crate) struct PaneOutputReceiver {
     inner: Arc<PaneOutputInner>,
     cursor: OutputCursor,
     passthrough_floor_sequence: u64,
+    observed_invalidation_revision: u64,
+    observed_process_exit_revision: u64,
+    pending_preserved_process_exits: u64,
+    pending_observed_output: Option<OutputCursorItem>,
     fast_rx: Option<mpsc::Receiver<FastPaneOutput>>,
 }
 
 impl PaneOutputReceiver {
     pub(super) fn shares_pane_source_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub(crate) const fn observed_invalidation_revision(&self) -> u64 {
+        self.observed_invalidation_revision
+    }
+
+    pub(crate) const fn observed_process_exit_revision(&self) -> u64 {
+        self.observed_process_exit_revision
+    }
+
+    /// Carries lifecycle delivery progress across an atomic rebase.
+    ///
+    /// The replacement receiver starts at the captured output boundary, but a
+    /// child can exit between the old receiver observing an invalidation and
+    /// that capture. Queuing only the missing lifecycle revisions keeps those
+    /// exits observable without replaying bytes already represented by the
+    /// rebase.
+    pub(crate) fn preserve_process_exits_since(&mut self, observed_revision: u64) {
+        self.pending_preserved_process_exits = self.pending_preserved_process_exits.max(
+            self.observed_process_exit_revision
+                .saturating_sub(observed_revision),
+        );
     }
 }
 
@@ -350,6 +405,10 @@ struct PaneOutputState {
     ring: OutputRing,
     passthroughs: VecDeque<PaneOutputPassthroughs>,
     retained_passthrough_bytes: usize,
+    invalidation_revision: u64,
+    process_exit_revision: u64,
+    process_exit_revision_at_invalidation: u64,
+    last_invalidation_reason: PaneInvalidationReason,
 }
 
 struct PaneOutputPassthroughs {
@@ -362,13 +421,69 @@ const PANE_OUTPUT_PASSTHROUGH_BYTE_CAPACITY: usize = 16 * 1024 * 1024;
 const FAST_PANE_OUTPUT_MAX_BYTES: usize = 16 * 1024;
 const FAST_PANE_OUTPUT_CHANNEL_CAPACITY: usize = 64;
 
+/// Cold-path mutations that make continuation from an older renderer
+/// checkpoint unsafe even when no pane-output bytes were published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaneInvalidationReason {
+    Initial,
+    Resize,
+    ClearHistory,
+    ParserStateExpired,
+    TerminalReset,
+    TranscriptMutation,
+    GenerationChanged,
+}
+
+/// One atomic cut through pane process identity, output and invalidations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PaneBoundary {
+    pub(crate) generation: u64,
+    pub(crate) next_output_sequence: u64,
+    pub(crate) invalidation_revision: u64,
+    pub(crate) process_exit_revision: u64,
+}
+
+/// An invalidation observed by a recoverable pane-output consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PaneInvalidation {
+    pub(crate) boundary: PaneBoundary,
+    pub(crate) reason: PaneInvalidationReason,
+}
+
+/// Output plus cold-path invalidations ignored by legacy raw subscribers.
+#[derive(Debug)]
+pub(crate) enum PaneObservationItem {
+    Output(OutputCursorItem),
+    Invalidated(PaneInvalidation),
+    ProcessExited { output_sequence: Option<u64> },
+}
+
 impl PaneOutputState {
     fn new(event_capacity: usize, recent_byte_capacity: usize) -> Self {
         Self {
             ring: OutputRing::new(event_capacity, recent_byte_capacity),
             passthroughs: VecDeque::with_capacity(PANE_OUTPUT_PASSTHROUGH_CAPACITY),
             retained_passthrough_bytes: 0,
+            invalidation_revision: 0,
+            process_exit_revision: 0,
+            process_exit_revision_at_invalidation: 0,
+            last_invalidation_reason: PaneInvalidationReason::Initial,
         }
+    }
+
+    fn boundary(&self, generation: u64) -> PaneBoundary {
+        PaneBoundary {
+            generation,
+            next_output_sequence: self.next_sequence(),
+            invalidation_revision: self.invalidation_revision,
+            process_exit_revision: self.process_exit_revision,
+        }
+    }
+
+    fn invalidate(&mut self, reason: PaneInvalidationReason) {
+        self.invalidation_revision = self.invalidation_revision.saturating_add(1);
+        self.process_exit_revision_at_invalidation = self.process_exit_revision;
+        self.last_invalidation_reason = reason;
     }
 
     fn push(
@@ -378,6 +493,9 @@ impl PaneOutputState {
         retain_recent: bool,
         retain_passthroughs: bool,
     ) -> u64 {
+        if bytes.is_empty() {
+            self.process_exit_revision = self.process_exit_revision.saturating_add(1);
+        }
         let sequence = self
             .ring
             .push_shared_with_recent_retention(bytes, retain_recent);
@@ -518,11 +636,29 @@ impl PaneOutputSender {
         self.push_for_generation(generation, bytes, passthroughs)
     }
 
+    #[cfg(test)]
     pub(crate) fn publish_for_generation<R>(
         &self,
         generation: Option<u64>,
         bytes: Vec<u8>,
         build_side_effects: impl FnOnce(&[u8]) -> (R, Vec<TerminalPassthrough>),
+    ) -> Option<(u64, R)> {
+        self.publish_for_generation_with_invalidation(generation, bytes, |bytes| {
+            let (result, passthroughs) = build_side_effects(bytes);
+            (result, passthroughs, None)
+        })
+    }
+
+    /// Publishes exact legacy bytes and, when requested, advances recoverable
+    /// observers past them to an authoritative state under the same lock.
+    pub(crate) fn publish_for_generation_with_invalidation<R>(
+        &self,
+        generation: Option<u64>,
+        bytes: Vec<u8>,
+        build_side_effects: impl FnOnce(
+            &[u8],
+        )
+            -> (R, Vec<TerminalPassthrough>, Option<PaneInvalidationReason>),
     ) -> Option<(u64, R)> {
         let fast_receiver_count = self.inner.fast_receiver_count.load(Ordering::Acquire);
         let (sequence, result, fast_bytes, fast_epoch) = {
@@ -534,11 +670,18 @@ impl PaneOutputSender {
             if !generation_matches(self.current_generation(), generation) {
                 return None;
             }
-            let (result, passthroughs) = build_side_effects(&bytes);
+            let (result, passthroughs, invalidation) = build_side_effects(&bytes);
             let retain_passthroughs = self.inner.receiver_count.load(Ordering::Acquire) > 0;
             let bytes: Arc<[u8]> = bytes.into();
-            let fast_bytes = fast_output_candidate(fast_receiver_count, &bytes, &passthroughs);
+            let fast_bytes = invalidation
+                .is_none()
+                .then(|| fast_output_candidate(fast_receiver_count, &bytes, &passthroughs))
+                .flatten();
             let sequence = state.push(bytes, passthroughs, true, retain_passthroughs);
+            if let Some(reason) = invalidation {
+                state.invalidate(reason);
+                self.inner.fast_epoch.fetch_add(1, Ordering::AcqRel);
+            }
             let fast_epoch = self.inner.fast_epoch.load(Ordering::Acquire);
             (sequence, result, fast_bytes, fast_epoch)
         };
@@ -559,13 +702,32 @@ impl PaneOutputSender {
         // Keep generation switches ordered with generation-guarded ring
         // pushes, so stale readers cannot pass a check from the old process
         // generation and then publish after a respawn.
-        let _ring = self
+        let mut state = self
             .inner
             .state
             .lock()
             .expect("pane output state mutex must not be poisoned");
         self.inner.generation.store(generation, Ordering::SeqCst);
+        state.invalidate(PaneInvalidationReason::GenerationChanged);
         self.inner.fast_epoch.fetch_add(1, Ordering::AcqRel);
+        drop(state);
+        self.notify_receivers();
+    }
+
+    /// Atomically fences the old process generation and drops its retained
+    /// output before a respawn starts publishing.
+    pub(crate) fn reset_generation(&self, generation: u64) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("pane output state mutex must not be poisoned");
+        self.inner.generation.store(generation, Ordering::SeqCst);
+        state.clear_retained();
+        state.invalidate(PaneInvalidationReason::GenerationChanged);
+        self.inner.fast_epoch.fetch_add(1, Ordering::AcqRel);
+        drop(state);
+        self.notify_receivers();
     }
 
     pub(crate) fn current_generation(&self) -> u64 {
@@ -580,7 +742,13 @@ impl PaneOutputSender {
             .expect("pane output state mutex must not be poisoned");
         let cursor = state.cursor_from_now();
         let passthrough_floor_sequence = cursor.next_sequence();
-        self.receiver(cursor, passthrough_floor_sequence, None)
+        self.receiver(
+            cursor,
+            passthrough_floor_sequence,
+            state.invalidation_revision,
+            state.process_exit_revision,
+            None,
+        )
     }
 
     pub(crate) fn subscribe_from_oldest(&self) -> PaneOutputReceiver {
@@ -589,7 +757,13 @@ impl PaneOutputSender {
             .state
             .lock()
             .expect("pane output state mutex must not be poisoned");
-        self.receiver(state.cursor_from_oldest(), state.next_sequence(), None)
+        self.receiver(
+            state.cursor_from_oldest(),
+            state.next_sequence(),
+            state.invalidation_revision,
+            state.process_exit_revision,
+            None,
+        )
     }
 
     #[allow(dead_code)]
@@ -602,6 +776,8 @@ impl PaneOutputSender {
         self.receiver(
             OutputRing::cursor_from_sequence(sequence),
             state.next_sequence(),
+            state.invalidation_revision,
+            state.process_exit_revision,
             None,
         )
     }
@@ -613,21 +789,34 @@ impl PaneOutputSender {
             .lock()
             .expect("pane output state mutex must not be poisoned");
         let sequence = state.next_sequence();
-        let receiver = self.register_live_receiver(sequence);
+        let receiver = self.register_live_receiver(
+            sequence,
+            state.invalidation_revision,
+            state.process_exit_revision,
+        );
         (sequence, receiver)
     }
 
     #[cfg(test)]
     pub(crate) fn subscribe_live_from_sequence(&self, sequence: u64) -> PaneOutputReceiver {
-        let _state = self
+        let state = self
             .inner
             .state
             .lock()
             .expect("pane output state mutex must not be poisoned");
-        self.register_live_receiver(sequence)
+        self.register_live_receiver(
+            sequence,
+            state.invalidation_revision,
+            state.process_exit_revision,
+        )
     }
 
-    fn register_live_receiver(&self, sequence: u64) -> PaneOutputReceiver {
+    fn register_live_receiver(
+        &self,
+        sequence: u64,
+        observed_invalidation_revision: u64,
+        observed_process_exit_revision: u64,
+    ) -> PaneOutputReceiver {
         let (fast_tx, fast_rx) = mpsc::channel(FAST_PANE_OUTPUT_CHANNEL_CAPACITY);
         self.inner
             .fast_receivers
@@ -640,6 +829,8 @@ impl PaneOutputSender {
         self.receiver(
             OutputRing::cursor_from_sequence(sequence),
             sequence,
+            observed_invalidation_revision,
+            observed_process_exit_revision,
             Some(fast_rx),
         )
     }
@@ -655,6 +846,105 @@ impl PaneOutputSender {
         (state.next_sequence(), captured)
     }
 
+    /// Captures owned pane state and registers a recoverable receiver at the
+    /// exact same output/invalidation boundary.
+    ///
+    /// The closure should only copy the state needed by its consumer.
+    /// Expensive ANSI or DTO serialization belongs after this method returns.
+    pub(crate) fn capture_with_observer<T>(
+        &self,
+        capture: impl FnOnce() -> T,
+    ) -> (PaneBoundary, T, PaneOutputReceiver) {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .expect("pane output state mutex must not be poisoned");
+        let captured = capture();
+        let boundary = state.boundary(self.current_generation());
+        let receiver = self.receiver(
+            OutputRing::cursor_from_sequence(boundary.next_output_sequence),
+            boundary.next_output_sequence,
+            boundary.invalidation_revision,
+            boundary.process_exit_revision,
+            None,
+        );
+        (boundary, captured, receiver)
+    }
+
+    /// Registers a receiver at a cached boundary if it is still current.
+    ///
+    /// The equality check and receiver registration share the output-state
+    /// lock, so a cached keyframe can be reused without reopening the
+    /// snapshot/subscribe race.
+    pub(crate) fn subscribe_at_boundary(
+        &self,
+        expected: PaneBoundary,
+    ) -> Option<PaneOutputReceiver> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .expect("pane output state mutex must not be poisoned");
+        let current = state.boundary(self.current_generation());
+        if current != expected {
+            return None;
+        }
+        Some(self.receiver(
+            OutputRing::cursor_from_sequence(current.next_output_sequence),
+            current.next_output_sequence,
+            current.invalidation_revision,
+            current.process_exit_revision,
+            None,
+        ))
+    }
+
+    /// Reports whether a previously captured boundary is still current.
+    ///
+    /// Admission paths use this as their linearization point after expensive
+    /// projection serialization. Unlike `subscribe_at_boundary`, this does
+    /// not allocate a receiver that the caller would immediately discard.
+    pub(crate) fn is_current_boundary(&self, expected: PaneBoundary) -> bool {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .expect("pane output state mutex must not be poisoned");
+        state.boundary(self.current_generation()) == expected
+    }
+
+    /// Applies a transcript mutation and its invalidation at one linearization
+    /// point. Output publication uses the same output-state -> transcript lock
+    /// order, so bytes cannot appear between mutation and revision bump.
+    pub(crate) fn mutate_transcript<R>(
+        &self,
+        transcript: &crate::pane_transcript::SharedPaneTranscript,
+        reason: PaneInvalidationReason,
+        mutation: impl FnOnce(&mut crate::pane_transcript::PaneTranscript) -> (R, bool),
+    ) -> R {
+        let (result, changed) = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .expect("pane output state mutex must not be poisoned");
+            let mut transcript = transcript
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (result, changed) = mutation(&mut transcript);
+            if changed {
+                state.invalidate(reason);
+                self.inner.fast_epoch.fetch_add(1, Ordering::AcqRel);
+            }
+            (result, changed)
+        };
+        if changed {
+            self.notify_receivers();
+        }
+        result
+    }
+
+    #[cfg(test)]
     pub(crate) fn clear_retained(&self) {
         let mut state = self
             .inner
@@ -662,6 +952,7 @@ impl PaneOutputSender {
             .lock()
             .expect("pane output state mutex must not be poisoned");
         state.clear_retained();
+        state.invalidate(PaneInvalidationReason::TranscriptMutation);
         self.inner.fast_epoch.fetch_add(1, Ordering::AcqRel);
         drop(state);
         self.notify_receivers();
@@ -703,6 +994,8 @@ impl PaneOutputSender {
         &self,
         cursor: OutputCursor,
         passthrough_floor_sequence: u64,
+        observed_invalidation_revision: u64,
+        observed_process_exit_revision: u64,
         fast_rx: Option<mpsc::Receiver<FastPaneOutput>>,
     ) -> PaneOutputReceiver {
         self.inner.receiver_count.fetch_add(1, Ordering::Relaxed);
@@ -710,6 +1003,10 @@ impl PaneOutputSender {
             inner: Arc::clone(&self.inner),
             cursor,
             passthrough_floor_sequence,
+            observed_invalidation_revision,
+            observed_process_exit_revision,
+            pending_preserved_process_exits: 0,
+            pending_observed_output: None,
             fast_rx,
         }
     }
@@ -838,6 +1135,97 @@ fn fast_output_candidate(
 }
 
 impl PaneOutputReceiver {
+    pub(crate) async fn recv_observed(&mut self) -> PaneObservationItem {
+        loop {
+            let inner = Arc::clone(&self.inner);
+            let notified = inner.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(item) = self.try_recv_observed() {
+                return item;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn try_recv_observed(&mut self) -> Option<PaneObservationItem> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .expect("pane output state mutex must not be poisoned");
+        if self.pending_preserved_process_exits > 0 {
+            self.pending_preserved_process_exits -= 1;
+            return Some(PaneObservationItem::ProcessExited {
+                output_sequence: None,
+            });
+        }
+        if state.invalidation_revision != self.observed_invalidation_revision {
+            if self.observed_process_exit_revision < state.process_exit_revision_at_invalidation {
+                self.observed_process_exit_revision =
+                    self.observed_process_exit_revision.saturating_add(1);
+                return Some(PaneObservationItem::ProcessExited {
+                    output_sequence: None,
+                });
+            }
+            self.observed_invalidation_revision = state.invalidation_revision;
+            self.cursor = state.cursor_from_now();
+            self.passthrough_floor_sequence = self.cursor.next_sequence();
+            self.pending_observed_output = None;
+            return Some(PaneObservationItem::Invalidated(PaneInvalidation {
+                boundary: state.boundary(self.inner.generation.load(Ordering::SeqCst)),
+                reason: state.last_invalidation_reason,
+            }));
+        }
+
+        if self.pending_observed_output.is_some()
+            && self.observed_process_exit_revision < state.process_exit_revision
+        {
+            self.observed_process_exit_revision =
+                self.observed_process_exit_revision.saturating_add(1);
+            return Some(PaneObservationItem::ProcessExited {
+                output_sequence: None,
+            });
+        }
+        if let Some(item) = self.pending_observed_output.take() {
+            return Some(PaneObservationItem::Output(item));
+        }
+
+        loop {
+            let item = state.poll_cursor(&mut self.cursor, self.passthrough_floor_sequence)?;
+            match &item {
+                OutputCursorItem::Gap(_)
+                    if self.observed_process_exit_revision < state.process_exit_revision =>
+                {
+                    // A ring gap may have evicted the zero-byte EOF marker.
+                    // Preserve the already-produced gap for the next poll,
+                    // and surface lifecycle first so a following rebase does
+                    // not silently erase the child exit.
+                    self.pending_observed_output = Some(item);
+                    self.observed_process_exit_revision =
+                        self.observed_process_exit_revision.saturating_add(1);
+                    return Some(PaneObservationItem::ProcessExited {
+                        output_sequence: None,
+                    });
+                }
+                OutputCursorItem::Event(event) if event.bytes().is_empty() => {
+                    // EOF markers are represented as typed lifecycle for
+                    // recoverable observers. If a preceding gap already
+                    // accounted for this revision, consume the retained
+                    // marker without emitting the lifecycle twice.
+                    if self.observed_process_exit_revision < state.process_exit_revision {
+                        self.observed_process_exit_revision =
+                            self.observed_process_exit_revision.saturating_add(1);
+                        return Some(PaneObservationItem::ProcessExited {
+                            output_sequence: Some(event.sequence()),
+                        });
+                    }
+                }
+                _ => return Some(PaneObservationItem::Output(item)),
+            }
+        }
+    }
+
     pub(crate) async fn recv(&mut self) -> OutputCursorItem {
         loop {
             if let Some(item) = self.try_recv_fast() {
@@ -1004,8 +1392,7 @@ mod tests {
         assert_eq!(event.sequence(), 0);
         assert_eq!(event.bytes(), b"old");
 
-        sender.set_generation(2);
-        sender.clear_retained();
+        sender.reset_generation(2);
         assert_eq!(sender.send_for_generation(Some(1), b"stale".to_vec()), None);
         assert!(
             receiver.try_recv().is_none(),
@@ -1021,6 +1408,271 @@ mod tests {
         };
         assert_eq!(event.sequence(), 1);
         assert_eq!(event.bytes(), b"fresh");
+    }
+
+    #[test]
+    fn reset_generation_clears_retention_under_one_generation_invalidation() {
+        let sender = pane_output_channel_with_limits(4, 64);
+        sender.set_generation(1);
+        sender.send(b"old".to_vec());
+        let (_, (), mut receiver) = sender.capture_with_observer(|| ());
+
+        sender.reset_generation(2);
+
+        let Some(PaneObservationItem::Invalidated(invalidation)) = receiver.try_recv_observed()
+        else {
+            panic!("generation reset must invalidate recoverable observers");
+        };
+        assert_eq!(
+            invalidation.reason,
+            PaneInvalidationReason::GenerationChanged
+        );
+        assert_eq!(invalidation.boundary.generation, 2);
+        assert_eq!(invalidation.boundary.next_output_sequence, 1);
+        assert!(receiver.try_recv_observed().is_none());
+    }
+
+    #[test]
+    fn recoverable_receiver_observes_transcript_invalidation_without_output() {
+        let sender = pane_output_channel_with_limits(4, 64);
+        let transcript =
+            crate::pane_transcript::PaneTranscript::shared(100, TerminalSize { cols: 8, rows: 3 });
+        let (initial, (), mut receiver) = sender.capture_with_observer(|| ());
+
+        sender.mutate_transcript(&transcript, PaneInvalidationReason::Resize, |transcript| {
+            transcript.resize(TerminalSize { cols: 9, rows: 3 });
+            ((), true)
+        });
+
+        let Some(PaneObservationItem::Invalidated(invalidation)) = receiver.try_recv_observed()
+        else {
+            panic!("resize must invalidate a recoverable receiver");
+        };
+        assert_eq!(invalidation.reason, PaneInvalidationReason::Resize);
+        assert_eq!(
+            invalidation.boundary.invalidation_revision,
+            initial.invalidation_revision + 1
+        );
+        assert_eq!(
+            invalidation.boundary.next_output_sequence,
+            initial.next_output_sequence
+        );
+        assert_eq!(invalidation.boundary.generation, initial.generation);
+        assert!(receiver.try_recv_observed().is_none());
+    }
+
+    #[test]
+    fn no_op_transcript_mutation_does_not_invalidate() {
+        let sender = pane_output_channel_with_limits(4, 64);
+        let transcript =
+            crate::pane_transcript::PaneTranscript::shared(100, TerminalSize { cols: 8, rows: 3 });
+        let (_, (), mut receiver) = sender.capture_with_observer(|| ());
+
+        sender.mutate_transcript(&transcript, PaneInvalidationReason::Resize, |_transcript| {
+            ((), false)
+        });
+
+        assert!(receiver.try_recv_observed().is_none());
+    }
+
+    #[test]
+    fn process_exit_before_invalidation_is_delivered_before_rebase() {
+        let sender = pane_output_channel_with_limits(4, 64);
+        let transcript =
+            crate::pane_transcript::PaneTranscript::shared(100, TerminalSize { cols: 8, rows: 3 });
+        let (_, (), mut receiver) = sender.capture_with_observer(|| ());
+
+        sender.send(Vec::new());
+        sender.mutate_transcript(&transcript, PaneInvalidationReason::Resize, |transcript| {
+            transcript.resize(TerminalSize { cols: 9, rows: 3 });
+            ((), true)
+        });
+
+        assert!(matches!(
+            receiver.try_recv_observed(),
+            Some(PaneObservationItem::ProcessExited { .. })
+        ));
+        assert!(matches!(
+            receiver.try_recv_observed(),
+            Some(PaneObservationItem::Invalidated(_))
+        ));
+    }
+
+    #[test]
+    fn retained_process_exit_reports_its_exact_output_sequence() {
+        let sender = pane_output_channel_with_limits(4, 64);
+        let (_, (), mut receiver) = sender.capture_with_observer(|| ());
+        let sequence = sender.send(Vec::new());
+
+        assert!(matches!(
+            receiver.try_recv_observed(),
+            Some(PaneObservationItem::ProcessExited {
+                output_sequence: Some(observed),
+            }) if observed == sequence
+        ));
+        assert!(receiver.try_recv_observed().is_none());
+    }
+
+    #[test]
+    fn process_exit_after_invalidation_is_delivered_after_rebase() {
+        let sender = pane_output_channel_with_limits(4, 64);
+        let transcript =
+            crate::pane_transcript::PaneTranscript::shared(100, TerminalSize { cols: 8, rows: 3 });
+        let (_, (), mut receiver) = sender.capture_with_observer(|| ());
+
+        sender.mutate_transcript(&transcript, PaneInvalidationReason::Resize, |transcript| {
+            transcript.resize(TerminalSize { cols: 9, rows: 3 });
+            ((), true)
+        });
+        sender.send(Vec::new());
+        assert!(matches!(
+            receiver.try_recv_observed(),
+            Some(PaneObservationItem::Invalidated(_))
+        ));
+        let delivered_exit_revision = receiver.observed_process_exit_revision();
+
+        let (_, (), mut replacement) = sender.capture_with_observer(|| ());
+        replacement.preserve_process_exits_since(delivered_exit_revision);
+        assert!(matches!(
+            replacement.try_recv_observed(),
+            Some(PaneObservationItem::ProcessExited { .. })
+        ));
+    }
+
+    #[test]
+    fn replacement_receiver_preserves_exit_racing_with_rebase_capture() {
+        let sender = pane_output_channel_with_limits(4, 64);
+        let transcript =
+            crate::pane_transcript::PaneTranscript::shared(100, TerminalSize { cols: 8, rows: 3 });
+        let (_, (), mut receiver) = sender.capture_with_observer(|| ());
+
+        sender.mutate_transcript(&transcript, PaneInvalidationReason::Resize, |transcript| {
+            transcript.resize(TerminalSize { cols: 9, rows: 3 });
+            ((), true)
+        });
+        assert!(matches!(
+            receiver.try_recv_observed(),
+            Some(PaneObservationItem::Invalidated(_))
+        ));
+        let delivered_exit_revision = receiver.observed_process_exit_revision();
+
+        sender.send(Vec::new());
+        let (_, (), mut replacement) = sender.capture_with_observer(|| ());
+        replacement.preserve_process_exits_since(delivered_exit_revision);
+
+        assert!(matches!(
+            replacement.try_recv_observed(),
+            Some(PaneObservationItem::ProcessExited { .. })
+        ));
+        assert!(replacement.try_recv_observed().is_none());
+    }
+
+    #[tokio::test]
+    async fn invalidation_wakes_recoverable_receiver() {
+        let sender = pane_output_channel_with_limits(4, 64);
+        let transcript =
+            crate::pane_transcript::PaneTranscript::shared(100, TerminalSize { cols: 8, rows: 3 });
+        let (_, (), mut receiver) = sender.capture_with_observer(|| ());
+        let task = tokio::spawn(async move { receiver.recv_observed().await });
+        tokio::task::yield_now().await;
+
+        sender.mutate_transcript(
+            &transcript,
+            PaneInvalidationReason::ClearHistory,
+            |transcript| {
+                transcript.clear_history(false);
+                ((), true)
+            },
+        );
+
+        let item = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("invalidation must wake receiver")
+            .expect("receiver task");
+        assert!(matches!(
+            item,
+            PaneObservationItem::Invalidated(PaneInvalidation {
+                reason: PaneInvalidationReason::ClearHistory,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn recoverable_receiver_preserves_evicted_process_exit_before_gap() {
+        let sender = pane_output_channel_with_limits(2, 64);
+        let (_, (), mut receiver) = sender.capture_with_observer(|| ());
+
+        sender.send(Vec::new());
+        sender.send(b"one".to_vec());
+        sender.send(b"two".to_vec());
+
+        assert!(matches!(
+            receiver.try_recv_observed(),
+            Some(PaneObservationItem::ProcessExited { .. })
+        ));
+        assert!(matches!(
+            receiver.try_recv_observed(),
+            Some(PaneObservationItem::Output(OutputCursorItem::Gap(_)))
+        ));
+    }
+
+    #[test]
+    fn recoverable_receiver_coalesces_evicted_and_retained_exit_markers_once_each() {
+        let sender = pane_output_channel_with_limits(2, 64);
+        let (_, (), mut receiver) = sender.capture_with_observer(|| ());
+
+        sender.send(Vec::new());
+        sender.send(Vec::new());
+        sender.send(b"tail".to_vec());
+
+        assert!(matches!(
+            receiver.try_recv_observed(),
+            Some(PaneObservationItem::ProcessExited { .. })
+        ));
+        assert!(matches!(
+            receiver.try_recv_observed(),
+            Some(PaneObservationItem::ProcessExited { .. })
+        ));
+        assert!(matches!(
+            receiver.try_recv_observed(),
+            Some(PaneObservationItem::Output(OutputCursorItem::Gap(_)))
+        ));
+        let Some(PaneObservationItem::Output(OutputCursorItem::Event(event))) =
+            receiver.try_recv_observed()
+        else {
+            panic!("retained non-empty output must follow the gap");
+        };
+        assert_eq!(event.bytes(), b"tail");
+        assert!(receiver.try_recv_observed().is_none());
+    }
+
+    #[test]
+    fn invalidation_discards_a_pending_pre_rebase_gap() {
+        let sender = pane_output_channel_with_limits(1, 64);
+        let transcript =
+            crate::pane_transcript::PaneTranscript::shared(100, TerminalSize { cols: 8, rows: 3 });
+        let (_, (), mut receiver) = sender.capture_with_observer(|| ());
+        sender.send(Vec::new());
+        sender.send(b"tail".to_vec());
+        assert!(matches!(
+            receiver.try_recv_observed(),
+            Some(PaneObservationItem::ProcessExited { .. })
+        ));
+
+        sender.mutate_transcript(&transcript, PaneInvalidationReason::Resize, |transcript| {
+            transcript.resize(TerminalSize { cols: 9, rows: 3 });
+            ((), true)
+        });
+
+        assert!(matches!(
+            receiver.try_recv_observed(),
+            Some(PaneObservationItem::Invalidated(PaneInvalidation {
+                reason: PaneInvalidationReason::Resize,
+                ..
+            }))
+        ));
+        assert!(receiver.try_recv_observed().is_none());
     }
 
     #[test]

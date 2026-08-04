@@ -1234,14 +1234,14 @@ async fn if_shell_shell_mode_uses_windows_shell_environment_and_caller_cwd() {
 }
 
 #[tokio::test]
-async fn if_shell_nested_set_buffer_accepts_hyphen_prefixed_content() {
+async fn if_shell_nested_set_buffer_accepts_hyphen_prefixed_content_after_separator() {
     let handler = RequestHandler::new();
 
     let response = handler
         .handle(Request::IfShell(Box::new(IfShellRequest {
             condition: "1".to_owned(),
             format_mode: true,
-            then_command: "set-buffer -b hyphen -value".to_owned(),
+            then_command: "set-buffer -b hyphen -- -value".to_owned(),
             else_command: None,
             target: None,
             caller_cwd: None,
@@ -1266,6 +1266,39 @@ async fn if_shell_nested_set_buffer_accepts_hyphen_prefixed_content() {
             .stdout(),
         b"-value"
     );
+}
+
+#[tokio::test]
+async fn if_shell_nested_set_buffer_rejects_hyphen_prefixed_content_without_separator() {
+    let handler = RequestHandler::new();
+
+    let response = handler
+        .handle(Request::IfShell(Box::new(IfShellRequest {
+            condition: "1".to_owned(),
+            format_mode: true,
+            then_command: "set-buffer -b rejected -value".to_owned(),
+            else_command: None,
+            target: None,
+            caller_cwd: None,
+            background: false,
+        })))
+        .await;
+
+    let Response::Error(error) = response else {
+        panic!("unknown nested set-buffer flag must fail: {response:?}");
+    };
+    assert_eq!(
+        error.error,
+        rmux_proto::RmuxError::Server("command set-buffer: unknown flag -v".to_owned())
+    );
+    assert!(matches!(
+        handler
+            .handle(Request::ShowBuffer(ShowBufferRequest {
+                name: Some("rejected".to_owned()),
+            }))
+            .await,
+        Response::Error(_)
+    ));
 }
 
 #[tokio::test]

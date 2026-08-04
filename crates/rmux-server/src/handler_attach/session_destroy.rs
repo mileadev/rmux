@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
+use rmux_core::SessionRecency;
 use rmux_proto::{OptionName, SessionId, SessionName, TerminalGeometry};
 
 use super::{AttachedSwitchCommitRequest, ClientFlags, RequestHandler};
@@ -44,8 +45,7 @@ impl SessionDetachOnDestroy {
 struct DestroySwitchCandidate {
     session_name: SessionName,
     session_id: SessionId,
-    activity_at: i64,
-    created_at: i64,
+    recency: SessionRecency,
     attached: bool,
 }
 
@@ -74,6 +74,7 @@ struct DestroySwitchPlans {
 pub(in crate::handler) struct PreparedAttachedDestroySwitches {
     source_session_id: SessionId,
     plans: Vec<DestroySwitchPlan>,
+    control_target_session_ids: Vec<SessionId>,
     pub(in crate::handler) control_lifecycle_events: Vec<super::super::QueuedLifecycleEvent>,
 }
 
@@ -90,9 +91,16 @@ impl RequestHandler {
         let control_lifecycle_events = self
             .prepare_control_destroy_switch_plans(session_id, switch_plans.control)
             .await;
+        let mut control_target_session_ids = control_lifecycle_events
+            .iter()
+            .filter_map(|event| event.control_session_identity)
+            .collect::<Vec<_>>();
+        control_target_session_ids.sort_unstable();
+        control_target_session_ids.dedup();
         PreparedAttachedDestroySwitches {
             source_session_id: session_id,
             plans: switch_plans.attached,
+            control_target_session_ids,
             control_lifecycle_events,
         }
     }
@@ -107,6 +115,11 @@ impl RequestHandler {
         );
         self.apply_attached_destroy_switch_plans(prepared.source_session_id, prepared.plans)
             .await;
+        for target_session_id in prepared.control_target_session_ids {
+            let _ = self
+                .reconcile_attached_session_identity_size_and_emit(target_session_id)
+                .await;
+        }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -144,7 +157,7 @@ impl RequestHandler {
                 .attached_count(&plan.target.session_name)
                 .await
                 .saturating_add(1);
-            if self
+            match self
                 .commit_attached_session_switch(
                     plan.attach_pid,
                     plan.attach_id,
@@ -165,14 +178,18 @@ impl RequestHandler {
                     },
                 )
                 .await
-                .is_ok()
             {
-                self.emit_client_session_changed(
-                    plan.attach_pid,
-                    plan.target.session_name,
-                    plan.target.session_id,
-                )
-                .await;
+                Ok(outcome) => {
+                    self.emit_client_session_changed(
+                        outcome.client_name,
+                        plan.target.session_name,
+                        plan.target.session_id,
+                    )
+                    .await;
+                }
+                Err(failure) => {
+                    let _ = self.finish_attached_switch_failure(failure).await;
+                }
             }
         }
         self.close_attached_session(source_session_id, || AttachControl::Exited)
@@ -240,8 +257,7 @@ impl RequestHandler {
             .map(|(candidate_name, session)| DestroySwitchCandidate {
                 session_name: candidate_name.clone(),
                 session_id: session.id(),
-                activity_at: session.activity_at(),
-                created_at: session.created_at(),
+                recency: session.recency(),
                 attached: attached_session_ids.contains(&session.id()),
             })
             .collect::<Vec<_>>();
@@ -346,9 +362,8 @@ fn most_recent_destroy_switch_candidate(
     candidates
         .iter()
         .max_by(|left, right| {
-            left.activity_at
-                .cmp(&right.activity_at)
-                .then_with(|| left.created_at.cmp(&right.created_at))
+            left.recency
+                .cmp(&right.recency)
                 .then_with(|| left.session_id.cmp(&right.session_id))
                 .then_with(|| right.session_name.as_str().cmp(left.session_name.as_str()))
         })

@@ -3,14 +3,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::RequestHandler;
+use crate::client_names::control_client_name;
 use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
+use crate::pane_io::AttachControl;
 use rmux_core::LifecycleEvent;
 use rmux_proto::{
-    ControlMode, DeleteBufferRequest, DetachClientRequest, DisplayMessageRequest, HookLifecycle,
-    HookName, KillSessionRequest, KillWindowRequest, NewSessionRequest, NewWindowRequest,
-    RenameSessionRequest, RenameWindowRequest, Request, Response, ScopeSelector,
-    SelectWindowRequest, SessionName, SetBufferRequest, SetHookRequest, ShowOptionsRequest,
-    SwitchClientRequest, Target, TerminalSize, WindowTarget,
+    ControlMode, DeleteBufferRequest, DetachClientRequest, DisplayMessageExtRequest,
+    DisplayMessageRequest, HookLifecycle, HookName, KillSessionRequest, KillWindowRequest,
+    NewSessionRequest, NewWindowRequest, RenameSessionRequest, RenameWindowRequest, Request,
+    Response, ScopeSelector, SelectWindowRequest, SessionName, SetBufferRequest, SetHookRequest,
+    ShowOptionsRequest, SwitchClientRequest, Target, TerminalSize, WindowTarget,
 };
 use tokio::sync::mpsc;
 
@@ -221,7 +223,8 @@ async fn full_control_server_event_queue_defers_removal_until_transport_finishes
         LifecycleEvent::ClientDetached {
             session_name,
             client_name: Some(client_name),
-        } if session_name == attached_session && client_name == requester_pid.to_string()
+        } if session_name == attached_session
+            && client_name == control_client_name(requester_pid)
     ));
 }
 
@@ -264,6 +267,30 @@ async fn dispatch_as(handler: &RequestHandler, requester_pid: u32, request: Requ
     }
 
     outcome.response
+}
+
+/// Returns the `#{client_name}` `list-clients` reports for `pid`.
+async fn listed_client_name(handler: &RequestHandler, pid: u32) -> String {
+    let response = handler
+        .handle(Request::ListClients(Box::new(
+            rmux_proto::ListClientsRequest {
+                format: Some("#{client_pid}|#{client_name}".to_owned()),
+                target_session: None,
+                filter: None,
+                sort_order: None,
+                reversed: false,
+            },
+        )))
+        .await;
+    let Response::ListClients(response) = response else {
+        panic!("expected list-clients response");
+    };
+    let prefix = format!("{pid}|");
+    String::from_utf8(response.output.stdout().to_vec())
+        .expect("list-clients output is utf-8")
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix).map(str::to_owned))
+        .expect("list-clients reports the client")
 }
 
 async fn prepared_client_session_changed(
@@ -327,9 +354,83 @@ async fn control_switch_client_sends_self_and_other_session_notifications() {
     );
     assert_eq!(
         drain_control_notifications(&mut other_rx),
-        vec![format!("%client-session-changed 101 ${beta_id} {beta}")]
+        vec![format!(
+            "%client-session-changed client-101 ${beta_id} {beta}"
+        )]
     );
     assert!(drain_control_notifications(&mut detached_rx).is_empty());
+}
+
+/// Frozen tmux 3.7b, measured 2026-07-25 with two `-C` clients (pids
+/// 74711/74712) on session `alpha`: after 74711 runs `switch-client -t beta`
+/// and then detaches, the surviving client is told
+///
+///     %client-session-changed client-74711 $1 beta
+///     %client-detached client-74711
+///
+/// The token is the same name `list-clients -F '#{client_name}'` reports for
+/// that client. A frontend keys its client table on that name, so the two
+/// surfaces must never spell the same client differently.
+#[tokio::test]
+async fn control_notifications_name_clients_the_way_list_clients_does() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+    new_session(&handler, &alpha).await;
+    new_session(&handler, &beta).await;
+
+    let switching_pid = 74_711;
+    let mut switching_rx =
+        register_control_client(&handler, switching_pid, Some(alpha.clone())).await;
+    let mut watching_rx = register_control_client(&handler, 74_712, Some(alpha.clone())).await;
+    let _ = drain_control_notifications(&mut switching_rx);
+    let _ = drain_control_notifications(&mut watching_rx);
+
+    let listed = listed_client_name(&handler, switching_pid).await;
+    assert_eq!(listed, format!("client-{switching_pid}"));
+
+    let response = dispatch_as(
+        &handler,
+        switching_pid,
+        Request::SwitchClient(SwitchClientRequest {
+            target: beta.clone(),
+        }),
+    )
+    .await;
+    assert_eq!(
+        response,
+        Response::SwitchClient(rmux_proto::SwitchClientResponse {
+            session_name: beta.clone(),
+        })
+    );
+
+    let beta_id = session_id(&handler, &beta).await;
+    assert_eq!(
+        drain_control_notifications(&mut watching_rx),
+        vec![format!(
+            "%client-session-changed {listed} ${beta_id} {beta}"
+        )]
+    );
+    assert_eq!(
+        drain_control_notifications(&mut switching_rx),
+        vec![format!("%session-changed ${beta_id} {beta}")],
+        "the switching client still recognises its own move"
+    );
+
+    let response = dispatch_as(
+        &handler,
+        switching_pid,
+        Request::DetachClient(DetachClientRequest),
+    )
+    .await;
+    assert_eq!(
+        response,
+        Response::DetachClient(rmux_proto::DetachClientResponse)
+    );
+    assert_eq!(
+        drain_control_notifications(&mut watching_rx),
+        vec![format!("%client-detached {listed}")]
+    );
 }
 
 #[tokio::test]
@@ -545,16 +646,19 @@ async fn sessions_changed_notifications_reach_control_clients_with_and_without_s
     let _ = drain_control_notifications(&mut detached_rx);
 
     new_session(&handler, &beta).await;
+    let beta_window_id = window_id(&handler, &WindowTarget::new(beta.clone())).await;
     assert_eq!(
         drain_control_notifications(&mut attached_rx),
-        vec!["%sessions-changed".to_owned()]
+        vec![
+            format!("%unlinked-window-add @{beta_window_id}"),
+            "%sessions-changed".to_owned(),
+        ]
     );
     assert_eq!(
         drain_control_notifications(&mut detached_rx),
         vec!["%sessions-changed".to_owned()]
     );
 
-    let beta_window_id = window_id(&handler, &WindowTarget::new(beta.clone())).await;
     let response = handler
         .handle(Request::KillSession(KillSessionRequest {
             target: beta,
@@ -663,7 +767,9 @@ async fn detached_control_clients_skip_session_scoped_window_notifications() {
 async fn display_message_for_control_client_uses_message_notification() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
+    let detached = session_name("detached");
     new_session(&handler, &alpha).await;
+    new_session(&handler, &detached).await;
 
     let mut control_rx = register_control_client(&handler, 610, Some(alpha.clone())).await;
     let _ = drain_control_notifications(&mut control_rx);
@@ -672,9 +778,12 @@ async fn display_message_for_control_client_uses_message_notification() {
         &handler,
         610,
         Request::DisplayMessage(DisplayMessageRequest {
-            target: Some(Target::Session(alpha)),
+            target: Some(Target::Session(alpha.clone())),
             print: false,
-            message: Some("hello\t#{session_name}".to_owned()),
+            message: Some(
+                "hello\t#{session_name}|#{client_session}|#{client_name}|#{client_width}|#{client_height}"
+                    .to_owned(),
+            ),
             empty_target_context: false,
         }),
     )
@@ -686,8 +795,278 @@ async fn display_message_for_control_client_uses_message_notification() {
     );
     assert_eq!(
         drain_control_notifications(&mut control_rx),
-        vec!["%message hello\\talpha".to_owned()]
+        vec!["%message hello\\talpha|alpha|client-610|80|".to_owned()]
     );
+
+    let response = dispatch_as(
+        &handler,
+        610,
+        Request::DisplayMessage(DisplayMessageRequest {
+            target: Some(Target::Session(detached.clone())),
+            print: false,
+            message: Some(
+                "#{session_name}|#{client_session}|#{client_name}|#{client_width}|#{client_height}"
+                    .to_owned(),
+            ),
+            empty_target_context: false,
+        }),
+    )
+    .await;
+    assert!(matches!(response, Response::DisplayMessage(_)));
+    assert_eq!(
+        drain_control_notifications(&mut control_rx),
+        vec!["%message detached|alpha|client-610|80|".to_owned()]
+    );
+
+    let response = dispatch_as(
+        &handler,
+        99_610,
+        Request::DisplayMessage(DisplayMessageRequest {
+            target: Some(Target::Session(alpha)),
+            print: false,
+            message: Some("external #{client_session}|#{client_name}".to_owned()),
+            empty_target_context: false,
+        }),
+    )
+    .await;
+    assert!(matches!(response, Response::DisplayMessage(_)));
+    assert_eq!(
+        drain_control_notifications(&mut control_rx),
+        vec!["%message external alpha|client-610".to_owned()]
+    );
+
+    let response = dispatch_as(
+        &handler,
+        99_611,
+        Request::DisplayMessageExt(Box::new(DisplayMessageExtRequest {
+            target: Some(Target::Session(detached.clone())),
+            print: true,
+            message: Some(
+                "#{session_name}|#{client_session}|#{client_name}|#{client_width}|#{client_height}"
+                    .to_owned(),
+            ),
+            target_client: Some("610".to_owned()),
+            empty_target_context: false,
+            duration_ms: None,
+            ignore_input: false,
+        })),
+    )
+    .await;
+    assert_eq!(
+        response.command_output().map(|output| output.stdout()),
+        Some(b"detached|alpha|client-610|80|\n".as_slice())
+    );
+
+    let response = dispatch_as(
+        &handler,
+        99_612,
+        Request::DisplayMessageExt(Box::new(DisplayMessageExtRequest {
+            target: Some(Target::Session(detached.clone())),
+            print: false,
+            message: Some("targeted #{client_session}|#{client_name}".to_owned()),
+            target_client: Some("610".to_owned()),
+            empty_target_context: false,
+            duration_ms: None,
+            ignore_input: false,
+        })),
+    )
+    .await;
+    assert!(matches!(response, Response::DisplayMessage(_)));
+    assert_eq!(
+        drain_control_notifications(&mut control_rx),
+        vec!["%message targeted alpha|client-610".to_owned()]
+    );
+
+    let mut second_alpha_rx =
+        register_control_client(&handler, 611, Some(session_name("alpha"))).await;
+    let mut beta_rx = register_control_client(&handler, 612, Some(detached)).await;
+    let _ = drain_control_notifications(&mut second_alpha_rx);
+    let _ = drain_control_notifications(&mut beta_rx);
+    let pane_id = handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&session_name("alpha"))
+        .and_then(rmux_core::Session::active_pane_id)
+        .expect("alpha active pane");
+    let response = handler
+        .handle_display_message_for_stable_pane(
+            99_613,
+            pane_id,
+            DisplayMessageRequest {
+                target: Some(Target::Session(session_name("alpha"))),
+                print: false,
+                message: Some("stable #{client_session}|#{client_name}".to_owned()),
+                empty_target_context: false,
+            },
+        )
+        .await;
+    assert!(matches!(response, Response::DisplayMessage(_)));
+    assert_eq!(
+        drain_control_notifications(&mut control_rx),
+        vec!["%message stable alpha|client-611".to_owned()]
+    );
+    assert_eq!(
+        drain_control_notifications(&mut second_alpha_rx),
+        vec!["%message stable alpha|client-611".to_owned()]
+    );
+    assert!(drain_control_notifications(&mut beta_rx).is_empty());
+}
+
+#[tokio::test]
+async fn rejected_control_display_message_is_not_added_to_show_messages() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("full-display-message-queue");
+    new_session(&handler, &alpha).await;
+
+    let requester_pid = 620;
+    let mut control_rx =
+        register_control_client(&handler, requester_pid, Some(alpha.clone())).await;
+    let _ = drain_control_notifications(&mut control_rx);
+    for index in 0..CONTROL_SERVER_EVENT_CAPACITY {
+        handler
+            .send_control_notification_to(requester_pid, format!("%message queued-{index}"))
+            .await;
+    }
+    assert_eq!(control_rx.len(), CONTROL_SERVER_EVENT_CAPACITY);
+
+    let response = dispatch_as(
+        &handler,
+        99_620,
+        Request::DisplayMessageExt(Box::new(DisplayMessageExtRequest {
+            target: Some(Target::Session(alpha)),
+            print: false,
+            message: Some("must-not-be-logged".to_owned()),
+            target_client: Some(requester_pid.to_string()),
+            empty_target_context: false,
+            duration_ms: None,
+            ignore_input: false,
+        })),
+    )
+    .await;
+
+    assert!(matches!(response, Response::DisplayMessage(_)));
+    assert!(handler.state.lock().await.message_log.is_empty());
+}
+
+#[tokio::test]
+async fn rejected_session_control_message_is_not_added_to_show_messages() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("full-session-display-queue");
+    new_session(&handler, &alpha).await;
+
+    let requester_pid = 621;
+    let mut control_rx =
+        register_control_client(&handler, requester_pid, Some(alpha.clone())).await;
+    let _ = drain_control_notifications(&mut control_rx);
+    for index in 0..CONTROL_SERVER_EVENT_CAPACITY {
+        handler
+            .send_control_notification_to(requester_pid, format!("%message queued-{index}"))
+            .await;
+    }
+    let pane_id = handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&alpha)
+        .and_then(rmux_core::Session::active_pane_id)
+        .expect("active pane");
+
+    let response = handler
+        .handle_display_message_for_stable_pane(
+            99_621,
+            pane_id,
+            DisplayMessageRequest {
+                target: Some(Target::Session(alpha)),
+                print: false,
+                message: Some("must-not-be-logged".to_owned()),
+                empty_target_context: false,
+            },
+        )
+        .await;
+
+    assert!(matches!(response, Response::DisplayMessage(_)));
+    assert!(handler.state.lock().await.message_log.is_empty());
+}
+
+#[tokio::test]
+async fn display_message_orders_attached_and_control_clients_by_tmux_activity_semantics() {
+    // tmux 3.7b uses registration as the control client's initial activity,
+    // but commands read from control mode do not update client_activity.
+    // Later accepted attached input therefore keeps the attached client ahead.
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    new_session(&handler, &alpha).await;
+
+    let attach_pid = 620;
+    let (attach_tx, mut attach_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(attach_pid, alpha.clone(), attach_tx)
+        .await;
+    let mut control_rx = register_control_client(&handler, 621, Some(alpha.clone())).await;
+    let _ = drain_control_notifications(&mut control_rx);
+
+    let request = || {
+        Request::DisplayMessage(DisplayMessageRequest {
+            target: Some(Target::Session(alpha.clone())),
+            print: false,
+            message: Some("activity".to_owned()),
+            empty_target_context: false,
+        })
+    };
+    assert!(matches!(
+        dispatch_as(&handler, 99_620, request()).await,
+        Response::DisplayMessage(_)
+    ));
+    assert_eq!(
+        drain_control_notifications(&mut control_rx),
+        vec!["%message activity".to_owned()]
+    );
+    assert!(attach_rx.try_recv().is_err());
+
+    let activity_sequence = handler.next_client_activity_sequence();
+    assert!(handler
+        .active_attach
+        .lock()
+        .await
+        .record_client_activity(attach_pid, activity_sequence));
+    assert!(matches!(
+        dispatch_as(&handler, 99_621, request()).await,
+        Response::DisplayMessage(_)
+    ));
+    assert!(drain_control_notifications(&mut control_rx).is_empty());
+    assert!(matches!(
+        attach_rx.recv().await,
+        Some(AttachControl::Overlay(_))
+    ));
+
+    let control_id = handler
+        .active_control
+        .lock()
+        .await
+        .by_pid
+        .get(&621)
+        .expect("control client remains active")
+        .id;
+    let commands = handler
+        .parse_control_commands("display-message -p control-activity")
+        .await
+        .expect("control command parses");
+    let result = handler
+        .execute_control_commands_identity(621, control_id, commands)
+        .await;
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert!(matches!(
+        dispatch_as(&handler, 99_622, request()).await,
+        Response::DisplayMessage(_)
+    ));
+    assert!(drain_control_notifications(&mut control_rx).is_empty());
+    assert!(matches!(
+        attach_rx.recv().await,
+        Some(AttachControl::Overlay(_))
+    ));
 }
 
 #[tokio::test]
@@ -766,7 +1145,7 @@ async fn control_detach_exits_self_and_notifies_other_controls() {
     assert!(matches!(self_events[0], ControlServerEvent::Exit(None)));
     assert_eq!(
         drain_control_notifications(&mut other_rx),
-        vec!["%client-detached 810".to_owned()]
+        vec!["%client-detached client-810".to_owned()]
     );
 }
 
@@ -800,9 +1179,13 @@ async fn hook_commands_emit_distinct_lifecycle_control_notifications() {
         }))
         .await;
     assert!(matches!(response, Response::ShowOptions(_)));
+    let beta_window_id = window_id(&handler, &WindowTarget::new(session_name("beta"))).await;
     assert_eq!(
         drain_control_notifications(&mut control_rx),
-        vec!["%sessions-changed".to_owned()]
+        vec![
+            format!("%unlinked-window-add @{beta_window_id}"),
+            "%sessions-changed".to_owned(),
+        ]
     );
 
     let has_beta = handler
@@ -845,7 +1228,7 @@ async fn exact_client_attached_event_follows_rename_and_name_reuse_by_session_id
 
     let mut events = handler.subscribe_lifecycle_events();
     handler
-        .emit_client_attached_identity(9_901, original, original_id)
+        .emit_client_attached_identity(control_client_name(9_901), original, original_id)
         .await;
     let queued = events
         .recv()
@@ -891,12 +1274,12 @@ async fn client_session_changed_notification_follows_rename_not_reused_name() {
     let _ = drain_control_notifications(&mut observer_rx);
 
     handler
-        .emit_client_session_changed(9_902, original, original_id)
+        .emit_client_session_changed(control_client_name(9_902), original, original_id)
         .await;
     assert_eq!(
         drain_control_notifications(&mut observer_rx),
         vec![format!(
-            "%client-session-changed 9902 ${} {renamed}",
+            "%client-session-changed client-9902 ${} {renamed}",
             original_id.as_u32()
         )]
     );
@@ -923,7 +1306,7 @@ async fn deactivated_lifecycle_dispatch_still_delivers_control_effects() {
             &mut state,
             &LifecycleEvent::ClientSessionChanged {
                 session_name: attached.clone(),
-                client_name: Some("9910".to_owned()),
+                client_name: Some(control_client_name(9_910)),
             },
         );
         queued.control_session_identity = Some(attached_id);
@@ -941,7 +1324,7 @@ async fn deactivated_lifecycle_dispatch_still_delivers_control_effects() {
     handler.emit_prepared(queued.clone()).await;
 
     let expected = vec![format!(
-        "%client-session-changed 9910 ${} {attached}",
+        "%client-session-changed client-9910 ${} {attached}",
         attached_id.as_u32()
     )];
     assert_eq!(drain_control_notifications(&mut observer_rx), expected);

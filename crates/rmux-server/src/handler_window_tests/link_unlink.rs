@@ -10,6 +10,137 @@ async fn assert_send_keys_succeeds(handler: &RequestHandler, target: PaneTarget)
     assert!(matches!(response, Response::SendKeys(_)), "{response:?}");
 }
 
+async fn assert_pane_output_observes(
+    receiver: &mut crate::pane_io::PaneOutputReceiver,
+    expected: &[u8],
+) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            match receiver.recv().await {
+                rmux_core::events::OutputCursorItem::Event(event) if event.bytes() == expected => {
+                    return;
+                }
+                rmux_core::events::OutputCursorItem::Event(_) => {}
+                rmux_core::events::OutputCursorItem::Gap(gap) => {
+                    panic!("pane output cursor fell behind before the expected event: {gap:?}");
+                }
+            }
+        }
+    })
+    .await
+    .expect("expected pane output was not observed");
+}
+
+#[tokio::test]
+async fn grouped_unlink_k_preserves_each_session_local_fallback_identity() {
+    for target_index in [2, 3] {
+        for renumber in [false, true] {
+            for peer_target_active in [false, true] {
+                let handler = RequestHandler::new();
+                let owner = session_name(&format!(
+                    "unlink-local-owner-{target_index}-{renumber}-{peer_target_active}"
+                ));
+                let peer = session_name(&format!(
+                    "unlink-local-peer-{target_index}-{renumber}-{peer_target_active}"
+                ));
+                let base_index = handler
+                    .handle(Request::SetOption(SetOptionRequest {
+                        scope: ScopeSelector::Global,
+                        option: OptionName::BaseIndex,
+                        value: target_index.to_string(),
+                        mode: SetOptionMode::Replace,
+                    }))
+                    .await;
+                assert!(
+                    matches!(base_index, Response::SetOption(_)),
+                    "{base_index:?}"
+                );
+                create_session(&handler, owner.as_str()).await;
+                for window_index in 0..target_index {
+                    create_window_at(&handler, &owner, window_index).await;
+                }
+                create_grouped_session(&handler, peer.as_str(), &owner).await;
+                if peer_target_active {
+                    // tmux starts the peer on index 0, so this single command
+                    // records 0 as its local last window. On the regression
+                    // base RMUX has already copied the owner's target, making
+                    // the same command a no-op with no fallback history.
+                    let selected = handler
+                        .handle(Request::SelectWindow(SelectWindowRequest {
+                            target: WindowTarget::with_window(peer.clone(), target_index),
+                        }))
+                        .await;
+                    assert!(
+                        matches!(selected, Response::SelectWindow(_)),
+                        "{selected:?}"
+                    );
+                }
+
+                for session_name in [&owner, &peer] {
+                    let response = handler
+                        .handle(Request::SetOption(SetOptionRequest {
+                            scope: ScopeSelector::Session(session_name.clone()),
+                            option: OptionName::RenumberWindows,
+                            value: if renumber { "on" } else { "off" }.to_owned(),
+                            mode: SetOptionMode::Replace,
+                        }))
+                        .await;
+                    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+                }
+
+                let (owner_expected, peer_expected) = {
+                    let state = handler.state.lock().await;
+                    let owner_session = state.sessions.session(&owner).expect("owner exists");
+                    let owner_expected = owner_session
+                        .window_at(target_index - 1)
+                        .expect("owner cyclic predecessor exists")
+                        .id();
+                    let peer_expected = state
+                        .sessions
+                        .session(&peer)
+                        .and_then(|session| session.window_at(0))
+                        .expect("peer local fallback exists")
+                        .id();
+                    (owner_expected, peer_expected)
+                };
+
+                let response = handler
+                    .handle(Request::UnlinkWindow(UnlinkWindowRequest {
+                        target: WindowTarget::with_window(owner.clone(), target_index),
+                        kill_if_last: true,
+                    }))
+                    .await;
+                assert!(
+                    matches!(response, Response::UnlinkWindow(_)),
+                    "{response:?}"
+                );
+
+                let state = handler.state.lock().await;
+                assert_eq!(
+                    state
+                        .sessions
+                        .session(&owner)
+                        .expect("owner survives")
+                        .window()
+                        .id(),
+                    owner_expected,
+                    "owner target={target_index}, renumber={renumber}, peer active={peer_target_active}"
+                );
+                assert_eq!(
+                    state
+                        .sessions
+                        .session(&peer)
+                        .expect("peer survives")
+                        .window()
+                        .id(),
+                    peer_expected,
+                    "peer target={target_index}, renumber={renumber}, active={peer_target_active}"
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn link_window_refreshes_attached_non_syntactic_group_peer_output_receiver() {
     let handler = RequestHandler::new();
@@ -78,14 +209,7 @@ async fn link_window_refreshes_attached_non_syntactic_group_peer_output_receiver
     };
     let expected = b"linked-peer-live-output".to_vec();
     output.send(expected.clone());
-
-    let received = timeout(Duration::from_secs(2), target.pane_output.recv())
-        .await
-        .expect("refreshed peer receiver must follow the linked pane runtime");
-    let rmux_core::events::OutputCursorItem::Event(event) = received else {
-        panic!("expected linked pane output, got {received:?}");
-    };
-    assert_eq!(event.bytes(), expected);
+    assert_pane_output_observes(&mut target.pane_output, &expected).await;
 }
 
 #[tokio::test]
@@ -562,13 +686,7 @@ async fn unlink_window_via_group_peer_refreshes_exact_family_and_removes_exact_t
     };
     let expected = b"unlink-peer-live-output".to_vec();
     output.send(expected.clone());
-    let received = timeout(Duration::from_secs(2), target.pane_output.recv())
-        .await
-        .expect("refreshed owner receiver follows the surviving active window");
-    let rmux_core::events::OutputCursorItem::Event(event) = received else {
-        panic!("expected surviving pane output, got {received:?}");
-    };
-    assert_eq!(event.bytes(), expected);
+    assert_pane_output_observes(&mut target.pane_output, &expected).await;
 
     for target in &removed_targets {
         assert_eq!(
@@ -1255,6 +1373,150 @@ async fn unlink_window_kill_if_last_deletes_an_unshared_window_slot() {
 }
 
 #[tokio::test]
+async fn unlink_only_linked_window_destroys_the_empty_session() {
+    // Frozen tmux 3.7b, measured on 2026-07-26: unlinking a session's only
+    // window removes that session when the window survives through another
+    // link.
+    let handler = RequestHandler::new();
+    let owner = session_name("unlink-only-window-owner");
+    let alias = session_name("unlink-only-window-alias");
+    create_session(&handler, owner.as_str()).await;
+    create_session(&handler, alias.as_str()).await;
+
+    assert!(matches!(
+        handler
+            .handle(Request::LinkWindow(LinkWindowRequest {
+                source: WindowTarget::with_window(owner.clone(), 0),
+                target: WindowTarget::with_window(alias.clone(), 9),
+                after: false,
+                before: false,
+                kill_destination: false,
+                detached: true,
+            }))
+            .await,
+        Response::LinkWindow(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::KillWindow(KillWindowRequest {
+                target: WindowTarget::with_window(alias.clone(), 0),
+                kill_all_others: false,
+            }))
+            .await,
+        Response::KillWindow(_)
+    ));
+
+    let response = handler
+        .handle(Request::UnlinkWindow(UnlinkWindowRequest {
+            target: WindowTarget::with_window(alias.clone(), 9),
+            kill_if_last: false,
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::UnlinkWindow(_)),
+        "{response:?}"
+    );
+
+    let state = handler.state.lock().await;
+    assert!(
+        state.sessions.session(&alias).is_none(),
+        "the empty alias session must be destroyed"
+    );
+    assert!(
+        state
+            .sessions
+            .session(&owner)
+            .and_then(|session| session.window_at(0))
+            .is_some(),
+        "the linked owner window must survive"
+    );
+}
+
+#[tokio::test]
+async fn unlink_only_linked_window_preserves_a_concurrently_added_window() {
+    let handler = std::sync::Arc::new(RequestHandler::new());
+    let owner = session_name("unlink-race-owner");
+    let alias = session_name("unlink-race-alias");
+    create_session(&handler, owner.as_str()).await;
+    create_session(&handler, alias.as_str()).await;
+
+    let linked = handler
+        .handle(Request::LinkWindow(LinkWindowRequest {
+            source: WindowTarget::with_window(owner.clone(), 0),
+            target: WindowTarget::with_window(alias.clone(), 9),
+            after: false,
+            before: false,
+            kill_destination: false,
+            detached: true,
+        }))
+        .await;
+    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
+    let killed = handler
+        .handle(Request::KillWindow(KillWindowRequest {
+            target: WindowTarget::with_window(alias.clone(), 0),
+            kill_all_others: false,
+        }))
+        .await;
+    assert!(matches!(killed, Response::KillWindow(_)), "{killed:?}");
+
+    let pause = handler.install_kill_session_selection_identity_pause(alias.clone());
+    let unlink_handler = std::sync::Arc::clone(&handler);
+    let unlink_alias = alias.clone();
+    let unlinking = tokio::spawn(async move {
+        unlink_handler
+            .handle(Request::UnlinkWindow(UnlinkWindowRequest {
+                target: WindowTarget::with_window(unlink_alias, 9),
+                kill_if_last: false,
+            }))
+            .await
+    });
+    timeout(Duration::from_secs(1), pause.reached.notified())
+        .await
+        .expect("conditional session removal reaches the identity pause");
+
+    let created = handler
+        .handle(Request::NewWindow(Box::new(NewWindowRequest {
+            target: alias.clone(),
+            name: None,
+            detached: true,
+            start_directory: None,
+            environment: None,
+            command: Some(quiet_window_test_command()),
+            process_command: None,
+            target_window_index: Some(10),
+            insert_at_target: false,
+        })))
+        .await;
+    assert!(matches!(created, Response::NewWindow(_)), "{created:?}");
+    pause.release.notify_one();
+
+    let unlinked = timeout(Duration::from_secs(2), unlinking)
+        .await
+        .expect("unlink-window must finish")
+        .expect("unlink-window task joins");
+    assert!(
+        matches!(unlinked, Response::UnlinkWindow(_)),
+        "{unlinked:?}"
+    );
+
+    let state = handler.state.lock().await;
+    let alias_session = state
+        .sessions
+        .session(&alias)
+        .expect("the concurrently extended session survives");
+    assert!(alias_session.window_at(9).is_none());
+    assert!(alias_session.window_at(10).is_some());
+    assert!(
+        state
+            .sessions
+            .session(&owner)
+            .and_then(|session| session.window_at(0))
+            .is_some(),
+        "the linked owner window survives"
+    );
+}
+
+#[tokio::test]
 async fn unlink_window_kill_if_last_rekeys_renumbered_silence_timers_without_delay() {
     let handler = RequestHandler::new();
     let alpha = session_name("unlink-renumber-timers");
@@ -1313,7 +1575,7 @@ async fn unlink_window_kill_if_last_rekeys_renumbered_silence_timers_without_del
         }))
         .await;
     assert!(
-        matches!(&response, Response::UnlinkWindow(result) if result.target == WindowTarget::with_window(alpha.clone(), 0)),
+        matches!(&response, Response::UnlinkWindow(result) if result.target == WindowTarget::with_window(alpha.clone(), 1)),
         "expected unlink-window -k success with renumbering, got {response:?}"
     );
 

@@ -248,6 +248,9 @@ fn read_only_request_allowed(request: &Request) -> bool {
                 | Request::SubscribePaneOutputRef(_)
                 | Request::UnsubscribePaneOutput(_)
                 | Request::PaneOutputCursor(_)
+                | Request::SubscribePaneStream(_)
+                | Request::PaneStreamCursor(_)
+                | Request::UnsubscribePaneStream(_)
                 | Request::PaneSnapshot(_)
                 | Request::PaneSnapshotRef(_)
                 | Request::PaneOptionGet(_)
@@ -690,6 +693,34 @@ mod tests {
     }
 
     #[test]
+    fn read_only_access_allows_recoverable_pane_stream_observation() {
+        let target = rmux_proto::PaneTargetRef::slot(PaneTarget::new(session_name(), 0));
+        let subscription_id = rmux_proto::PaneOutputSubscriptionId::new(1);
+        let requests = [
+            Request::SubscribePaneStream(rmux_proto::SubscribePaneStreamRequest {
+                target,
+                mode: rmux_proto::PaneStreamMode::Raw,
+                include_snapshot: false,
+            }),
+            Request::PaneStreamCursor(rmux_proto::PaneStreamCursorRequest {
+                subscription_id,
+                max_events: Some(1),
+            }),
+            Request::UnsubscribePaneStream(rmux_proto::UnsubscribePaneStreamRequest {
+                subscription_id,
+            }),
+        ];
+
+        for request in requests {
+            assert_eq!(
+                apply_access_policy(request.clone(), false)
+                    .expect("recoverable pane streams are read-only observation"),
+                request
+            );
+        }
+    }
+
+    #[test]
     fn read_only_access_allows_capture_pane_target_action() {
         let capture =
             Request::CapturePaneTargetAction(Box::new(capture_pane_target_action(true, None)));
@@ -751,6 +782,8 @@ mod tests {
             message: Some("#{client_name}".to_owned()),
             target_client: Some("=".to_owned()),
             empty_target_context: false,
+            duration_ms: None,
+            ignore_input: false,
         }));
 
         assert_eq!(
@@ -780,6 +813,8 @@ mod tests {
                 message: Some("visible overlay".to_owned()),
                 target_client: Some("=".to_owned()),
                 empty_target_context: false,
+                duration_ms: None,
+                ignore_input: false,
             },
         )));
         assert_read_only_rejected(Request::DisplayPanes(Box::new(DisplayPanesRequest {

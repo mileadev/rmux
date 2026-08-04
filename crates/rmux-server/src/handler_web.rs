@@ -7,21 +7,22 @@ use std::time::{Duration, SystemTime};
 
 use rmux_proto::{
     CreateWebShareRequest, ErrorResponse, KillSessionRequest, KillWindowRequest, NewWindowRequest,
-    OptionName, PaneInputRequest, PaneKillRequest, PaneResizeRequest, PaneSelectRequest,
-    PaneTargetRef, RenameWindowRequest, Request, ResizePaneAdjustment, Response, RmuxError,
-    SelectWindowRequest, SessionId, SessionName, SplitDirection, SplitWindowRequest,
-    SplitWindowTarget, WebShareRequest, WebShareScope, WindowId, WindowTarget,
+    PaneInputRequest, PaneKillRequest, PaneResizeRequest, PaneSelectRequest, PaneTargetRef,
+    RenameWindowRequest, Request, ResizePaneAdjustment, Response, RmuxError, SelectWindowRequest,
+    SessionId, SessionName, SplitDirection, SplitWindowRequest, SplitWindowTarget, WebShareRequest,
+    WebShareScope, WindowId, WindowTarget,
 };
 use tokio::sync::{mpsc, watch};
 
 use super::attach_support::{
-    attach_render_target_for_session_window, attach_target_for_session, AttachRegistration,
+    attach_render_target_for_session_window, attach_target_for_web_session, AttachRegistration,
     ClientFlags,
 };
 use super::pane_support::resolve_pane_target_ref;
 use super::{NormalRequestGuard, RequestHandler};
 use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::{self, AttachControl, LiveAttachInputContext, PaneOutputReceiver};
+use crate::pane_recovery::PaneRecoveryDraft;
 use crate::pane_terminal_lookup::pane_id_for_target;
 use crate::server_access::current_owner_uid;
 use crate::web::{
@@ -39,7 +40,7 @@ mod stream;
 
 #[cfg(test)]
 pub(crate) use snapshot::WebSessionView as TestWebSessionView;
-use snapshot::{overlay_pane_lines, session_content_geometry, snapshot_ansi_lines, WebSessionView};
+use snapshot::{overlay_pane_lines, session_content_geometry, WebSessionView};
 pub(crate) use snapshot::{
     WebPaneSnapshot, WebSessionPaneFrame, WebSessionPaneView, WebSessionSnapshot,
 };
@@ -119,6 +120,27 @@ impl RequestHandler {
     }
 
     #[cfg(test)]
+    pub(crate) async fn publish_web_pane_bytes_for_test(
+        &self,
+        target: &PaneTargetRef,
+        bytes: Vec<u8>,
+    ) -> Result<(), RmuxError> {
+        let (output, transcript) = {
+            let state = self.state.lock().await;
+            let target = resolve_pane_target_ref(&state, target)?;
+            let output = state.pane_output_for_target(
+                target.session_name(),
+                target.window_index(),
+                target.pane_index(),
+            )?;
+            let transcript = state.transcript_handle(&target)?;
+            (output, transcript)
+        };
+        pane_io::publish_pane_bytes_for_test(&transcript, &output, bytes);
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) async fn open_web_share(
         &self,
         token: &str,
@@ -142,6 +164,10 @@ impl RequestHandler {
 
     pub(crate) fn mark_web_listener_unavailable(&self, reason: impl Into<String>) {
         self.web_shares.mark_listener_unavailable(reason);
+    }
+
+    pub(in crate::handler) fn has_persistent_web_listener(&self) -> bool {
+        self.web_shares.listener_available()
     }
 
     pub(crate) async fn ensure_web_share_listener_running(&self) -> Result<(), RmuxError> {
@@ -346,7 +372,7 @@ impl RequestHandler {
                 .session_by_id(session_target.id())
                 .ok_or_else(|| session_not_found_web(session_target.name()))?;
             let current_target = WebSessionTarget::new(session.name().clone(), session.id());
-            let target = attach_target_for_session(
+            let target = attach_target_for_web_session(
                 &state,
                 current_target.name(),
                 attached_count,
@@ -377,6 +403,10 @@ impl RequestHandler {
                     closing: closing.clone(),
                     persistent_overlay_epoch: persistent_overlay_epoch.clone(),
                     terminal_context,
+                    client_title: target
+                        .client_title
+                        .as_ref()
+                        .map(|rendered| rendered.state().clone()),
                     flags,
                     render_stream: true,
                     uid: current_owner_uid(),
@@ -516,15 +546,11 @@ impl RequestHandler {
         let Some(pane) = panes.into_iter().find(|pane| pane.id() == pane_id) else {
             return Ok(None);
         };
-        let status = state
-            .options
-            .resolve(Some(session.name()), OptionName::Status);
-        let Some(geometry) = session_content_geometry(pane.geometry(), window.size(), status)
-        else {
+        let Some(geometry) = session_content_geometry(pane.geometry(), window.size()) else {
             return Ok(None);
         };
         let Some(scrollback) =
-            state.pane_scrollback_view_from_top_line(session.name(), pane.id(), top_line)
+            state.pane_scrollback_view_from_top_line(session.name(), pane.id(), top_line)?
         else {
             return Err(RmuxError::Server(format!(
                 "missing pane transcript: {}",
@@ -539,8 +565,17 @@ impl RequestHandler {
                 screen.mode() & mode::ALL_MOUSE_MODES != 0
             })
             .unwrap_or(false);
+        if !scrollback.metadata_complete {
+            // Over-budget recovery metadata is a fidelity degrade, not a
+            // protocol error. The pane-frame opcode carries no completeness
+            // flag, so defer to the full snapshot, which renders the same
+            // scrolled rows and reports the gap through the session view's
+            // `metadata_complete`. Failing here would tear the viewer socket
+            // down with no close code.
+            return Ok(None);
+        }
         let mut frame = Vec::new();
-        overlay_pane_lines(&mut frame, geometry, &scrollback.ansi_lines);
+        overlay_pane_lines(&mut frame, geometry, &scrollback.ansi_lines)?;
         let pane = WebSessionPaneView::new(
             pane.id(),
             geometry,
@@ -550,53 +585,76 @@ impl RequestHandler {
             scrollback.alternate_on,
             mouse_on,
         );
-        Ok(Some(WebSessionPaneFrame::new(window.size(), pane, frame)))
+        Ok(Some(WebSessionPaneFrame::new(window.size(), pane, frame)?))
     }
 
     pub(crate) async fn web_resnapshot(
         &self,
         target: &PaneTargetRef,
     ) -> Result<(WebPaneSnapshot, PaneOutputReceiver), RmuxError> {
-        let (pane_output, transcript) = {
-            let state = self.state.lock().await;
-            let target = resolve_pane_target_ref(&state, target)?;
-            let pane_output = state.pane_output_for_target(
-                target.session_name(),
-                target.window_index(),
-                target.pane_index(),
-            )?;
-            let transcript = state.transcript_handle(&target)?;
-            (pane_output, transcript)
-        };
-        let (output_sequence, snapshot) = pane_output.capture_with_next_sequence(|| {
-            let transcript = match transcript.lock() {
-                Ok(transcript) => transcript,
-                Err(poisoned) => poisoned.into_inner(),
+        let mut captured = None;
+        for _ in 0..super::pane_stream_support::MAX_SOURCE_CAPTURE_ATTEMPTS {
+            let (pane_output, transcript, generation) = {
+                let state = self.state.lock().await;
+                let target = resolve_pane_target_ref(&state, target)?;
+                let pane_output = state.pane_output_for_target(
+                    target.session_name(),
+                    target.window_index(),
+                    target.pane_index(),
+                )?;
+                let transcript = state.transcript_handle(&target)?;
+                let generation = pane_output.current_generation();
+                (pane_output, transcript, generation)
             };
-            let screen = transcript.screen();
-            let size = screen.size();
-            let (cursor_col, cursor_row) = screen.cursor_position();
-            let (scroll_top, scroll_bottom) = screen.scroll_region();
-            WebPaneSnapshot {
-                cols: size.cols,
-                rows: size.rows,
-                output_sequence: 0,
-                ansi_lines: snapshot_ansi_lines(screen),
-                cursor_row: cursor_row.min(u32::from(size.rows.saturating_sub(1))) as u16,
-                cursor_col: cursor_col.min(u32::from(size.cols.saturating_sub(1))) as u16,
-                cursor_visible: screen.mode() & mode::MODE_CURSOR != 0,
-                mode_bits: screen.mode(),
-                cursor_style: screen.cursor_style(),
-                alternate: screen.is_alternate(),
-                scroll_top,
-                scroll_bottom,
-            }
-        });
-        let snapshot = WebPaneSnapshot {
-            output_sequence,
-            ..snapshot
+            let candidate = pane_output.capture_with_observer(|| {
+                let transcript = match transcript.lock() {
+                    Ok(transcript) => transcript,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                PaneRecoveryDraft::capture(&transcript)
+            });
+            if candidate.0.generation == generation {
+                captured = Some(candidate);
+                break;
+            };
+        }
+        let Some((boundary, draft, output)) = captured else {
+            return Err(RmuxError::Server(
+                "pane process changed repeatedly while capturing web state".to_owned(),
+            ));
         };
-        let output = pane_output.subscribe_from_sequence(output_sequence);
+        // A shared pane link is a read-only *view*: the pane-scoped WebShare
+        // protocol has no scrollback at all, so the browser must receive the
+        // pane's visible state and never the rows that scrolled out of it
+        // before the link was handed out.
+        let seed = draft?.materialize_visible_only()?;
+        let keyframe = seed.keyframe();
+        let screen = seed.screen();
+        let size = screen.size();
+        debug_assert_eq!((keyframe.cols, keyframe.rows), (size.cols, size.rows));
+        debug_assert_eq!(keyframe.alternate, seed.alternate());
+        let (cursor_col, cursor_row) = screen.cursor_position();
+        let (scroll_top, scroll_bottom) = screen.scroll_region();
+        let snapshot = WebPaneSnapshot {
+            cols: size.cols,
+            rows: size.rows,
+            output_sequence: boundary.next_output_sequence,
+            // The authoritative bounded keyframe below supersedes the legacy
+            // line representation. Avoid rendering and retaining it twice.
+            ansi_lines: Vec::new(),
+            cursor_row: cursor_row.min(u32::from(size.rows.saturating_sub(1))) as u16,
+            cursor_col: cursor_col.min(u32::from(size.cols.saturating_sub(1))) as u16,
+            cursor_visible: screen.mode() & mode::MODE_CURSOR != 0,
+            mode_bits: screen.mode(),
+            cursor_style: screen.cursor_style(),
+            alternate: seed.alternate(),
+            scroll_top,
+            scroll_bottom,
+            history_rows_total: keyframe.history_rows_total,
+            history_rows_included: keyframe.history_rows_included,
+            metadata_complete: keyframe.metadata_complete,
+            recovery_keyframe: Some(keyframe.bytes),
+        };
         Ok((snapshot, output))
     }
 
@@ -1282,11 +1340,7 @@ fn web_session_snapshot_from_state(
             }
             screen.mode
         });
-        let status = state
-            .options
-            .resolve(Some(session.name()), OptionName::Status);
-        let Some(geometry) = session_content_geometry(pane.geometry(), window.size(), status)
-        else {
+        let Some(geometry) = session_content_geometry(pane.geometry(), window.size()) else {
             continue;
         };
         let scrollback = match scrolls.get(&pane.id()).copied() {
@@ -1294,10 +1348,13 @@ fn web_session_snapshot_from_state(
                 state.pane_scrollback_view_from_top_line(session.name(), pane.id(), top_line)
             }
             None => state.pane_scrollback_view(session.name(), pane.id(), 0),
-        }
+        }?
         .ok_or_else(|| RmuxError::Server(format!("missing pane transcript: {}", pane.id())))?;
         if scrollback.scroll_offset > 0 {
-            overlay_pane_lines(&mut frame, geometry, &scrollback.ansi_lines);
+            overlay_pane_lines(&mut frame, geometry, &scrollback.ansi_lines)?;
+        }
+        if !scrollback.metadata_complete {
+            view.mark_metadata_incomplete();
         }
         view.push_pane(WebSessionPaneView::new(
             pane.id(),
@@ -1310,13 +1367,13 @@ fn web_session_snapshot_from_state(
         ));
     }
 
-    Ok(WebSessionSnapshot::new(
+    WebSessionSnapshot::new(
         window.size(),
         frame,
         view,
         active_mode_bits,
         active_cursor_style,
-    ))
+    )
 }
 
 fn web_session_view_session(

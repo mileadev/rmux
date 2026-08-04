@@ -167,6 +167,37 @@ metadata_daemon_hash="$(sed -n 's/.*"daemon_binary_sha256"[[:space:]]*:[[:space:
 packaged_daemon_hash="$(sha256_file "$package_root/bin/rmux-daemon")"
 [ "$metadata_daemon_hash" = "$packaged_daemon_hash" ] || die "metadata daemon_binary_sha256 does not match packaged daemon binary"
 
+package_glibc_min=""
+metadata_target="$(sed -n 's/.*"target"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$metadata" | head -n 1)"
+case "$metadata_target" in
+  *-unknown-linux-gnu)
+    glibc_floor_script="$script_dir/glibc-symbol-floor.sh"
+    binary_glibc_min="$($glibc_floor_script "$package_root/bin/rmux")"
+    helper_binary_glibc_min="$($glibc_floor_script "$package_root/libexec/rmux/rmux")"
+    daemon_binary_glibc_min="$($glibc_floor_script "$package_root/bin/rmux-daemon")"
+    package_glibc_min="$($glibc_floor_script \
+      "$package_root/bin/rmux" \
+      "$package_root/libexec/rmux/rmux" \
+      "$package_root/bin/rmux-daemon")"
+    for field_and_value in \
+      "binary_glibc_min:$binary_glibc_min" \
+      "helper_binary_glibc_min:$helper_binary_glibc_min" \
+      "daemon_binary_glibc_min:$daemon_binary_glibc_min" \
+      "package_glibc_min:$package_glibc_min"
+    do
+      field="${field_and_value%%:*}"
+      expected="${field_and_value#*:}"
+      grep -q "\"$field\"[[:space:]]*:[[:space:]]*\"$expected\"" "$metadata" ||
+        die "metadata $field does not match imported GLIBC symbols ($expected)"
+    done
+    max_supported_glibc="$(sed -n 's/.*"max_supported_glibc"[[:space:]]*:[[:space:]]*"\([0-9.]*\)".*/\1/p' "$metadata" | head -n 1)"
+    [ -n "$max_supported_glibc" ] || die "metadata max_supported_glibc is missing"
+    if [ "$(printf '%s\n%s\n' "$package_glibc_min" "$max_supported_glibc" | LC_ALL=C sort -V | tail -n 1)" != "$max_supported_glibc" ]; then
+      die "packaged binaries require GLIBC_$package_glibc_min, newer than supported GLIBC_$max_supported_glibc"
+    fi
+    ;;
+esac
+
 grep -q '"artifact_kind"[[:space:]]*:[[:space:]]*"unix-package-binary"' "$metadata" || die "metadata artifact_kind is not unix-package-binary"
 grep -q '"git_commit"[[:space:]]*:' "$metadata" || die "metadata git_commit is missing"
 grep -q '"package_layout"[[:space:]]*:[[:space:]]*"rmux-package-v2"' "$metadata" || die "metadata package_layout is not rmux-package-v2"
@@ -196,5 +227,6 @@ printf 'archive=%s\n' "$archive_abs"
 printf 'sha256=%s\n' "$actual_hash"
 printf 'binary_sha256=%s\n' "$packaged_binary_hash"
 printf 'daemon_binary_sha256=%s\n' "$packaged_daemon_hash"
+[ -z "$package_glibc_min" ] || printf 'glibc_min=%s\n' "$package_glibc_min"
 printf 'run_binary=%s\n' "$([ "$run_binary" -eq 1 ] && printf true || printf false)"
 printf 'require_release_artifact=%s\n' "$([ "$require_release_artifact" -eq 1 ] && printf true || printf false)"

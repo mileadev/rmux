@@ -29,7 +29,7 @@ pub(super) fn parse_select_pane_args(
 pub(super) fn parse_select_layout_args(
     arguments: Vec<String>,
 ) -> Result<SelectLayoutArgs, clap::Error> {
-    parse_command_args::<SelectLayoutArgs>("select-layout", arguments)?.validate()
+    parse_command_args::<SelectLayoutArgs>("select-layout", arguments)
 }
 
 pub(super) fn parse_resize_pane_args(
@@ -589,25 +589,27 @@ pub(crate) struct SelectLayoutArgs {
     pub(crate) layout: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelectLayoutMode {
+    Next,
+    Previous,
+    Spread,
+    Old,
+}
+
 impl SelectLayoutArgs {
-    fn validate(self) -> Result<Self, clap::Error> {
-        let mode_count = [self.spread, self.next, self.old, self.previous]
-            .into_iter()
-            .filter(|present| *present)
-            .count();
-        if mode_count > 1 {
-            return Err(clap::Error::raw(
-                clap::error::ErrorKind::ArgumentConflict,
-                "select-layout accepts only one mode flag",
-            ));
+    pub(crate) const fn mode(&self) -> Option<SelectLayoutMode> {
+        if self.next {
+            Some(SelectLayoutMode::Next)
+        } else if self.previous {
+            Some(SelectLayoutMode::Previous)
+        } else if self.spread {
+            Some(SelectLayoutMode::Spread)
+        } else if self.old {
+            Some(SelectLayoutMode::Old)
+        } else {
+            None
         }
-        if mode_count == 1 && self.layout.is_some() {
-            return Err(clap::Error::raw(
-                clap::error::ErrorKind::TooManyValues,
-                "command select-layout: too many arguments (need at most 0)",
-            ));
-        }
-        Ok(self)
     }
 }
 

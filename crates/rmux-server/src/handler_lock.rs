@@ -22,6 +22,7 @@ pub(in crate::handler) use identity_test_pause::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LockAttachTarget {
     identity: ActiveAttachIdentity,
+    client_name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +43,7 @@ impl RequestHandler {
                 })
                 .map(|(pid, active)| LockAttachTarget {
                     identity: active.identity(*pid),
+                    client_name: active.client_name.clone(),
                 })
                 .collect::<Vec<_>>()
         };
@@ -109,6 +111,7 @@ impl RequestHandler {
                 })
                 .map(|(pid, active)| LockAttachTarget {
                     identity: active.identity(*pid),
+                    client_name: active.client_name.clone(),
                 })
                 .collect::<Vec<_>>()
         };
@@ -195,6 +198,7 @@ impl RequestHandler {
                 .expect("resolved attached client must remain present under the same lock");
             return Ok(LockAttachTarget {
                 identity: active.identity(attach_pid),
+                client_name: active.client_name.clone(),
             });
         }
 
@@ -202,6 +206,7 @@ impl RequestHandler {
             if let Some(active) = active_attach.by_pid.get(&pid) {
                 return Ok(LockAttachTarget {
                     identity: active.identity(pid),
+                    client_name: active.client_name.clone(),
                 });
             }
             return Err(RmuxError::Server(format!(
@@ -214,15 +219,14 @@ impl RequestHandler {
             .iter()
             .map(|(pid, active)| LockAttachTarget {
                 identity: active.identity(*pid),
+                client_name: active.client_name.clone(),
             })
             .collect::<Vec<_>>();
         drop(active_attach);
 
         attach_targets
             .into_iter()
-            .find(|target| {
-                attached_client_matches_target(target.identity.attach_pid(), target_client)
-            })
+            .find(|target| attached_client_matches_target(&target.client_name, target_client))
             .ok_or_else(|| RmuxError::Server(format!("can't find client: {target_client}")))
     }
 

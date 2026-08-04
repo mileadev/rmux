@@ -3,11 +3,12 @@ use crate::common;
 pub(super) use std::error::Error;
 pub(super) use std::ffi::OsString;
 pub(super) use std::fs::{self, File};
-pub(super) use std::io::Write;
+pub(super) use std::io::{BufRead, BufReader, Write};
 pub(super) use std::os::fd::AsRawFd;
 pub(super) use std::path::{Path, PathBuf};
 pub(super) use std::process::{Child, Command, Stdio};
-pub(super) use std::sync::{Mutex, MutexGuard, OnceLock};
+pub(super) use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+pub(super) use std::thread;
 pub(super) use std::time::{Duration, Instant};
 
 pub(super) use crate::common::{
@@ -269,8 +270,15 @@ pub(super) struct PtyAttachedClient {
 }
 
 impl PtyAttachedClient {
-    pub(super) fn spawn(mut command: Command) -> Result<Self, Box<dyn Error>> {
-        let pty = PtyPair::open_with_size(PtyTerminalSize { cols: 80, rows: 24 })?;
+    pub(super) fn spawn(command: Command) -> Result<Self, Box<dyn Error>> {
+        Self::spawn_with_size(command, PtyTerminalSize { cols: 80, rows: 24 })
+    }
+
+    pub(super) fn spawn_with_size(
+        mut command: Command,
+        size: PtyTerminalSize,
+    ) -> Result<Self, Box<dyn Error>> {
+        let pty = PtyPair::open_with_size(size)?;
         let master = File::from(pty.master().try_clone()?.into_owned_fd()?);
         let _terminal = File::from(pty.slave().try_clone()?.into_owned_fd());
         // SAFETY: fcntl is called on a valid file descriptor obtained from the PTY master.
@@ -392,6 +400,18 @@ pub(super) fn spawn_rmux_attached_input_client(
     harness: &TmuxCompatHarness,
     session_name: &str,
 ) -> Result<PtyAttachedClient, Box<dyn Error>> {
+    spawn_rmux_attached_input_client_at_size(
+        harness,
+        session_name,
+        PtyTerminalSize { cols: 80, rows: 24 },
+    )
+}
+
+pub(super) fn spawn_rmux_attached_input_client_at_size(
+    harness: &TmuxCompatHarness,
+    session_name: &str,
+    size: PtyTerminalSize,
+) -> Result<PtyAttachedClient, Box<dyn Error>> {
     let home = harness.tmpdir().join("home");
     let xdg = harness.tmpdir().join("xdg");
     fs::create_dir_all(&home)?;
@@ -408,13 +428,27 @@ pub(super) fn spawn_rmux_attached_input_client(
         .env("LC_CTYPE", "C.UTF-8")
         .env_remove("RMUX")
         .args(["attach-session", "-t", session_name]);
-    PtyAttachedClient::spawn(command)
+    PtyAttachedClient::spawn_with_size(command, size)
 }
 
 pub(super) fn spawn_tmux_attached_input_client(
     harness: &TmuxCompatHarness,
     tmux_binary: &Path,
     session_name: &str,
+) -> Result<PtyAttachedClient, Box<dyn Error>> {
+    spawn_tmux_attached_input_client_at_size(
+        harness,
+        tmux_binary,
+        session_name,
+        PtyTerminalSize { cols: 80, rows: 24 },
+    )
+}
+
+pub(super) fn spawn_tmux_attached_input_client_at_size(
+    harness: &TmuxCompatHarness,
+    tmux_binary: &Path,
+    session_name: &str,
+    size: PtyTerminalSize,
 ) -> Result<PtyAttachedClient, Box<dyn Error>> {
     let mut command = Command::new(tmux_binary);
     command
@@ -427,7 +461,7 @@ pub(super) fn spawn_tmux_attached_input_client(
         .arg("-S")
         .arg(harness.tmux_socket_path())
         .args(["attach-session", "-t", session_name]);
-    PtyAttachedClient::spawn(command)
+    PtyAttachedClient::spawn_with_size(command, size)
 }
 
 pub(super) struct AttachedClientDeadline {
@@ -815,19 +849,28 @@ pub(super) struct ControlModeOutput {
 }
 
 pub(super) fn run_control_mode_client(
-    mut command: Command,
+    command: Command,
     commands: &str,
+) -> Result<ControlModeOutput, Box<dyn Error>> {
+    run_control_mode_client_staged(command, &[(commands, Duration::ZERO)])
+}
+
+pub(super) fn run_control_mode_client_staged(
+    mut command: Command,
+    stages: &[(&str, Duration)],
 ) -> Result<ControlModeOutput, Box<dyn Error>> {
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    child
-        .stdin
-        .as_mut()
-        .expect("control stdin")
-        .write_all(commands.as_bytes())?;
+    for (commands, delay) in stages {
+        let stdin = child.stdin.as_mut().expect("control stdin");
+        stdin.write_all(commands.as_bytes())?;
+        stdin.flush()?;
+        std::thread::sleep(*delay);
+    }
+    drop(child.stdin.take());
 
     let output = child.wait_with_output()?;
     Ok(ControlModeOutput {
@@ -850,6 +893,23 @@ pub(super) fn run_rmux_control_mode_with(
     top_level_args: &[&str],
     environment: &[(&str, &str)],
 ) -> Result<ControlModeOutput, Box<dyn Error>> {
+    let command = rmux_control_mode_command(harness, top_level_args, environment)?;
+    run_control_mode_client(command, commands)
+}
+
+pub(super) fn run_rmux_control_mode_staged(
+    harness: &TmuxCompatHarness,
+    stages: &[(&str, Duration)],
+) -> Result<ControlModeOutput, Box<dyn Error>> {
+    let command = rmux_control_mode_command(harness, &[], &[])?;
+    run_control_mode_client_staged(command, stages)
+}
+
+pub(super) fn rmux_control_mode_command(
+    harness: &TmuxCompatHarness,
+    top_level_args: &[&str],
+    environment: &[(&str, &str)],
+) -> Result<Command, Box<dyn Error>> {
     let home = harness.tmpdir().join("home");
     let xdg = harness.tmpdir().join("xdg");
     fs::create_dir_all(&home)?;
@@ -867,7 +927,7 @@ pub(super) fn run_rmux_control_mode_with(
         command.env(name, value);
     }
     command.args(top_level_args).arg("-C");
-    run_control_mode_client(command, commands)
+    Ok(command)
 }
 
 pub(super) fn run_tmux_control_mode(
@@ -885,6 +945,25 @@ pub(super) fn run_tmux_control_mode_with(
     top_level_args: &[&str],
     environment: &[(&str, &str)],
 ) -> Result<ControlModeOutput, Box<dyn Error>> {
+    let command = tmux_control_mode_command(harness, tmux_binary, top_level_args, environment)?;
+    run_control_mode_client(command, commands)
+}
+
+pub(super) fn run_tmux_control_mode_staged(
+    harness: &TmuxCompatHarness,
+    tmux_binary: &Path,
+    stages: &[(&str, Duration)],
+) -> Result<ControlModeOutput, Box<dyn Error>> {
+    let command = tmux_control_mode_command(harness, tmux_binary, &[], &[])?;
+    run_control_mode_client_staged(command, stages)
+}
+
+pub(super) fn tmux_control_mode_command(
+    harness: &TmuxCompatHarness,
+    tmux_binary: &Path,
+    top_level_args: &[&str],
+    environment: &[(&str, &str)],
+) -> Result<Command, Box<dyn Error>> {
     let mut command = Command::new(tmux_binary);
     let home = harness.tmpdir().join("home");
     let xdg = harness.tmpdir().join("xdg");
@@ -907,7 +986,156 @@ pub(super) fn run_tmux_control_mode_with(
         .arg("-C")
         .arg("-S")
         .arg(harness.tmux_socket_path());
-    run_control_mode_client(command, commands)
+    Ok(command)
+}
+
+type ControlNotificationSink = Arc<Mutex<Vec<String>>>;
+
+const CONTROL_NOTIFICATION_POLL: Duration = Duration::from_millis(25);
+
+#[derive(Debug)]
+pub(super) struct LiveControlClient {
+    child: Child,
+    notifications: Option<ControlNotificationSink>,
+}
+
+impl LiveControlClient {
+    pub(super) fn spawn(command: Command) -> Result<Self, Box<dyn Error>> {
+        Self::spawn_with_capture(command, false)
+    }
+
+    /// Spawns a control client whose notification stream is captured so a test
+    /// can assert on what the server pushed to it.
+    pub(super) fn spawn_capturing(command: Command) -> Result<Self, Box<dyn Error>> {
+        Self::spawn_with_capture(command, true)
+    }
+
+    fn spawn_with_capture(mut command: Command, capture: bool) -> Result<Self, Box<dyn Error>> {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(if capture {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stderr(Stdio::null())
+            .spawn()?;
+        let notifications = capture
+            .then(|| {
+                let stdout = child.stdout.take()?;
+                let sink: ControlNotificationSink = Arc::new(Mutex::new(Vec::new()));
+                let reader_sink = Arc::clone(&sink);
+                thread::spawn(move || {
+                    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                        reader_sink
+                            .lock()
+                            .expect("control notification sink")
+                            .push(line);
+                    }
+                });
+                Some(sink)
+            })
+            .flatten();
+        Ok(Self {
+            child,
+            notifications,
+        })
+    }
+
+    /// Number of lines captured so far, usable as a cursor for
+    /// [`Self::wait_for_notification`].
+    pub(super) fn notification_cursor(&self) -> usize {
+        self.sink().lock().expect("control notification sink").len()
+    }
+
+    /// Returns the captured lines at or after `cursor`.
+    pub(super) fn notifications_since(&self, cursor: usize) -> Vec<String> {
+        let captured = self
+            .sink()
+            .lock()
+            .expect("control notification sink")
+            .clone();
+        captured[cursor.min(captured.len())..].to_vec()
+    }
+
+    /// Waits for the first captured line at or after `cursor` matching
+    /// `predicate`.
+    pub(super) fn wait_for_notification(
+        &self,
+        cursor: usize,
+        timeout: Duration,
+        label: &str,
+        predicate: impl Fn(&str) -> bool,
+    ) -> Result<String, Box<dyn Error>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let captured = self
+                .sink()
+                .lock()
+                .expect("control notification sink")
+                .clone();
+            if let Some(line) = captured[cursor.min(captured.len())..]
+                .iter()
+                .find(|line| predicate(line))
+            {
+                return Ok(line.clone());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "{label} never reported a matching notification; captured: {:?}",
+                    &captured[cursor.min(captured.len())..]
+                )
+                .into());
+            }
+            thread::sleep(CONTROL_NOTIFICATION_POLL);
+        }
+    }
+
+    /// Positions, relative to `cursor`, of the first line matching `first` and
+    /// the first line matching `second`. `None` when either is absent.
+    pub(super) fn notification_index_pair(
+        &self,
+        cursor: usize,
+        first: impl Fn(&str) -> bool,
+        second: impl Fn(&str) -> bool,
+    ) -> Option<(usize, usize)> {
+        let captured = self
+            .sink()
+            .lock()
+            .expect("control notification sink")
+            .clone();
+        let tail = &captured[cursor.min(captured.len())..];
+        let first_index = tail.iter().position(|line| first(line))?;
+        let second_index = tail.iter().position(|line| second(line))?;
+        Some((first_index, second_index))
+    }
+
+    fn sink(&self) -> &ControlNotificationSink {
+        self.notifications
+            .as_ref()
+            .expect("control client was spawned without notification capture")
+    }
+
+    pub(super) fn send(&mut self, commands: &str) -> Result<(), Box<dyn Error>> {
+        let stdin = self.child.stdin.as_mut().expect("control stdin");
+        stdin.write_all(commands.as_bytes())?;
+        stdin.flush()?;
+        Ok(())
+    }
+
+    pub(super) fn assert_running(&mut self, label: &str) -> Result<(), Box<dyn Error>> {
+        if let Some(status) = self.child.try_wait()? {
+            return Err(format!("{label} control client exited early with status {status}").into());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for LiveControlClient {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 pub(super) fn sorted_first_words(output: &str) -> Vec<String> {

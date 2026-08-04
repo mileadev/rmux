@@ -16,7 +16,8 @@ use super::mode_tree_model::{
 };
 use super::mode_tree_selection::selected_items;
 use super::{
-    CHOOSE_BUFFER_DEFAULT_TEMPLATE, CHOOSE_CLIENT_DEFAULT_TEMPLATE, CHOOSE_TREE_DEFAULT_TEMPLATE,
+    ModeTreeInputError, CHOOSE_BUFFER_DEFAULT_TEMPLATE, CHOOSE_CLIENT_DEFAULT_TEMPLATE,
+    CHOOSE_TREE_DEFAULT_TEMPLATE,
 };
 use crate::pane_terminals::session_not_found;
 
@@ -28,12 +29,13 @@ impl RequestHandler {
     ) -> Result<(), RmuxError> {
         self.accept_mode_tree_selection_with_identity(attach_pid, None)
             .await
+            .map_err(ModeTreeInputError::into_rmux_error)
     }
 
     pub(super) async fn accept_mode_tree_selection_for_action_identity(
         &self,
         identity: ModeTreeActionIdentity,
-    ) -> Result<(), RmuxError> {
+    ) -> Result<(), ModeTreeInputError> {
         self.accept_mode_tree_selection_with_identity(identity.attach_pid(), Some(identity))
             .await
     }
@@ -42,7 +44,7 @@ impl RequestHandler {
         &self,
         attach_pid: u32,
         expected_identity: Option<ModeTreeActionIdentity>,
-    ) -> Result<(), RmuxError> {
+    ) -> Result<(), ModeTreeInputError> {
         let (mut mode, action_identity) = {
             let active_attach = self.active_attach.lock().await;
             let active = active_attach
@@ -68,7 +70,10 @@ impl RequestHandler {
         let selected_id_before_rebuild = mode.selected_id.clone();
         let build = self.build_mode_tree(&mut mode, attach_pid).await?;
         if had_tagged_items_before_rebuild && mode.tagged.is_empty() {
-            return self.refresh_mode_tree_overlay_if_active(attach_pid).await;
+            return self
+                .refresh_mode_tree_overlay_if_active(attach_pid)
+                .await
+                .map_err(ModeTreeInputError::from);
         }
         if mode.tagged.is_empty() {
             match selected_id_before_rebuild {
@@ -296,27 +301,32 @@ impl RequestHandler {
         // The default choose-tree action is `switch-client -Zt`. Commit it
         // through the same atomic path so target selection, client-size
         // reconciliation, PTY rollback, and attach identity move together.
-        self.commit_attached_session_switch(
-            attach_pid,
-            expected_attach_id,
-            AttachedSwitchCommitRequest {
-                expected_current_session_id: None,
-                session_name: session_name.clone(),
-                session_id,
-                target_selection,
-                terminal_context,
-                client_geometry: TerminalGeometry {
-                    size: client_size,
-                    pixels: client_pixels,
+        let outcome = match self
+            .commit_attached_session_switch(
+                attach_pid,
+                expected_attach_id,
+                AttachedSwitchCommitRequest {
+                    expected_current_session_id: None,
+                    session_name: session_name.clone(),
+                    session_id,
+                    target_selection,
+                    terminal_context,
+                    client_geometry: TerminalGeometry {
+                        size: client_size,
+                        pixels: client_pixels,
+                    },
+                    client_flags,
+                    render_stream,
+                    attached_count,
+                    client_environment: None,
                 },
-                client_flags,
-                render_stream,
-                attached_count,
-                client_environment: None,
-            },
-        )
-        .await?;
-        self.emit_client_session_changed(attach_pid, session_name.clone(), session_id)
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(failure) => return Err(self.finish_attached_switch_failure(failure).await),
+        };
+        self.finish_attached_session_switch(outcome, session_name.clone(), session_id)
             .await;
         for refresh in refresh_sessions {
             self.refresh_attached_session(&refresh).await;
@@ -330,7 +340,7 @@ impl RequestHandler {
         action_identity: ModeTreeActionIdentity,
         mode: &ModeTreeClientState,
         build: &ModeTreeBuild,
-    ) -> Result<(), RmuxError> {
+    ) -> Result<(), ModeTreeInputError> {
         let Some(template) = mode.template.as_deref() else {
             return Ok(());
         };
@@ -345,26 +355,37 @@ impl RequestHandler {
         let refresh_sessions = self
             .dismiss_mode_tree_for_action_identity(action_identity)
             .await?;
-        for target in targets {
-            let substituted = substitute_prompt_template(template, &[target]);
-            let parsed = CommandParser::new()
-                .parse_one_group(&substituted)
-                .map_err(|error| {
-                    RmuxError::Server(format!(
-                        "mode-tree command parse failed: {}",
-                        error.message()
-                    ))
-                })?;
-            let context = QueueExecutionContext::without_caller_cwd()
-                .with_current_target(current_target.clone());
-            let _ = self
-                .execute_parsed_commands(requester_pid, parsed, context)
-                .await?;
+        let command_result: Result<(), ModeTreeInputError> = async {
+            for target in targets {
+                let substituted = substitute_prompt_template(template, &[target]);
+                let parsed =
+                    CommandParser::new()
+                        .parse_one_group(&substituted)
+                        .map_err(|error| {
+                            ModeTreeInputError::UserCommandAfterModeExit(RmuxError::Server(
+                                format!("mode-tree command parse failed: {}", error.message()),
+                            ))
+                        })?;
+                let context = QueueExecutionContext::without_caller_cwd()
+                    .with_current_target(current_target.clone());
+                if let Err(error) = self
+                    .execute_parsed_commands(requester_pid, parsed, context)
+                    .await
+                {
+                    // Access loss remains fatal even though it raced the
+                    // already-committed mode exit. Only a still-authorized
+                    // command rejection is safe to return to attached input.
+                    let _access = self.require_requester_origin_write(&mode.origin).await?;
+                    return Err(ModeTreeInputError::UserCommandAfterModeExit(error));
+                }
+            }
+            Ok(())
         }
+        .await;
         for session_name in refresh_sessions {
             self.refresh_attached_session(&session_name).await;
         }
-        Ok(())
+        command_result
     }
 
     pub(super) async fn start_customize_set_prompt_for_identity(

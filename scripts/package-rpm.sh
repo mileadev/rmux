@@ -173,10 +173,11 @@ rpm_arch="$(rpm_arch_for_target "$target")"
 platform_label="$(platform_label_for_target "$target")"
 
 profile_dir="$configuration"
-cargo_args=(build --package rmux --locked --target "$target")
+cargo_args=(build --package rmux --locked)
 if [ "$configuration" = "release" ]; then
   cargo_args+=(--release)
 fi
+compatible_build=("$repo_root/scripts/release/cargo-build-compatible.sh" --target "$target" --)
 
 target_dir="${CARGO_TARGET_DIR:-target}"
 binary="$target_dir/$target/$profile_dir/rmux"
@@ -184,10 +185,10 @@ helper_binary="$target_dir/$target/$profile_dir/rmux-full"
 daemon_binary="$target_dir/$target/$profile_dir/rmux-daemon"
 completion_cache="${RMUX_COMPLETIONS_DIR:-$target_dir/$target/$profile_dir/completions}"
 if [ "$skip_build" -eq 0 ]; then
-  cargo "${cargo_args[@]}" --bin rmux
+  "${compatible_build[@]}" "${cargo_args[@]}" --bin rmux
   cp "$binary" "$helper_binary"
-  cargo "${cargo_args[@]}" --features tiny-cli --bin rmux
-  cargo "${cargo_args[@]}" --bin rmux-daemon
+  "${compatible_build[@]}" "${cargo_args[@]}" --features tiny-cli --bin rmux
+  "${compatible_build[@]}" "${cargo_args[@]}" --bin rmux-daemon
 fi
 [ -x "$binary" ] || die "expected executable binary was not found: $binary"
 [ -x "$helper_binary" ] || die "expected executable private helper binary was not found: $helper_binary"
@@ -227,7 +228,7 @@ binary_glibc_min="$($glibc_floor_script "$packaged_binary")"
 helper_binary_glibc_min="$($glibc_floor_script "$packaged_helper")"
 daemon_binary_glibc_min="$($glibc_floor_script "$packaged_daemon")"
 package_glibc_min="$($glibc_floor_script "$packaged_binary" "$packaged_helper" "$packaged_daemon")"
-max_supported_glibc="${RMUX_MAX_SUPPORTED_GLIBC:-2.35}"
+max_supported_glibc="${RMUX_MAX_SUPPORTED_GLIBC:-2.31}"
 case "$max_supported_glibc" in ''|*[!0-9.]*|.*|*.|*..*) die "invalid RMUX_MAX_SUPPORTED_GLIBC: $max_supported_glibc" ;; esac
 if [ "$(printf '%s\n%s\n' "$package_glibc_min" "$max_supported_glibc" | LC_ALL=C sort -V | tail -n 1)" != "$max_supported_glibc" ]; then
   die "packaged binaries require GLIBC_$package_glibc_min, newer than supported GLIBC_$max_supported_glibc; rebuild in the oldest supported sysroot"

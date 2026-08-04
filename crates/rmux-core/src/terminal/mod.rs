@@ -19,7 +19,7 @@
 
 use rmux_proto::TerminalSize;
 
-use crate::input::{InputParser, InputState};
+use crate::input::{InputParser, InputState, OscColourSlot};
 use crate::screen::Screen;
 use crate::terminal_passthrough::TerminalPassthrough;
 use crate::utf8::Utf8Config;
@@ -141,6 +141,10 @@ impl TerminalParser {
         self.parser.parse(bytes, &mut self.screen);
     }
 
+    pub(crate) fn take_recovery_rebase_required(&mut self) -> bool {
+        self.parser.take_recovery_rebase_required()
+    }
+
     /// Returns the current parser progress state for diagnostics.
     #[must_use]
     pub(crate) fn parser_state(&self) -> TerminalParserState {
@@ -171,6 +175,68 @@ impl TerminalParser {
         self.parser.pending_bytes()
     }
 
+    pub(crate) fn pending_bytes_ref(&self) -> &[u8] {
+        self.parser.pending_bytes_ref()
+    }
+
+    pub(crate) fn clone_recovery_screen(&self) -> Screen {
+        self.screen.clone_recovery_state()
+    }
+
+    pub(crate) fn active_cell_state_ansi(&self) -> Vec<u8> {
+        self.cell_state_ansi(self.parser.cell_state())
+    }
+
+    pub(crate) fn active_cell_state_ansi_bounded(
+        &self,
+        max_hyperlink_bytes: usize,
+    ) -> (Vec<u8>, bool) {
+        self.cell_state_ansi_bounded(self.parser.cell_state(), max_hyperlink_bytes)
+    }
+
+    pub(crate) fn saved_cell_state_ansi(&self) -> Vec<u8> {
+        self.cell_state_ansi(self.parser.saved_state().cell())
+    }
+
+    pub(crate) fn saved_cell_state_ansi_bounded(
+        &self,
+        max_hyperlink_bytes: usize,
+    ) -> (Vec<u8>, bool) {
+        self.cell_state_ansi_bounded(self.parser.saved_state().cell(), max_hyperlink_bytes)
+    }
+
+    pub(crate) fn saved_cursor_state(&self) -> (u32, u32, bool) {
+        let saved = self.parser.saved_state();
+        let (x, y) = saved.cursor_position();
+        (x, y, saved.origin_mode())
+    }
+
+    pub(crate) fn recovery_parser_state_ansi(&self) -> Vec<u8> {
+        self.parser.recovery_dynamic_colours_ansi()
+    }
+
+    pub(crate) fn dynamic_colour(&self, slot: OscColourSlot) -> Option<&str> {
+        self.parser.osc_colour(slot)
+    }
+
+    fn cell_state_ansi(&self, cell: &crate::input::CellState) -> Vec<u8> {
+        let mut out = self.screen.render_cell_state_ansi(cell);
+        append_character_sets(cell, &mut out);
+        out
+    }
+
+    fn cell_state_ansi_bounded(
+        &self,
+        cell: &crate::input::CellState,
+        max_hyperlink_bytes: usize,
+    ) -> (Vec<u8>, bool) {
+        let (mut out, complete) = self
+            .screen
+            .render_cell_state_ansi_bounded(cell, max_hyperlink_bytes);
+        append_character_sets(cell, &mut out);
+        (out, complete)
+    }
+
     /// Returns whether the parser ground timer would currently be running.
     #[must_use]
     pub(crate) fn ground_timer_active(&self) -> bool {
@@ -197,6 +263,20 @@ impl TerminalParser {
         self.parser = InputParser::new();
         self.parser.set_input_buffer_limit(input_buffer_limit);
     }
+}
+
+fn append_character_sets(cell: &crate::input::CellState, out: &mut Vec<u8>) {
+    out.extend_from_slice(if cell.g0set != 0 {
+        b"\x1b(0"
+    } else {
+        b"\x1b(B"
+    });
+    out.extend_from_slice(if cell.g1set != 0 {
+        b"\x1b)0"
+    } else {
+        b"\x1b)B"
+    });
+    out.push(if cell.set == 0 { 0x0f } else { 0x0e });
 }
 
 #[cfg(test)]

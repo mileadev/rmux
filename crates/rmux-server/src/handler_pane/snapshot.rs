@@ -10,6 +10,7 @@ use rmux_proto::{
 };
 
 use super::super::RequestHandler;
+use crate::pane_recovery::MAX_RECOVERY_SURFACE_CELLS;
 use crate::pane_terminal_lookup::pane_id_for_target;
 use crate::pane_terminals::HandlerState;
 use crate::pane_transcript::SharedPaneTranscript;
@@ -20,6 +21,12 @@ use crate::pane_transcript::SharedPaneTranscript;
 // representation before allocation. Variable-length glyph text is still
 // protected by the encoder's exact byte limit.
 const MAX_PANE_SNAPSHOT_CELLS: usize = DEFAULT_MAX_DETACHED_FRAME_LENGTH / 32;
+
+#[derive(Clone, Copy)]
+pub(in crate::handler) enum CellCollectionBudget {
+    PaneSnapshot,
+    Surface,
+}
 
 pub(in crate::handler) struct PaneSnapshotInputs {
     pane_id: PaneId,
@@ -32,7 +39,7 @@ pub(in crate::handler) struct PaneSnapshotInputs {
 /// well-formed pane keeps the cursor inside `u16` bounds, but a defensive
 /// saturating cast guarantees that pathological screen state cannot produce a
 /// silently-truncated cursor coordinate on the wire.
-fn cursor_coord_to_u16(value: u32) -> u16 {
+pub(in crate::handler) fn cursor_coord_to_u16(value: u32) -> u16 {
     if value > u16::MAX as u32 {
         u16::MAX
     } else {
@@ -103,7 +110,13 @@ impl RequestHandler {
             };
             let output_sequence = transcript.output_sequence();
 
-            let cells = match collect_cells(screen, cols, rows, history_size) {
+            let cells = match collect_cells(
+                screen,
+                cols,
+                rows,
+                history_size,
+                CellCollectionBudget::PaneSnapshot,
+            ) {
                 Ok(cells) => cells,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
@@ -168,12 +181,35 @@ impl RequestHandler {
         coalescers.observe(pane_id, revision, now)
     }
 
-    fn assign_pane_snapshot_revision(&self, pane_id: PaneId, fingerprint: u64) -> u64 {
+    pub(in crate::handler) fn assign_pane_snapshot_revision(
+        &self,
+        pane_id: PaneId,
+        fingerprint: u64,
+    ) -> u64 {
+        self.assign_pane_snapshot_revision_at_least(pane_id, fingerprint, 0)
+    }
+
+    /// Assigns a pane snapshot revision that is never below `minimum`.
+    ///
+    /// Callers that must publish a strictly newer revision than one they
+    /// already emitted (surface stream resets) raise the floor here instead
+    /// of clamping the returned value, so the raised revision is recorded in
+    /// the registry. `PaneSurfaceSnapshot::revision` and
+    /// `PaneSnapshotResponse::revision` are documented as one shared
+    /// monotonic counter; a floor applied outside the registry would let the
+    /// snapshot endpoint hand back a revision below one the surface stream
+    /// already published.
+    pub(in crate::handler) fn assign_pane_snapshot_revision_at_least(
+        &self,
+        pane_id: PaneId,
+        fingerprint: u64,
+        minimum: u64,
+    ) -> u64 {
         let mut revisions = self
             .pane_snapshot_revisions
             .lock()
             .expect("pane snapshot revision mutex must not be poisoned");
-        revisions.revision_for(pane_id, fingerprint)
+        revisions.revision_for_at_least(pane_id, fingerprint, minimum)
     }
 
     /// Drains a pending pane snapshot revision that is now eligible to be
@@ -215,15 +251,16 @@ impl RequestHandler {
     }
 }
 
-fn collect_cells(
+pub(in crate::handler) fn collect_cells(
     screen: &rmux_core::Screen,
     cols: u16,
     rows: u16,
     _history_size: usize,
+    budget: CellCollectionBudget,
 ) -> Result<Vec<PaneSnapshotCell>, RmuxError> {
     let cols_usize = usize::from(cols);
     let rows_usize = usize::from(rows);
-    let total = snapshot_cell_count(cols, rows)?;
+    let total = snapshot_cell_count(cols, rows, budget)?;
     let mut cells = Vec::with_capacity(total);
     if cols_usize == 0 || rows_usize == 0 {
         return Ok(cells);
@@ -255,13 +292,25 @@ fn collect_cells(
     Ok(cells)
 }
 
-fn snapshot_cell_count(cols: u16, rows: u16) -> Result<usize, RmuxError> {
+fn snapshot_cell_count(
+    cols: u16,
+    rows: u16,
+    budget: CellCollectionBudget,
+) -> Result<usize, RmuxError> {
     let total = usize::from(cols)
         .checked_mul(usize::from(rows))
         .ok_or_else(|| RmuxError::Server("pane snapshot dimensions overflow".to_owned()))?;
-    if total > MAX_PANE_SNAPSHOT_CELLS {
+    let maximum = match budget {
+        CellCollectionBudget::PaneSnapshot => MAX_PANE_SNAPSHOT_CELLS,
+        CellCollectionBudget::Surface => MAX_RECOVERY_SURFACE_CELLS,
+    };
+    if total > maximum {
+        let subject = match budget {
+            CellCollectionBudget::PaneSnapshot => "pane snapshot",
+            CellCollectionBudget::Surface => "surface materialization",
+        };
         return Err(RmuxError::Server(format!(
-            "pane snapshot grid has {total} cells, exceeding the {MAX_PANE_SNAPSHOT_CELLS}-cell limit"
+            "{subject} grid has {total} cells, exceeding the {maximum}-cell limit"
         )));
     }
     Ok(total)
@@ -281,7 +330,7 @@ fn blank_cell() -> PaneSnapshotCell {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn compute_snapshot_fingerprint(
+pub(in crate::handler) fn compute_snapshot_fingerprint(
     cols: u16,
     rows: u16,
     cells: &[PaneSnapshotCell],
@@ -332,25 +381,33 @@ struct PaneSnapshotRevisionState {
 }
 
 impl PaneSnapshotRevisionRegistry {
+    #[cfg(test)]
     fn revision_for(&mut self, pane_id: PaneId, fingerprint: u64) -> u64 {
-        let Some(state) = self.panes.get_mut(&pane_id) else {
-            self.panes.insert(
-                pane_id,
-                PaneSnapshotRevisionState {
-                    fingerprint,
-                    revision: 1,
-                },
-            );
-            return 1;
-        };
+        self.revision_for_at_least(pane_id, fingerprint, 0)
+    }
 
-        if state.fingerprint == fingerprint {
-            return state.revision;
+    /// Returns this pane's revision for `fingerprint`, raised to `minimum`.
+    ///
+    /// Identical observable state keeps its revision; a changed fingerprint
+    /// advances it. A `minimum` above the resulting value is stored, not just
+    /// returned, so every later read of this pane's revision — from the
+    /// snapshot endpoint, a raw rebase, or another surface frame — stays at or
+    /// above a revision that has already been published.
+    fn revision_for_at_least(&mut self, pane_id: PaneId, fingerprint: u64, minimum: u64) -> u64 {
+        let revision = match self.panes.get(&pane_id) {
+            Some(state) if state.fingerprint == fingerprint => state.revision,
+            Some(state) => state.revision.saturating_add(1),
+            None => 1,
         }
-
-        state.fingerprint = fingerprint;
-        state.revision = state.revision.saturating_add(1);
-        state.revision
+        .max(minimum);
+        self.panes.insert(
+            pane_id,
+            PaneSnapshotRevisionState {
+                fingerprint,
+                revision,
+            },
+        );
+        revision
     }
 
     fn forget(&mut self, pane_id: PaneId) {
@@ -405,22 +462,26 @@ mod tests {
     #[test]
     fn collect_cells_returns_empty_vec_when_either_dim_is_zero() {
         let screen = screen_with_size(0, 4);
-        let cells = collect_cells(&screen, 0, 4, 0).expect("zero cols ok");
+        let cells = collect_cells(&screen, 0, 4, 0, CellCollectionBudget::PaneSnapshot)
+            .expect("zero cols ok");
         assert!(cells.is_empty());
 
         let screen = screen_with_size(4, 0);
-        let cells = collect_cells(&screen, 4, 0, 0).expect("zero rows ok");
+        let cells = collect_cells(&screen, 4, 0, 0, CellCollectionBudget::PaneSnapshot)
+            .expect("zero rows ok");
         assert!(cells.is_empty());
     }
 
     #[test]
     fn snapshot_cell_count_rejects_oversized_grids_before_allocation() {
         assert_eq!(
-            snapshot_cell_count(512, 512).expect("limit-sized snapshot is allowed"),
+            snapshot_cell_count(512, 512, CellCollectionBudget::PaneSnapshot)
+                .expect("limit-sized snapshot is allowed"),
             MAX_PANE_SNAPSHOT_CELLS
         );
 
-        let error = snapshot_cell_count(513, 512).expect_err("oversized snapshot must fail");
+        let error = snapshot_cell_count(513, 512, CellCollectionBudget::PaneSnapshot)
+            .expect_err("oversized snapshot must fail");
         assert!(
             error
                 .to_string()
@@ -428,7 +489,9 @@ mod tests {
             "unexpected error: {error}"
         );
 
-        assert!(snapshot_cell_count(u16::MAX, u16::MAX).is_err());
+        assert!(
+            snapshot_cell_count(u16::MAX, u16::MAX, CellCollectionBudget::PaneSnapshot).is_err()
+        );
     }
 
     #[test]
@@ -438,7 +501,8 @@ mod tests {
         // for any future grid backend that could hand us short rows. The
         // captured row count must always equal `rows * cols`.
         let screen = screen_with_size(4, 2);
-        let cells = collect_cells(&screen, 4, 2, 0).expect("collect ok");
+        let cells = collect_cells(&screen, 4, 2, 0, CellCollectionBudget::PaneSnapshot)
+            .expect("collect ok");
         assert_eq!(cells.len(), 8);
         for cell in &cells {
             // Default cells are blank single-width spaces with default colors.
@@ -453,7 +517,8 @@ mod tests {
         let mut terminal = TerminalScreen::new(TerminalSize { cols: 4, rows: 1 }, 0);
         terminal.feed("界x".as_bytes());
         let screen = terminal.screen().clone();
-        let cells = collect_cells(&screen, 4, 1, 0).expect("collect ok");
+        let cells = collect_cells(&screen, 4, 1, 0, CellCollectionBudget::PaneSnapshot)
+            .expect("collect ok");
         assert_eq!(cells.len(), 4);
         assert!(!cells[0].padding);
         assert_eq!(cells[0].text, "界");
@@ -475,7 +540,8 @@ mod tests {
         let mut terminal = TerminalScreen::new(TerminalSize { cols: 4, rows: 2 }, 0);
         terminal.feed(b"abcd\r\nefgh");
         let screen = terminal.screen().clone();
-        let cells = collect_cells(&screen, 4, 2, 0).expect("collect ok");
+        let cells = collect_cells(&screen, 4, 2, 0, CellCollectionBudget::PaneSnapshot)
+            .expect("collect ok");
         assert_eq!(cells.len(), 8);
         let row0_text: String = cells[0..4].iter().map(|c| c.text.as_str()).collect();
         let row1_text: String = cells[4..8].iter().map(|c| c.text.as_str()).collect();
@@ -564,6 +630,39 @@ mod tests {
             registry.revision_for(pane_id, 10),
             3,
             "returning to prior content is still a new transition",
+        );
+    }
+
+    #[test]
+    fn pane_snapshot_revision_floor_is_recorded_not_just_returned() {
+        // The surface stream raises the floor so a reset republishes a strictly
+        // newer revision even when the pane state is byte-identical. The raised
+        // value must be stored: the snapshot endpoint reads the same registry
+        // with the same fingerprint straight afterwards, and returning the
+        // pre-floor revision there would walk the shared counter backwards.
+        let mut registry = PaneSnapshotRevisionRegistry::default();
+        let pane_id = PaneId::new(6);
+
+        assert_eq!(registry.revision_for(pane_id, 10), 1);
+        assert_eq!(
+            registry.revision_for_at_least(pane_id, 10, 2),
+            2,
+            "an identical reset publishes a strictly newer revision",
+        );
+        assert_eq!(
+            registry.revision_for(pane_id, 10),
+            2,
+            "a later reader of the identical state must not fall back to 1",
+        );
+        assert_eq!(
+            registry.revision_for(pane_id, 11),
+            3,
+            "the next real transition advances past the floored revision",
+        );
+        assert_eq!(
+            registry.revision_for_at_least(pane_id, 12, 1),
+            4,
+            "a floor below the assigned revision never pulls it down",
         );
     }
 

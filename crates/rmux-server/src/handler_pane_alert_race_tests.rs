@@ -225,6 +225,7 @@ fn pane_event(
         bell_count: 1,
         title_changed: true,
         title_change: None,
+        path_changed: false,
         clipboard_set: true,
         clipboard_writes: Vec::new(),
         clipboard_queries: Vec::new(),
@@ -334,6 +335,7 @@ async fn queued_pane_hook_does_not_block_an_unrelated_pane_alert() {
         bell_count: 0,
         title_changed: true,
         title_change: None,
+        path_changed: false,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
         clipboard_queries: Vec::new(),
@@ -357,6 +359,7 @@ async fn queued_pane_hook_does_not_block_an_unrelated_pane_alert() {
         bell_count: 1,
         title_changed: false,
         title_change: None,
+        path_changed: false,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
         clipboard_queries: Vec::new(),
@@ -423,6 +426,7 @@ async fn exiting_pane_hook_wait_does_not_block_unrelated_pane_alert_flush() {
         bell_count: 0,
         title_changed: true,
         title_change: None,
+        path_changed: false,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
         clipboard_queries: Vec::new(),
@@ -454,6 +458,7 @@ async fn exiting_pane_hook_wait_does_not_block_unrelated_pane_alert_flush() {
         bell_count: 1,
         title_changed: false,
         title_change: None,
+        path_changed: false,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
         clipboard_queries: Vec::new(),
@@ -554,6 +559,7 @@ async fn pane_alert_reserves_each_lifecycle_position_immediately_before_emission
         bell_count: 0,
         title_changed: true,
         title_change: None,
+        path_changed: false,
         clipboard_set: true,
         clipboard_writes: Vec::new(),
         clipboard_queries: Vec::new(),
@@ -713,6 +719,7 @@ async fn exiting_pane_activity_cannot_rearm_silence_after_newer_same_window_acti
         bell_count: 0,
         title_changed: true,
         title_change: None,
+        path_changed: false,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
         clipboard_queries: Vec::new(),
@@ -749,6 +756,7 @@ async fn exiting_pane_activity_cannot_rearm_silence_after_newer_same_window_acti
         bell_count: 0,
         title_changed: false,
         title_change: None,
+        path_changed: false,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
         clipboard_queries: Vec::new(),
@@ -1315,5 +1323,66 @@ async fn alert_plan_effects_fail_closed_after_session_destroy_and_name_reuse() {
             .await
             .is_err(),
         "new alpha incarnation must receive no destroyed-session alert effect"
+    );
+}
+
+#[tokio::test]
+async fn alert_overlay_fails_closed_when_session_name_is_reused_after_resolution() {
+    let handler = RequestHandler::new();
+    let alpha = create_quiet_session(&handler, "alert-overlay-reuse").await;
+    let alerted = create_quiet_window(&handler, &alpha).await;
+    set_option(
+        &handler,
+        ScopeSelector::Window(alerted.clone()),
+        OptionName::MonitorBell,
+        "on",
+    )
+    .await;
+    for (option, value) in [
+        (OptionName::BellAction, "any"),
+        (OptionName::VisualBell, "on"),
+    ] {
+        set_option(
+            &handler,
+            ScopeSelector::Session(alpha.clone()),
+            option,
+            value,
+        )
+        .await;
+    }
+
+    let pause = handler.install_alert_overlay_identity_pause();
+    let task_handler = handler.clone();
+    let mut alert = tokio::spawn(async move {
+        task_handler.alerts_queue_window(alerted, WINDOW_BELL).await;
+    });
+    timeout(Duration::from_secs(3), pause.wait_until_reached())
+        .await
+        .expect("alert overlay pauses after resolving the stable session");
+
+    let response = handler
+        .handle(Request::KillSession(KillSessionRequest {
+            target: alpha.clone(),
+            kill_all_except_target: false,
+            clear_alerts: false,
+            kill_group: false,
+        }))
+        .await;
+    assert!(matches!(response, Response::KillSession(_)), "{response:?}");
+    let replacement = create_quiet_session(&handler, alpha.as_str()).await;
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    handler.register_attach(713, replacement, control_tx).await;
+    drain_controls(&mut control_rx).await;
+
+    pause.release();
+    timeout(Duration::from_secs(5), &mut alert)
+        .await
+        .expect("stale alert overlay finishes")
+        .expect("alert overlay task succeeds");
+    assert!(
+        timeout(Duration::from_millis(150), control_rx.recv())
+            .await
+            .is_err(),
+        "replacement session must receive no stale alert overlay"
     );
 }

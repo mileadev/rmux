@@ -186,7 +186,6 @@ impl RequestHandler {
     }
 
     pub(super) async fn mode_tree_clients_snapshot(&self) -> Vec<ClientSnapshot> {
-        let now = Local::now().timestamp();
         let active_attach = self.active_attach.lock().await;
         active_attach
             .by_pid
@@ -195,8 +194,8 @@ impl RequestHandler {
                 pid,
                 attach_id: active.id,
                 session_name: Some(active.session_name.clone()),
-                label: attached_client_label(pid),
-                activity: now,
+                label: active.client_name.clone(),
+                activity: active.activity_at,
                 width: active.client_size.cols,
                 height: active.client_size.rows,
             })
@@ -422,12 +421,6 @@ fn local_datetime(epoch: i64) -> Option<DateTime<Local>> {
         LocalResult::Ambiguous(date_time, _) => Some(date_time),
         LocalResult::None => None,
     }
-}
-
-fn attached_client_label(attach_pid: u32) -> String {
-    rmux_os::process::fd_path(attach_pid, 0)
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| attach_pid.to_string())
 }
 
 fn mode_tree_default_selection(

@@ -97,6 +97,11 @@ impl HandlerState {
         let before_pane_options = self.pane_option_slots_for_session(&session_name)?;
         let source_pane_options = self.pane_explicit_option_entries(&request.source)?;
         let source_window_metadata = PaneTransferWindowMetadata::capture(self, &request.source)?;
+        let source_window_is_single_pane = source_window_metadata.source_window_is_single_pane();
+        let source_family_sessions = self.window_linked_session_family_list(
+            request.source.session_name(),
+            request.source.window_index(),
+        );
         let session = self
             .sessions
             .session(&session_name)
@@ -120,7 +125,7 @@ impl HandlerState {
 
         let target = request.target.clone();
         let direction = join_pane_internal_direction(request.direction);
-        let (response, destroyed_sessions) = self.mutate_session_transfer_and_resize_terminals(
+        let (_, destroyed_sessions) = self.mutate_session_transfer_and_resize_terminals(
             &session_name,
             |session| {
                 session.join_pane(
@@ -162,6 +167,7 @@ impl HandlerState {
                     Some(plan) => state.commit_linked_last_pane_transfer_removal(plan)?,
                     None => Vec::new(),
                 };
+                source_window_metadata.prune_destroyed_aliases_before_reindex(state);
                 state.synchronize_session_group_from(&session_name)?;
                 state.sync_pane_lifecycle_dimensions_for_session(&session_name);
                 state.synchronize_grouped_transfer_windows(
@@ -174,13 +180,16 @@ impl HandlerState {
                     &session_name,
                 )?;
                 state.restore_transferred_pane_options(&response.target, &source_pane_options)?;
-                source_window_metadata.prune_removed_aliases(state);
+                if source_window_is_single_pane {
+                    state.renumber_transfer_source_sessions(&source_family_sessions)?;
+                }
                 Ok(destroyed_sessions)
             },
         )?;
         self.finish_destroyed_linked_session_transfers(destroyed_sessions)?;
         self.clear_marked_pane_if_id(moved_pane_id);
-        Ok(response)
+        super::pane_target_for_id(self, &session_name, moved_pane_id)
+            .map(|target| JoinPaneResponse { target })
     }
 
     pub(super) fn break_pane_within_group(

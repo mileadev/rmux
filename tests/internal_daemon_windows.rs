@@ -16,6 +16,7 @@ use rmux_proto::{KillServerRequest, ListSessionsRequest, Request, Response};
 const BINARY_OVERRIDE_ENV: &str = "RMUX_INTERNAL_BINARY_PATH";
 const BINARY_OVERRIDE_TEST_OPT_IN_ENV: &str = "RMUX_ALLOW_INTERNAL_BINARY_OVERRIDE";
 const CLIENT_VERSION_OVERRIDE_ENV: &str = "RMUX_INTERNAL_CLIENT_VERSION";
+const CALLER_JOB_TEST_OPT_IN_ENV: &str = "RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB";
 const WINDOWS_DAEMON_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 const WINDOWS_DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const WINDOWS_DAEMON_EXIT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -177,7 +178,7 @@ fn attach_session_preserves_preexisting_empty_windows_daemon_and_state(
 }
 
 #[test]
-fn start_server_with_captured_output_returns_after_spawning_windows_daemon(
+fn start_server_with_captured_output_returns_after_empty_windows_daemon_exits(
 ) -> Result<(), Box<dyn Error>> {
     let _guard = env_lock().lock().expect("lock env");
     let previous_binary = std::env::var_os(BINARY_OVERRIDE_ENV);
@@ -191,7 +192,10 @@ fn start_server_with_captured_output_returns_after_spawning_windows_daemon(
         "captured-start-server-windows-{}",
         std::process::id()
     ))?;
-    let output = run_rmux_command(&socket_path, &["start-server"])?;
+    let output = run_rmux_command(
+        &socket_path,
+        &["start-server", ";", "display-message", "-p", "#{pid}"],
+    )?;
     assert!(
         output.status.success(),
         "captured start-server failed: status={:?}\nstdout={}\nstderr={}",
@@ -199,28 +203,100 @@ fn start_server_with_captured_output_returns_after_spawning_windows_daemon(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
+    let daemon_pid = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .expect("the queued observational tail must prove that the daemon existed");
+    assert_ne!(daemon_pid, 0, "the observed daemon PID must be nonzero");
 
-    let output = run_rmux_command(&socket_path, &["kill-server"])?;
-    assert!(
-        output.status.success(),
-        "captured kill-server failed: status={:?}\nstdout={}\nstderr={}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
     wait_for_daemon_process_absent(&socket_path)?;
+    Ok(())
+}
+
+#[test]
+fn queued_start_server_commands_follow_the_rotated_windows_endpoint() -> Result<(), Box<dyn Error>>
+{
+    let label = format!("queued-rotation-windows-{}", std::process::id());
+    let old_socket_path = socket_path_for_label(&label)?;
+    let mut old_daemon = spawn_hidden_daemon(&old_socket_path)?;
+    let mut old_connection = match wait_for_connection(&old_socket_path, &mut old_daemon) {
+        Ok(connection) => connection,
+        Err(error) => {
+            let _ = old_daemon.kill();
+            let _ = old_daemon.wait();
+            return Err(error);
+        }
+    };
+    let response = old_connection.roundtrip(&Request::KillServer(KillServerRequest))?;
+    assert!(matches!(response, Response::KillServer(_)));
+    drop(old_connection);
+    wait_for_child_exit(&mut old_daemon)?;
+
+    let create_and_list = run_rmux_command_with_auto_start_binary(
+        &old_socket_path,
+        &[
+            "new-session",
+            "-d",
+            "-s",
+            "alpha",
+            ";",
+            "list-sessions",
+            "-F",
+            "#{session_name}",
+        ],
+    )?;
+    assert!(
+        create_and_list.status.success(),
+        "queued new-session/list-sessions failed after rotation: status={:?}\nstdout={}\nstderr={}",
+        create_and_list.status.code(),
+        String::from_utf8_lossy(&create_and_list.stdout),
+        String::from_utf8_lossy(&create_and_list.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&create_and_list.stdout), "alpha\n");
+
+    let selected_socket_path = socket_path_for_label(&label)?;
+    assert_ne!(
+        selected_socket_path, old_socket_path,
+        "startup must rotate away from the stopped generation"
+    );
+
+    let start_and_list = run_rmux_command_with_auto_start_binary(
+        &old_socket_path,
+        &[
+            "start-server",
+            ";",
+            "list-sessions",
+            "-F",
+            "#{session_name}",
+        ],
+    )?;
+    assert!(
+        start_and_list.status.success(),
+        "queued start-server/list-sessions failed on selected generation: status={:?}\nstdout={}\nstderr={}",
+        start_and_list.status.code(),
+        String::from_utf8_lossy(&start_and_list.stdout),
+        String::from_utf8_lossy(&start_and_list.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&start_and_list.stdout), "alpha\n");
+
+    let kill = run_rmux_command(&selected_socket_path, &["kill-server"])?;
+    assert!(
+        kill.status.success(),
+        "replacement daemon cleanup failed: stderr={}",
+        String::from_utf8_lossy(&kill.stderr)
+    );
+    wait_for_daemon_process_absent(&selected_socket_path)?;
     Ok(())
 }
 
 #[test]
 fn seamless_upgrade_restarts_idle_stale_windows_daemon() -> Result<(), Box<dyn Error>> {
     let _guard = env_lock().lock().expect("lock env");
-    let socket_path =
-        socket_path_for_label(format!("seamless-upgrade-windows-{}", std::process::id()))?;
-    let mut old_daemon = spawn_hidden_daemon(&socket_path)?;
-    let old_connection = match wait_for_connection(&socket_path, &mut old_daemon) {
+    let label = format!("seamless-upgrade-windows-{}", std::process::id());
+    let old_socket_path = socket_path_for_label(&label)?;
+    let mut old_daemon = spawn_hidden_daemon(&old_socket_path)?;
+    let old_connection = match wait_for_connection(&old_socket_path, &mut old_daemon) {
         Ok(connection) => connection,
         Err(error) => {
             let _ = old_daemon.kill();
@@ -230,7 +306,7 @@ fn seamless_upgrade_restarts_idle_stale_windows_daemon() -> Result<(), Box<dyn E
     };
     drop(old_connection);
 
-    let status = run_client_as_newer_version(&socket_path, &["start-server"])?;
+    let status = run_client_as_newer_version(&old_socket_path, &["start-server"])?;
     assert!(
         status.success(),
         "newer client failed against idle stale daemon: status={:?}",
@@ -238,7 +314,12 @@ fn seamless_upgrade_restarts_idle_stale_windows_daemon() -> Result<(), Box<dyn E
     );
 
     wait_for_child_exit(&mut old_daemon)?;
-    let output = run_rmux_command(&socket_path, &["list-sessions"])?;
+    let replacement_socket_path = socket_path_for_label(&label)?;
+    assert_ne!(
+        replacement_socket_path, old_socket_path,
+        "seamless upgrade must publish a fresh private endpoint generation"
+    );
+    let output = run_rmux_command(&replacement_socket_path, &["list-sessions"])?;
     assert!(
         output.status.success(),
         "new daemon did not serve detached RPC after seamless upgrade: status={:?}\nstdout={}\nstderr={}",
@@ -246,7 +327,7 @@ fn seamless_upgrade_restarts_idle_stale_windows_daemon() -> Result<(), Box<dyn E
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let output = run_rmux_command(&socket_path, &["kill-server"])?;
+    let output = run_rmux_command(&replacement_socket_path, &["kill-server"])?;
     assert!(
         output.status.success(),
         "new daemon did not accept kill-server after seamless upgrade: status={:?}\nstdout={}\nstderr={}",
@@ -254,7 +335,7 @@ fn seamless_upgrade_restarts_idle_stale_windows_daemon() -> Result<(), Box<dyn E
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    wait_for_daemon_process_absent(&socket_path)?;
+    wait_for_daemon_process_absent(&replacement_socket_path)?;
     Ok(())
 }
 
@@ -312,7 +393,8 @@ fn run_client_as_newer_version(
         .args(args)
         .env(BINARY_OVERRIDE_ENV, env!("CARGO_BIN_EXE_rmux"))
         .env(BINARY_OVERRIDE_TEST_OPT_IN_ENV, "1")
-        .env(CLIENT_VERSION_OVERRIDE_ENV, "999.0.0-test");
+        .env(CLIENT_VERSION_OVERRIDE_ENV, "999.0.0-test")
+        .env(CALLER_JOB_TEST_OPT_IN_ENV, "1");
     run_command_status(command)
 }
 
@@ -416,7 +498,7 @@ fn wait_for_daemon_process_absent(socket_path: &Path) -> Result<(), Box<dyn Erro
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "{process_count} hidden daemon process(es) still match the test pipe after kill-server"
+                "{process_count} hidden daemon process(es) still match the test pipe after waiting for shutdown"
             )
             .into());
         }

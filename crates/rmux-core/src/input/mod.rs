@@ -13,6 +13,7 @@ mod dispatch;
 pub mod mode;
 mod params;
 mod passthrough;
+mod recovery;
 mod sgr;
 mod states;
 mod tables;
@@ -132,6 +133,10 @@ pub struct InputParser {
 
     /// Last printed character data for REP.
     last_char: Option<char>,
+    /// Whether this parse call emitted a printable character before REP.
+    printed_in_current_parse: bool,
+    /// A typed REP transition consumed parser state that ANSI cannot restore.
+    recovery_rebase_required: bool,
 
     /// Bytes accumulated since last ground state, for control-mode catch-up.
     since_ground: Vec<u8>,
@@ -173,6 +178,8 @@ impl InputParser {
             utf8_expected: 0,
             utf8_started: false,
             last_char: None,
+            printed_in_current_parse: false,
+            recovery_rebase_required: false,
             since_ground: Vec::new(),
             ground_timer_active: false,
             reply_buf: Vec::new(),
@@ -244,13 +251,19 @@ impl InputParser {
     /// Returns any bytes still buffered in an incomplete parser state.
     #[must_use]
     pub fn pending_bytes(&self) -> Vec<u8> {
+        self.pending_bytes_ref().to_vec()
+    }
+
+    /// Borrows bytes still buffered in an incomplete parser state.
+    #[must_use]
+    pub(crate) fn pending_bytes_ref(&self) -> &[u8] {
         if self.state != InputState::Ground {
-            return self.since_ground.clone();
+            return &self.since_ground;
         }
         if self.utf8_started {
-            return self.utf8_buf[..usize::from(self.utf8_len)].to_vec();
+            return &self.utf8_buf[..usize::from(self.utf8_len)];
         }
-        Vec::new()
+        &[]
     }
 
     /// Returns true if the ground timer should be running.
@@ -278,12 +291,19 @@ impl InputParser {
         &self.cell
     }
 
+    /// Returns the state restored by DECRC/SCP.
+    #[must_use]
+    pub const fn saved_state(&self) -> &SavedState {
+        &self.saved
+    }
+
     pub(crate) fn plain_output_forwarding_safe(&self) -> bool {
         self.state == InputState::Ground && !self.utf8_started && self.cell == CellState::default()
     }
 
     /// Parse a buffer of bytes, dispatching actions to the screen writer.
     pub fn parse<W: ScreenWriter + ?Sized>(&mut self, buf: &[u8], writer: &mut W) {
+        self.printed_in_current_parse = false;
         let mut index = 0;
         while index < buf.len() {
             if self.state == InputState::Ground && !self.utf8_started {
@@ -324,6 +344,7 @@ impl InputParser {
         writer.collect_add_ascii_run(bytes, &self.cell, acs);
         if let Some(&last) = bytes.last() {
             self.last_char = Some(char::from(last));
+            self.printed_in_current_parse = true;
         }
         self.flags |= INPUT_LAST;
     }
@@ -526,6 +547,7 @@ impl InputParser {
         writer.collect_add_with_charset(ch, &self.cell, set != 0);
 
         self.last_char = Some(ch);
+        self.printed_in_current_parse = true;
         self.flags |= INPUT_LAST;
 
         false
@@ -703,6 +725,7 @@ impl InputParser {
         writer.collect_add(c, &self.cell);
 
         self.last_char = Some(c);
+        self.printed_in_current_parse = true;
         self.flags |= INPUT_LAST;
 
         false
@@ -716,6 +739,19 @@ impl InputParser {
     /// Interm buf as a string slice for table lookups.
     fn interm_str(&self) -> &[u8] {
         &self.interm_buf[..self.interm_len]
+    }
+
+    fn note_effective_rep(&mut self) {
+        if !self.printed_in_current_parse {
+            self.recovery_rebase_required = true;
+        }
+    }
+
+    /// Returns and clears the signal that raw recovery needs an authoritative
+    /// rebase because REP consumed parser-only state from an earlier feed.
+    #[must_use]
+    pub(crate) fn take_recovery_rebase_required(&mut self) -> bool {
+        std::mem::take(&mut self.recovery_rebase_required)
     }
 }
 

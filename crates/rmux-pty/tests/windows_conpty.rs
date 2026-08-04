@@ -9,8 +9,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rmux_pty::{
-    write_windows_console_key, write_windows_console_key_then_interrupt_if_processed, ChildCommand,
-    PtyMaster, PtyPair, SpawnedPty, TerminalSize, WindowsConsoleKeyEvent,
+    send_windows_console_interrupt, write_windows_console_key,
+    write_windows_console_key_reporting_processed_input, ChildCommand, PtyMaster, PtyPair,
+    SpawnedPty, TerminalSize, WindowsConsoleKeyEvent,
 };
 use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
 use windows_sys::Win32::System::Console::{
@@ -84,6 +85,27 @@ fn conpty_spawn_reads_child_output_and_waits() -> Result<(), Box<dyn std::error:
     );
     assert!(spawned.child_mut().try_wait()?.is_some());
     Ok(())
+}
+
+#[test]
+fn conpty_process_tree_exit_completes_without_descendants() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut spawned = ChildCommand::new("C:\\Windows\\System32\\cmd.exe")
+        .args(["/D", "/Q", "/C", "exit 0"])
+        .size(TerminalSize::new(80, 24))
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(status) = spawned.child_mut().try_wait_for_process_tree_exit()? {
+            assert!(status.success());
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            spawned.child().terminate_forcefully()?;
+            return Err("process-tree exit stayed pending without descendants".into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -191,10 +213,12 @@ fn conpty_processed_ctrl_c_emits_one_interrupt_per_key() -> Result<(), Box<dyn s
         String::from_utf8_lossy(&ready)
     );
 
-    write_windows_console_key_then_interrupt_if_processed(
+    if write_windows_console_key_reporting_processed_input(
         spawned.child().pid(),
         WindowsConsoleKeyEvent::ctrl_c(),
-    )?;
+    )? {
+        send_windows_console_interrupt(spawned.child().pid())?;
+    }
     let deadline = Instant::now() + Duration::from_secs(2);
     let observed = loop {
         let callbacks = read_ctrl_c_count(&count_path).unwrap_or(0);
@@ -440,7 +464,7 @@ fn conpty_exit_watcher_leader_helper() -> Result<(), Box<dyn std::error::Error>>
 }
 
 #[test]
-fn conpty_exit_watcher_terminates_descendants_before_close(
+fn conpty_process_tree_wait_preserves_descendant_until_explicit_teardown(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let pid_path = env::temp_dir().join(format!(
@@ -467,14 +491,20 @@ fn conpty_exit_watcher_terminates_descendants_before_close(
     let descendant_pid = fs::read_to_string(&pid_path)?.trim().parse::<u32>()?;
     assert!(
         process_is_running(descendant_pid),
-        "same-console descendant must be alive before exit teardown"
+        "same-console descendant must remain alive after its leader exits"
+    );
+    assert!(
+        exit_watcher.try_wait_for_process_tree_exit()?.is_none(),
+        "process-tree exit must remain pending while a descendant owns the console"
     );
 
     let teardown_started = Instant::now();
     exit_watcher.terminate_forcefully()?;
+    let status = exit_watcher.wait_for_process_tree_exit()?;
+    assert!(status.success(), "the direct leader exited successfully");
     assert!(
         teardown_started.elapsed() < Duration::from_secs(2),
-        "Job termination must precede ClosePseudoConsole"
+        "explicit Job termination must promptly reap the process tree"
     );
     exit_watcher.terminate_forcefully()?;
     exit_watcher.close_pseudoconsole();

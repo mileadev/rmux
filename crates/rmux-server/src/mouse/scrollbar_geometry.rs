@@ -1,10 +1,9 @@
 use rmux_core::PaneGeometry;
-use rmux_proto::{OptionName, PaneTarget, SessionName};
+use rmux_proto::{PaneTarget, SessionName};
 
 use crate::pane_scrollbar::{PaneScrollbarConfig, PaneScrollbarLayout};
 use crate::pane_terminals::HandlerState;
 use crate::pane_visible_geometry::visible_pane_content_geometry;
-use crate::status_lines::status_line_count;
 
 pub(crate) fn pane_content_geometry_for_target(
     state: &HandlerState,
@@ -20,21 +19,7 @@ pub(crate) fn pane_content_geometry_for_target(
     {
         return None;
     }
-    let status_lines = if state
-        .options
-        .resolve(Some(target.session_name()), OptionName::Status)
-        .is_some_and(|value| value == "off")
-    {
-        0
-    } else {
-        status_line_count(
-            state
-                .options
-                .resolve(Some(target.session_name()), OptionName::Status),
-            window.size().rows,
-        )
-    };
-    let content_rows = window.size().rows.saturating_sub(status_lines);
+    let content_rows = window.size().rows;
     let alternate_on = state
         .pane_screen_state(target.session_name(), pane.id())
         .is_some_and(|screen| screen.alternate_on);

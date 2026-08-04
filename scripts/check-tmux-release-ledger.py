@@ -6,8 +6,11 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import toml_reader  # noqa: E402  (path bootstrap must run first)
 
 
 LEDGER = Path("tests/reference/tmux_compat/divergences.toml")
@@ -15,6 +18,7 @@ COMMAND_INVENTORY = Path("crates/rmux-core/src/command_inventory/signatures.rs")
 PRODUCT_DIVERGENCE_TEST = re.compile(
     r"(?m)^\s*(?:async\s+)?fn\s+([A-Za-z][A-Za-z0-9_]*_product_divergence)\s*\("
 )
+PRODUCT_DIVERGENCE_SUFFIX = "_product_divergence"
 ENTRY_ID = re.compile(r"C-D[1-9][0-9]*")
 FORBIDDEN_PLANNING_LABEL = re.compile(r"\b(?:lot|round|step)\s*[0-9]+\b|finale", re.I)
 TRACKED_REFERENCE_PREFIXES = (
@@ -43,9 +47,9 @@ def git_tracks(path: Path) -> bool:
     )
 
 
-def tracked_rust_sources() -> list[Path]:
+def tracked_sources() -> list[Path]:
     result = subprocess.run(
-        ["git", "ls-files", "--", "*.rs"],
+        ["git", "ls-files"],
         check=True,
         capture_output=True,
         text=True,
@@ -55,9 +59,14 @@ def tracked_rust_sources() -> list[Path]:
 
 def product_divergence_tests() -> dict[str, Path]:
     tests: dict[str, Path] = {}
-    for path in tracked_rust_sources():
-        source = path.read_text(encoding="utf-8")
-        for name in PRODUCT_DIVERGENCE_TEST.findall(source):
+    for path in tracked_sources():
+        if path.suffix == ".rs":
+            names = PRODUCT_DIVERGENCE_TEST.findall(path.read_text(encoding="utf-8"))
+        elif path.stem.endswith(PRODUCT_DIVERGENCE_SUFFIX):
+            names = [path.stem]
+        else:
+            continue
+        for name in names:
             previous = tests.get(name)
             if previous is not None:
                 raise ValueError(
@@ -92,7 +101,7 @@ def validate_reference(reference: str) -> tuple[Path, str | None]:
 
 
 def load_entries() -> tuple[dict[str, object], dict[str, dict[str, object]]]:
-    payload = tomllib.loads(LEDGER.read_text(encoding="utf-8"))
+    payload = toml_reader.loads(LEDGER.read_text(encoding="utf-8"))
     raw_entries = payload.get("entry")
     if not isinstance(raw_entries, list) or not raw_entries:
         raise ValueError("entry must be a non-empty array of tables")
@@ -141,9 +150,13 @@ def validate_product_tests(
     for entry_id, entry in entries.items():
         for reference in require_string_list(entry, "tests"):
             path, symbol = validate_reference(reference)
-            if symbol is None or not symbol.endswith("_product_divergence"):
+            if symbol is not None and symbol.endswith(PRODUCT_DIVERGENCE_SUFFIX):
+                name = symbol
+            elif symbol is None and path.stem.endswith(PRODUCT_DIVERGENCE_SUFFIX):
+                name = path.stem
+            else:
                 continue
-            references.setdefault(symbol, []).append((entry_id, path))
+            references.setdefault(name, []).append((entry_id, path))
 
     for name, path in discovered.items():
         matches = references.get(name, [])
@@ -171,7 +184,7 @@ def validate_product_tests(
 def main() -> int:
     try:
         payload, entries = load_entries()
-    except (OSError, tomllib.TOMLDecodeError, ValueError) as error:
+    except (OSError, toml_reader.TOMLDecodeError, ValueError) as error:
         return fail(f"{LEDGER}: {error}")
 
     policy = payload.get("policy")

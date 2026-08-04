@@ -22,6 +22,7 @@ mod view;
 #[path = "screen/writer.rs"]
 mod writer;
 
+pub use capture::{RecoveryRow, RecoveryRowRenderer};
 pub use view::{ScreenCellRef, ScreenCellView, ScreenLineView};
 
 pub(crate) const MAX_TERMINAL_PASSTHROUGH_EVENTS: usize = 256;
@@ -58,6 +59,7 @@ pub struct Screen {
     tabs: Vec<bool>,
     hyperlinks: Hyperlinks,
     active_hyperlink: u32,
+    metadata_revision: u64,
     bell_count: u64,
     terminal_passthrough: Vec<TerminalPassthrough>,
     dropped_terminal_passthrough_count: u64,
@@ -68,6 +70,28 @@ pub struct Screen {
 }
 
 impl Screen {
+    pub(crate) fn render_cell_state_ansi(&self, state: &CellState) -> Vec<u8> {
+        crate::grid::render_cell_state_ansi(state, &self.hyperlinks)
+    }
+
+    pub(crate) fn render_cell_state_ansi_bounded(
+        &self,
+        state: &CellState,
+        max_hyperlink_bytes: usize,
+    ) -> (Vec<u8>, bool) {
+        let mut bounded = state.clone();
+        let complete = self
+            .hyperlinks
+            .entry_fits(bounded.link(), max_hyperlink_bytes);
+        if !complete {
+            bounded.cell.link = 0;
+        }
+        (
+            crate::grid::render_cell_state_ansi(&bounded, &self.hyperlinks),
+            complete,
+        )
+    }
+
     /// Creates a new screen with the given geometry and history limit.
     #[must_use]
     pub fn new(size: TerminalSize, history_limit: usize) -> Self {
@@ -94,6 +118,7 @@ impl Screen {
             tabs: Vec::new(),
             hyperlinks: Hyperlinks::new(),
             active_hyperlink: 0,
+            metadata_revision: 0,
             bell_count: 0,
             terminal_passthrough: Vec::new(),
             dropped_terminal_passthrough_count: 0,
@@ -152,9 +177,35 @@ impl Screen {
         &self.title
     }
 
+    /// Returns the title stack from oldest to newest.
+    #[must_use]
+    pub fn title_stack(&self) -> &[String] {
+        &self.title_stack
+    }
+
+    /// Maximum title stack depth accepted by the terminal model.
+    #[must_use]
+    pub const fn title_stack_limit() -> usize {
+        TITLE_STACK_MAX
+    }
+
     /// Sets the current screen title.
     pub fn set_title(&mut self, title: impl Into<String>) {
-        self.title = title.into();
+        let title = title.into();
+        if self.title != title {
+            self.title = title;
+            self.bump_metadata_revision();
+        }
+    }
+
+    /// Returns the revision of terminal-controlled metadata.
+    #[must_use]
+    pub const fn metadata_revision(&self) -> u64 {
+        self.metadata_revision
+    }
+
+    fn bump_metadata_revision(&mut self) {
+        self.metadata_revision = self.metadata_revision.saturating_add(1);
     }
 
     /// Enables or disables title changes requested by pane output.
@@ -184,6 +235,46 @@ impl Screen {
     #[must_use]
     pub fn is_alternate(&self) -> bool {
         self.saved_grid.is_some()
+    }
+
+    /// Returns the cursor saved by DEC alternate-screen entry, when present.
+    #[must_use]
+    pub fn alternate_saved_cursor(&self) -> Option<(u32, u32, bool)> {
+        self.saved_cursor_x.zip(self.saved_cursor_y).map(|(x, y)| {
+            (
+                x,
+                y,
+                self.saved_cursor_pending_wrap && self.mode & mode::MODE_WRAP != 0,
+            )
+        })
+    }
+
+    /// Returns whether the next printable character first performs autowrap.
+    #[must_use]
+    pub const fn pending_wrap(&self) -> bool {
+        self.pending_wrap
+    }
+
+    /// Returns the active tab-stop bitmap.
+    #[must_use]
+    pub fn tab_stops(&self) -> &[bool] {
+        &self.tabs
+    }
+
+    /// Clones all state needed to reconstruct a renderer, including bounded
+    /// scrollback and the saved main buffer beneath alternate screen.
+    ///
+    /// Ephemeral notifications and passthrough side effects are discarded:
+    /// replaying a recovery keyframe must not replay clipboard, graphics, bell,
+    /// or other host-side effects.
+    #[must_use]
+    pub(crate) fn clone_recovery_state(&self) -> Self {
+        let mut recovery = self.clone();
+        recovery.bell_count = 0;
+        recovery.terminal_passthrough.clear();
+        recovery.dropped_terminal_passthrough_count = 0;
+        recovery.has_selected_cells = false;
+        recovery
     }
 
     /// Returns the configured history limit.
@@ -392,6 +483,7 @@ impl Screen {
         self.grid.clear_history();
         if reset_hyperlinks {
             self.hyperlinks.reset();
+            self.bump_metadata_revision();
         }
     }
 
@@ -567,6 +659,10 @@ impl Screen {
         self.clear_selected_cells();
         let sx = self.grid.sx();
         let end = end_inclusive.min(sx.saturating_sub(1));
+        let clears_whole_line = start == 0 && end == sx.saturating_sub(1);
+        if clears_whole_line {
+            self.grid.break_wrap_before_visible_line(y);
+        }
         let Some(line) = self.grid.visible_line_mut(y) else {
             return;
         };
@@ -576,13 +672,16 @@ impl Screen {
             }
         }
         Self::repair_wide_cells_on_line(line, sx, bg);
-        line.set_wrapped(false);
+        if clears_whole_line {
+            line.set_wrapped(false);
+        }
         line.touch();
     }
 
     fn clear_screen_region(&mut self, start_y: u32, end_y_inclusive: u32, bg: i32) {
         self.clear_selected_cells();
         for y in start_y..=end_y_inclusive.min(self.grid.sy().saturating_sub(1)) {
+            self.grid.break_wrap_before_visible_line(y);
             if let Some(line) = self.grid.visible_line_mut(y) {
                 line.clear(bg);
             }
@@ -861,6 +960,15 @@ impl Screen {
     }
 }
 
+#[cfg(test)]
+#[path = "screen/capture_ascii_space_tests.rs"]
+mod capture_ascii_space_tests;
+#[cfg(test)]
+#[path = "screen/capture_mutation_tests.rs"]
+mod capture_mutation_tests;
+#[cfg(test)]
+#[path = "screen/erase_tests.rs"]
+mod erase_tests;
 #[cfg(test)]
 #[path = "screen/tests.rs"]
 mod tests;

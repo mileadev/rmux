@@ -15,16 +15,16 @@ use super::attach_transport::{
 };
 use super::json_output::{list_clients_json_format, write_list_clients_json};
 use super::{
-    connect_with_startserver, connect_with_startserver_outcome, current_terminal_size,
-    expect_command_success, finish_command_success, list_session_names,
-    resolve_session_target_spec, run_command, run_payload_command_resolved, unexpected_response,
-    ExitFailure, StartupOptions,
+    connect_with_startserver_outcome, current_terminal_size, expect_command_success,
+    finish_command_success, list_session_names, resolve_session_target_spec, run_command,
+    run_payload_command_resolved, unexpected_response, ExitFailure, StartupOptions,
 };
 use crate::cli_args::{
     AttachSessionArgs, Cli, DetachClientArgs, ListClientsArgs, RefreshClientArgs,
     SuspendClientArgs, SwitchClientArgs,
 };
 use crate::client_terminal::client_terminal_context_from_parts;
+use crate::empty_server_lifecycle::shutdown_started_empty_server_at;
 
 pub(super) fn client_terminal_context_from_cli(cli: &Cli) -> ClientTerminalContext {
     let mut terminal_features = cli
@@ -239,7 +239,10 @@ pub(super) fn run_control_mode(
     socket_path: &Path,
     startup: StartupOptions,
 ) -> Result<i32, ExitFailure> {
-    let connection = connect_with_startserver(socket_path, startup)?;
+    let endpoint = startup.endpoint.clone();
+    let outcome = connect_with_startserver_outcome(socket_path, startup)?;
+    let provenance = outcome.provenance;
+    let connection = outcome.into_connection();
     match connection
         .begin_control_mode_with_initial_commands(
             ControlMode::from_count(cli.control_mode),
@@ -249,7 +252,12 @@ pub(super) fn run_control_mode(
         .map_err(ExitFailure::from_client)?
     {
         ControlTransition::Upgraded(upgrade) => {
-            drive_control_mode(upgrade, &[]).map_err(ExitFailure::from_client)?;
+            let control_result = drive_control_mode(upgrade, &[]).map_err(ExitFailure::from_client);
+            let cleanup_result =
+                shutdown_started_empty_server_at(&endpoint.socket_path(), provenance)
+                    .map_err(|error| ExitFailure::new(1, error.to_string()));
+            control_result?;
+            cleanup_result?;
             Ok(0)
         }
         ControlTransition::Rejected(Response::Error(ErrorResponse { error })) => {

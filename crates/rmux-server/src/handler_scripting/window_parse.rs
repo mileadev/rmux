@@ -11,7 +11,7 @@ use rmux_proto::{
 use crate::pane_terminals::session_not_found;
 
 use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
-use super::values::unsupported_flag;
+use super::values::{reject_unknown_option_before_positional, unsupported_flag};
 use super::{
     implicit_session_name, implicit_window_target, parse_new_window_target_argument,
     parse_window_target,
@@ -88,7 +88,8 @@ pub(super) fn parse_window_request(
                 } else {
                     ("", "")
                 };
-                let Some(cluster) = parse_compact_flag_cluster(&token, bare_flags, value_flags)
+                let Some(cluster) =
+                    parse_compact_flag_cluster(command, &token, bare_flags, value_flags)?
                 else {
                     if token.starts_with('-') {
                         return Err(unsupported_flag(command, &token));
@@ -256,7 +257,8 @@ pub(super) fn parse_new_window(
                 detached = true;
             }
             token => {
-                let Some(cluster) = parse_compact_flag_cluster(token, "abd", "cetn") else {
+                let Some(cluster) = parse_compact_flag_cluster("new-window", token, "abd", "cetn")?
+                else {
                     break;
                 };
                 let _ = args.optional();
@@ -388,7 +390,10 @@ pub(super) fn parse_rename_window(
                     args.required("-t target")?,
                 )?);
             }
-            _ => break,
+            token => {
+                reject_unknown_option_before_positional("rename-window", token)?;
+                break;
+            }
         }
     }
 
@@ -427,7 +432,8 @@ pub(super) fn parse_kill_window(
                 )?);
             }
             flag if flag.starts_with('-') => {
-                let Some(cluster) = parse_compact_flag_cluster(flag, "a", "t") else {
+                let Some(cluster) = parse_compact_flag_cluster("kill-window", flag, "a", "t")?
+                else {
                     return Err(unsupported_flag("kill-window", flag));
                 };
                 for flag in cluster {

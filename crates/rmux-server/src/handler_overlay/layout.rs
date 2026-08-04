@@ -247,14 +247,14 @@ fn overlay_status_at(
 
     match options.resolve(Some(session.name()), OptionName::StatusPosition) {
         Some("top") => Some(0),
-        _ => Some(session.window().size().rows.saturating_sub(status_lines)),
+        _ => Some(session.terminal_size().rows.saturating_sub(status_lines)),
     }
 }
 
 fn overlay_status_lines(session: &rmux_core::Session, options: &rmux_core::OptionStore) -> u16 {
     status_line_count(
         options.resolve(Some(session.name()), OptionName::Status),
-        session.window().size().rows,
+        session.terminal_size().rows,
     )
 }
 

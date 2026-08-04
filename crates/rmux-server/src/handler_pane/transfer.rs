@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use rmux_core::{HookStore, LifecycleEvent, WindowId};
 use rmux_proto::{
     BreakPaneRequest, CommandOutput, ErrorResponse, PaneTarget, Response, SessionId, SessionName,
@@ -5,11 +7,14 @@ use rmux_proto::{
 };
 
 use super::super::{
-    attach_support::{PreparedAttachedDestroySwitches, SessionDetachOnDestroy},
+    attach_support::{
+        prepare_applied_window_resize_events, PreparedAttachedDestroySwitches,
+        SessionDetachOnDestroy,
+    },
     defer_lifecycle_event, prepare_deferred_lifecycle_event, prepare_lifecycle_event,
     scripting_support::format_context_for_target,
     DeferredLifecycleEvent, PaneOutputSubscriptionKeySnapshot, QueuedLifecycleEvent,
-    RequestHandler,
+    RequestHandler, SelectionTransitionSnapshot,
 };
 use super::pane_timer_mutations::BreakPaneTimerTargetPlan;
 use crate::format_runtime::render_runtime_template;
@@ -19,6 +24,7 @@ const DEFAULT_BREAK_PANE_FORMAT: &str = "#{session_name}:#{window_index}.#{pane_
 
 struct PaneTransferEffects {
     source_family_sessions: Vec<SessionName>,
+    selection_before: SelectionTransitionSnapshot,
     refresh_sessions: Vec<SessionName>,
     hook_snapshot: HookStore,
     unlinked_windows: Vec<DeferredLifecycleEvent>,
@@ -33,8 +39,11 @@ struct PaneTransferEffects {
 struct PreparedPaneTransferEffects {
     refresh_sessions: Vec<SessionName>,
     unlinked_windows: Vec<QueuedLifecycleEvent>,
+    pane_selection_events: Vec<QueuedLifecycleEvent>,
     layout_events: Vec<QueuedLifecycleEvent>,
+    resize_events: Vec<QueuedLifecycleEvent>,
     linked_event: Option<QueuedLifecycleEvent>,
+    session_selection_events: Vec<QueuedLifecycleEvent>,
     closed_sessions: Vec<(
         SessionName,
         SessionId,
@@ -48,6 +57,22 @@ enum SourceWindowEffect {
     None,
     RemoveLinkedFamily,
     MoveGroupedSlots,
+}
+
+#[derive(Clone, Copy)]
+enum PaneTransferEmissionPolicy {
+    JoinOrMove,
+    Break,
+}
+
+impl PaneTransferEmissionPolicy {
+    fn reserve_applied_resizes(self) -> bool {
+        matches!(self, Self::JoinOrMove)
+    }
+
+    fn include_selection_changes(self) -> bool {
+        matches!(self, Self::Break)
+    }
 }
 
 struct BreakSourceWindowIdentity {
@@ -133,6 +158,7 @@ impl PaneTransferEffects {
             .collect();
         Self {
             source_family_sessions,
+            selection_before: SelectionTransitionSnapshot::capture(state),
             refresh_sessions,
             hook_snapshot: state.hooks.clone(),
             unlinked_windows,
@@ -160,9 +186,12 @@ impl PaneTransferEffects {
         removed_sessions: &[SessionName],
         layout_targets: &[WindowTarget],
         linked_event: Option<LifecycleEvent>,
+        policy: PaneTransferEmissionPolicy,
     ) -> PreparedPaneTransferEffects {
         let Self {
             refresh_sessions,
+            source_family_sessions,
+            selection_before,
             mut hook_snapshot,
             unlinked_windows,
             closed_sessions,
@@ -172,16 +201,56 @@ impl PaneTransferEffects {
             .into_iter()
             .map(|event| prepare_deferred_lifecycle_event(state, &mut hook_snapshot, event))
             .collect();
+        let pane_selection_events = if policy.include_selection_changes() {
+            selection_before.prepare_window_pane_changes(state, layout_targets)
+        } else {
+            Vec::new()
+        };
+        let mut control_notified_windows = HashSet::new();
         let layout_events = layout_targets
             .iter()
             .cloned()
             .map(|target| {
-                prepare_lifecycle_event(state, &LifecycleEvent::WindowLayoutChanged { target })
+                let window_id = state
+                    .sessions
+                    .session(target.session_name())
+                    .and_then(|session| session.window_at(target.window_index()))
+                    .map(rmux_core::Window::id);
+                let mut event =
+                    prepare_lifecycle_event(state, &LifecycleEvent::WindowLayoutChanged { target });
+                // tmux 3.7b still dispatches both pane-transfer layout hooks
+                // when the source window disappears, but sends only one
+                // `%layout-change` for the surviving target window.
+                if window_id.is_some_and(|window_id| !control_notified_windows.insert(window_id)) {
+                    event.suppress_control_effects();
+                }
+                event
             })
             .collect();
+        // Reserve the resize immediately after its layout events. This both
+        // claims the layout half of the pending pair and prevents an executing
+        // layout hook from draining the shared resize queue through a nested
+        // command. Reserving it before session-close tickets also keeps ticket
+        // order identical to the emission order below.
+        let resize_events = if policy.reserve_applied_resizes() {
+            prepare_applied_window_resize_events(state)
+        } else {
+            Vec::new()
+        };
         let linked_event = linked_event
             .as_ref()
             .map(|event| prepare_lifecycle_event(state, event));
+        let session_selection_events = if policy.include_selection_changes() {
+            let mut preferred_sessions = linked_event
+                .as_ref()
+                .and_then(|event| event.event.session_name().cloned())
+                .into_iter()
+                .collect::<Vec<_>>();
+            preferred_sessions.extend(source_family_sessions);
+            selection_before.prepare_session_window_changes(state, &preferred_sessions)
+        } else {
+            Vec::new()
+        };
         let closed_sessions = closed_sessions
             .into_iter()
             .filter(|(session_name, _, _, _)| removed_sessions.contains(session_name))
@@ -197,8 +266,11 @@ impl PaneTransferEffects {
         PreparedPaneTransferEffects {
             refresh_sessions,
             unlinked_windows,
+            pane_selection_events,
             layout_events,
+            resize_events,
             linked_event,
+            session_selection_events,
             closed_sessions,
         }
     }
@@ -223,6 +295,8 @@ impl RequestHandler {
             );
             let source_identity = PaneTransferWindowIdentity::capture(&state, &request.source);
             let target_identity = PaneTransferWindowIdentity::capture(&state, &request.target);
+            let same_pane_identity =
+                pane_targets_share_pane_identity(&state, &request.source, &request.target);
             let refresh_sessions =
                 pane_transfer_refresh_sessions(&state, &source_window, Some(&target_window));
             let response = match state.swap_pane(request) {
@@ -232,17 +306,18 @@ impl RequestHandler {
                 }
                 Err(error) => Response::Error(ErrorResponse { error }),
             };
-            let layout_targets = matches!(response, Response::SwapPane(_))
-                .then(|| {
-                    swap_layout_targets(
-                        &state,
-                        &source_window,
-                        &target_window,
-                        source_identity.as_ref(),
-                        target_identity.as_ref(),
-                    )
-                })
-                .unwrap_or_default();
+            let layout_targets = if matches!(response, Response::SwapPane(_)) && !same_pane_identity
+            {
+                swap_layout_targets(
+                    &state,
+                    &source_window,
+                    &target_window,
+                    source_identity.as_ref(),
+                    target_identity.as_ref(),
+                )
+            } else {
+                Vec::new()
+            };
             (response, layout_targets, refresh_sessions)
         };
 
@@ -323,7 +398,13 @@ impl RequestHandler {
                 })
                 .unwrap_or_default();
             let effects = matches!(response, Response::JoinPane(_)).then(|| {
-                effects.prepare_emitted(&mut state, &removed_sessions, &layout_targets, None)
+                effects.prepare_emitted(
+                    &mut state,
+                    &removed_sessions,
+                    &layout_targets,
+                    None,
+                    PaneTransferEmissionPolicy::JoinOrMove,
+                )
             });
             (response, effects, removed_sessions)
         };
@@ -399,7 +480,13 @@ impl RequestHandler {
                 })
                 .unwrap_or_default();
             let effects = matches!(response, Response::MovePane(_)).then(|| {
-                effects.prepare_emitted(&mut state, &removed_sessions, &layout_targets, None)
+                effects.prepare_emitted(
+                    &mut state,
+                    &removed_sessions,
+                    &layout_targets,
+                    None,
+                    PaneTransferEmissionPolicy::JoinOrMove,
+                )
             });
             (response, effects, removed_sessions)
         };
@@ -508,6 +595,7 @@ impl RequestHandler {
                     &removed_sessions,
                     &layout_targets,
                     linked_event,
+                    PaneTransferEmissionPolicy::Break,
                 )
             });
             (response, effects, removed_sessions)
@@ -574,11 +662,20 @@ impl RequestHandler {
         for event in &effects.unlinked_windows {
             self.emit_prepared(event.clone()).await;
         }
+        for event in &effects.pane_selection_events {
+            self.emit_prepared(event.clone()).await;
+        }
         for event in &effects.layout_events {
+            self.emit_prepared(event.clone()).await;
+        }
+        for event in &effects.resize_events {
             self.emit_prepared(event.clone()).await;
         }
         if let Some(event) = &effects.linked_event {
             self.pause_before_window_lifecycle_emit().await;
+            self.emit_prepared(event.clone()).await;
+        }
+        for event in &effects.session_selection_events {
             self.emit_prepared(event.clone()).await;
         }
         for (_, _, _, event) in &effects.closed_sessions {
@@ -658,6 +755,22 @@ fn pane_transfer_refresh_sessions(
         }
     }
     sessions
+}
+
+fn pane_targets_share_pane_identity(
+    state: &HandlerState,
+    source: &PaneTarget,
+    target: &PaneTarget,
+) -> bool {
+    let pane_identity = |target: &PaneTarget| {
+        let session = state.sessions.session(target.session_name())?;
+        let window = session.window_at(target.window_index())?;
+        let pane = window.pane(target.pane_index())?;
+        Some((window.id(), pane.id()))
+    };
+    pane_identity(source)
+        .zip(pane_identity(target))
+        .is_some_and(|(source, target)| source == target)
 }
 
 fn swap_layout_targets(

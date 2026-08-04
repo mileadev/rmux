@@ -410,13 +410,6 @@ fn run_attached(invocation: ClaudeInvocation) -> Result<i32, ExitFailure> {
         .unwrap_or_else(|| format!("rmux-claude-{}", process::id()));
     let pid_file = runtime_dir.join("claude.pid");
 
-    #[cfg(windows)]
-    if let Err(error) = prepare_windows_claude_server(&binary, &main_socket) {
-        let _ = shutdown_private_server(&binary, &main_socket);
-        let _ = fs::remove_dir_all(runtime_dir);
-        return Err(error);
-    }
-
     if let Err(error) = start_main_session(&binary, &main_socket, &pid_file, invocation.args) {
         #[cfg(windows)]
         let _ = shutdown_private_server(&binary, &main_socket);
@@ -455,73 +448,6 @@ fn run_attached(invocation: ClaudeInvocation) -> Result<i32, ExitFailure> {
 }
 
 #[cfg(windows)]
-fn prepare_windows_claude_server(binary: &Path, main_socket: &str) -> Result<(), ExitFailure> {
-    start_private_server(binary, main_socket)?;
-    configure_windows_claude_default_shell(binary, main_socket)
-}
-
-#[cfg(windows)]
-fn start_private_server(binary: &Path, main_socket: &str) -> Result<(), ExitFailure> {
-    let output = private_rmux_command(binary)
-        .arg("-L")
-        .arg(main_socket)
-        .arg("start-server")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| {
-            ExitFailure::new(
-                1,
-                format!("rmux claude: failed to start private RMUX server: {error}"),
-            )
-        })?;
-    if output.status.success() {
-        return Ok(());
-    }
-    Err(ExitFailure::new(
-        output.status.code().unwrap_or(1),
-        format!(
-            "rmux claude: failed to start private RMUX server{}",
-            command_output_suffix(&output)
-        ),
-    ))
-}
-
-#[cfg(windows)]
-fn configure_windows_claude_default_shell(
-    binary: &Path,
-    main_socket: &str,
-) -> Result<(), ExitFailure> {
-    let bash = windows_git_bash_path()?;
-    let output = private_rmux_command(binary)
-        .arg("-L")
-        .arg(main_socket)
-        .arg("set-option")
-        .arg("-g")
-        .arg("default-shell")
-        .arg(&bash)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| {
-            ExitFailure::new(
-                1,
-                format!("rmux claude: failed to configure teammate shell: {error}"),
-            )
-        })?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let _ = shutdown_private_server(binary, main_socket);
-    Err(ExitFailure::new(
-        output.status.code().unwrap_or(1),
-        format!(
-            "rmux claude: failed to configure teammate shell '{}'{}",
-            bash.display(),
-            command_output_suffix(&output)
-        ),
-    ))
-}
-
-#[cfg(windows)]
 fn shutdown_private_server(binary: &Path, main_socket: &str) -> Result<(), ExitFailure> {
     let status = private_rmux_command(binary)
         .arg("-L")
@@ -547,20 +473,6 @@ fn shutdown_private_server(binary: &Path, main_socket: &str) -> Result<(), ExitF
     }
 }
 
-#[cfg(windows)]
-fn command_output_suffix(output: &std::process::Output) -> String {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = stdout.trim();
-    let stderr = stderr.trim();
-    match (stdout.is_empty(), stderr.is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => format!(": {stdout}"),
-        (true, false) => format!(": {stderr}"),
-        (false, false) => format!(": {stdout}; {stderr}"),
-    }
-}
-
 #[cfg(any(unix, windows))]
 fn start_main_session(
     binary: &Path,
@@ -578,9 +490,24 @@ fn start_main_session(
     runner_args.extend(claude_args);
 
     let mut command = private_rmux_command(binary);
+    command.arg("-L").arg(main_socket);
+    #[cfg(windows)]
+    {
+        // `start-server` applies `exit-empty` before its standalone process
+        // returns. Keep startup, shell configuration, and the first live
+        // session in one queue so that cleanup observes the session without
+        // overriding the user's `exit-empty` setting.
+        let bash = windows_git_bash_path()?;
+        command
+            .arg("start-server")
+            .arg(";")
+            .arg("set-option")
+            .arg("-g")
+            .arg("default-shell")
+            .arg(bash)
+            .arg(";");
+    }
     command
-        .arg("-L")
-        .arg(main_socket)
         .arg("new-session")
         .arg("-d")
         .arg("-s")

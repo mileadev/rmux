@@ -1,16 +1,14 @@
 use std::sync::atomic::Ordering;
 
-use rmux_core::LifecycleEvent;
 use rmux_proto::{OptionName, RmuxError, SessionId, WindowId, WindowTarget};
 
 use crate::pane_terminals::HandlerState;
 
-use super::super::super::{
-    prepare_lifecycle_event_if_enabled, QueuedLifecycleEvent, RequestHandler,
-};
+use super::super::super::{QueuedLifecycleEvent, RequestHandler};
 use super::{
-    attached_size_candidates, linked_session_identities, policy_from_option_value,
-    selected_attached_size, AttachedSizeSelection, ATTACHED_SIZE_RECONCILE_ATTEMPTS,
+    attached_size_candidates, control_size_candidates, linked_session_statuses,
+    policy_from_option_value, prepare_applied_window_resize_events, selected_client_size,
+    AttachedSizeSelection, ATTACHED_SIZE_RECONCILE_ATTEMPTS,
 };
 
 impl RequestHandler {
@@ -39,17 +37,15 @@ impl RequestHandler {
         session_id: SessionId,
         window_id: WindowId,
     ) -> Result<(), RmuxError> {
-        if let Some(applied) = self
+        let applied = self
             .reconcile_attached_window_identity_size(session_id, window_id)
-            .await?
-        {
-            self.pause_before_window_lifecycle_emit().await;
-            match applied.prepared_event {
-                Some(event) => self.emit_prepared(event).await,
-                None => {
-                    self.emit_without_attached_refresh(applied.event).await;
-                }
-            }
+            .await?;
+        if applied.is_empty() {
+            return Ok(());
+        }
+        self.pause_before_window_lifecycle_emit().await;
+        for event in applied {
+            self.emit_prepared(event).await;
         }
         Ok(())
     }
@@ -58,13 +54,13 @@ impl RequestHandler {
         &self,
         session_id: SessionId,
         window_id: WindowId,
-    ) -> Result<Option<AppliedIdentityResize>, RmuxError> {
+    ) -> Result<Vec<QueuedLifecycleEvent>, RmuxError> {
         for _ in 0..ATTACHED_SIZE_RECONCILE_ATTEMPTS {
             let Some((target, selection)) = self
                 .selected_attached_window_identity_size(session_id, window_id)
                 .await
             else {
-                return Ok(None);
+                return Ok(Vec::new());
             };
             self.pause_after_attached_size_selection().await;
 
@@ -73,47 +69,44 @@ impl RequestHandler {
                 continue;
             }
             let active_attach = self.active_attach.lock().await;
+            let active_control = self.active_control.lock().await;
             if !self.attached_size_selection_is_current(
                 &state,
                 &active_attach,
+                &active_control,
                 target.session_name(),
                 &selection,
                 false,
             ) {
                 continue;
             }
-            let Some(selected_size) = selection.selected_size else {
-                return Ok(None);
-            };
-            let current_size = state
+            if selection.selected_size().is_none() {
+                return Ok(Vec::new());
+            }
+            let session = state
                 .sessions
                 .session(target.session_name())
-                .expect("stable resize session identity was revalidated")
-                .window_at(target.window_index())
-                .expect("stable resize window identity was revalidated")
-                .size();
-            if current_size == selected_size {
-                return Ok(None);
+                .expect("stable resize session identity was revalidated");
+            if selection.matches_window(session, target.window_index()) {
+                return Ok(Vec::new());
             }
             self.pause_before_attached_size_apply().await;
             let window_index = target.window_index();
             state.mutate_session_and_resize_window_terminal(
                 target.session_name(),
                 window_index,
-                |session| {
-                    session.resize_window(window_index, selected_size)?;
-                    Ok(())
-                },
+                |session| selection.apply_to_window(session, window_index),
             )?;
+            drop(active_control);
             drop(active_attach);
-            let event = LifecycleEvent::WindowResized { target };
-            let prepared_event = prepare_lifecycle_event_if_enabled(&mut state, &event);
-            return Ok(Some(AppliedIdentityResize {
-                event,
-                prepared_event,
-            }));
+            // tmux 3.7b, measured 2026-07-25: a reconcile that actually resizes
+            // the window notifies the window's control clients with
+            // `%layout-change` and runs `window-layout-changed` before
+            // `window-resized`. Reserve the tickets the geometry chokepoint just
+            // recorded under the same state lock so the published order matches.
+            return Ok(prepare_applied_window_resize_events(&mut state));
         }
-        Ok(None)
+        Ok(Vec::new())
     }
 
     async fn selected_attached_window_identity_size(
@@ -121,7 +114,7 @@ impl RequestHandler {
         session_id: SessionId,
         window_id: WindowId,
     ) -> Option<(WindowTarget, AttachedSizeSelection)> {
-        let (target, policy, aggressive_resize, linked_sessions) = {
+        let (target, policy, status, aggressive_resize, linked_sessions) = {
             let state = self.state.lock().await;
             let target = window_target_for_identity(&state, session_id, window_id)?;
             let policy = policy_from_option_value(state.options.resolve_for_window(
@@ -134,37 +127,45 @@ impl RequestHandler {
                 target.window_index(),
                 OptionName::AggressiveResize,
             ) == Some("on");
-            let linked_sessions = linked_session_identities(
+            let linked_sessions = linked_session_statuses(
                 &state,
                 target.session_name(),
                 target.window_index(),
                 aggressive_resize,
             );
-            (target, policy, aggressive_resize, linked_sessions)
+            let status = state
+                .options
+                .resolve(Some(target.session_name()), OptionName::Status)
+                .map(str::to_owned);
+            (target, policy, status, aggressive_resize, linked_sessions)
         };
-        let (candidates, active_attach_epoch) = {
+        let (candidates, control_candidates, active_attach_epoch) = {
             let active_attach = self.active_attach.lock().await;
-            let candidates = attached_size_candidates(&active_attach, &linked_sessions, None);
-            (candidates, self.active_attach_epoch.load(Ordering::Acquire))
+            let active_control = self.active_control.lock().await;
+            let candidates = attached_size_candidates(&active_attach, &linked_sessions, None, None);
+            let control_candidates =
+                control_size_candidates(&active_control, &linked_sessions, None);
+            (
+                candidates,
+                control_candidates,
+                self.active_attach_epoch.load(Ordering::Acquire),
+            )
         };
         let selection = AttachedSizeSelection {
-            selected_size: selected_attached_size(policy, &candidates),
+            selected_size: selected_client_size(policy, candidates, &control_candidates),
             session_id,
             active_window_index: target.window_index(),
             active_window_id: window_id,
             policy,
+            status,
             aggressive_resize,
             linked_sessions,
             active_attach_epoch,
-            incoming_client_size: None,
+            incoming_client: None,
+            control_candidates,
         };
         Some((target, selection))
     }
-}
-
-struct AppliedIdentityResize {
-    event: LifecycleEvent,
-    prepared_event: Option<QueuedLifecycleEvent>,
 }
 
 fn window_target_for_identity(

@@ -14,8 +14,28 @@ mod history_bytes;
 #[path = "grid/render.rs"]
 mod render;
 
+pub use cell::RenderedLineSpan;
 pub(crate) use cell::{GridCell, GridCellFlags, GridLine, GridLineFlags};
 use render::{append_cell_text, append_grid_string_code, append_hyperlink};
+
+pub(crate) fn render_cell_state_ansi(
+    state: &crate::input::CellState,
+    hyperlinks: &Hyperlinks,
+) -> Vec<u8> {
+    let previous = GridCell::blank_with_bg(COLOUR_DEFAULT);
+    let current = GridCell::from_state(' ', 1, state, GridCellFlags::default());
+    let mut rendered = String::new();
+    let mut has_link = false;
+    append_grid_string_code(
+        &previous,
+        &current,
+        &mut rendered,
+        false,
+        Some(hyperlinks),
+        &mut has_link,
+    );
+    rendered.into_bytes()
+}
 
 const HISTORY_STAMP_REFRESH_LINES: u16 = 256;
 
@@ -126,6 +146,7 @@ pub(crate) struct Grid {
     history_stamp: i64,
     history_stamp_remaining: u16,
     history: VecDeque<GridLine>,
+    history_content_bytes: usize,
     visible: VecDeque<GridLine>,
 }
 
@@ -145,6 +166,7 @@ impl Grid {
             history_stamp: 0,
             history_stamp_remaining: 0,
             history: VecDeque::new(),
+            history_content_bytes: 0,
             visible: (0..sy).map(|_| GridLine::new(sx)).collect(),
         }
     }
@@ -193,7 +215,7 @@ impl Grid {
         self.hlimit = hlimit;
         self.reflow_history_capacity = 0;
         while self.history.len() > self.hlimit {
-            let _ = self.history.pop_front();
+            let _ = self.pop_history_front();
         }
         self.hscrolled = self.hscrolled.min(self.history.len());
     }
@@ -220,6 +242,26 @@ impl Grid {
         self.visible.get_mut(y as usize)
     }
 
+    /// Breaks the soft-wrap boundary immediately before one visible row.
+    ///
+    /// The predecessor may be the final history row when the first viewport
+    /// row is a continuation. Alternate-screen rows never continue main-screen
+    /// history, which is retained in the same grid with history disabled.
+    pub(crate) fn break_wrap_before_visible_line(&mut self, y: u32) {
+        let previous = if y == 0 {
+            if self.history_enabled {
+                self.history.back_mut()
+            } else {
+                None
+            }
+        } else {
+            self.visible.get_mut(y.saturating_sub(1) as usize)
+        };
+        if let Some(previous) = previous {
+            previous.set_wrapped(false);
+        }
+    }
+
     /// Returns one absolute line where rows `0..hsize` are history and
     /// `hsize..hsize+sy` are the visible screen.
     #[allow(dead_code)]
@@ -238,7 +280,11 @@ impl Grid {
     /// at the bottom.
     pub fn remove_absolute_line(&mut self, absolute_y: usize) -> bool {
         if absolute_y < self.history.len() {
-            let _ = self.history.remove(absolute_y);
+            if let Some(line) = self.history.remove(absolute_y) {
+                self.history_content_bytes = self
+                    .history_content_bytes
+                    .saturating_sub(history_line_content_bytes(&line));
+            }
             self.reflow_history_capacity = self.reflow_history_capacity.saturating_sub(1);
             self.hscrolled = self.hscrolled.min(self.history.len());
             return true;
@@ -283,6 +329,7 @@ impl Grid {
         while self.history.len() > self.effective_history_capacity() {
             let _ = self.history.pop_front();
         }
+        self.recompute_history_content_bytes();
         self.visible = visible.into();
         self.hscrolled = self.history.len();
         true
@@ -295,9 +342,18 @@ impl Grid {
             .map(|line| line.flags.contains(GridLineFlags::WRAPPED))
     }
 
+    /// Returns the columns a pre-wrapped wide glyph left unused at the end of
+    /// the absolute line.
+    #[must_use]
+    pub fn absolute_line_trailing_reflow_gap(&self, absolute_y: usize) -> Option<u32> {
+        self.absolute_line(absolute_y)
+            .map(GridLine::trailing_reflow_gap)
+    }
+
     /// Clears every history row.
     pub fn clear_history(&mut self) {
         self.history.clear();
+        self.history_content_bytes = 0;
         self.reflow_history_capacity = 0;
         self.hscrolled = 0;
     }
@@ -399,10 +455,25 @@ impl Grid {
         let mut pending = String::new();
 
         for line in self.history.iter().chain(self.visible.iter()) {
-            let rendered = line.render_text();
+            let wrapped = line.flags.contains(GridLineFlags::WRAPPED);
+            let rendered = if join_wrapped {
+                line.render_with_options(
+                    self.sx as usize,
+                    GridRenderOptions {
+                        join_wrapped: true,
+                        include_empty_cells: false,
+                        trim_spaces: false,
+                        ..GridRenderOptions::default()
+                    },
+                    &mut GridStringState::default(),
+                    None,
+                )
+            } else {
+                line.render_text()
+            };
             if join_wrapped {
                 pending.push_str(&rendered);
-                if !line.flags.contains(GridLineFlags::WRAPPED) {
+                if !wrapped {
                     lines.push(std::mem::take(&mut pending));
                 }
                 continue;
@@ -429,6 +500,20 @@ impl Grid {
     ) -> Option<String> {
         self.absolute_line(absolute_y)
             .map(|line| line.render_with_options(self.sx as usize, options, state, hyperlinks))
+    }
+
+    /// Renders one absolute line and reports the columns it paints.
+    #[must_use]
+    pub fn render_absolute_line_measured(
+        &self,
+        absolute_y: usize,
+        options: GridRenderOptions,
+        state: &mut GridStringState,
+        hyperlinks: Option<&Hyperlinks>,
+    ) -> Option<(String, RenderedLineSpan)> {
+        self.absolute_line(absolute_y).map(|line| {
+            line.render_with_options_measured(self.sx as usize, options, state, hyperlinks)
+        })
     }
 
     pub fn append_rendered_absolute_line(
@@ -467,17 +552,52 @@ impl Grid {
 
     /// Returns the retained history size in bytes including newlines.
     #[must_use]
-    pub fn history_byte_size(&self) -> usize {
-        self.history
-            .iter()
-            .map(|line| line.render_text().len() + 1)
-            .sum()
+    pub const fn history_byte_size(&self) -> usize {
+        self.history_content_bytes
     }
 
     /// Captures only the visible rows.
     #[must_use]
     pub fn visible_lines(&self) -> Vec<GridLine> {
         self.visible.iter().cloned().collect()
+    }
+
+    pub(crate) fn clone_recovery_projection(&self, max_history_bytes: usize) -> Self {
+        let mut remaining = max_history_bytes;
+        let mut start = self.history.len();
+        while start > 0 {
+            let group_start = self.logical_start_y(start - 1);
+            let group_bytes = self
+                .history
+                .range(group_start..start)
+                .map(GridLine::recovery_clone_bytes)
+                .fold(0_usize, usize::saturating_add);
+            if group_bytes > remaining {
+                break;
+            }
+            remaining -= group_bytes;
+            start = group_start;
+        }
+
+        let retained = self
+            .history
+            .range(start..)
+            .cloned()
+            .collect::<VecDeque<_>>();
+        let history_content_bytes = retained.iter().map(history_line_content_bytes).sum();
+        Self {
+            sx: self.sx,
+            sy: self.sy,
+            hlimit: retained.len(),
+            reflow_history_capacity: 0,
+            hscrolled: retained.len(),
+            history_enabled: self.history_enabled,
+            history_stamp: self.history_stamp,
+            history_stamp_remaining: self.history_stamp_remaining,
+            history: retained,
+            history_content_bytes,
+            visible: self.visible.clone(),
+        }
     }
 
     pub(crate) fn scroll_region_up(
@@ -491,6 +611,14 @@ impl Grid {
             return;
         }
 
+        let moved_lines = lower.saturating_sub(upper);
+        if !(to_history && self.history_enabled) {
+            self.prepare_wrapped_line_move(upper, upper.saturating_add(1), moved_lines);
+        }
+        self.scroll_region_up_one(upper, lower, bg, to_history);
+    }
+
+    fn scroll_region_up_one(&mut self, upper: u32, lower: u32, bg: Colour, to_history: bool) {
         let upper = upper as usize;
         let lower = lower as usize;
         if upper == 0 && lower + 1 == self.visible.len() {
@@ -529,6 +657,12 @@ impl Grid {
             return;
         }
 
+        let moved_lines = lower.saturating_sub(upper);
+        self.prepare_wrapped_line_move(upper.saturating_add(1), upper, moved_lines);
+        self.scroll_region_down_one(upper, lower, bg);
+    }
+
+    fn scroll_region_down_one(&mut self, upper: u32, lower: u32, bg: Colour) {
         let upper = upper as usize;
         let lower = lower as usize;
         if upper == 0 && lower + 1 == self.visible.len() {
@@ -543,6 +677,42 @@ impl Grid {
         let visible = self.visible.make_contiguous();
         visible[upper..=lower].rotate_right(1);
         visible[upper].clear(bg);
+    }
+
+    pub(crate) fn insert_lines(&mut self, upper: u32, lower: u32, count: u32, bg: Colour) {
+        if !self.valid_region(upper, lower) {
+            return;
+        }
+        let region_lines = lower.saturating_sub(upper).saturating_add(1);
+        let count = count.max(1).min(region_lines);
+        let moved_lines = region_lines.saturating_sub(count);
+        if moved_lines == 0 {
+            self.break_wrap_before_visible_line(upper);
+        } else {
+            self.prepare_wrapped_line_move(upper.saturating_add(count), upper, moved_lines);
+        }
+        for _ in 0..count {
+            self.scroll_region_down_one(upper, lower, bg);
+        }
+        // tmux follows the move with a full-line clear starting after the
+        // moved range. That clear also breaks WRAPPED immediately before its
+        // start, even when its unsigned row count describes an empty range.
+        if count != moved_lines {
+            self.break_wrap_before_visible_line(upper.saturating_add(moved_lines));
+        }
+    }
+
+    /// Mirrors tmux's `grid_move_lines` wrap-boundary maintenance without
+    /// coupling raw row storage to tmux's allocation strategy.
+    fn prepare_wrapped_line_move(&mut self, destination: u32, source: u32, count: u32) {
+        if count == 0 || source == destination {
+            return;
+        }
+        self.break_wrap_before_visible_line(destination);
+        let destination_end = destination.saturating_add(count);
+        if source < destination || source >= destination_end {
+            self.break_wrap_before_visible_line(source);
+        }
     }
 
     pub(crate) fn logical_cursor(
@@ -608,6 +778,7 @@ impl Grid {
                 line.resize_width_preserving_wrap(sx, bg);
             }
             self.sx = sx;
+            self.recompute_history_content_bytes();
             return self.locate_cursor_from_logical(cursor);
         }
 
@@ -653,6 +824,7 @@ impl Grid {
             line.resize_width_preserving_wrap(sx, bg);
         }
         self.history = compacted_history(reflowed);
+        self.recompute_history_content_bytes();
         self.reflow_history_capacity = if self.history.len() > self.hlimit {
             self.history.len()
         } else {
@@ -712,7 +884,7 @@ impl Grid {
             if self.history_enabled && pull > 0 {
                 let mut restored = Vec::with_capacity(pull as usize);
                 for _ in 0..pull {
-                    if let Some(line) = self.history.pop_back() {
+                    if let Some(line) = self.pop_history_back() {
                         restored.push(line);
                     }
                 }
@@ -859,10 +1031,33 @@ impl Grid {
         line.stamp_for_history_at(self.next_history_stamp());
         line.compact_for_history();
         if self.history.len() >= history_capacity {
-            let _ = self.history.pop_front();
+            let _ = self.pop_history_front();
         }
+        self.history_content_bytes = self
+            .history_content_bytes
+            .saturating_add(history_line_content_bytes(&line));
         self.history.push_back(line);
         self.hscrolled = (self.hscrolled + 1).min(self.history.len());
+    }
+
+    fn pop_history_front(&mut self) -> Option<GridLine> {
+        let line = self.history.pop_front()?;
+        self.history_content_bytes = self
+            .history_content_bytes
+            .saturating_sub(history_line_content_bytes(&line));
+        Some(line)
+    }
+
+    fn pop_history_back(&mut self) -> Option<GridLine> {
+        let line = self.history.pop_back()?;
+        self.history_content_bytes = self
+            .history_content_bytes
+            .saturating_sub(history_line_content_bytes(&line));
+        Some(line)
+    }
+
+    fn recompute_history_content_bytes(&mut self) {
+        self.history_content_bytes = self.history.iter().map(history_line_content_bytes).sum();
     }
 
     fn next_history_stamp(&mut self) -> i64 {
@@ -873,6 +1068,10 @@ impl Grid {
         self.history_stamp_remaining = self.history_stamp_remaining.saturating_sub(1);
         self.history_stamp
     }
+}
+
+fn history_line_content_bytes(line: &GridLine) -> usize {
+    line.rendered_text_len().saturating_add(1)
 }
 
 fn compacted_history(lines: Vec<GridLine>) -> VecDeque<GridLine> {

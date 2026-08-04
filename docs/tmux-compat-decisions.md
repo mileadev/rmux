@@ -1,8 +1,10 @@
 # tmux Compatibility Decisions
 
-This document is the source of truth for tmux compatibility decisions in RMUX.
-A compatibility claim is accepted only after a current head-to-head probe against
-tmux and the current RMUX tree.
+This document explains the human-readable tmux compatibility policy in RMUX.
+The structured source of truth for accepted product divergences is
+`tests/reference/tmux_compat/divergences.toml`. A compatibility claim is
+accepted only after a current head-to-head probe against tmux and the current
+RMUX tree.
 
 Compatibility status values:
 
@@ -33,7 +35,7 @@ Compatibility status values:
 | `join-pane -d -s <only-pane> -t target` moves the pane and removes the empty source session | `ISO required` | Fixed in the current working tree; covered by core and PTY integration tests | Rust unit/integration tests |
 | `split-window -d -t <non-active-pane>` does not change the active pane | `ISO required` | Fixed in the current working tree; detached split restores the previously active pane | Rust integration test |
 | tmux regex-compatible wording for no-server errors | `Deferred` | Mostly aligned for reviewed paths, but wording should be probed per command before claiming byte-level compatibility | release-review smokes plus targeted probes |
-| tmux quirks that expose undefined state or unsafe behavior | `Do not copy tmux bug` | No standing entries yet; add a row with the exact tmux version and reproduction before relying on this status | document only |
+| tmux quirks that lose data, violate caller intent, expose unsafe behavior, or hang | `Do not copy tmux bug` | Standing cases are registered in the structured ledger, including C-D78 through C-D84 | ledger entry, tracked regression, and tmux 3.7b oracle evidence |
 
 ## CI Policy
 

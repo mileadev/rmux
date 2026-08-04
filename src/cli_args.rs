@@ -36,7 +36,7 @@ pub(crate) use config::{
 };
 #[path = "cli_args/control.rs"]
 mod control;
-use control::render_control_command_lines;
+use control::initial_control_command_lines;
 #[path = "cli_args/automation.rs"]
 mod automation;
 pub(crate) use automation::{
@@ -85,7 +85,7 @@ use pane::{
 pub(crate) use pane::{
     BreakPaneArgs, ClockModeArgs, CopyModeArgs, DisplayPanesArgs, JoinPaneArgs, LastPaneArgs,
     ListPanesArgs, PaneTargetArgs, PipePaneArgs, ResizePaneArgs, ResizePaneSize, RespawnPaneArgs,
-    SelectLayoutArgs, SelectPaneArgs, SplitWindowArgs, SwapPaneArgs,
+    SelectLayoutArgs, SelectLayoutMode, SelectPaneArgs, SplitWindowArgs, SwapPaneArgs,
 };
 #[path = "cli_args/session.rs"]
 mod session;
@@ -417,7 +417,7 @@ struct RawCli {
 impl Cli {
     fn from_raw_control(raw: RawCli) -> Result<Self, clap::Error> {
         let explicit_command_args = !raw.command.is_empty();
-        let control_command_lines = render_control_command_lines(&raw.command)?;
+        let control_command_lines = initial_control_command_lines(&raw.command)?;
         let command_queue = explicit_command_args
             .then_some(Command::Noop)
             .into_iter()
@@ -440,7 +440,7 @@ impl Cli {
         let control_command_lines = if raw.control_mode == 0 {
             Vec::new()
         } else {
-            render_control_command_lines(&raw.command)?
+            initial_control_command_lines(&raw.command)?
         };
         let runtime_assignments = apply_runtime_assignments
             .then(|| parsed_commands.assignments_to_tmux_reparse_string())

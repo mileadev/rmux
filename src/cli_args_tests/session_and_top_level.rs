@@ -102,6 +102,20 @@ fn command_free_invocation_leaves_command_for_default_client_command() {
     let cli = parse_args(&[]).unwrap();
 
     assert!(cli.command.is_none());
+    assert!(cli.control_command_lines().is_empty());
+}
+
+#[test]
+fn command_free_control_mode_queues_default_new_session_without_explicit_marker() {
+    for control_flag in ["-C", "-CC"] {
+        let cli = parse_args(&[control_flag]).unwrap();
+
+        assert_eq!(cli.control_command_lines(), &["new-session".to_owned()]);
+        assert!(
+            cli.command.is_none(),
+            "the implicit control command must not look like explicit argv"
+        );
+    }
 }
 
 #[test]

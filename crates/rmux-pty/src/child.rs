@@ -227,6 +227,18 @@ impl PtyChild {
         }
     }
 
+    /// Waits until the Windows pane leader and every job-scoped descendant exit.
+    #[cfg(windows)]
+    pub fn wait_for_process_tree_exit(&mut self) -> Result<ExitStatus> {
+        backend::wait_child_process_tree(&mut self.child)
+    }
+
+    /// Observes Windows process-tree exit without blocking.
+    #[cfg(windows)]
+    pub fn try_wait_for_process_tree_exit(&mut self) -> Result<Option<ExitStatus>> {
+        backend::try_wait_child_process_tree(&mut self.child)
+    }
+
     /// Clones a wait-only handle without retaining the Windows Job Object.
     ///
     /// Popup teardown relies on dropping the owning child to close the last
@@ -240,7 +252,7 @@ impl PtyChild {
     }
 
     /// Clones the process, ConPTY, and Windows Job Object handles needed by a
-    /// pane exit watcher to terminate surviving descendants before close.
+    /// pane exit watcher to observe the complete process tree before close.
     #[cfg(windows)]
     pub fn try_clone_for_exit_teardown(&self) -> Result<Self> {
         Ok(Self {
@@ -252,9 +264,9 @@ impl PtyChild {
     /// Closes the backing ConPTY after the child has exited.
     ///
     /// Windows keeps the ConPTY output pipe alive while the pseudo console is
-    /// open. The server's exit watcher calls this after `wait()` so the output
-    /// reader observes EOF instead of blocking indefinitely on an already-dead
-    /// child process.
+    /// open. The server's exit watcher calls this after the entire pane process
+    /// tree exits so the output reader observes EOF without destroying a live
+    /// descendant that still owns the console.
     #[cfg(windows)]
     pub fn close_pseudoconsole(&self) {
         backend::close_child_pseudoconsole(&self.child);

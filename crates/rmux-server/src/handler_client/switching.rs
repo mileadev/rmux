@@ -20,9 +20,9 @@ use crate::pane_terminals::{session_not_found, HandlerState};
 use super::super::{
     active_session_target,
     attach_support::{
-        AttachedSwitchCommitOutcome, AttachedSwitchCommitRequest, AttachedSwitchCommittedTarget,
+        ActiveAttachIdentity, AttachedSwitchCommitRequest, AttachedSwitchCommittedTarget,
     },
-    attached_client_matches_target, client_environment_snapshot,
+    attached_client_matches_target, client_environment_snapshot, control_client_target_pid,
     control_support::{current_control_queue_identity, ManagedClient},
     normalize_target_client, parse_session_sort_order, switch_client_target_find_type,
     switch_target_selector_count, with_visible_pane_bases, RequestHandler, SessionSortOrder,
@@ -179,10 +179,7 @@ impl SwitchTargetSelection {
                 }
                 Ok(())
             }
-        }?;
-        let selected_size = session.window().size();
-        session.resize_active_window_terminal(selected_size);
-        Ok(())
+        }
     }
 }
 
@@ -470,6 +467,39 @@ impl RequestHandler {
             }
             Err(error) => return Response::Error(ErrorResponse { error }),
         };
+        self.handle_switch_client_ext3_for_managed_client(requester_pid, client, request)
+            .await
+    }
+
+    pub(in crate::handler) async fn handle_switch_client_ext3_for_attach_identity(
+        &self,
+        identity: ActiveAttachIdentity,
+        request: SwitchClientExt3Request,
+    ) -> Response {
+        if request.target_client.is_some() {
+            return Response::Error(ErrorResponse {
+                error: RmuxError::Server(
+                    "identity-bound switch-client does not accept -c".to_owned(),
+                ),
+            });
+        }
+        let client = SwitchManagedClientIdentity::Attach {
+            pid: identity.attach_pid(),
+            attach_id: identity.attach_id(),
+        };
+        if let Err(error) = self.validate_switch_managed_client_identity(client).await {
+            return Response::Error(ErrorResponse { error });
+        }
+        self.handle_switch_client_ext3_for_managed_client(identity.attach_pid(), client, request)
+            .await
+    }
+
+    async fn handle_switch_client_ext3_for_managed_client(
+        &self,
+        requester_pid: u32,
+        client: SwitchManagedClientIdentity,
+        request: SwitchClientExt3Request,
+    ) -> Response {
         record_switch_client_target_identity(client);
         if switch_target_selector_count(&request) > 1 {
             return Response::Error(ErrorResponse {
@@ -863,7 +893,8 @@ impl RequestHandler {
                 active_attach.by_pid.get(&pid).map(|active| (pid, active))
             } else {
                 active_attach.by_pid.iter().find_map(|(&pid, active)| {
-                    attached_client_matches_target(pid, target_client).then_some((pid, active))
+                    attached_client_matches_target(&active.client_name, target_client)
+                        .then_some((pid, active))
                 })
             };
             if let Some((pid, active)) = matched {
@@ -873,7 +904,7 @@ impl RequestHandler {
                 });
             }
         }
-        if let Ok(pid) = target_client.parse::<u32>() {
+        if let Some(pid) = control_client_target_pid(target_client) {
             let active_control = self.active_control.lock().await;
             if let Some(active) = active_control.by_pid.get(&pid) {
                 if active.closing.load(Ordering::SeqCst) {
@@ -1069,28 +1100,35 @@ impl RequestHandler {
                     )
                     .await
                 {
-                    Ok(AttachedSwitchCommitOutcome {
-                        previous_session_name: _previous_session_name,
-                        committed_target,
-                    }) => {
-                        record_switch_client_committed_target(client, committed_target);
-                        self.emit_client_session_changed(
-                            attach_pid,
+                    Ok(outcome) => {
+                        record_switch_client_committed_target(
+                            client,
+                            outcome.committed_target.clone(),
+                        );
+                        self.finish_attached_session_switch(
+                            outcome,
                             session_name.clone(),
                             session_id,
                         )
                         .await;
                         Response::SwitchClient(SwitchClientResponse { session_name })
                     }
-                    Err(error) => Response::Error(ErrorResponse { error }),
+                    Err(failure) => {
+                        let error = self.finish_attached_switch_failure(failure).await;
+                        Response::Error(ErrorResponse { error })
+                    }
                 }
             }
             SwitchManagedClientIdentity::Control {
                 pid: control_pid,
                 control_id,
             } => {
+                // The commit publishes `client-session-changed` itself, before
+                // the geometry reconciles it triggers, because tmux 3.7b
+                // reports the client move before the `%layout-change` lines it
+                // causes.
                 match self
-                    .set_control_session_for_client_identity(
+                    .switch_control_session_for_client_identity(
                         control_pid,
                         control_id,
                         session_name.clone(),
@@ -1101,12 +1139,6 @@ impl RequestHandler {
                     .await
                 {
                     Ok(_previous_session_name) => {
-                        self.emit_client_session_changed(
-                            control_pid,
-                            session_name.clone(),
-                            session_id,
-                        )
-                        .await;
                         Response::SwitchClient(SwitchClientResponse { session_name })
                     }
                     Err(error) => Response::Error(ErrorResponse { error }),
@@ -1439,6 +1471,13 @@ mod tests {
         SessionName::new(value).expect("valid session name")
     }
 
+    const fn content_size_for_default_status(terminal_size: TerminalSize) -> TerminalSize {
+        TerminalSize {
+            cols: terminal_size.cols,
+            rows: terminal_size.rows.saturating_sub(1),
+        }
+    }
+
     fn drain_control_events(
         events: &mut mpsc::Receiver<ControlServerEvent>,
     ) -> Vec<ControlServerEvent> {
@@ -1569,7 +1608,7 @@ mod tests {
         state
             .mutate_session_and_resize_window_terminal(session_name, window_index, |session| {
                 if session.active_window_index() == window_index {
-                    session.resize_active_window_terminal(size);
+                    session.resize_active_window_geometry(size, size);
                     Ok(())
                 } else {
                     session.resize_window(window_index, size)
@@ -1604,13 +1643,12 @@ mod tests {
         size: TerminalSize,
     ) {
         let mut active_attach = handler.active_attach.lock().await;
-        let size_sequence = active_attach.next_size_sequence;
-        active_attach.next_size_sequence = size_sequence.saturating_add(1);
+        let size_sequence = handler.next_client_size_sequence();
         let active = active_attach
             .by_pid
             .get_mut(&attach_pid)
             .expect("test attached client exists");
-        active.client_size = size;
+        active.set_declared_client_size(size);
         active.size_sequence = size_sequence;
         drop(active_attach);
         handler.bump_active_attach_epoch();
@@ -1796,7 +1834,7 @@ mod tests {
             .by_pid
             .get_mut(&attach_pid)
             .expect("attach exists")
-            .client_size = client_size;
+            .set_declared_client_size(client_size);
         let pause = install_switch_target_identity_pause(beta.clone());
 
         let switch_handler = handler.clone();
@@ -2282,7 +2320,7 @@ mod tests {
                     .window_at(beta_window)
                     .expect("selected target survives")
                     .size(),
-                TARGET_CLIENT_SIZE,
+                content_size_for_default_status(TARGET_CLIENT_SIZE),
                 "the target's smallest policy must choose the existing target client over the larger incoming client"
             );
             assert_eq!(
@@ -2297,11 +2335,10 @@ mod tests {
             "the old active PTY must remain untouched"
         );
         let target_pty_size = test_pane_terminal_size(&handler, &beta, beta_window).await;
-        assert_eq!(target_pty_size.cols, TARGET_CLIENT_SIZE.cols);
-        assert!(
-            target_pty_size.rows == TARGET_CLIENT_SIZE.rows
-                || target_pty_size.rows == TARGET_CLIENT_SIZE.rows.saturating_sub(1),
-            "the selected target PTY follows its reconciled geometry: {target_pty_size:?}"
+        assert_eq!(
+            target_pty_size,
+            content_size_for_default_status(TARGET_CLIENT_SIZE),
+            "the selected target PTY follows its reconciled content geometry"
         );
     }
 

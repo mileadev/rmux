@@ -5,13 +5,14 @@ use rmux_core::{
     SessionStore, TargetFindContext, TargetFindFlags, TargetFindType, UnresolvedTarget,
 };
 use rmux_proto::{
-    CapturePaneRequest, ClearHistoryRequest, DisplayMessageExtRequest, DisplayMessageRequest,
-    PaneTarget, Request, RmuxError, ShowMessagesRequest, Target,
+    CapturePaneRequest, ClearHistoryRequest, DisplayMessageDurationMillis,
+    DisplayMessageExtRequest, DisplayMessageRequest, PaneTarget, Request, RmuxError,
+    ShowMessagesRequest, Target,
 };
 
 use super::targets::implicit_pane_target;
 use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
-use super::values::unsupported_flag;
+use super::values::{reject_unknown_option_before_positional, unsupported_flag};
 use super::{parse_pane_target, parse_target_arg};
 
 pub(super) fn parse_capture_pane(
@@ -168,6 +169,8 @@ pub(super) fn parse_display_message(args: CommandTokens) -> Result<Request, Rmux
         parsed.message,
         parsed.target_client,
         false,
+        parsed.duration_ms,
+        parsed.ignore_input,
     ))
 }
 
@@ -198,6 +201,8 @@ pub(super) fn parse_queued_display_message(
         parsed.message,
         parsed.target_client,
         empty_target_context,
+        parsed.duration_ms,
+        parsed.ignore_input,
     ))
 }
 
@@ -222,6 +227,8 @@ struct ParsedDisplayMessageArgs {
     print: bool,
     stdin: bool,
     message: Option<String>,
+    duration_ms: Option<DisplayMessageDurationMillis>,
+    ignore_input: bool,
 }
 
 fn parse_display_message_args(
@@ -235,6 +242,8 @@ fn parse_display_message_args(
     let mut all_formats = false;
     let mut no_expand = false;
     let mut message = None;
+    let mut duration_ms = None;
+    let mut ignore_input = false;
 
     while let Some(token) = args.peek() {
         match token {
@@ -256,14 +265,20 @@ fn parse_display_message_args(
                 target_client = Some(args.required("-c target-client")?);
             }
             "-d" => {
-                return Err(unsupported_flag("display-message", "-d"));
+                let _ = args.optional();
+                duration_ms = Some(parse_display_message_duration(&args.required("-d delay")?)?);
             }
             flag if flag.starts_with("-d") && flag.len() > 2 => {
-                return Err(unsupported_flag("display-message", "-d"));
+                let value = flag[2..].to_owned();
+                let _ = args.optional();
+                duration_ms = Some(parse_display_message_duration(&value)?);
             }
-            flag if is_display_message_compact_cluster(flag) => {
-                let cluster = parse_compact_flag_cluster(flag, "aCIlNpv", "cdFt")
-                    .expect("display-message compact cluster was prevalidated");
+            flag if flag.starts_with('-') && flag.len() > 2 => {
+                let Some(cluster) =
+                    parse_compact_flag_cluster("display-message", flag, "aCIlNpv", "cdFt")?
+                else {
+                    unreachable!("multi-character display-message flag must be a cluster");
+                };
                 let _ = args
                     .optional()
                     .expect("peeked display-message flag must still exist");
@@ -277,7 +292,7 @@ fn parse_display_message_args(
                         CompactFlag::Bare('I') => stdin = true,
                         CompactFlag::Bare('l') => no_expand = true,
                         CompactFlag::Bare('N') => {
-                            return Err(unsupported_flag("display-message", "-N"));
+                            ignore_input = true;
                         }
                         CompactFlag::Bare('p') => print = true,
                         CompactFlag::Bare('v') => verbose = true,
@@ -291,8 +306,10 @@ fn parse_display_message_args(
                             target_client =
                                 Some(compact_flag.value_or_next(&mut args, "-c target-client")?);
                         }
-                        CompactFlag::Value { flag: 'd', .. } => {
-                            return Err(unsupported_flag("display-message", "-d"));
+                        compact_flag @ CompactFlag::Value { flag: 'd', .. } => {
+                            duration_ms = Some(parse_display_message_duration(
+                                &compact_flag.value_or_next(&mut args, "-d delay")?,
+                            )?);
                         }
                         compact_flag @ CompactFlag::Value { flag: 't', .. } => {
                             target = Some(compact_flag.value_or_next(&mut args, "-t target")?);
@@ -311,7 +328,8 @@ fn parse_display_message_args(
                 let _ = args.optional();
             }
             "-N" => {
-                return Err(unsupported_flag("display-message", "-N"));
+                let _ = args.optional();
+                ignore_input = true;
             }
             "-v" => {
                 let _ = args.optional();
@@ -329,7 +347,10 @@ fn parse_display_message_args(
                 let _ = args.optional();
                 target = Some(args.required("-t target")?)
             }
-            _ => break,
+            token => {
+                reject_unknown_option_before_positional("display-message", token)?;
+                break;
+            }
         }
     }
 
@@ -369,6 +390,8 @@ fn parse_display_message_args(
         print,
         stdin,
         message,
+        duration_ms,
+        ignore_input,
     })
 }
 
@@ -488,14 +511,18 @@ fn display_message_request(
     message: Option<String>,
     target_client: Option<String>,
     empty_target_context: bool,
+    duration_ms: Option<DisplayMessageDurationMillis>,
+    ignore_input: bool,
 ) -> Request {
-    if target_client.is_some() {
+    if target_client.is_some() || duration_ms.is_some() || ignore_input {
         return Request::DisplayMessageExt(Box::new(DisplayMessageExtRequest {
             target,
             print,
             message,
             target_client,
             empty_target_context,
+            duration_ms,
+            ignore_input,
         }));
     }
 
@@ -505,6 +532,14 @@ fn display_message_request(
         message,
         empty_target_context,
     })
+}
+
+fn parse_display_message_duration(value: &str) -> Result<DisplayMessageDurationMillis, RmuxError> {
+    value
+        .parse()
+        .map_err(|error: rmux_proto::DisplayMessageDurationParseError| {
+            RmuxError::Message(error.to_string())
+        })
 }
 
 fn literal_display_message_template(value: &str) -> String {
@@ -567,10 +602,6 @@ fn verbose_token_is_simple_variable(token: &str) -> bool {
         && token
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-}
-
-fn is_display_message_compact_cluster(flag: &str) -> bool {
-    parse_compact_flag_cluster(flag, "aCIlNpv", "cdFt").is_some()
 }
 
 fn display_all_formats_template() -> String {

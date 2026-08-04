@@ -82,7 +82,7 @@ impl PaneTerminal {
             return Ok(false);
         }
 
-        match self.child.try_wait()? {
+        match self.try_wait_for_terminal_exit()? {
             Some(status) => {
                 self.exit_status = Some(status);
                 Ok(false)
@@ -141,7 +141,7 @@ impl PaneTerminal {
     fn wait_for_exit(&mut self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
-            match self.child.try_wait() {
+            match self.try_wait_for_terminal_exit() {
                 Ok(Some(status)) => {
                     self.exit_status = Some(status);
                     return true;
@@ -155,6 +155,18 @@ impl PaneTerminal {
                 return false;
             }
             std::thread::sleep(TERMINATION_POLL_INTERVAL.min(deadline - now));
+        }
+    }
+
+    fn try_wait_for_terminal_exit(&mut self) -> rmux_pty::Result<Option<ExitStatus>> {
+        #[cfg(windows)]
+        {
+            self.child.try_wait_for_process_tree_exit()
+        }
+
+        #[cfg(not(windows))]
+        {
+            self.child.try_wait()
         }
     }
 }

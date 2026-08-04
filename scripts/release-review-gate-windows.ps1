@@ -3,32 +3,37 @@ param(
     [string]$TargetDir = "target\release-review-gate-windows-cargo",
     [switch]$SkipPackage,
     [switch]$SkipClippy,
-    [switch]$RunCtrlMatrixSmoke
+    [switch]$RunCtrlMatrixSmoke,
+    [switch]$EndpointSmokeOnly
 )
 
 $ErrorActionPreference = "Stop"
 
+$env:RUST_MIN_STACK = "8388608"
+$env:RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB = "1"
 $env:CARGO_TARGET_DIR = $TargetDir
-if (-not $env:CARGO_INCREMENTAL) {
-    $env:CARGO_INCREMENTAL = "0"
-}
-if (-not $env:CARGO_BUILD_JOBS) {
-    $env:CARGO_BUILD_JOBS = "1"
-}
-if (-not $env:CARGO_PROFILE_DEV_DEBUG) {
-    $env:CARGO_PROFILE_DEV_DEBUG = "0"
-}
-if (-not $env:CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG) {
-    $env:CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG = "0"
-}
-if (-not $env:CARGO_PROFILE_TEST_DEBUG) {
-    $env:CARGO_PROFILE_TEST_DEBUG = "0"
-}
-$pdbSuppressFlag = "-Clink-arg=/DEBUG:NONE"
-if (-not $env:RUSTFLAGS) {
-    $env:RUSTFLAGS = $pdbSuppressFlag
-} elseif ($env:RUSTFLAGS -notlike "*$pdbSuppressFlag*") {
-    $env:RUSTFLAGS = "$env:RUSTFLAGS $pdbSuppressFlag"
+if (-not $EndpointSmokeOnly) {
+    if (-not $env:CARGO_INCREMENTAL) {
+        $env:CARGO_INCREMENTAL = "0"
+    }
+    if (-not $env:CARGO_BUILD_JOBS) {
+        $env:CARGO_BUILD_JOBS = "1"
+    }
+    if (-not $env:CARGO_PROFILE_DEV_DEBUG) {
+        $env:CARGO_PROFILE_DEV_DEBUG = "0"
+    }
+    if (-not $env:CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG) {
+        $env:CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG = "0"
+    }
+    if (-not $env:CARGO_PROFILE_TEST_DEBUG) {
+        $env:CARGO_PROFILE_TEST_DEBUG = "0"
+    }
+    $pdbSuppressFlag = "-Clink-arg=/DEBUG:NONE"
+    if (-not $env:RUSTFLAGS) {
+        $env:RUSTFLAGS = $pdbSuppressFlag
+    } elseif ($env:RUSTFLAGS -notlike "*$pdbSuppressFlag*") {
+        $env:RUSTFLAGS = "$env:RUSTFLAGS $pdbSuppressFlag"
+    }
 }
 
 $assertCargoFilter = Join-Path $PSScriptRoot "assert-cargo-filter-nonempty.ps1"
@@ -200,6 +205,18 @@ function Check-WorktreeHygiene {
         $trackedArtifacts | ForEach-Object { Write-Error $_ }
         throw "tracked local deployment artifacts are forbidden"
     }
+    $macUser = "pingu" + "delfuego"
+    $linuxUser = "pi" + "ngu"
+    $personalPathPattern = "/Users/$macUser/|/home/$linuxUser/|[A-Za-z]:[\\/]Users[\\/]($linuxUser|$macUser)[\\/]"
+    $trackedPersonalPaths = @(& git grep -I -n -E $personalPathPattern -- .)
+    $grepExit = $LASTEXITCODE
+    if ($grepExit -gt 1) {
+        throw "git grep for tracked personal paths failed with exit code $grepExit"
+    }
+    if ($trackedPersonalPaths.Count -gt 0) {
+        $trackedPersonalPaths | ForEach-Object { Write-Error $_ }
+        throw "tracked personal filesystem paths are forbidden"
+    }
     $untrackedSockets = @(Git-LsFiles @("--others", "--exclude-standard") | Where-Object { $_ -match '\.(sock|socket)$' })
     if ($untrackedSockets.Count -gt 0) {
         $untrackedSockets | ForEach-Object { Write-Error $_ }
@@ -208,6 +225,23 @@ function Check-WorktreeHygiene {
     Write-Host "worktree-hygiene=ok"
 }
 
+function Invoke-WindowsEndpointSmoke {
+    Assert-CargoFilter 1 @("test", "-p", "rmux-ipc", "--locked", "--test", "named_pipe_integration")
+    Run "cargo" @("test", "-p", "rmux-ipc", "--locked", "--test", "named_pipe_integration", "--", "--test-threads=1")
+    Assert-CargoFilter 1 @("test", "-p", "rmux-client", "--locked", "--test", "windows_legacy_shutdown")
+    Run "cargo" @("test", "-p", "rmux-client", "--locked", "--test", "windows_legacy_shutdown", "--", "--test-threads=1")
+}
+
+if ($EndpointSmokeOnly) {
+    Step "Windows endpoint discovery and legacy shutdown" {
+        Invoke-WindowsEndpointSmoke
+    }
+    Write-Host ""
+    Write-Host "release-review-gate-windows=ok"
+    return
+}
+
+Step "release TOML reader self-test" { Run-PythonScript "scripts\toml_reader.py" @("--self-test") }
 Step "release versions" { Check-ReleaseVersions }
 Step "changelog release audit" { Run-PythonScript "scripts\check-changelog-release.py" @("CHANGELOG.md") }
 Step "tmux divergence ledger" { Run-PythonScript "scripts\check-tmux-release-ledger.py" }
@@ -218,6 +252,7 @@ Write-Host "cargo-build-jobs=$env:CARGO_BUILD_JOBS"
 Write-Host "cargo-profile-dev-debug=$env:CARGO_PROFILE_DEV_DEBUG"
 Write-Host "cargo-profile-dev-build-override-debug=$env:CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG"
 Write-Host "cargo-profile-test-debug=$env:CARGO_PROFILE_TEST_DEBUG"
+Write-Host "rust-min-stack=$env:RUST_MIN_STACK"
 Write-Host "rustflags=$env:RUSTFLAGS"
 Step "formatting" { Run "cargo" @("fmt", "--all", "--check") }
 Step "platform cfg budget" { Check-CfgBudgets }
@@ -240,6 +275,22 @@ Step "mutating target-action retry tests" {
 Step "server lib tests" {
     Run "cargo" @("test", "-p", "rmux-server", "--lib", "--locked", "--", "--test-threads=1")
 }
+Step "independent xterm.js recovery oracle" {
+    $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
+    if (-not $npm) {
+        throw "npm.cmd is required for the pinned independent xterm.js recovery oracle"
+    }
+    Assert-CargoFilter 1 @(
+        "test", "-p", "rmux-server", "--lib", "--locked",
+        "pane_recovery::tests::keyframes_converge_in_independent_xterm_oracle"
+    )
+    Run $npm.Source @("--prefix", "tests\xterm-oracle", "ci", "--ignore-scripts", "--no-audit", "--no-fund")
+    Run "cargo" @(
+        "test", "-p", "rmux-server", "--lib", "--locked",
+        "pane_recovery::tests::keyframes_converge_in_independent_xterm_oracle",
+        "--", "--ignored", "--exact", "--test-threads=1"
+    )
+}
 Step "SDK lib tests" {
     Run "cargo" @("test", "-p", "rmux-sdk", "--lib", "--locked", "--", "--test-threads=1")
 }
@@ -259,6 +310,9 @@ Step "Windows attach stream queue regressions" {
     Run "cargo" @("test", "-p", "rmux-client", "--locked", "blocked_console_output_does_not_block_input_forwarding", "--", "--test-threads=1")
     Assert-CargoFilter 1 @("test", "-p", "rmux-client", "--locked", "output_backpressure_keeps_local_input_and_resize_live")
     Run "cargo" @("test", "-p", "rmux-client", "--locked", "output_backpressure_keeps_local_input_and_resize_live", "--", "--test-threads=1")
+}
+Step "Windows endpoint discovery and legacy shutdown" {
+    Invoke-WindowsEndpointSmoke
 }
 Step "Windows CLI queue formats" {
     Assert-CargoFilter 1 @("test", "-p", "rmux", "--locked", "--test", "windows_cli_queue_formats")

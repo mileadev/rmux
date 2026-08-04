@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
+use rmux_ipc::PeerIdentity;
 use rmux_proto::{OptionName, RmuxError};
 use tokio::sync::watch;
 
@@ -10,9 +11,13 @@ use crate::diagnostic_log::{record_shutdown_queued, record_shutdown_request};
 use crate::server_access::{AccessMode, ServerAccessAdmission};
 
 use super::{
-    DetachedRequesterAccess, DetachedRequesterAuthority, PendingShutdownReason, RequestHandler,
-    RequesterOrigin,
+    DetachedRequesterAccess, DetachedRequesterAuthority, DetachedRequesterScope,
+    PendingShutdownReason, RequestHandler, RequesterOrigin,
 };
+
+#[path = "handler_shutdown/retry.rs"]
+mod retry;
+pub(in crate::handler) use retry::ShutdownRetryState;
 
 const SHUTDOWN_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
@@ -115,14 +120,41 @@ impl RequestHandler {
         }
     }
 
+    /// A requester scope carrying an admission but no authenticated peer.
+    ///
+    /// Every production connection now opens its scope through
+    /// [`Self::begin_authenticated_peer_access`], which carries the peer the OS
+    /// authenticated (issue #182); this remains only for the tests that drive a
+    /// requester scope without a connection behind it.
+    #[cfg(test)]
     pub(crate) fn begin_detached_requester_access(
         &self,
         requester_pid: u32,
         admission: ServerAccessAdmission,
     ) -> DetachedRequesterAccessGuard {
-        self.begin_detached_requester_authority(
+        self.begin_detached_requester_scope(
             requester_pid,
-            DetachedRequesterAuthority::Admission(admission),
+            DetachedRequesterScope::new(DetachedRequesterAuthority::Admission(admission), None),
+        )
+    }
+
+    /// Opens the scope a connection loop runs one dispatched request under,
+    /// carrying the local peer the OS authenticated for that connection.
+    ///
+    /// An attach frame is rendered before the listener registers the client,
+    /// so this is how that render reaches the same `#{client_uid}` /
+    /// `#{client_user}` the registration then stores (issue #182).
+    pub(crate) fn begin_authenticated_peer_access(
+        &self,
+        peer: &PeerIdentity,
+        admission: ServerAccessAdmission,
+    ) -> DetachedRequesterAccessGuard {
+        self.begin_detached_requester_scope(
+            peer.pid,
+            DetachedRequesterScope::new(
+                DetachedRequesterAuthority::Admission(admission),
+                Some(peer.clone()),
+            ),
         )
     }
 
@@ -131,14 +163,24 @@ impl RequestHandler {
         requester_pid: u32,
     ) -> DetachedRequesterAccessGuard {
         let authority = self.requester_detached_authority(requester_pid).await;
-        self.begin_detached_requester_authority(requester_pid, authority)
+        // A nested scope inherits the peer with the authority, so running a
+        // hook or a shell under an authenticated connection does not turn its
+        // own requester identity ambiguous.
+        let peer = self.authenticated_requester_peer(requester_pid);
+        self.begin_detached_requester_scope(
+            requester_pid,
+            DetachedRequesterScope::new(authority, peer),
+        )
     }
 
     pub(in crate::handler) fn begin_requester_origin_access(
         &self,
         origin: &RequesterOrigin,
     ) -> DetachedRequesterAccessGuard {
-        self.begin_detached_requester_authority(origin.requester_pid, origin.authority.clone())
+        self.begin_detached_requester_scope(
+            origin.requester_pid,
+            DetachedRequesterScope::new(origin.authority.clone(), None),
+        )
     }
 
     pub(in crate::handler) async fn require_requester_origin_write(
@@ -176,20 +218,20 @@ impl RequestHandler {
         self.begin_detached_requester_access(requester_pid, admission)
     }
 
-    fn begin_detached_requester_authority(
+    fn begin_detached_requester_scope(
         &self,
         requester_pid: u32,
-        authority: DetachedRequesterAuthority,
+        scope: DetachedRequesterScope,
     ) -> DetachedRequesterAccessGuard {
         let mut access = self
             .active_detached_requester_access
             .lock()
             .expect("active detached requester access mutex must not be poisoned");
         let entry = access.entry(requester_pid).or_default();
-        entry.scopes.push(authority.clone());
+        entry.scopes.push(scope.clone());
         DetachedRequesterAccessGuard {
             requester_pid,
-            authority,
+            scope,
             active_detached_requester_access: self.active_detached_requester_access.clone(),
         }
     }
@@ -224,12 +266,20 @@ impl RequestHandler {
             .lock()
             .expect("shutdown reason mutex must not be poisoned");
         let force_shutdown = matches!(reason, Some(PendingShutdownReason::KillServer));
+        let mut idle_exclusion_evaluation = None;
         if let Some(
             reason
             @ (PendingShutdownReason::ExitEmpty | PendingShutdownReason::SeamlessUpgradeIdle),
         ) = reason
         {
-            match self.pending_idle_shutdown_state(reason, excluded_connection_id) {
+            let effective_excluded_connection_id = self
+                .shutdown_retry_state
+                .lock()
+                .expect("shutdown retry state mutex must not be poisoned")
+                .effective_exclusion(excluded_connection_id);
+            idle_exclusion_evaluation =
+                Some((excluded_connection_id, effective_excluded_connection_id));
+            match self.pending_idle_shutdown_state(reason, effective_excluded_connection_id) {
                 IdleShutdownState::StillApplies => {}
                 IdleShutdownState::Stale => {
                     self.shutdown_requested.store(false, Ordering::SeqCst);
@@ -242,7 +292,7 @@ impl RequestHandler {
                     return false;
                 }
                 IdleShutdownState::Unknown => {
-                    self.schedule_shutdown_retry(excluded_connection_id);
+                    self.schedule_shutdown_retry(effective_excluded_connection_id);
                     return false;
                 }
             }
@@ -276,6 +326,24 @@ impl RequestHandler {
         if !retained_outputs_empty {
             return false;
         }
+        let retry_state_guard =
+            if let Some((requested_exclusion, evaluated_exclusion)) = idle_exclusion_evaluation {
+                let mut retry_state = self
+                    .shutdown_retry_state
+                    .lock()
+                    .expect("shutdown retry state mutex must not be poisoned");
+                let current_exclusion = retry_state.effective_exclusion(requested_exclusion);
+                if current_exclusion != evaluated_exclusion {
+                    let tightened_exclusion =
+                        retry::tighten_exclusions(current_exclusion, evaluated_exclusion);
+                    drop(retry_state);
+                    self.schedule_shutdown_retry(tightened_exclusion);
+                    return false;
+                }
+                Some(retry_state)
+            } else {
+                None
+            };
         if !self.shutdown_requested.swap(false, Ordering::SeqCst) {
             return false;
         }
@@ -295,10 +363,19 @@ impl RequestHandler {
             record_shutdown_request(reason);
             handle.request_shutdown();
         }
+        drop(retry_state_guard);
         true
     }
 
     fn schedule_shutdown_retry(&self, excluded_connection_id: Option<u64>) {
+        if self
+            .shutdown_retry_state
+            .lock()
+            .expect("shutdown retry state mutex must not be poisoned")
+            .tighten_if_scheduled(excluded_connection_id)
+        {
+            return;
+        }
         let Some(runtime) = self
             .server_task_runtime()
             .or_else(|| tokio::runtime::Handle::try_current().ok())
@@ -311,14 +388,15 @@ impl RequestHandler {
         let Some(handoff) = registration.try_begin_mutation() else {
             return;
         };
-        if self
-            .shutdown_retry_scheduled
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
+        let Some(retry_token) = self
+            .shutdown_retry_state
+            .lock()
+            .expect("shutdown retry state mutex must not be poisoned")
+            .schedule_or_tighten(excluded_connection_id)
+        else {
             drop(handoff);
             return;
-        }
+        };
 
         let retry_handler = self.downgrade();
         let cleanup_handler = retry_handler.clone();
@@ -336,9 +414,14 @@ impl RequestHandler {
                 let Some(handler) = retry_handler.upgrade() else {
                     return;
                 };
-                handler
-                    .shutdown_retry_scheduled
-                    .store(false, Ordering::SeqCst);
+                let Some(excluded_connection_id) = handler
+                    .shutdown_retry_state
+                    .lock()
+                    .expect("shutdown retry state mutex must not be poisoned")
+                    .take(retry_token)
+                else {
+                    return;
+                };
                 let _ = handler.request_shutdown_if_pending_excluding_detached_connection(
                     excluded_connection_id,
                 );
@@ -346,8 +429,10 @@ impl RequestHandler {
             let cleanup = async move {
                 if let Some(handler) = cleanup_handler.upgrade() {
                     handler
-                        .shutdown_retry_scheduled
-                        .store(false, Ordering::SeqCst);
+                        .shutdown_retry_state
+                        .lock()
+                        .expect("shutdown retry state mutex must not be poisoned")
+                        .cancel(retry_token);
                 }
             };
             let _ = super::lifecycle_producer_tasks::run_registered_lifecycle_producer_with_cancellation_cleanup(
@@ -426,7 +511,17 @@ impl RequestHandler {
             .iter()
             .any(|connection_id| Some(*connection_id) != excluded_connection_id)
         {
-            return IdleShutdownState::Stale;
+            return match reason {
+                // A detached connection can have finished the mutation and
+                // received its response while an attached client's terminal
+                // exit is still draining. Keep exit-empty pending until that
+                // connection closes, then re-evaluate the server state.
+                PendingShutdownReason::ExitEmpty => IdleShutdownState::Unknown,
+                PendingShutdownReason::SeamlessUpgradeIdle => IdleShutdownState::Stale,
+                PendingShutdownReason::KillServer => {
+                    unreachable!("kill-server does not use the idle shutdown state machine")
+                }
+            };
         }
         drop(active_detached_connections);
 
@@ -467,7 +562,7 @@ impl Drop for DetachedConnectionGuard {
 
 pub(crate) struct DetachedRequesterAccessGuard {
     requester_pid: u32,
-    authority: DetachedRequesterAuthority,
+    scope: DetachedRequesterScope,
     active_detached_requester_access: Arc<StdMutex<HashMap<u32, DetachedRequesterAccess>>>,
 }
 
@@ -483,7 +578,7 @@ impl Drop for DetachedRequesterAccessGuard {
         if let Some(position) = entry
             .scopes
             .iter()
-            .position(|candidate| candidate == &self.authority)
+            .position(|candidate| candidate == &self.scope)
         {
             entry.scopes.swap_remove(position);
         }
@@ -529,139 +624,5 @@ impl Drop for AttachForwarderGuard {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::daemon::ShutdownHandle;
-
-    #[test]
-    fn normal_request_close_linearizes_against_drain_admission() {
-        let handler = RequestHandler::new();
-        let admitted = handler
-            .try_begin_normal_request(true)
-            .expect("request is admitted before quiesce");
-
-        handler.close_normal_request_admission();
-
-        assert!(!handler.normal_requests_quiesced());
-        assert!(!handler.normal_drain_requests_quiesced());
-        assert!(
-            handler.try_begin_normal_request(true).is_none(),
-            "requests after the close linearization point are rejected"
-        );
-
-        drop(admitted);
-        assert!(handler.normal_requests_quiesced());
-        assert!(handler.normal_drain_requests_quiesced());
-    }
-
-    #[test]
-    fn cancel_safe_requests_do_not_hold_the_drain_barrier() {
-        let handler = RequestHandler::new();
-        let admitted = handler
-            .try_begin_normal_request(false)
-            .expect("cancel-safe request is admitted before quiesce");
-        handler.close_normal_request_admission();
-
-        assert!(!handler.normal_requests_quiesced());
-        assert!(handler.normal_drain_requests_quiesced());
-
-        drop(admitted);
-        assert!(handler.normal_requests_quiesced());
-    }
-
-    #[tokio::test]
-    async fn idle_shutdown_retry_preserves_excluded_detached_connection() {
-        let handler = RequestHandler::new();
-        let (shutdown_handle, shutdown_rx) = ShutdownHandle::new();
-        handler.install_shutdown_handle(shutdown_handle);
-
-        let requester_connection_id = 7;
-        let _requester_connection = handler.begin_detached_connection(requester_connection_id);
-        handler.queue_shutdown_request(PendingShutdownReason::SeamlessUpgradeIdle);
-
-        let active_connections = handler
-            .active_detached_connections
-            .lock()
-            .expect("active detached connection mutex must not be poisoned");
-        assert!(
-            !handler.request_shutdown_if_pending_excluding_detached_connection(Some(
-                requester_connection_id
-            ))
-        );
-        drop(active_connections);
-
-        tokio::time::timeout(std::time::Duration::from_millis(500), shutdown_rx)
-            .await
-            .expect("retry should preserve requester exclusion and request shutdown")
-            .expect("shutdown receiver should complete cleanly");
-    }
-
-    #[tokio::test]
-    async fn idle_shutdown_retries_after_in_flight_detached_request() {
-        let handler = RequestHandler::new();
-        let (shutdown_handle, shutdown_rx) = ShutdownHandle::new();
-        handler.install_shutdown_handle(shutdown_handle);
-        let _request = handler.begin_detached_request();
-
-        handler.queue_shutdown_request(PendingShutdownReason::ExitEmpty);
-        assert!(
-            !handler.request_shutdown_if_pending(),
-            "in-flight detached requests should defer, not cancel, exit-empty shutdown"
-        );
-        drop(_request);
-
-        tokio::time::timeout(std::time::Duration::from_millis(500), shutdown_rx)
-            .await
-            .expect("retry should request shutdown after detached request finishes")
-            .expect("shutdown receiver should complete cleanly");
-    }
-
-    #[tokio::test]
-    async fn idle_shutdown_retries_after_attach_forwarder_drain() {
-        let handler = RequestHandler::new();
-        let (shutdown_handle, shutdown_rx) = ShutdownHandle::new();
-        handler.install_shutdown_handle(shutdown_handle);
-        let forwarder = handler.begin_attach_forwarder();
-
-        handler.queue_shutdown_request(PendingShutdownReason::ExitEmpty);
-        assert!(
-            !handler.request_shutdown_if_pending(),
-            "an attached wire drain should defer, not cancel, exit-empty shutdown"
-        );
-        drop(forwarder);
-
-        tokio::time::timeout(std::time::Duration::from_millis(500), shutdown_rx)
-            .await
-            .expect("retry should request shutdown after the attach forwarder drains")
-            .expect("shutdown receiver should complete cleanly");
-    }
-
-    #[tokio::test]
-    async fn lifecycle_close_cancels_pending_shutdown_retry_and_cleans_its_flag() {
-        let handler = RequestHandler::new();
-        let (shutdown_handle, shutdown_rx) = ShutdownHandle::new();
-        handler.install_shutdown_handle(shutdown_handle);
-        let state = handler.state.lock().await;
-
-        handler.queue_shutdown_request(PendingShutdownReason::ExitEmpty);
-        assert!(
-            !handler.request_shutdown_if_pending(),
-            "the held state lock forces the retry path"
-        );
-        assert!(handler.shutdown_retry_scheduled.load(Ordering::SeqCst));
-
-        handler.close_normal_and_drain_lifecycle_producers().await;
-        assert!(
-            !handler.shutdown_retry_scheduled.load(Ordering::SeqCst),
-            "cancellation cleanup owns the scheduled flag"
-        );
-        drop(state);
-
-        assert!(
-            tokio::time::timeout(SHUTDOWN_RETRY_DELAY * 2, shutdown_rx)
-                .await
-                .is_err(),
-            "a cancelled retry cannot request shutdown after the lane is sealed"
-        );
-    }
-}
+#[path = "handler_shutdown/tests.rs"]
+mod tests;

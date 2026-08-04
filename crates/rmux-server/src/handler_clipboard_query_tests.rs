@@ -3,9 +3,10 @@ use std::sync::Arc;
 
 use rmux_core::{input::InputEndType, PaneId, TerminalClipboardQuery};
 use rmux_proto::{
-    HookName, LinkWindowRequest, NewSessionRequest, NewWindowRequest, OptionName, PaneTarget,
-    Request, RespawnPaneRequest, Response, ScopeSelector, SelectWindowRequest, SessionName,
-    SetOptionMode, SetOptionRequest, SwitchClientRequest, TerminalSize, WindowTarget,
+    DisplayMessageExtRequest, HookName, LinkWindowRequest, NewSessionRequest, NewWindowRequest,
+    OptionName, PaneTarget, Request, RespawnPaneRequest, Response, ScopeSelector,
+    SelectWindowRequest, SessionName, SetOptionMode, SetOptionRequest, SwitchClientRequest, Target,
+    TerminalSize, WindowTarget,
 };
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
@@ -141,6 +142,7 @@ async fn register_attach_for_uid(
                 closing: Arc::new(AtomicBool::new(false)),
                 persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
                 terminal_context: OuterTerminalContext::default(),
+                client_title: None,
                 flags: settings.flags,
                 render_stream: settings.render_stream,
                 uid,
@@ -371,6 +373,7 @@ async fn pane_alert_request_round_trip_uses_fixed_outer_query_without_changing_b
         bell_count: 0,
         title_changed: false,
         title_change: None,
+        path_changed: false,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
         clipboard_queries: vec![TerminalClipboardQuery::new("0c", InputEndType::Bel)],
@@ -389,6 +392,77 @@ async fn pane_alert_request_round_trip_uses_fixed_outer_query_without_changing_b
     let state = fixture.handler.state.lock().await;
     let head = state.buffers.stack_head().expect("old buffer remains");
     assert_eq!(state.buffers.get(head), Some(b"old-buffer".as_slice()));
+}
+
+#[tokio::test]
+async fn ignored_display_message_routes_fragmented_clipboard_responses() {
+    let fixture = create_fixture("clipboard-display-message").await;
+    enable_get_clipboard(&fixture.handler, "request").await;
+    let attach_pid = 101_052;
+    let (_, mut control_rx) = register_attach(
+        &fixture.handler,
+        attach_pid,
+        &fixture.session,
+        AttachSettings::default(),
+    )
+    .await;
+    request_query(&fixture, TerminalClipboardQuery::new("c", InputEndType::St)).await;
+    recv_clipboard_query(&fixture.handler, attach_pid, &mut control_rx).await;
+
+    let response = fixture
+        .handler
+        .handle(Request::DisplayMessageExt(Box::new(
+            DisplayMessageExtRequest {
+                target: Some(Target::Session(fixture.session.clone())),
+                print: false,
+                message: Some("clipboard response".to_owned()),
+                target_client: Some(attach_pid.to_string()),
+                empty_target_context: false,
+                duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(10_000)),
+                ignore_input: true,
+            },
+        )))
+        .await;
+    assert!(matches!(response, Response::DisplayMessage(_)));
+    loop {
+        if matches!(
+            timeout(Duration::from_secs(1), control_rx.recv())
+                .await
+                .expect("display message is sent")
+                .expect("attach remains active"),
+            AttachControl::Overlay(_)
+        ) {
+            break;
+        }
+    }
+
+    let response = b"\x1b]52;c;bmV3LWRhdGE=\x07";
+    let split = response.len() / 2;
+    let mut pending = Vec::new();
+    fixture
+        .handler
+        .handle_attached_live_input(attach_pid, &mut pending, &response[..split])
+        .await
+        .expect("first OSC 52 fragment is retained");
+    fixture
+        .handler
+        .handle_attached_live_input(attach_pid, &mut pending, &response[split..])
+        .await
+        .expect("complete OSC 52 response is routed");
+    assert!(pending.is_empty());
+    assert_eq!(
+        captured_input(&fixture).await,
+        b"\x1b]52;c;bmV3LWRhdGE=\x1b\\"
+    );
+    assert_eq!(fixture.handler.pending_clipboard_query_count_for_test(), 0);
+    assert!(fixture
+        .handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .get(&attach_pid)
+        .is_some_and(|active| active.transient_message.is_some()));
 }
 
 #[tokio::test]
@@ -715,6 +789,7 @@ async fn pane_alert_callbacks_keep_clipboard_queries_in_publication_order() {
         bell_count: 0,
         title_changed: false,
         title_change: None,
+        path_changed: false,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
         clipboard_queries: vec![query],
@@ -761,6 +836,7 @@ async fn pane_alert_clipboard_query_queue_is_bounded_while_the_worker_is_busy() 
         bell_count: 0,
         title_changed: false,
         title_change: None,
+        path_changed: false,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
         clipboard_queries: queries,

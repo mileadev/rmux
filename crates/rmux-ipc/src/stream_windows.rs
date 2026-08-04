@@ -22,6 +22,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Pipes::{
     GetNamedPipeClientProcessId, ImpersonateNamedPipeClient, PeekNamedPipe, WaitNamedPipeW,
+    NMPWAIT_NOWAIT,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
 
@@ -37,6 +38,7 @@ const RMUX_NAMED_PIPE_CLIENT_ACCESS: u32 =
 const RMUX_NAMED_PIPE_CLIENT_FLAGS: u32 =
     SECURITY_IDENTIFICATION | SECURITY_SQOS_PRESENT | FILE_FLAG_OVERLAPPED;
 const WINDOWS_SYNTHETIC_UID: u32 = 0;
+const NONBLOCKING_PIPE_PROBE_TIMEOUT: u32 = NMPWAIT_NOWAIT;
 
 /// Async local byte stream used by the server runtime.
 pub type LocalStream = NamedPipeServer;
@@ -169,9 +171,9 @@ fn named_pipe_is_definitely_absent(pipe_name: &std::ffi::OsStr) -> bool {
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
     let available = unsafe {
-        // SAFETY: `wide` is a nul-terminated UTF-16 pipe name. A zero timeout
-        // only asks the kernel whether any matching pipe instance exists.
-        WaitNamedPipeW(wide.as_ptr(), 0)
+        // SAFETY: `wide` is a nul-terminated UTF-16 pipe name. NOWAIT asks
+        // whether an instance exists without honoring a server-chosen delay.
+        WaitNamedPipeW(wide.as_ptr(), NONBLOCKING_PIPE_PROBE_TIMEOUT)
     };
     if available != 0 {
         return false;
@@ -530,6 +532,11 @@ mod tests {
     use crate::endpoint_for_label;
     use std::sync::mpsc;
     use tokio::net::windows::named_pipe::ServerOptions;
+
+    #[test]
+    fn missing_pipe_probe_uses_win32_nowait() {
+        assert_eq!(NONBLOCKING_PIPE_PROBE_TIMEOUT, 1);
+    }
 
     #[tokio::test]
     async fn peer_identity_query_owns_handle_after_accept_future_drop() -> io::Result<()> {

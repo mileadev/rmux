@@ -2,14 +2,16 @@ use super::http::{path_from_target, HttpRequest};
 use super::pre_auth::PreAuthQueue;
 use super::{is_fd_exhaustion, serve_admitted_connection, should_continue_accept_loop};
 use crate::handler::RequestHandler;
-use crate::web::protocol::{AUTH_FRAME_TIMEOUT, WEB_SHARE_PROTOCOL_VERSION};
+use crate::web::protocol::{
+    AUTH_FRAME_TIMEOUT, PANE_RECOVERY_COVERAGE_CAPABILITY, WEB_SHARE_PROTOCOL_VERSION,
+};
 use crate::web::SecretHashForCrypto;
 use base64::Engine;
 use rmux_proto::{
     CreateWebShareRequest, KillSessionRequest, ListSessionsRequest, ListWindowsRequest,
-    NewSessionRequest, NewWindowRequest, PaneTarget, Request, Response, SessionName,
-    SplitDirection, SplitWindowRequest, SplitWindowTarget, StopWebShareRequest, TerminalSize,
-    WebShareCreatedResponse, WebShareRequest, WebShareResponse, WebShareScope,
+    NewSessionExtRequest, NewSessionRequest, NewWindowRequest, PaneTarget, Request, Response,
+    SessionName, SplitDirection, SplitWindowRequest, SplitWindowTarget, StopWebShareRequest,
+    TerminalSize, WebShareCreatedResponse, WebShareRequest, WebShareResponse, WebShareScope,
 };
 use rmux_web_crypto::{derive_client_session, generate_ephemeral, Message, Opener, Sealer};
 use serde_json::Value;
@@ -421,9 +423,11 @@ async fn share_websocket_auth_ready_snapshot_operator_and_revoke_loop() {
         },
     )
     .await;
-    let mut client = TestWebSocket::connect(
+    let auth = auth_text_with_pane_recovery_coverage();
+    let mut client = TestWebSocket::connect_with_auth(
         Arc::clone(&handler),
         &token_from_url(created.operator_url.as_deref().expect("operator URL")),
+        &auth,
     )
     .await;
     let ready = client.read_json().await;
@@ -446,7 +450,19 @@ async fn share_websocket_auth_ready_snapshot_operator_and_revoke_loop() {
         .iter()
         .any(|capability| capability == "e2ee-token-auth"));
 
-    client.read_binary_with_prefix(0x10, "snapshot").await;
+    let snapshot = client
+        .read_binary_with_prefix_payload(0x13, "bounded pane recovery snapshot")
+        .await;
+    assert!(snapshot.len() > 18);
+    assert_eq!(
+        u64::from_be_bytes(snapshot[1..9].try_into().expect("total row bytes")),
+        0
+    );
+    assert_eq!(
+        u64::from_be_bytes(snapshot[9..17].try_into().expect("included row bytes")),
+        0
+    );
+    assert_eq!(snapshot[17], 1);
 
     client.send_binary(&[0x80, b'p', b'w', b'd', b'\n']).await;
     let stopped = handler
@@ -466,6 +482,112 @@ async fn share_websocket_auth_ready_snapshot_operator_and_revoke_loop() {
     assert_eq!(revoked["reason"], "stopped_by_owner");
 
     client.close().await;
+}
+
+#[tokio::test]
+async fn pane_keyframe_redacts_spectator_metadata_and_preserves_operator_access() {
+    const STACKED_TITLE: &[u8] = b"private-stacked-title";
+    const CURRENT_TITLE: &[u8] = b"private-current-title";
+    const CURRENT_DIRECTORY: &[u8] = b"file:///home/owner/private-project";
+    const VISIBLE_CONTENT: &[u8] = b"visible terminal content";
+
+    let handler = Arc::new(RequestHandler::new());
+    let session_name = create_quiet_session(&handler, "websocket-metadata-policy").await;
+    let target = PaneTarget::new(session_name.clone(), 0);
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&target)
+        .await;
+    let mut pane_bytes = b"\x1b]2;".to_vec();
+    pane_bytes.extend_from_slice(STACKED_TITLE);
+    pane_bytes.extend_from_slice(b"\x1b\\\x1b[22;2t\x1b]2;");
+    pane_bytes.extend_from_slice(CURRENT_TITLE);
+    pane_bytes.extend_from_slice(b"\x1b\\\x1b]7;");
+    pane_bytes.extend_from_slice(CURRENT_DIRECTORY);
+    pane_bytes.extend_from_slice(b"\x1b\\");
+    pane_bytes.extend_from_slice(VISIBLE_CONTENT);
+    handler
+        .publish_web_pane_bytes_for_test(&target.clone().into(), pane_bytes)
+        .await
+        .expect("publish pane metadata and visible content");
+
+    let spectator_share = create_share(
+        &handler,
+        share_request(WebShareScope::Pane(target.clone().into())),
+    )
+    .await;
+    let operator_share = create_share(
+        &handler,
+        CreateWebShareRequest {
+            operator: true,
+            ..share_request(WebShareScope::Pane(target.into()))
+        },
+    )
+    .await;
+    let auth = auth_text_with_pane_recovery_coverage();
+
+    let mut spectator = TestWebSocket::connect_with_auth(
+        Arc::clone(&handler),
+        &token_from_url(
+            spectator_share
+                .spectator_url
+                .as_deref()
+                .expect("spectator URL"),
+        ),
+        &auth,
+    )
+    .await;
+    assert_eq!(spectator.read_json().await["role"], "spectator");
+    let spectator_keyframe = spectator
+        .read_binary_with_prefix_payload(0x13, "spectator pane recovery keyframe")
+        .await;
+    assert!(
+        spectator_keyframe
+            .windows(VISIBLE_CONTENT.len())
+            .any(|window| window == VISIBLE_CONTENT),
+        "spectator keyframe must retain terminal rendering content"
+    );
+    for private_metadata in [STACKED_TITLE, CURRENT_TITLE, CURRENT_DIRECTORY] {
+        assert!(
+            !spectator_keyframe
+                .windows(private_metadata.len())
+                .any(|window| window == private_metadata),
+            "spectator keyframe leaked pane metadata {:?}",
+            String::from_utf8_lossy(private_metadata)
+        );
+    }
+
+    let mut operator = TestWebSocket::connect_with_auth(
+        Arc::clone(&handler),
+        &token_from_url(
+            operator_share
+                .operator_url
+                .as_deref()
+                .expect("operator URL"),
+        ),
+        &auth,
+    )
+    .await;
+    assert_eq!(operator.read_json().await["role"], "operator");
+    let operator_keyframe = operator
+        .read_binary_with_prefix_payload(0x13, "operator pane recovery keyframe")
+        .await;
+    for authorized_content in [
+        STACKED_TITLE,
+        CURRENT_TITLE,
+        CURRENT_DIRECTORY,
+        VISIBLE_CONTENT,
+    ] {
+        assert!(
+            operator_keyframe
+                .windows(authorized_content.len())
+                .any(|window| window == authorized_content),
+            "operator keyframe lost authorized content {:?}",
+            String::from_utf8_lossy(authorized_content)
+        );
+    }
+
+    spectator.close().await;
+    operator.close().await;
 }
 
 #[tokio::test]
@@ -1568,6 +1690,59 @@ async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
     session_name
 }
 
+#[cfg(unix)]
+fn quiet_pane_command() -> Vec<String> {
+    vec![
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
+        "exec sleep 120".to_owned(),
+    ]
+}
+
+#[cfg(windows)]
+fn quiet_pane_command() -> Vec<String> {
+    let system_root =
+        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+    vec![
+        std::path::PathBuf::from(system_root)
+            .join("System32")
+            .join("cmd.exe")
+            .to_string_lossy()
+            .into_owned(),
+        "/d".to_owned(),
+        "/q".to_owned(),
+        "/c".to_owned(),
+        "ping -n 120 127.0.0.1 >NUL".to_owned(),
+    ]
+}
+
+async fn create_quiet_session(handler: &RequestHandler, name: &str) -> SessionName {
+    let session_name = SessionName::new(name).expect("valid session");
+    let response = handler
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(session_name.clone()),
+            working_directory: None,
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: Some(quiet_pane_command()),
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
+        })))
+        .await;
+    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    session_name
+}
+
 async fn create_share(
     handler: &RequestHandler,
     request: CreateWebShareRequest,
@@ -2037,6 +2212,13 @@ fn auth_text() -> String {
     format!(
         r#"{{"type":"auth","protocol_version":{},"capabilities":["e2ee-token-auth","terminal-palette-v1"]}}"#,
         WEB_SHARE_PROTOCOL_VERSION
+    )
+}
+
+fn auth_text_with_pane_recovery_coverage() -> String {
+    format!(
+        r#"{{"type":"auth","protocol_version":{},"capabilities":["e2ee-token-auth","terminal-palette-v1","{}"]}}"#,
+        WEB_SHARE_PROTOCOL_VERSION, PANE_RECOVERY_COVERAGE_CAPABILITY
     )
 }
 

@@ -3,10 +3,13 @@
 use std::io::ErrorKind;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::process::Command;
+use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use rmux_ipc::{
-    connect_blocking, connect_windows_pipe, endpoint_for_label, wait_for_peer_close, LocalListener,
+    connect_blocking, connect_windows_pipe, endpoint_for_label, legacy_shutdown_endpoint,
+    reserve_managed_endpoint_start, wait_for_peer_close, LocalEndpoint, LocalListener,
 };
 use rmux_os::identity::{IdentityResolver, UserIdentity};
 use rmux_os::path::socket_paths_match;
@@ -16,6 +19,13 @@ use tokio::net::windows::named_pipe::ServerOptions;
 use tokio::time::timeout;
 
 const WINDOWS_IPC_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+const STALE_GENERATION_HELPER_ENV: &str = "RMUX_TEST_STALE_GENERATION_LABEL";
+const STALE_GENERATION_OUTPUT_ENV: &str = "RMUX_TEST_STALE_GENERATION_OUTPUT";
+const DEAD_RUNNING_HELPER_ENV: &str = "RMUX_TEST_DEAD_RUNNING_GENERATION_LABEL";
+const DEAD_RUNNING_OUTPUT_ENV: &str = "RMUX_TEST_DEAD_RUNNING_GENERATION_OUTPUT";
+const RESOLVE_ONLY_HELPER_ENV: &str = "RMUX_TEST_RESOLVE_ONLY_LABEL";
+const RESOLVE_ONLY_READY_ENV: &str = "RMUX_TEST_RESOLVE_ONLY_READY";
+const RESOLVE_ONLY_RELEASE_ENV: &str = "RMUX_TEST_RESOLVE_ONLY_RELEASE";
 
 #[test]
 fn blocking_connect_to_missing_pipe_reports_not_found() -> std::io::Result<()> {
@@ -28,6 +38,16 @@ fn blocking_connect_to_missing_pipe_reports_not_found() -> std::io::Result<()> {
         error.kind() == ErrorKind::NotFound || matches!(error.raw_os_error(), Some(2)),
         "unexpected missing-pipe error: {error:?}"
     );
+    Ok(())
+}
+
+#[test]
+fn label_endpoint_is_ascii_case_insensitive() -> std::io::Result<()> {
+    let suffix = format!("case-endpoint-{}", std::process::id());
+    let upper = endpoint_for_label(suffix.to_ascii_uppercase())?;
+    let lower = endpoint_for_label(suffix.to_ascii_lowercase())?;
+
+    assert_eq!(upper, lower);
     Ok(())
 }
 
@@ -330,6 +350,390 @@ async fn first_pipe_instance_rejects_preexisting_raw_server() -> std::io::Result
 
     assert_bind_conflict(error);
     Ok(())
+}
+
+#[test]
+fn concurrent_label_resolution_defers_ownership_until_reservation() -> std::io::Result<()> {
+    let label = format!("generation-concurrency-{}", std::process::id());
+    let barrier = Arc::new(Barrier::new(12));
+    let threads = (0..12)
+        .map(|_| {
+            let label = label.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                endpoint_for_label(label).map(|endpoint| endpoint.into_path())
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let paths = threads
+        .into_iter()
+        .map(|thread| thread.join().expect("resolver thread"))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    assert!(
+        paths.iter().all(|candidate| candidate == &paths[0]),
+        "resolution should reuse one passive candidate without claiming startup"
+    );
+    let winner = reserve_managed_endpoint_start(&paths[0])?;
+    assert!(winner.is_owner());
+    for candidate in paths.iter().skip(1) {
+        let follower = reserve_managed_endpoint_start(candidate)?;
+        assert!(!follower.is_owner());
+        assert_eq!(follower.endpoint(), winner.endpoint());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn resolve_only_process_cannot_publish_a_starting_owner() -> std::io::Result<()> {
+    let label = format!("generation-resolve-only-{}", std::process::id());
+    let ready = std::env::temp_dir().join(format!("{label}-ready.txt"));
+    let release = std::env::temp_dir().join(format!("{label}-release.txt"));
+    let mut child = Command::new(std::env::current_exe()?)
+        .arg("--exact")
+        .arg("resolve_only_helper")
+        .arg("--nocapture")
+        .env(RESOLVE_ONLY_HELPER_ENV, &label)
+        .env(RESOLVE_ONLY_READY_ENV, &ready)
+        .env(RESOLVE_ONLY_RELEASE_ENV, &release)
+        .spawn()?;
+
+    wait_for_file(&ready)?;
+    let candidate =
+        LocalEndpoint::from_path(std::path::PathBuf::from(std::fs::read_to_string(&ready)?));
+    let reservation = reserve_managed_endpoint_start(candidate.as_path());
+    std::fs::write(&release, b"continue")?;
+    let status = child.wait()?;
+    let _ = std::fs::remove_file(&ready);
+    let _ = std::fs::remove_file(&release);
+    assert!(status.success(), "resolve-only helper failed");
+
+    let reservation = reservation?;
+    assert!(
+        reservation.is_owner(),
+        "a resolver that never starts a daemon must not own discovery state"
+    );
+    let listener = LocalListener::bind(reservation.endpoint())?;
+    drop(listener);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cross_process_resolution_preserves_the_legacy_upgrade_guard() -> std::io::Result<()> {
+    let label = format!("legacy-cross-process-{}", std::process::id());
+    let ready = std::env::temp_dir().join(format!("{label}-ready.txt"));
+    let release = std::env::temp_dir().join(format!("{label}-release.txt"));
+    let mut child = Command::new(std::env::current_exe()?)
+        .arg("--exact")
+        .arg("resolve_only_helper")
+        .arg("--nocapture")
+        .env(RESOLVE_ONLY_HELPER_ENV, &label)
+        .env(RESOLVE_ONLY_READY_ENV, &ready)
+        .env(RESOLVE_ONLY_RELEASE_ENV, &release)
+        .spawn()?;
+
+    wait_for_file(&ready)?;
+    let candidate =
+        LocalEndpoint::from_path(std::path::PathBuf::from(std::fs::read_to_string(&ready)?));
+    let legacy_path = legacy_path_for(&label, &candidate);
+    let _legacy_daemon = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&legacy_path)?;
+    let reservation = reserve_managed_endpoint_start(candidate.as_path());
+
+    std::fs::write(&release, b"continue")?;
+    let status = child.wait()?;
+    let _ = std::fs::remove_file(&ready);
+    let _ = std::fs::remove_file(&release);
+    assert!(status.success(), "resolve-only helper failed");
+
+    let error = reservation.expect_err("cross-process v6 startup must detect the v5 namespace");
+    assert_eq!(error.kind(), ErrorKind::AddrInUse);
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_legacy_namespace_blocks_v6_reservation_before_startup() -> std::io::Result<()> {
+    let label = format!("legacy-upgrade-{}", std::process::id());
+    let candidate = endpoint_for_label(&label)?;
+    let legacy_path = legacy_path_for(&label, &candidate);
+    let _legacy_daemon = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&legacy_path)?;
+
+    let error = reserve_managed_endpoint_start(candidate.as_path())
+        .expect_err("a live legacy daemon must block v6 startup");
+    assert_eq!(error.kind(), ErrorKind::AddrInUse);
+    assert!(error.to_string().contains("stop"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_shutdown_resolution_requires_the_exact_passive_generation() -> std::io::Result<()> {
+    let label = format!("legacy-shutdown-{}", std::process::id());
+    let candidate = endpoint_for_label(&label)?;
+    let legacy_path = legacy_path_for(&label, &candidate);
+    let _legacy_daemon = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&legacy_path)?;
+
+    let legacy = legacy_shutdown_endpoint(candidate.as_path())?
+        .expect("resolved generation should retain its live legacy endpoint");
+    assert_eq!(legacy.as_path(), legacy_path);
+
+    let mut forged = candidate.as_path().to_string_lossy().into_owned();
+    let replacement = if forged.ends_with('0') { '1' } else { '0' };
+    forged.pop();
+    forged.push(replacement);
+    assert!(legacy_shutdown_endpoint(Path::new(&forged))?.is_none());
+    assert!(legacy_shutdown_endpoint(&legacy_path)?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn running_generation_never_resolves_its_legacy_guard_for_shutdown() -> std::io::Result<()> {
+    let label = format!("legacy-shutdown-running-{}", std::process::id());
+    let endpoint = endpoint_for_label(&label)?;
+    let listener = LocalListener::bind(&endpoint)?;
+
+    assert!(legacy_shutdown_endpoint(endpoint.as_path())?.is_none());
+    drop(listener);
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_guard_rejects_clients_and_blocks_preclaim_until_shutdown() -> std::io::Result<()> {
+    let label = format!("legacy-rollback-{}", std::process::id());
+    let endpoint = endpoint_for_label(&label)?;
+    let legacy_path = legacy_path_for(&label, &endpoint);
+    let listener = LocalListener::bind(&endpoint)?;
+
+    let async_error = timeout(
+        Duration::from_secs(2),
+        connect_windows_pipe(legacy_path.as_os_str()),
+    )
+    .await
+    .expect("async legacy guard connection must fail promptly")
+    .expect_err("async clients must not connect to the legacy guard");
+    assert_eq!(async_error.kind(), ErrorKind::PermissionDenied);
+
+    let blocking_endpoint = LocalEndpoint::from_path(legacy_path.clone());
+    let blocking_error = timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || {
+            connect_blocking(&blocking_endpoint, Duration::from_secs(1))
+        }),
+    )
+    .await
+    .expect("blocking legacy guard connection must fail promptly")
+    .expect("blocking legacy guard connection task")
+    .expect_err("blocking clients must not connect to the legacy guard");
+    assert_eq!(blocking_error.kind(), ErrorKind::PermissionDenied);
+
+    let conflict = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&legacy_path)
+        .expect_err("a rollback daemon must not coexist with v6");
+    assert_bind_conflict(conflict);
+
+    drop(listener);
+    let legacy_after_shutdown = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&legacy_path)?;
+    drop(legacy_after_shutdown);
+    Ok(())
+}
+
+#[tokio::test]
+async fn stopped_listener_rotates_away_from_preclaimed_old_generation() -> std::io::Result<()> {
+    let label = format!("generation-restart-squat-{}", std::process::id());
+    let first = endpoint_for_label(&label)?;
+    let first_path = first.clone().into_path();
+    let listener = LocalListener::bind(&first)?;
+    drop(listener);
+
+    let _old_generation_squatter = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(first.as_pipe_name())?;
+    let replacement = endpoint_for_label(&label)?;
+
+    assert_ne!(
+        replacement.as_path(),
+        first_path,
+        "restart must never reuse the publicly observed stopped generation"
+    );
+    let replacement_listener = LocalListener::bind(&replacement)?;
+    drop(replacement_listener);
+    Ok(())
+}
+
+#[tokio::test]
+async fn stopped_generation_never_adopts_a_stale_candidate_nonce() -> std::io::Result<()> {
+    let label = format!("generation-stopped-stale-{}", std::process::id());
+    let first = endpoint_for_label(&label)?;
+    let first_path = first.as_path().to_path_buf();
+    drop(LocalListener::bind(&first)?);
+
+    let second = endpoint_for_label(&label)?;
+    let second_path = second.as_path().to_path_buf();
+    assert_ne!(second_path, first_path);
+    drop(LocalListener::bind(&second)?);
+
+    let replacement = reserve_managed_endpoint_start(&first_path)?;
+    assert!(replacement.is_owner());
+    assert_ne!(replacement.endpoint().as_path(), first_path);
+    assert_ne!(replacement.endpoint().as_path(), second_path);
+
+    let stale_error = LocalListener::bind(&first)
+        .expect_err("a stale stopped generation must not become current again");
+    assert_eq!(stale_error.kind(), ErrorKind::PermissionDenied);
+    let replacement_listener = LocalListener::bind(replacement.endpoint())?;
+    drop(replacement_listener);
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_restart_reservation_rejects_the_abandoned_child_generation(
+) -> std::io::Result<()> {
+    let label = format!("generation-restart-reservation-{}", std::process::id());
+    let abandoned_endpoint = endpoint_for_label(&label)?;
+    let abandoned_path = abandoned_endpoint.as_path().to_path_buf();
+
+    let abandoned_claim = reserve_managed_endpoint_start(&abandoned_path)?;
+    assert!(abandoned_claim.is_owner());
+    drop(abandoned_claim);
+
+    let winner = reserve_managed_endpoint_start(&abandoned_path)?;
+    assert!(winner.is_owner());
+    assert_ne!(winner.endpoint().as_path(), abandoned_path);
+
+    let loser = reserve_managed_endpoint_start(&abandoned_path)?;
+    assert!(!loser.is_owner());
+    assert_eq!(loser.endpoint(), winner.endpoint());
+
+    let stale_error = LocalListener::bind(&abandoned_endpoint)
+        .expect_err("an abandoned child must not bind after generation rotation");
+    assert_eq!(stale_error.kind(), ErrorKind::PermissionDenied);
+
+    let replacement_listener = LocalListener::bind(winner.endpoint())?;
+    drop(replacement_listener);
+    Ok(())
+}
+
+#[test]
+fn dead_starting_process_cannot_pin_a_generation() -> std::io::Result<()> {
+    let label = format!("generation-dead-owner-{}", std::process::id());
+    let output = std::env::temp_dir().join(format!(
+        "rmux-generation-dead-owner-{}.txt",
+        std::process::id()
+    ));
+    let status = Command::new(std::env::current_exe()?)
+        .arg("--exact")
+        .arg("stale_generation_helper")
+        .arg("--nocapture")
+        .env(STALE_GENERATION_HELPER_ENV, &label)
+        .env(STALE_GENERATION_OUTPUT_ENV, &output)
+        .status()?;
+    assert!(status.success(), "stale-generation helper failed");
+
+    let stale = std::fs::read_to_string(&output)?;
+    let replacement = endpoint_for_label(&label)?;
+    assert_ne!(
+        replacement.as_path().to_string_lossy(),
+        stale,
+        "a dead resolver process must force generation rotation"
+    );
+    let _ = std::fs::remove_file(output);
+    Ok(())
+}
+
+#[test]
+fn daemon_death_between_resolve_and_reservation_rotates_the_generation() -> std::io::Result<()> {
+    let label = format!("generation-dead-running-{}", std::process::id());
+    let output = std::env::temp_dir().join(format!(
+        "rmux-generation-dead-running-{}.txt",
+        std::process::id()
+    ));
+    let status = Command::new(std::env::current_exe()?)
+        .arg("--exact")
+        .arg("dead_running_generation_helper")
+        .arg("--nocapture")
+        .env(DEAD_RUNNING_HELPER_ENV, &label)
+        .env(DEAD_RUNNING_OUTPUT_ENV, &output)
+        .status()?;
+    assert!(status.success(), "dead-running helper failed");
+
+    let stale = std::fs::read_to_string(&output)?;
+    let reservation = reserve_managed_endpoint_start(Path::new(stale.trim()))?;
+    assert!(reservation.is_owner());
+    assert_ne!(
+        reservation.endpoint().as_path().to_string_lossy(),
+        stale.trim(),
+        "a dead Running owner must rotate during the atomic reservation"
+    );
+    let _ = std::fs::remove_file(output);
+    Ok(())
+}
+
+#[test]
+fn stale_generation_helper() -> std::io::Result<()> {
+    let Some(label) = std::env::var_os(STALE_GENERATION_HELPER_ENV) else {
+        return Ok(());
+    };
+    let output = std::env::var_os(STALE_GENERATION_OUTPUT_ENV)
+        .ok_or_else(|| std::io::Error::other("missing stale-generation output path"))?;
+    let endpoint = endpoint_for_label(label)?;
+    std::fs::write(output, endpoint.as_path().to_string_lossy().as_bytes())
+}
+
+#[tokio::test]
+async fn dead_running_generation_helper() -> std::io::Result<()> {
+    let Some(label) = std::env::var_os(DEAD_RUNNING_HELPER_ENV) else {
+        return Ok(());
+    };
+    let output = std::env::var_os(DEAD_RUNNING_OUTPUT_ENV)
+        .ok_or_else(|| std::io::Error::other("missing dead-running output path"))?;
+    let endpoint = endpoint_for_label(label)?;
+    let listener = LocalListener::bind(&endpoint)?;
+    std::fs::write(output, endpoint.as_path().to_string_lossy().as_bytes())?;
+    std::mem::forget(listener);
+    std::process::exit(0);
+}
+
+#[test]
+fn resolve_only_helper() -> std::io::Result<()> {
+    let Some(label) = std::env::var_os(RESOLVE_ONLY_HELPER_ENV) else {
+        return Ok(());
+    };
+    let ready = std::env::var_os(RESOLVE_ONLY_READY_ENV)
+        .ok_or_else(|| std::io::Error::other("missing resolve-only ready path"))?;
+    let release = std::env::var_os(RESOLVE_ONLY_RELEASE_ENV)
+        .ok_or_else(|| std::io::Error::other("missing resolve-only release path"))?;
+    let endpoint = endpoint_for_label(label)?;
+    std::fs::write(ready, endpoint.as_path().to_string_lossy().as_bytes())?;
+    wait_for_file(Path::new(&release))
+}
+
+fn wait_for_file(path: &Path) -> std::io::Result<()> {
+    for _ in 0..200 {
+        if path.exists() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Err(std::io::Error::new(
+        ErrorKind::TimedOut,
+        format!("timed out waiting for {}", path.display()),
+    ))
+}
+
+fn legacy_path_for(label: &str, managed: &rmux_ipc::LocalEndpoint) -> std::path::PathBuf {
+    let managed = managed.as_path().to_string_lossy();
+    let marker = managed
+        .rfind("-g-")
+        .expect("managed endpoint contains generation marker");
+    std::path::PathBuf::from(format!("{}-{label}", &managed[..marker]))
 }
 
 fn assert_bind_conflict(error: std::io::Error) {

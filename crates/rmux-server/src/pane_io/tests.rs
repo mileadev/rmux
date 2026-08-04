@@ -8,9 +8,9 @@ use rmux_core::events::OutputCursorItem;
 use rmux_core::{OptionStore, PaneGeometry, TerminalPassthrough};
 use rmux_proto::{
     encode_attach_message, AttachFrameDecoder, AttachMessage, AttachShellCommand,
-    AttachedKeystroke, BindKeyRequest, KeyDispatched, KillSessionRequest, NewSessionRequest,
-    OptionName, PaneTarget, Request, Response, ScopeSelector, SessionName, SetOptionMode,
-    TerminalSize, WaitForMode, WaitForRequest,
+    AttachedKeystroke, BindKeyRequest, DisplayMessageExtRequest, KeyDispatched, KillSessionRequest,
+    NewSessionRequest, OptionName, PaneTarget, Request, Response, ScopeSelector, SessionName,
+    SetOptionMode, Target, TerminalSize, WaitForMode, WaitForRequest, DEFAULT_MAX_FRAME_LENGTH,
 };
 use rmux_pty::PtyPair;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -644,6 +644,9 @@ impl PendingEscapeSchedulerFixture {
             }))
             .await;
         assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+        handler
+            .wait_for_pane_startup_to_finish_for_test(&target)
+            .await;
         let escape_time = handler
             .handle(Request::SetOption(rmux_proto::SetOptionRequest {
                 scope: rmux_proto::ScopeSelector::Global,
@@ -757,6 +760,65 @@ impl PendingEscapeSchedulerFixture {
             .expect("attach task join");
         assert!(result.is_ok(), "attach exits cleanly after prefix-d");
     }
+}
+
+async fn arm_ignored_display_message(fixture: &PendingEscapeSchedulerFixture, duration_ms: u32) {
+    let response = fixture
+        .handler
+        .handle(Request::DisplayMessageExt(Box::new(
+            DisplayMessageExtRequest {
+                target: Some(Target::Pane(fixture.target.clone())),
+                print: false,
+                message: Some("ignore input".to_owned()),
+                target_client: Some(std::process::id().to_string()),
+                empty_target_context: false,
+                duration_ms: Some(rmux_proto::DisplayMessageDurationMillis::new(duration_ms)),
+                ignore_input: true,
+            },
+        )))
+        .await;
+    assert!(
+        matches!(response, Response::DisplayMessage(_)),
+        "{response:?}"
+    );
+}
+
+#[tokio::test]
+async fn ignored_display_message_expiry_flushes_a_lone_retained_csi() {
+    let mut fixture = PendingEscapeSchedulerFixture::start("display-ignore-expiry-lone-csi").await;
+    arm_ignored_display_message(&fixture, 40).await;
+    fixture.send(AttachMessage::Data(b"\x1b[".to_vec())).await;
+
+    let captured = fixture
+        .wait_for_capture(
+            |captured| captured == b"\x1b[",
+            "ignored CSI after message and escape expiry",
+        )
+        .await;
+    assert_eq!(captured, b"\x1b[");
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn ignored_display_message_keeps_csi_contiguous_across_expiry() {
+    let mut fixture =
+        PendingEscapeSchedulerFixture::start("display-ignore-expiry-completed-csi").await;
+    arm_ignored_display_message(&fixture, 40).await;
+    fixture.send(AttachMessage::Data(b"\x1b[".to_vec())).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    fixture.send(AttachMessage::Data(b"A".to_vec())).await;
+
+    let captured = fixture
+        .wait_for_capture(
+            |captured| matches!(captured, b"\x1b[A" | b"\x1bOA"),
+            "ignored CSI completed after message expiry",
+        )
+        .await;
+    assert!(
+        matches!(captured.as_slice(), b"\x1b[A" | b"\x1bOA"),
+        "the split Up key must remain one contiguous key in either cursor-key mode"
+    );
+    fixture.finish().await;
 }
 
 #[tokio::test]
@@ -1457,6 +1519,40 @@ async fn live_render_delta_uses_data_message_for_stateful_frames() {
 }
 
 #[tokio::test]
+async fn live_replaceable_repaint_above_payload_ceiling_uses_ordered_data_fragments() {
+    let alpha = SessionName::new("alpha").expect("valid session name");
+    let target = test_attach_target(&alpha, b"", None);
+    let mut target = open_attach_target(target, true).expect("open attach target");
+    let frame = PaneRenderDeltaFrame::new(vec![b'x'; DEFAULT_MAX_FRAME_LENGTH + 1], None);
+    let (stream, mut peer) = tokio::io::duplex(DEFAULT_MAX_FRAME_LENGTH + 64);
+    let stream = AttachTransport::from_io(stream);
+
+    super::emit_live_render_frame(&stream, &mut target, &frame, true)
+        .await
+        .expect("emit oversized live repaint");
+
+    let mut decoder = AttachFrameDecoder::new();
+    let mut messages = Vec::new();
+    let mut bytes = [0_u8; 8192];
+    while messages.len() < 2 {
+        let count = peer.read(&mut bytes).await.expect("read emitted frame");
+        assert!(count > 0, "attach stream closed before both fragments");
+        decoder.push_bytes(&bytes[..count]);
+        while let Some(message) = decoder.next_message().expect("decode emitted frame") {
+            messages.push(message);
+        }
+    }
+
+    assert_eq!(
+        messages,
+        vec![
+            AttachMessage::Data(vec![b'x'; DEFAULT_MAX_FRAME_LENGTH]),
+            AttachMessage::Data(vec![b'x']),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn pane_output_receiver_reports_lag_and_resumes_from_oldest_retained_event() {
     let sender = pane_output_channel_with_limits(1, 32);
     let mut receiver = sender.subscribe();
@@ -1684,6 +1780,7 @@ async fn forward_attach_emits_stop_sequence_when_processing_errors() {
         pane_output_start_sequence,
         render_frame: Vec::new(),
         outer_terminal,
+        client_title: None,
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         raw_passthrough: false,
@@ -1937,6 +2034,7 @@ fn test_attach_target_with_protocols(
             &OptionStore::default(),
             OuterTerminalContext::default(),
         ),
+        client_title: None,
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         raw_passthrough: kitty_graphics_passthrough || sixel_passthrough,
@@ -1982,12 +2080,39 @@ fn live_output_is_preserved_only_for_coalescible_same_source_refreshes() {
     assert!(!preserves_live_output(&current, &different_source));
 
     let non_coalescible_same_source =
-        test_attach_target_with_output(&session_name, b"BASE-D", None, shared_output, true);
+        test_attach_target_with_output(&session_name, b"BASE-D", None, shared_output.clone(), true);
     assert!(!non_coalescible_same_source.is_coalescible_render_refresh());
     assert!(!preserves_live_output(
         &current,
         &non_coalescible_same_source
     ));
+
+    // A frame carrying OSC 0 is kept out of the queue's replaceable slot, but
+    // it is still a re-render of the same pane: its buffered kitty/sixel
+    // passthroughs must survive. Coupling the two predicates would drop them on
+    // every title change (issue #182).
+    let mut title_carrying =
+        test_attach_target_with_output(&session_name, b"BASE-E", None, shared_output, true);
+    title_carrying.pane_master = None;
+    let terminal = OuterTerminal::resolve(
+        &OptionStore::new(),
+        OuterTerminalContext::from_pairs(&[("TERM", "tmux-256color")]),
+    );
+    title_carrying.client_title =
+        terminal.rendered_client_title(crate::outer_terminal::ClientTitleUpdate {
+            resolved: Some("LIVE-OUTPUT-TITLE"),
+            path: crate::outer_terminal::ClientPathUpdate::Unread,
+            previous: None,
+        });
+    assert!(
+        !title_carrying.is_coalescible_render_refresh(),
+        "a title-carrying frame must not be replaceable in the queue"
+    );
+    assert!(title_carrying.is_plain_render_refresh());
+    assert!(
+        preserves_live_output(&current, &title_carrying),
+        "a title-carrying refresh of the same pane must keep its live output"
+    );
 }
 
 #[test]
@@ -2534,6 +2659,68 @@ async fn read_attach_data_until(peer: &mut tokio::net::UnixStream, needle: &[u8]
     })
     .await
     .expect("timed out waiting for attach data")
+}
+
+#[tokio::test]
+async fn initial_attach_repaint_above_two_mib_uses_bounded_ordered_fragments() {
+    let handler = Arc::new(RequestHandler::new());
+    let session_name = SessionName::new("large-initial-repaint").expect("valid session name");
+    let repaint = (0..(2 * DEFAULT_MAX_FRAME_LENGTH + 17))
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    let (_control_tx, control_rx) = mpsc::unbounded_channel();
+    let attach_task = tokio::spawn(forward_attach(
+        stream,
+        test_render_only_attach_target(&session_name, &repaint),
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicU64::new(0)),
+        LiveAttachInputContext::unregistered_for_test(handler, std::process::id()),
+        true,
+    ));
+
+    let mut decoder = AttachFrameDecoder::new();
+    let mut reconstructed = Vec::with_capacity(repaint.len());
+    let mut fragment_lengths = Vec::new();
+    let mut bytes = [0_u8; 64 * 1024];
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while reconstructed.len() < repaint.len() {
+            let count = peer.read(&mut bytes).await.expect("read initial repaint");
+            assert!(count > 0, "attach stream closed during initial repaint");
+            decoder.push_bytes(&bytes[..count]);
+            while let Some(message) = decoder.next_message().expect("decode initial repaint") {
+                let AttachMessage::Data(fragment) = message else {
+                    panic!("oversized initial repaint must use strict ordered data");
+                };
+                if fragment.len() == DEFAULT_MAX_FRAME_LENGTH || !fragment_lengths.is_empty() {
+                    fragment_lengths.push(fragment.len());
+                    reconstructed.extend_from_slice(&fragment);
+                }
+            }
+        }
+    })
+    .await
+    .expect("initial repaint timed out");
+
+    assert_eq!(
+        fragment_lengths,
+        vec![DEFAULT_MAX_FRAME_LENGTH, DEFAULT_MAX_FRAME_LENGTH, 17]
+    );
+    assert_eq!(reconstructed, repaint);
+
+    shutdown_tx.send(()).expect("request attach shutdown");
+    assert!(
+        attach_task
+            .await
+            .expect("attach task joins after shutdown")
+            .is_ok(),
+        "large initial repaint must not terminate the attach forwarder"
+    );
 }
 
 #[tokio::test]
@@ -3823,6 +4010,7 @@ async fn forward_attach_emits_overlay_control_frames() {
             &OptionStore::default(),
             OuterTerminalContext::default(),
         ),
+        client_title: None,
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         raw_passthrough: false,

@@ -42,6 +42,10 @@ impl PaneTransferWindowMetadata {
         })
     }
 
+    pub(super) const fn source_window_is_single_pane(&self) -> bool {
+        self.single_pane
+    }
+
     /// Moves slot-keyed metadata when `break-pane` moved the complete source window.
     pub(super) fn move_to_surviving_window(
         &self,
@@ -84,6 +88,15 @@ impl PaneTransferWindowMetadata {
 
     /// Removes slot-keyed metadata from aliases which no longer name the captured window.
     pub(super) fn prune_removed_aliases(&self, state: &mut HandlerState) {
+        self.prune_removed_aliases_with_hooks(state, false);
+    }
+
+    /// Removes stale source hooks before survivor slots are reindexed over them.
+    pub(super) fn prune_destroyed_aliases_before_reindex(&self, state: &mut HandlerState) {
+        self.prune_removed_aliases_with_hooks(state, true);
+    }
+
+    fn prune_removed_aliases_with_hooks(&self, state: &mut HandlerState, remove_hooks: bool) {
         for target in &self.source_aliases {
             let occupant = state
                 .sessions
@@ -103,6 +116,9 @@ impl PaneTransferWindowMetadata {
                 None => {}
             }
             let _ = state.options.remove_window(target);
+            if remove_hooks {
+                let _ = state.hooks.remove_window(target);
+            }
             state.clear_auto_named_window(target.session_name(), target.window_index());
         }
     }

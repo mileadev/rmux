@@ -317,13 +317,22 @@ pub(crate) fn spawn_pane_exit_watcher(
     if let Err(error) = std::thread::Builder::new()
         .name(thread_name.clone())
         .spawn(move || {
-            let _ = child.wait();
-            if let Err(error) = child.terminate_forcefully() {
+            if let Err(error) = child.wait_for_process_tree_exit() {
                 warn!(
                     session = %session_name,
                     pane_id = pane_id.as_u32(),
-                    "failed to terminate pane descendants before closing ConPTY: {error}"
+                    "failed to wait for pane process tree before closing ConPTY: {error}"
                 );
+                if let Err(teardown_error) = child.terminate_forcefully() {
+                    warn!(
+                        session = %session_name,
+                        pane_id = pane_id.as_u32(),
+                        "failed to terminate pane process tree after liveness query failure: \
+                         {teardown_error}"
+                    );
+                    child.close_pseudoconsole();
+                }
+            } else {
                 child.close_pseudoconsole();
             }
             if eof_state.wait_until_published(WINDOWS_PANE_EOF_PUBLISHED_GRACE) {
@@ -547,7 +556,7 @@ fn publish_pane_bytes(context: PanePublishContext<'_>, bytes: Vec<u8>) -> Vec<u8
         return Vec::new();
     }
     let Some((_sequence, append_result)) =
-        pane_output.publish_for_generation(generation, bytes, |bytes| {
+        pane_output.publish_for_generation_with_invalidation(generation, bytes, |bytes| {
             let mut transcript = transcript
                 .lock()
                 .expect("pane transcript mutex must not be poisoned");
@@ -572,6 +581,7 @@ fn publish_pane_bytes(context: PanePublishContext<'_>, bytes: Vec<u8>) -> Vec<u8
                     bell_count: append_result.bell_count,
                     title_changed: append_result.title_changed,
                     title_change: append_result.title_change.clone(),
+                    path_changed: append_result.path_changed,
                     clipboard_set,
                     clipboard_writes,
                     clipboard_queries,
@@ -581,13 +591,22 @@ fn publish_pane_bytes(context: PanePublishContext<'_>, bytes: Vec<u8>) -> Vec<u8
                     generation,
                 });
             }
-            (append_result, passthroughs)
+            let invalidation = append_result
+                .recovery_rebase_required
+                .then_some(super::PaneInvalidationReason::TranscriptMutation);
+            (append_result, passthroughs, invalidation)
         })
     else {
         return Vec::new();
     };
     if let Some(timer) = append_result.ground_timer {
-        schedule_pane_ground_timer(session_name, pane_id, Arc::clone(transcript), timer);
+        schedule_pane_ground_timer(
+            session_name,
+            pane_id,
+            Arc::clone(transcript),
+            pane_output.clone(),
+            timer,
+        );
     }
     let replies = append_result.replies;
     let dropped_passthrough_count = append_result.dropped_passthrough_count;
@@ -600,6 +619,71 @@ fn publish_pane_bytes(context: PanePublishContext<'_>, bytes: Vec<u8>) -> Vec<u8
         );
     }
     replies
+}
+
+/// Publishes bytes through the production pane-output path for one real pane
+/// and returns the alert events production built from them.
+///
+/// Tests that need the handler side of an alert drive it with these events
+/// rather than a hand-written one, so what the parser reported and what the
+/// handler acts on cannot drift apart.
+#[cfg(test)]
+pub(crate) fn publish_pane_bytes_capturing_alerts(
+    session_name: &rmux_proto::SessionName,
+    pane_id: PaneId,
+    transcript: &SharedPaneTranscript,
+    pane_output: &PaneOutputSender,
+    bytes: Vec<u8>,
+) -> Vec<super::PaneAlertEvent> {
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    {
+        let callback: super::PaneAlertCallback = Arc::new(move |event| {
+            sink.lock()
+                .expect("pane alert capture mutex must not be poisoned")
+                .push(event);
+        });
+        let _ = publish_pane_bytes(
+            PanePublishContext {
+                session_name,
+                pane_id,
+                transcript,
+                pane_output,
+                generation: None,
+                pane_alert_callback: Some(&callback),
+                emit_no_bell_alert: false,
+            },
+            bytes,
+        );
+    }
+    let captured = std::mem::take(
+        &mut *events
+            .lock()
+            .expect("pane alert capture mutex must not be poisoned"),
+    );
+    captured
+}
+
+#[cfg(test)]
+pub(crate) fn publish_pane_bytes_for_test(
+    transcript: &SharedPaneTranscript,
+    pane_output: &PaneOutputSender,
+    bytes: Vec<u8>,
+) {
+    let session_name =
+        rmux_proto::SessionName::new("pane-output-test").expect("test session name must be valid");
+    let _ = publish_pane_bytes(
+        PanePublishContext {
+            session_name: &session_name,
+            pane_id: PaneId::new(1),
+            transcript,
+            pane_output,
+            generation: None,
+            pane_alert_callback: None,
+            emit_no_bell_alert: false,
+        },
+        bytes,
+    );
 }
 
 fn passthrough_is_clipboard_set(passthrough: &TerminalPassthrough) -> bool {
@@ -671,6 +755,7 @@ pub(super) fn osc52_payload_decodes(payload: &[u8]) -> bool {
 
 struct PaneGroundTimerJob {
     transcript: SharedPaneTranscript,
+    pane_output: PaneOutputSender,
     timer: PaneGroundTimer,
 }
 
@@ -678,9 +763,14 @@ fn schedule_pane_ground_timer(
     session_name: &rmux_proto::SessionName,
     pane_id: PaneId,
     transcript: SharedPaneTranscript,
+    pane_output: PaneOutputSender,
     timer: PaneGroundTimer,
 ) {
-    let job = PaneGroundTimerJob { transcript, timer };
+    let job = PaneGroundTimerJob {
+        transcript,
+        pane_output,
+        timer,
+    };
     if let Err(error) = pane_ground_timer_tx().send(job) {
         warn!(
             session = %session_name,
@@ -764,17 +854,14 @@ fn expire_due_pane_ground_timers(jobs: &mut Vec<PaneGroundTimerJob>) {
 }
 
 fn expire_pane_ground_timer_job(job: PaneGroundTimerJob) {
-    let mut transcript = match job.transcript.lock() {
-        Ok(transcript) => transcript,
-        Err(poisoned) => {
-            warn!(
-                "pane transcript mutex was poisoned while expiring parser ground timer; \
-                 recovering timer worker"
-            );
-            poisoned.into_inner()
-        }
-    };
-    let _ = transcript.expire_ground_timer(job.timer);
+    job.pane_output.mutate_transcript(
+        &job.transcript,
+        super::PaneInvalidationReason::ParserStateExpired,
+        |transcript| {
+            let expired = transcript.expire_ground_timer(job.timer);
+            ((), expired)
+        },
+    );
 }
 
 #[cfg(unix)]
@@ -1094,6 +1181,57 @@ mod tests {
         );
 
         assert!(callback_observed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn production_publication_invalidates_recovery_at_the_post_rep_boundary() {
+        let transcript = PaneTranscript::shared(2_000, TerminalSize { cols: 8, rows: 2 });
+        let output = pane_output_channel();
+        let mut recovery = output.subscribe();
+        let mut legacy = output.subscribe();
+        let session_name = SessionName::new("rep-recovery").expect("valid session name");
+        let context = || PanePublishContext {
+            session_name: &session_name,
+            pane_id: PaneId::new(1),
+            transcript: &transcript,
+            pane_output: &output,
+            generation: None,
+            pane_alert_callback: None,
+            emit_no_bell_alert: false,
+        };
+
+        let _ = publish_pane_bytes(context(), b"X".to_vec());
+        assert!(matches!(
+            recovery.try_recv_observed(),
+            Some(crate::pane_io::PaneObservationItem::Output(
+                rmux_core::events::OutputCursorItem::Event(event)
+            )) if event.bytes() == b"X"
+        ));
+        let _ = legacy.try_recv().expect("legacy subscriber receives X");
+
+        let _ = publish_pane_bytes(context(), b"\x1b[2b".to_vec());
+
+        let Some(crate::pane_io::PaneObservationItem::Invalidated(invalidation)) =
+            recovery.try_recv_observed()
+        else {
+            panic!("recoverable subscriber must skip REP and rebase");
+        };
+        assert_eq!(
+            invalidation.reason,
+            crate::pane_io::PaneInvalidationReason::TranscriptMutation
+        );
+        assert_eq!(invalidation.boundary.next_output_sequence, 2);
+        assert!(
+            recovery.try_recv_observed().is_none(),
+            "the non-replayable REP event must not follow its invalidation"
+        );
+
+        let rmux_core::events::OutputCursorItem::Event(event) =
+            legacy.try_recv().expect("legacy attach still receives REP")
+        else {
+            panic!("legacy REP must remain an output event");
+        };
+        assert_eq!(event.bytes(), b"\x1b[2b");
     }
 
     #[test]
@@ -1468,7 +1606,11 @@ mod windows_tests {
             panic!("poison pane transcript mutex for timer worker test");
         });
 
-        let mut jobs = vec![PaneGroundTimerJob { transcript, timer }];
+        let mut jobs = vec![PaneGroundTimerJob {
+            transcript,
+            pane_output: pane_output_channel(),
+            timer,
+        }];
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             expire_due_pane_ground_timers(&mut jobs);
         }));

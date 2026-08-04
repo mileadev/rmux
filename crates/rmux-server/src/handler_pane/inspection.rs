@@ -9,18 +9,24 @@ use rmux_core::{
 };
 use rmux_proto::{
     CommandOutput, DisplayMessageResponse, ErrorResponse, ListPanesResponse, Response, RmuxError,
-    Target, TerminalSize,
+    Target,
 };
 
+use super::super::control_support::{
+    current_control_queue_identity, ManagedClient as ManagedDisplayClient,
+};
 use super::super::target_support::{pane_id_target, requester_environment_pane_id};
-use super::super::{format_client_uid, format_client_user, ListClientSnapshot, RequestHandler};
+use super::super::{
+    current_expected_attach_identity, format_client_uid, format_client_user, ControlClientIdentity,
+    ListClientSnapshot, RequestHandler,
+};
 #[cfg(windows)]
 use super::pane_deferred_wait::format_references_pane_pid;
 use crate::control_notifications::format_control_message_line;
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
+use crate::handler::attach_support::ActiveAttachIdentity;
 use crate::handler::scripting_support::{queued_display_target_client, QueuedDisplayTargetClient};
 use crate::pane_terminals::{session_not_found, HandlerState};
-use crate::renderer;
 
 #[path = "inspection/list_panes_default.rs"]
 mod list_panes_default;
@@ -37,6 +43,14 @@ struct DisplayMessageInvocation {
     expected_pane_id: Option<PaneId>,
     empty_target_context: bool,
     route_control_to_target_session: bool,
+    duration_ms: Option<rmux_proto::DisplayMessageDurationMillis>,
+    ignore_input: bool,
+}
+
+#[derive(Clone, Copy)]
+enum DisplayMessageClient {
+    Attached(ActiveAttachIdentity),
+    Control(ControlClientIdentity),
 }
 
 impl RequestHandler {
@@ -55,6 +69,8 @@ impl RequestHandler {
                 expected_pane_id: None,
                 empty_target_context: request.empty_target_context,
                 route_control_to_target_session: false,
+                duration_ms: None,
+                ignore_input: false,
             },
         )
         .await
@@ -75,6 +91,8 @@ impl RequestHandler {
                 expected_pane_id: None,
                 empty_target_context: request.empty_target_context,
                 route_control_to_target_session: false,
+                duration_ms: request.duration_ms,
+                ignore_input: request.ignore_input,
             },
         )
         .await
@@ -107,6 +125,8 @@ impl RequestHandler {
                         expected_pane_id: Some(pane_id),
                         empty_target_context: request.empty_target_context,
                         route_control_to_target_session: true,
+                        duration_ms: None,
+                        ignore_input: false,
                     },
                 )
                 .await;
@@ -131,6 +151,142 @@ impl RequestHandler {
             })
     }
 
+    async fn display_message_client_from_managed(
+        &self,
+        client: ManagedDisplayClient,
+    ) -> Option<DisplayMessageClient> {
+        match client {
+            ManagedDisplayClient::Attach { pid, attach_id } => {
+                let active_attach = self.active_attach.lock().await;
+                active_attach
+                    .by_pid
+                    .get(&pid)
+                    .filter(|active| {
+                        active.id == attach_id
+                            && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                    })
+                    .map(|active| DisplayMessageClient::Attached(active.identity(pid)))
+            }
+            ManagedDisplayClient::Control(identity) => {
+                Some(DisplayMessageClient::Control(identity))
+            }
+        }
+    }
+
+    async fn recent_display_message_client(
+        &self,
+        session: Option<&rmux_proto::SessionName>,
+    ) -> Option<DisplayMessageClient> {
+        let attached = {
+            let active_attach = self.active_attach.lock().await;
+            active_attach
+                .by_pid
+                .iter()
+                .filter(|(_, active)| {
+                    !active.suspended
+                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                        && session.is_none_or(|name| &active.session_name == name)
+                })
+                .max_by_key(|(_, active)| (active.last_activity_sequence, active.id))
+                .map(|(pid, active)| {
+                    (
+                        active.last_activity_sequence,
+                        DisplayMessageClient::Attached(active.identity(*pid)),
+                    )
+                })
+        };
+        let control = {
+            let active_control = self.active_control.lock().await;
+            active_control
+                .by_pid
+                .iter()
+                .filter(|(_, active)| {
+                    !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                        && session.is_none_or(|name| active.session_name.as_ref() == Some(name))
+                })
+                .max_by_key(|(_, active)| (active.last_activity_sequence, active.id))
+                .map(|(pid, active)| {
+                    (
+                        active.last_activity_sequence,
+                        DisplayMessageClient::Control(ControlClientIdentity::new(*pid, active.id)),
+                    )
+                })
+        };
+        match (attached, control) {
+            (Some((attached_activity, attached)), Some((control_activity, control))) => {
+                Some(if control_activity > attached_activity {
+                    control
+                } else {
+                    attached
+                })
+            }
+            (Some((_, attached)), None) => Some(attached),
+            (None, Some((_, control))) => Some(control),
+            (None, None) => None,
+        }
+    }
+
+    async fn display_message_client_session(
+        &self,
+        client: DisplayMessageClient,
+    ) -> Result<Option<(rmux_proto::SessionName, rmux_proto::SessionId)>, RmuxError> {
+        match client {
+            DisplayMessageClient::Attached(identity) => self
+                .attached_session_identity_for_identity(identity)
+                .await
+                .map(Some),
+            DisplayMessageClient::Control(identity) => {
+                let active_control = self.active_control.lock().await;
+                let active = active_control
+                    .by_pid
+                    .get(&identity.requester_pid())
+                    .filter(|active| {
+                        active.id == identity.control_id()
+                            && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                    })
+                    .ok_or_else(|| RmuxError::Server("control client disappeared".to_owned()))?;
+                match (&active.session_name, active.session_id) {
+                    (Some(session_name), Some(session_id)) => {
+                        Ok(Some((session_name.clone(), session_id)))
+                    }
+                    (None, None) => Ok(None),
+                    _ => Err(RmuxError::Server(
+                        "control client has an invalid session identity".to_owned(),
+                    )),
+                }
+            }
+        }
+    }
+
+    async fn send_display_message_to_control_session_identity(
+        &self,
+        session_name: &rmux_proto::SessionName,
+        session_id: rmux_proto::SessionId,
+        message: &str,
+    ) -> bool {
+        let identities = {
+            let active_control = self.active_control.lock().await;
+            active_control
+                .by_pid
+                .iter()
+                .filter(|(_, active)| {
+                    active.session_name.as_ref() == Some(session_name)
+                        && active.session_id == Some(session_id)
+                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                })
+                .map(|(pid, active)| ControlClientIdentity::new(*pid, active.id))
+                .collect::<Vec<_>>()
+        };
+        let line = format_control_message_line(message);
+        let mut delivered = false;
+        for identity in identities {
+            delivered |= self
+                .send_control_response_notification_to_queue(identity, line.clone())
+                .await;
+        }
+        delivered
+    }
+
     async fn handle_display_message_inner(
         &self,
         requester_pid: u32,
@@ -144,45 +300,52 @@ impl RequestHandler {
             expected_pane_id,
             empty_target_context,
             route_control_to_target_session,
+            duration_ms,
+            ignore_input,
         } = invocation;
-        let (target_attach_pid, target_attach_identity) = match queued_display_target_client() {
+        let explicit_display_client = match queued_display_target_client() {
             Some(QueuedDisplayTargetClient::Attached(identity)) => {
-                (Some(identity.attach_pid()), Some(identity))
+                Some(DisplayMessageClient::Attached(identity))
             }
-            Some(QueuedDisplayTargetClient::Missing) if print => (None, None),
+            Some(QueuedDisplayTargetClient::Control(identity)) => {
+                Some(DisplayMessageClient::Control(identity))
+            }
+            Some(QueuedDisplayTargetClient::Missing) if print => None,
             Some(QueuedDisplayTargetClient::Missing) => {
                 return Response::DisplayMessage(DisplayMessageResponse::no_output());
-            }
-            Some(QueuedDisplayTargetClient::ResolutionError(error))
-                if print && display_message_client_is_control_only(&error) =>
-            {
-                (None, None)
             }
             Some(QueuedDisplayTargetClient::ResolutionError(error)) => {
                 return Response::Error(ErrorResponse { error });
             }
             None => match target_client.as_deref() {
                 Some(target_client) => match self
-                    .find_target_attach_client_pid(requester_pid, target_client, "display-message")
+                    .find_display_message_client(requester_pid, target_client)
                     .await
                 {
-                    Ok(Some(attach_pid)) => (Some(attach_pid), None),
-                    Ok(None) if print => (None, None),
+                    Ok(Some(client)) => {
+                        match self.display_message_client_from_managed(client).await {
+                            Some(client) => Some(client),
+                            None if print => None,
+                            None => {
+                                return Response::DisplayMessage(
+                                    DisplayMessageResponse::no_output(),
+                                );
+                            }
+                        }
+                    }
+                    Ok(None) if print => None,
                     Ok(None) => {
                         return Response::DisplayMessage(DisplayMessageResponse::no_output());
                     }
-                    Err(error) if print && display_message_client_is_control_only(&error) => {
-                        (None, None)
-                    }
                     Err(error) => return Response::Error(ErrorResponse { error }),
                 },
-                None => (None, None),
+                None => None,
             },
         };
         let requester_is_control = self.is_control_client(requester_pid).await;
-        let captured_target_client_session = match target_attach_identity {
-            Some(identity) => match self.attached_session_identity_for_identity(identity).await {
-                Ok(session) => Some(session),
+        let captured_target_client_session = match explicit_display_client {
+            Some(identity) => match self.display_message_client_session(identity).await {
+                Ok(session) => session,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             },
             None => None,
@@ -191,50 +354,101 @@ impl RequestHandler {
             .is_none()
             .then(|| captured_target_client_session.clone())
             .flatten();
-        let format_client_pid = match target_attach_pid {
-            Some(attach_pid) => Some(attach_pid),
-            None => self
-                .resolve_target_attach_client_pid(requester_pid, None, "display-message")
+        let resolved_requester_client = if let Some(identity) = current_expected_attach_identity() {
+            Some(DisplayMessageClient::Attached(identity))
+        } else if let Some(identity) = current_control_queue_identity(requester_pid) {
+            Some(DisplayMessageClient::Control(identity))
+        } else {
+            match self
+                .resolve_target_managed_client(requester_pid, None, "display-message")
                 .await
-                .ok(),
+            {
+                Ok(client) => self.display_message_client_from_managed(client).await,
+                Err(_) => None,
+            }
         };
-        let requester_client = match format_client_pid {
-            Some(attach_pid) => self
-                .list_clients_snapshot()
-                .await
-                .into_iter()
-                .find(|client| !client.control && client.pid == attach_pid),
-            None => None,
-        };
-        let requester_environment_target = if target.is_none() && target_client.is_none() {
+        let requester_environment_target = {
             let socket_path = self.socket_path();
-            let requester_pane_id = requester_environment_pane_id(requester_pid, &socket_path);
-            match requester_pane_id {
+            match requester_environment_pane_id(requester_pid, &socket_path) {
                 Some(pane_id) => {
                     let state = self.state.lock().await;
                     pane_id_target(&state.sessions, pane_id)
                 }
                 None => None,
             }
-        } else {
-            None
         };
-        let session_client_pid = target_attach_pid.unwrap_or(requester_pid);
-        let attached_session_name = if let Some((session_name, _)) = &exact_target_client_session {
-            Some(session_name.clone())
-        } else if target.is_none() && print {
-            let active_attach = self.active_attach.lock().await;
-            active_attach
-                .session_for_attached_client(session_client_pid, "display-message")
-                .ok()
-                .flatten()
-        } else if target.is_none() {
-            let active_attach = self.active_attach.lock().await;
-            match active_attach.session_for_attached_client(session_client_pid, "display-message") {
-                Ok(session_name) => session_name,
-                Err(_error) if requester_is_control => None,
-                Err(error) => return Response::Error(ErrorResponse { error }),
+        let format_fallback_client = match resolved_requester_client {
+            Some(identity) => Some(identity),
+            None if requester_is_control => None,
+            None => {
+                let preferred_session = requester_environment_target
+                    .as_ref()
+                    .map(Target::session_name);
+                match self.recent_display_message_client(preferred_session).await {
+                    Some(identity) => Some(identity),
+                    None if preferred_session.is_some() => {
+                        self.recent_display_message_client(None).await
+                    }
+                    None => None,
+                }
             }
+        };
+        let display_client = if route_control_to_target_session {
+            None
+        } else {
+            explicit_display_client.or(format_fallback_client)
+        };
+        let display_client_session = match display_client {
+            Some(identity) => match self.display_message_client_session(identity).await {
+                Ok(session) => session,
+                Err(error) if explicit_display_client.is_some() => {
+                    return Response::Error(ErrorResponse { error });
+                }
+                Err(_) => None,
+            },
+            None => None,
+        };
+        let format_client = match (
+            target.as_ref().map(Target::session_name),
+            display_client_session.as_ref(),
+        ) {
+            (Some(target_session), Some((display_session, _)))
+                if target_session == display_session =>
+            {
+                display_client
+            }
+            (Some(target_session), _) => self
+                .recent_display_message_client(Some(target_session))
+                .await
+                .or(format_fallback_client)
+                .or(display_client),
+            (None, _) => format_fallback_client.or(display_client),
+        };
+        let format_client_snapshot = match format_client {
+            Some(DisplayMessageClient::Attached(identity)) => self
+                .list_clients_snapshot()
+                .await
+                .into_iter()
+                .find(|client| {
+                    !client.control
+                        && client.pid == identity.attach_pid()
+                        && client.order == identity.attach_id()
+                }),
+            Some(DisplayMessageClient::Control(identity)) => self
+                .list_clients_snapshot()
+                .await
+                .into_iter()
+                .find(|client| {
+                    client.control
+                        && client.pid == identity.requester_pid()
+                        && client.order == identity.control_id()
+                }),
+            None => None,
+        };
+        let attached_session_name = if target.is_none() {
+            format_client_snapshot
+                .as_ref()
+                .and_then(|client| client.session_name.clone())
         } else {
             None
         };
@@ -272,7 +486,7 @@ impl RequestHandler {
                 let state = self.state.lock().await;
                 let mut runtime =
                     RuntimeFormatContext::new(FormatContext::new()).with_state(&state);
-                if let Some(client) = requester_client.as_ref() {
+                if let Some(client) = format_client_snapshot.as_ref() {
                     runtime = with_runtime_client_values(runtime, client);
                 }
                 render_runtime_template(template, &runtime, true)
@@ -298,7 +512,7 @@ impl RequestHandler {
                 let state = self.state.lock().await;
                 let mut runtime =
                     RuntimeFormatContext::new(FormatContext::new()).with_state(&state);
-                if let Some(client) = requester_client.as_ref() {
+                if let Some(client) = format_client_snapshot.as_ref() {
                     runtime = with_runtime_client_values(runtime, client);
                 }
                 render_runtime_template(template, &runtime, true)
@@ -313,12 +527,12 @@ impl RequestHandler {
                 let state = self.state.lock().await;
                 let mut runtime =
                     RuntimeFormatContext::new(FormatContext::new()).with_state(&state);
-                if let Some(client) = requester_client.as_ref() {
+                if let Some(client) = format_client_snapshot.as_ref() {
                     runtime = with_runtime_client_values(runtime, client);
                 }
                 render_runtime_template(template, &runtime, true)
             };
-            self.send_control_notification_to(
+            self.send_control_response_notification_to(
                 requester_pid,
                 format_control_message_line(&expanded),
             )
@@ -334,14 +548,14 @@ impl RequestHandler {
         }
         let attached_count = self.attached_count(&session_name).await;
 
-        let (expanded, overlay_frame, clear_frame, duration) = {
+        let (expanded, duration, display_session_id) = {
             let mut state = self.state.lock().await;
             if exact_target_client_session
                 .as_ref()
-                .is_some_and(|(_, expected_id)| {
+                .is_some_and(|(expected_name, expected_id)| {
                     state
                         .sessions
-                        .session(&session_name)
+                        .session(expected_name)
                         .map(|session| session.id())
                         != Some(*expected_id)
                 })
@@ -378,19 +592,16 @@ impl RequestHandler {
             if let Err(error) = state.refresh_format_target_exit_status(&context_target) {
                 return Response::Error(ErrorResponse { error });
             }
-            let (session, mut context) =
+            let (format_session, mut context) =
                 match display_message_context(&state, &context_target, attached_count) {
                     Ok(context) => context,
                     Err(error) => return Response::Error(ErrorResponse { error }),
                 };
-            if let Some(client) = requester_client.as_ref() {
+            if let Some(client) = format_client_snapshot.as_ref() {
                 context = with_runtime_client_values(context, client);
             }
             if uses_lone_session_print_context {
                 context = context.without_session_size();
-                if requester_client.is_none() {
-                    context = context.with_unclipped_geometry();
-                }
             }
             context = context.with_named_value(
                 "socket_path",
@@ -404,22 +615,41 @@ impl RequestHandler {
                 ));
             }
 
-            let mut overlay_frame =
-                renderer::render_display_panes_clear(session, &state.options, &state);
-            overlay_frame.extend_from_slice(
-                renderer::render_status_message(session, &state.options, &expanded).as_slice(),
-            );
-            let clear_frame = renderer::render_display_panes_clear(session, &state.options, &state);
+            let display_session_name = display_client_session
+                .as_ref()
+                .map(|(name, _)| name)
+                .unwrap_or(&session_name);
+            let display_session = match (&display_client_session, display_client) {
+                (Some((display_session_name, display_session_id)), Some(_)) => {
+                    let Some(display_session) = state
+                        .sessions
+                        .session(display_session_name)
+                        .filter(|session| session.id() == *display_session_id)
+                    else {
+                        return Response::DisplayMessage(DisplayMessageResponse::no_output());
+                    };
+                    display_session
+                }
+                _ => format_session,
+            };
             (
                 expanded,
-                overlay_frame,
-                clear_frame,
-                display_time(&state.options, &session_name),
+                duration_ms.map_or_else(
+                    || {
+                        let duration = display_time(&state.options, display_session_name);
+                        (!duration.is_zero()).then_some(duration)
+                    },
+                    |duration| {
+                        (duration.get() != 0)
+                            .then(|| std::time::Duration::from_millis(u64::from(duration.get())))
+                    },
+                ),
+                display_session.id(),
             )
         };
 
-        if requester_is_control && target_attach_pid.is_none() && !route_control_to_target_session {
-            self.send_control_notification_to(
+        if requester_is_control && display_client.is_none() && !route_control_to_target_session {
+            self.send_control_response_notification_to(
                 requester_pid,
                 format_control_message_line(&expanded),
             )
@@ -427,29 +657,49 @@ impl RequestHandler {
             return Response::DisplayMessage(DisplayMessageResponse::no_output());
         }
 
-        let delivered = match target_attach_pid {
-            Some(_attach_pid) if target_attach_identity.is_some() => {
-                self.send_attached_overlay_to_client_identity(
-                    target_attach_identity.expect("guarded target client identity"),
-                    exact_target_client_session.as_ref().map(|(_, id)| *id),
-                    overlay_frame,
-                    clear_frame,
+        let input_policy = if ignore_input && duration.is_some() {
+            super::super::attach_support::TransientMessageInputPolicy::IgnoreUntilExpiry
+        } else {
+            super::super::attach_support::TransientMessageInputPolicy::DismissAndForward
+        };
+        let delivered = if route_control_to_target_session {
+            let attached = self
+                .send_attached_overlay_to_session_identity(
+                    &session_name,
+                    display_session_id,
+                    expanded.clone(),
                     duration,
+                    input_policy,
                 )
-                .await
-            }
-            Some(attach_pid) => {
-                self.send_attached_overlay_to_client(
-                    attach_pid,
-                    overlay_frame,
-                    clear_frame,
-                    duration,
+                .await;
+            let control = self
+                .send_display_message_to_control_session_identity(
+                    &session_name,
+                    display_session_id,
+                    &expanded,
                 )
-                .await
-            }
-            None => {
-                self.send_attached_overlay(&session_name, overlay_frame, clear_frame, duration)
+                .await;
+            attached || control
+        } else {
+            match display_client {
+                Some(DisplayMessageClient::Attached(identity)) => {
+                    self.send_attached_overlay_to_client_identity(
+                        identity,
+                        Some(display_session_id),
+                        expanded.clone(),
+                        duration,
+                        input_policy,
+                    )
                     .await
+                }
+                Some(DisplayMessageClient::Control(identity)) => {
+                    self.send_control_response_notification_to_queue(
+                        identity,
+                        format_control_message_line(&expanded),
+                    )
+                    .await
+                }
+                None => false,
             }
         };
         if delivered {
@@ -520,13 +770,6 @@ impl RequestHandler {
         };
         Response::ListPanes(ListPanesResponse { output })
     }
-}
-
-fn display_message_client_is_control_only(error: &RmuxError) -> bool {
-    matches!(
-        error,
-        RmuxError::Server(message) if message == "display-message requires an attached client"
-    )
 }
 
 fn display_message_stable_target_moved(response: &Response) -> bool {
@@ -600,7 +843,6 @@ pub(in crate::handler) fn display_message_context<'a>(
     match target {
         Target::Session(_) => {
             let window = session.window();
-            let use_unclipped_geometry = attached_count == 0 && window.pane_count() == 1;
             let mut context = FormatContext::from_session(session)
                 .with_session_attached(attached_count)
                 .with_window(active_window, window, true, false);
@@ -614,9 +856,6 @@ pub(in crate::handler) fn display_message_context<'a>(
             if let Some(pane) = window.active_pane() {
                 runtime = runtime.with_pane(pane);
             }
-            if use_unclipped_geometry {
-                runtime = runtime.with_unclipped_geometry();
-            }
             Ok((session, runtime))
         }
         Target::Window(target) => {
@@ -627,7 +866,6 @@ pub(in crate::handler) fn display_message_context<'a>(
                     "window index does not exist in session",
                 )
             })?;
-            let use_unclipped_geometry = attached_count == 0 && window.pane_count() == 1;
             let mut context = FormatContext::from_session(session)
                 .with_session_attached(attached_count)
                 .with_window(
@@ -646,9 +884,6 @@ pub(in crate::handler) fn display_message_context<'a>(
             if let Some(pane) = window.active_pane() {
                 runtime = runtime.with_pane(pane);
             }
-            if use_unclipped_geometry {
-                runtime = runtime.with_unclipped_geometry();
-            }
             Ok((session, runtime))
         }
         Target::Pane(target) => {
@@ -666,7 +901,6 @@ pub(in crate::handler) fn display_message_context<'a>(
                     "pane index does not exist in session",
                 )
             })?;
-            let use_unclipped_geometry = attached_count == 0 && window.pane_count() == 1;
             let context = FormatContext::from_session(session)
                 .with_session_attached(attached_count)
                 .with_window(
@@ -676,33 +910,38 @@ pub(in crate::handler) fn display_message_context<'a>(
                     Some(window_index) == last_window,
                 )
                 .with_pane(pane, pane_index == window.active_pane_index());
-            let mut runtime = RuntimeFormatContext::new(context)
+            let runtime = RuntimeFormatContext::new(context)
                 .with_state(state)
                 .with_session(session)
                 .with_window(window_index, window)
                 .with_pane(pane);
-            if use_unclipped_geometry {
-                runtime = runtime.with_unclipped_geometry();
-            }
             Ok((session, runtime))
         }
     }
 }
 
 fn with_runtime_client_values<'a>(
-    runtime: RuntimeFormatContext<'a>,
+    mut runtime: RuntimeFormatContext<'a>,
     client: &ListClientSnapshot,
 ) -> RuntimeFormatContext<'a> {
+    if let Some(client_size) = client.terminal_size() {
+        runtime = runtime.with_client_size(client_size);
+    }
     runtime
-        .with_client_size(TerminalSize {
-            cols: client.width,
-            rows: client.height,
-        })
         .with_named_value("client_name", client.name.clone())
         .with_named_value("client_pid", client.pid.to_string())
         .with_named_value("client_tty", client.tty.clone())
+        .with_named_value("client_activity", client.activity_at.to_string())
+        .with_named_value(
+            "client_session",
+            client
+                .session_name
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+        )
         .with_named_value("client_width", client.width.to_string())
-        .with_named_value("client_height", client.height.to_string())
+        .with_named_value("client_height", client.height_value())
         .with_named_value("client_termfeatures", client.termfeatures.clone())
         .with_named_value("client_termname", client.termname.clone())
         .with_named_value("client_termtype", client.termtype.clone())
@@ -737,8 +976,7 @@ pub(in crate::handler) fn display_time(
         options
             .resolve(Some(session_name), rmux_proto::OptionName::DisplayTime)
             .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(750)
-            .max(1),
+            .unwrap_or(750),
     )
 }
 
@@ -841,15 +1079,12 @@ fn collect_list_pane_output_with_selection(
                 stdout.pop();
             }
             let context = window_context.clone().with_pane(pane, pane_active);
-            let mut runtime = RuntimeFormatContext::new(context)
+            let runtime = RuntimeFormatContext::new(context)
                 .with_state(state)
                 .with_socket_path(socket_path)
                 .with_session(session)
                 .with_window(*window_index, window)
                 .with_pane(pane);
-            if attached_count == 0 {
-                runtime = runtime.with_unclipped_geometry();
-            }
             if let Some(filter) = filter {
                 let expanded = render_runtime_template(filter, &runtime, false);
                 if !is_truthy(&expanded) {

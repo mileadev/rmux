@@ -14,6 +14,45 @@ fn function_body<'a>(source: &'a str, name: &str, next_name: &str) -> &'a str {
 }
 
 #[test]
+fn package_verifier_tolerates_process_exit_during_cleanup() {
+    let stop = function_body(VERIFIER, "Stop-ProcessIfRunning", "Remove-PackageDaemon");
+    assert!(stop.contains("$Process.HasExited"));
+    assert!(stop.contains("$Process.Kill()"));
+    assert!(stop.contains("catch [System.InvalidOperationException]"));
+    assert!(stop.contains("catch [System.InvalidOperationException] {\n        return\n    }"));
+    assert_eq!(
+        VERIFIER.matches(".Kill()").count(),
+        1,
+        "all verifier cleanup paths must use the race-safe helper"
+    );
+    for caller in [
+        "Stop-ProcessIfRunning $Daemon.Process",
+        "Stop-ProcessIfRunning $process",
+        "Stop-ProcessIfRunning $concurrentInstaller",
+    ] {
+        assert!(
+            VERIFIER.contains(caller),
+            "Windows package cleanup lost {caller}"
+        );
+    }
+
+    let start = function_body(VERIFIER, "Start-PackageDaemon", "Stop-PackageDaemon");
+    let process_start = start
+        .find("$process = Start-Process")
+        .expect("package daemon process start");
+    let handle = start
+        .find("[void]$process.Handle")
+        .expect("live package daemon handle capture");
+    let wait = start
+        .find("$readyEvent.WaitOne")
+        .expect("package daemon ready wait");
+    assert!(
+        process_start < handle && handle < wait,
+        "Windows PowerShell 5.1 needs a live process handle before waiting"
+    );
+}
+
+#[test]
 fn archived_package_smokes_list_exactly_one_test_before_running() {
     for required in [
         "\"nextest\", \"list\"",

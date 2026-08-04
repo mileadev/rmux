@@ -21,6 +21,14 @@ pub(super) enum ParsedSelectLayout {
     Request(Request),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectLayoutMode {
+    Next,
+    Previous,
+    Spread,
+    Old,
+}
+
 pub(super) fn parse_display_panes(
     mut args: CommandTokens,
     sessions: &SessionStore,
@@ -58,7 +66,9 @@ pub(super) fn parse_display_panes(
                 target_client = Some(args.required("-t target-client")?);
             }
             _ => {
-                let Some(cluster) = parse_compact_flag_cluster(&token, "bN", "dt") else {
+                let Some(cluster) =
+                    parse_compact_flag_cluster("display-panes", &token, "bN", "dt")?
+                else {
                     reject_unknown_option_before_positional("display-panes", &token)?;
                     break;
                 };
@@ -105,8 +115,8 @@ pub(super) fn parse_select_layout(
     let mut old_layout = false;
     let mut previous_layout = false;
 
-    while let Some(token) = args.peek() {
-        match token {
+    while let Some(token) = args.peek().map(str::to_owned) {
+        match token.as_str() {
             "--" => {
                 let _ = args.optional();
                 break;
@@ -131,7 +141,29 @@ pub(super) fn parse_select_layout(
                 let _ = args.optional();
                 target = Some(parse_select_layout_target(args.required("-t target")?)?);
             }
-            _ => break,
+            _ => {
+                let Some(cluster) =
+                    parse_compact_flag_cluster("select-layout", &token, "Enop", "t")?
+                else {
+                    reject_unknown_option_before_positional("select-layout", &token)?;
+                    break;
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('E') => spread = true,
+                        CompactFlag::Bare('n') => next_layout = true,
+                        CompactFlag::Bare('o') => old_layout = true,
+                        CompactFlag::Bare('p') => previous_layout = true,
+                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                            target = Some(parse_select_layout_target(
+                                compact_flag.value_or_next(&mut args, "-t target")?,
+                            )?);
+                        }
+                        _ => unreachable!("compact select-layout flags are prevalidated"),
+                    }
+                }
+            }
         }
     }
 
@@ -140,50 +172,54 @@ pub(super) fn parse_select_layout(
         find_context,
         "select-layout",
     )?));
-    let mode_count = [spread, next_layout, old_layout, previous_layout]
-        .into_iter()
-        .filter(|present| *present)
-        .count();
-    if mode_count > 1 {
-        return Err(RmuxError::Server(
-            "select-layout accepts only one mode flag".to_owned(),
-        ));
-    }
-    if mode_count == 1 && !args.is_empty() {
-        return Err(RmuxError::Server(
-            "command select-layout: too many arguments (need at most 0)".to_owned(),
-        ));
-    }
-    if spread {
-        return Ok(ParsedSelectLayout::Request(Request::SpreadLayout(
-            SpreadLayoutRequest { target },
-        )));
-    }
-    if next_layout {
-        return Ok(ParsedSelectLayout::Request(Request::NextLayout(
-            NextLayoutRequest {
-                target: select_layout_window_target(&target, sessions)?,
-            },
-        )));
-    }
-    if old_layout {
-        return Ok(ParsedSelectLayout::Request(Request::SelectOldLayout(
-            SelectOldLayoutRequest { target },
-        )));
-    }
-    if previous_layout {
-        return Ok(ParsedSelectLayout::Request(Request::PreviousLayout(
-            PreviousLayoutRequest {
-                target: select_layout_window_target(&target, sessions)?,
-            },
-        )));
-    }
-    if args.is_empty() {
-        return Ok(ParsedSelectLayout::NoOp);
+    let mode = if next_layout {
+        Some(SelectLayoutMode::Next)
+    } else if previous_layout {
+        Some(SelectLayoutMode::Previous)
+    } else if spread {
+        Some(SelectLayoutMode::Spread)
+    } else if old_layout {
+        Some(SelectLayoutMode::Old)
+    } else {
+        None
+    };
+    let layout = args.optional();
+    args.no_extra("select-layout")?;
+
+    match mode {
+        Some(SelectLayoutMode::Next) => {
+            return Ok(ParsedSelectLayout::Request(Request::NextLayout(
+                NextLayoutRequest {
+                    target: select_layout_window_target(&target, sessions)?,
+                },
+            )));
+        }
+        Some(SelectLayoutMode::Previous) => {
+            return Ok(ParsedSelectLayout::Request(Request::PreviousLayout(
+                PreviousLayoutRequest {
+                    target: select_layout_window_target(&target, sessions)?,
+                },
+            )));
+        }
+        Some(SelectLayoutMode::Spread) => {
+            return Ok(ParsedSelectLayout::Request(Request::SpreadLayout(
+                SpreadLayoutRequest { target },
+            )));
+        }
+        Some(SelectLayoutMode::Old) => {
+            return Ok(ParsedSelectLayout::Request(match layout {
+                Some(layout) => {
+                    Request::SelectCustomLayout(SelectCustomLayoutRequest { target, layout })
+                }
+                None => Request::SelectOldLayout(SelectOldLayoutRequest { target }),
+            }));
+        }
+        None => {}
     }
 
-    let layout = args.required("select-layout layout")?;
-    args.no_extra("select-layout")?;
+    let Some(layout) = layout else {
+        return Ok(ParsedSelectLayout::NoOp);
+    };
 
     match parse_layout_name(&layout) {
         Ok(layout) => Ok(ParsedSelectLayout::Request(Request::SelectLayout(
@@ -395,7 +431,12 @@ pub(super) fn parse_resize_pane(
             "-M" => {
                 let _ = args.optional();
             }
-            _ => break,
+            _ => {
+                if token.starts_with('-') && !integer_like_resize_pane_adjustment(token) {
+                    let _ = parse_compact_flag_cluster("resize-pane", token, "DLMRTUZ", "txy")?;
+                }
+                break;
+            }
         }
     }
     relative = parse_trailing_resize_pane_adjustment(&mut args, relative)?;
@@ -597,3 +638,7 @@ fn resize_pane_adjustment(
         (None, None, None) => None,
     }
 }
+
+#[cfg(test)]
+#[path = "layout_parse_tests.rs"]
+mod tests;

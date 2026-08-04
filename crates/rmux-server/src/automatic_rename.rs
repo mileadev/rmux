@@ -10,6 +10,16 @@ pub(crate) fn automatic_rename_enabled(
         == Some("on")
 }
 
+pub(crate) fn automatic_rename_enabled_for_new_window(
+    options: &OptionStore,
+    session_name: &SessionName,
+) -> bool {
+    // A not-yet-created window has no local option node. Resolve from the
+    // session context so an occupied insertion slot cannot lend its override
+    // to the new window that will shift it away.
+    options.resolve(Some(session_name), OptionName::AutomaticRename) == Some("on")
+}
+
 pub(crate) fn window_allows_automatic_rename(
     options: &OptionStore,
     session_name: &SessionName,
@@ -40,7 +50,7 @@ mod tests {
         OptionName, ScopeSelector, SessionName, SetOptionMode, TerminalSize, WindowTarget,
     };
 
-    use super::session_window_allows_automatic_rename;
+    use super::{automatic_rename_enabled_for_new_window, session_window_allows_automatic_rename};
 
     fn session_name(value: &str) -> SessionName {
         SessionName::new(value).expect("valid session name")
@@ -74,5 +84,33 @@ mod tests {
             0,
             false
         ));
+    }
+
+    #[test]
+    fn new_window_policy_does_not_inherit_an_occupied_slot_override() {
+        let alpha = session_name("alpha");
+        let mut options = OptionStore::new();
+        options
+            .set(
+                ScopeSelector::Global,
+                OptionName::AutomaticRename,
+                "off".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("global automatic-rename option set succeeds");
+        options
+            .set(
+                ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 1)),
+                OptionName::AutomaticRename,
+                "on".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("occupied window override set succeeds");
+
+        assert_eq!(
+            options.resolve_for_window(&alpha, 1, OptionName::AutomaticRename),
+            Some("on")
+        );
+        assert!(!automatic_rename_enabled_for_new_window(&options, &alpha));
     }
 }

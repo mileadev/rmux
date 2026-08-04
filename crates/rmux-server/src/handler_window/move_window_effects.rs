@@ -10,13 +10,14 @@ use rmux_proto::{
 use super::super::attach_support::{surviving_attached_resize_targets, SessionDetachOnDestroy};
 use super::super::{
     defer_lifecycle_event, prepare_deferred_lifecycle_event, prepare_lifecycle_event_if_enabled,
-    DeferredLifecycleEvent, QueuedLifecycleEvent, RequestHandler,
+    DeferredLifecycleEvent, QueuedLifecycleEvent, RequestHandler, SelectionTransitionSnapshot,
 };
 use crate::pane_terminals::HandlerState;
 
 pub(super) struct MoveWindowEffects {
     source_session_name: Option<SessionName>,
     source_family_sessions: Vec<SessionName>,
+    selection_before: SelectionTransitionSnapshot,
     destination_window_id_before: Option<WindowId>,
     resize_window_ids: Vec<WindowId>,
     hook_snapshot: HookStore,
@@ -31,6 +32,7 @@ pub(super) struct MoveWindowEffects {
 
 pub(in crate::handler) struct PreparedMoveWindowEffects {
     linked_event: Option<QueuedLifecycleEvent>,
+    selection_events: Vec<QueuedLifecycleEvent>,
     lifecycle_events: Vec<PreparedLifecycleEffect>,
     removed_sessions: Vec<SessionName>,
     refresh_sessions: Vec<SessionName>,
@@ -128,6 +130,7 @@ impl MoveWindowEffects {
         Self {
             source_session_name: source.map(|source| source.session_name().clone()),
             source_family_sessions,
+            selection_before: SelectionTransitionSnapshot::capture(state),
             destination_window_id_before,
             resize_window_ids,
             hook_snapshot: state.hooks.clone(),
@@ -144,6 +147,7 @@ impl MoveWindowEffects {
         let Self {
             source_session_name,
             source_family_sessions,
+            selection_before,
             destination_window_id_before,
             resize_window_ids,
             mut hook_snapshot,
@@ -189,6 +193,10 @@ impl MoveWindowEffects {
                 target: response.target.clone(),
             })
             .and_then(|event| prepare_lifecycle_event_if_enabled(state, &event));
+        let mut selection_order = vec![response.session_name.clone()];
+        selection_order.extend(source_family_sessions.iter().cloned());
+        let selection_events =
+            selection_before.prepare_session_window_changes(state, &selection_order);
         let removed_sessions = source_family_sessions
             .iter()
             .filter(|session_name| state.sessions.session(session_name).is_none())
@@ -244,6 +252,7 @@ impl MoveWindowEffects {
         }
         PreparedMoveWindowEffects {
             linked_event,
+            selection_events,
             lifecycle_events,
             removed_sessions,
             refresh_sessions,
@@ -281,10 +290,13 @@ impl RequestHandler {
             prepared_rehomes.insert(*session_id, prepared);
         }
 
-        // The linked event and ordered teardown effects were reserved before
-        // the control rehome events. Publish that exact order first.
+        // The linked, selection, and ordered teardown effects were reserved
+        // before the control rehome events. Publish that exact order first.
         if let Some(event) = effects.linked_event {
             self.pause_before_window_lifecycle_emit().await;
+            self.emit_prepared(event).await;
+        }
+        for event in effects.selection_events {
             self.emit_prepared(event).await;
         }
         for effect in effects.lifecycle_events {

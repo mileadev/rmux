@@ -387,13 +387,9 @@ async fn attach_session_uses_client_size_before_first_frame() {
 
     assert!(matches!(outcome.response, Response::AttachSession(_)));
     let state = handler.state.lock().await;
-    let size = state
-        .sessions
-        .session(&alpha)
-        .expect("session exists")
-        .window()
-        .size();
-    assert_eq!(size, TerminalSize { cols: 80, rows: 24 });
+    let session = state.sessions.session(&alpha).expect("session exists");
+    assert_eq!(session.terminal_size(), TerminalSize { cols: 80, rows: 24 });
+    assert_eq!(session.window().size(), TerminalSize { cols: 80, rows: 23 });
     drop(state);
     assert_eq!(
         pane_terminal_size(&handler, &alpha, 0, 0).await,

@@ -164,6 +164,7 @@ impl HandlerState {
             .transcripts
             .get(runtime_session_name)
             .and_then(|panes| panes.get(&pane_id))
+            .cloned()
             .ok_or_else(|| {
                 RmuxError::Server(format!(
                     "missing pane transcript for pane id {} in session {}",
@@ -171,11 +172,75 @@ impl HandlerState {
                     runtime_session_name
                 ))
             })?;
-        transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned")
-            .append_bytes(bytes);
+        if let Some(output) = self
+            .pane_outputs
+            .get(runtime_session_name)
+            .and_then(|panes| panes.get(&pane_id))
+            .cloned()
+        {
+            output.mutate_transcript(
+                &transcript,
+                crate::pane_io::PaneInvalidationReason::TranscriptMutation,
+                |transcript| {
+                    transcript.append_bytes(bytes);
+                    ((), !bytes.is_empty())
+                },
+            );
+        } else {
+            transcript
+                .lock()
+                .expect("pane transcript mutex must not be poisoned")
+                .append_bytes(bytes);
+        }
         Ok(())
+    }
+
+    /// Publishes synthetic pane bytes and applies them to the transcript at
+    /// the same output-state linearization point as PTY output.
+    #[cfg(windows)]
+    pub(crate) fn publish_bytes_to_runtime_pane_transcript(
+        &mut self,
+        runtime_session_name: &SessionName,
+        pane_id: PaneId,
+        generation: Option<u64>,
+        bytes: Vec<u8>,
+    ) -> Result<bool, RmuxError> {
+        let transcript = self
+            .transcripts
+            .get(runtime_session_name)
+            .and_then(|panes| panes.get(&pane_id))
+            .cloned()
+            .ok_or_else(|| {
+                RmuxError::Server(format!(
+                    "missing pane transcript for pane id {} in session {}",
+                    pane_id.as_u32(),
+                    runtime_session_name
+                ))
+            })?;
+        let output = self
+            .pane_outputs
+            .get(runtime_session_name)
+            .and_then(|panes| panes.get(&pane_id))
+            .cloned()
+            .ok_or_else(|| {
+                RmuxError::Server(format!(
+                    "missing pane output for pane id {} in session {}",
+                    pane_id.as_u32(),
+                    runtime_session_name
+                ))
+            })?;
+        Ok(output
+            .publish_for_generation_with_invalidation(generation, bytes, |bytes| {
+                let append = transcript
+                    .lock()
+                    .expect("pane transcript mutex must not be poisoned")
+                    .append_bytes_with_effects(bytes);
+                let invalidation = append
+                    .recovery_rebase_required
+                    .then_some(crate::pane_io::PaneInvalidationReason::TranscriptMutation);
+                ((), Vec::new(), invalidation)
+            })
+            .is_some())
     }
 
     pub(crate) fn pane_output_for_target(

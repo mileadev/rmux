@@ -1,6 +1,8 @@
+#[path = "support/python3.rs"]
+mod python3;
+
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 
 const ACTIVATION: &str = include_str!("../.github/release/release-activation.json");
 const CHOCOLATEY: &str = include_str!("../.github/workflows/release-chocolatey-retry.yml");
@@ -41,6 +43,20 @@ fn workflow_calls(text: &str, name: &str) -> usize {
                 .is_some_and(|target| target == format!("./.github/workflows/{name}"))
         })
         .count()
+}
+
+fn job_block<'a>(workflow: &'a str, job: &str, next_job: Option<&str>) -> &'a str {
+    let start_marker = format!("\n  {job}:\n");
+    let start = workflow.find(&start_marker).expect("retry job boundary");
+    let end = next_job
+        .map(|name| {
+            workflow[start + start_marker.len()..]
+                .find(&format!("\n  {name}:\n"))
+                .map(|offset| start + start_marker.len() + offset)
+                .expect("next retry job boundary")
+        })
+        .unwrap_or(workflow.len());
+    &workflow[start..end]
 }
 
 #[test]
@@ -100,7 +116,16 @@ fn retry_wrappers_use_one_common_exact_evidence_preparer() {
         assert!(workflow.contains(&format!("channel: {channel}")));
         assert!(workflow.contains("environment: release"));
         assert!(workflow.contains("assert-release-capability.py downstream_channels"));
-        assert!(workflow.contains("prepare-channel-retry.py verify-prepared"));
+        assert!(workflow.contains("prepare-channel-retry.py validate-identity-inputs --from-env"));
+        assert!(workflow.contains("prepare-channel-retry.py verify-prepared --from-env"));
+        assert!(
+            workflow
+                .find("prepare-channel-retry.py validate-identity-inputs --from-env")
+                .expect("retry input validator")
+                < workflow
+                    .find("actions-artifact.py verify")
+                    .expect("first retry input consumer")
+        );
         assert!(workflow.contains("uses: ./.github/actions/release-channel-result"));
         assert!(!workflow.contains("if: ${{ false }}"));
         assert!(!workflow.contains("cargo build"));
@@ -119,6 +144,39 @@ fn retry_wrappers_use_one_common_exact_evidence_preparer() {
 }
 
 #[test]
+fn prepare_loads_its_validator_from_the_immutable_workflow_revision() {
+    for (name, workflow) in [("Chocolatey", CHOCOLATEY), ("Snap", SNAP)] {
+        let prepare = job_block(workflow, "prepare", Some("retry"));
+        let trusted_checkout = prepare
+            .find("ref: ${{ github.workflow_sha }}")
+            .unwrap_or_else(|| panic!("{name} prepare checkout is not workflow-anchored"));
+        let local_validator = prepare
+            .find("uses: ./.github/actions/release-channel-retry-prepare")
+            .unwrap_or_else(|| panic!("{name} prepare validator action is missing"));
+
+        assert!(
+            trusted_checkout < local_validator,
+            "{name} validator must be loaded after the immutable workflow checkout"
+        );
+        assert!(
+            !prepare.contains("ref: ${{ inputs.expected_source_sha }}"),
+            "{name} prepare must not checkout an input-selected revision"
+        );
+
+        let retry = job_block(workflow, "retry", None);
+        let validated_source_checkout = retry
+            .find("ref: ${{ inputs.expected_source_sha }}")
+            .unwrap_or_else(|| panic!("{name} retry source checkout is missing"));
+        assert!(
+            retry
+                .find("needs: prepare")
+                .is_some_and(|boundary| boundary < validated_source_checkout),
+            "{name} source checkout must remain behind the prepare boundary"
+        );
+    }
+}
+
+#[test]
 fn common_retry_preparer_binds_receipt_result_attestation_and_original_bytes() {
     assert_eq!(PREPARE.matches("actions-artifact.py verify").count(), 5);
     assert_eq!(PREPARE.matches("actions/download-artifact@").count(), 5);
@@ -134,7 +192,16 @@ fn common_retry_preparer_binds_receipt_result_attestation_and_original_bytes() {
     assert!(PREPARE.contains("install-gh-2.93.0.sh"));
     assert!(PREPARE.contains("--include-retention"));
     assert!(PREPARE.contains("artifact-ids: ${{ steps.payload.outputs.artifact_id }}"));
-    assert!(PREPARE.contains("prepare-channel-retry.py prepare"));
+    assert!(PREPARE.contains("prepare-channel-retry.py validate-prepare-inputs --from-env"));
+    assert!(PREPARE.contains("prepare-channel-retry.py prepare --from-env"));
+    assert!(
+        PREPARE
+            .find("prepare-channel-retry.py validate-prepare-inputs --from-env")
+            .expect("prepare input validator")
+            < PREPARE
+                .find("[[ \"$RMUX_CHANNEL\" =~")
+                .expect("first prepare input consumer")
+    );
     assert!(PREPARE.contains("test \"$RMUX_RECEIPT_RUN_ID\" = \"$RMUX_PRIOR_RESULT_RUN_ID\""));
     assert!(PREPARE
         .contains("test \"$RMUX_PRIOR_RESULT_RUN_WORKFLOW_ID\" = \"$RMUX_RECEIPT_WORKFLOW_ID\""));
@@ -170,7 +237,7 @@ fn retry_helper_enforces_single_depth_no_mutation_and_exact_file_sets() {
 
 #[test]
 fn retry_helper_imports_the_shared_request_model() {
-    let status = Command::new("python3")
+    let status = python3::command()
         .args(["scripts/release/prepare-channel-retry.py", "--help"])
         .status()
         .expect("run Python import probe");
@@ -231,7 +298,7 @@ for field, value in (
         continue
     raise SystemExit(f'forged retry producer accepted: {field}')
 "#;
-    let output = Command::new("python3")
+    let output = python3::command()
         .arg("-c")
         .arg(script)
         .current_dir(repo_root())

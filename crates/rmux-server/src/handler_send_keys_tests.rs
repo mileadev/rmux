@@ -6,13 +6,14 @@ use crate::input_keys::{
 use crate::mouse::{AttachedMouseEvent, MouseLocation};
 use rmux_core::{input::mode, key_string_lookup_string};
 use rmux_proto::{
-    BindKeyRequest, CopyModeRequest, ErrorResponse, HookLifecycle, HookName, ListKeysRequest,
-    ListPanesRequest, NewSessionExtRequest, NewSessionRequest, OptionName,
-    PaneBroadcastInputRequest, PaneId, PaneTarget, PaneTargetRef, Request, Response, RmuxError,
-    ScopeSelector, SelectPaneRequest, SendKeysExtRequest, SendKeysRequest, SendKeysResponse,
-    SendPrefixRequest, SendPrefixResponse, SetHookMutationRequest, SetHookRequest, SetOptionMode,
-    SetOptionRequest, ShowBufferRequest, SplitDirection, SplitWindowRequest, SplitWindowTarget,
-    SwitchClientExtRequest, TerminalSize, UnbindKeyRequest, WindowTarget, DEFAULT_MAX_FRAME_LENGTH,
+    BindKeyRequest, CopyModeRequest, DisplayMessageExtRequest, ErrorResponse, HookLifecycle,
+    HookName, ListKeysRequest, ListPanesRequest, NewSessionExtRequest, NewSessionRequest,
+    OptionName, PaneBroadcastInputRequest, PaneId, PaneTarget, PaneTargetRef, Request, Response,
+    RmuxError, ScopeSelector, SelectPaneRequest, SendKeysExtRequest, SendKeysRequest,
+    SendKeysResponse, SendPrefixRequest, SendPrefixResponse, SetHookMutationRequest,
+    SetHookRequest, SetOptionMode, SetOptionRequest, ShowBufferRequest, SplitDirection,
+    SplitWindowRequest, SplitWindowTarget, SwitchClientExtRequest, Target, TerminalSize,
+    UnbindKeyRequest, WindowTarget, DEFAULT_MAX_FRAME_LENGTH,
 };
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -32,6 +33,12 @@ use super::super::input_capture::RawPaneInputProbe;
 #[path = "handler_send_keys_tests/live_attach.rs"]
 mod live_attach;
 
+#[path = "handler_send_keys_tests/read_only_detach.rs"]
+mod read_only_detach;
+
+#[path = "handler_send_keys_tests/read_only_navigation_security.rs"]
+mod read_only_navigation_security;
+
 #[path = "handler_send_keys_tests/kitty_keyboard.rs"]
 mod kitty_keyboard;
 
@@ -44,6 +51,9 @@ mod bracketed_paste_live;
 
 #[path = "handler_send_keys_tests/bracketed_paste_large.rs"]
 mod bracketed_paste_large;
+
+#[path = "handler_send_keys_tests/bracketed_paste_final_sink.rs"]
+mod bracketed_paste_final_sink;
 
 #[path = "handler_send_keys_tests/kitty_graphics_live.rs"]
 mod kitty_graphics_live;
@@ -65,6 +75,12 @@ mod copy_mode_mouse_origin;
 
 #[path = "handler_send_keys_tests/copy_mode_vi.rs"]
 mod copy_mode_vi;
+
+#[path = "handler_send_keys_tests/key_table_precedence.rs"]
+mod key_table_precedence;
+
+#[path = "handler_send_keys_tests/combined_input_credit.rs"]
+mod combined_input_credit;
 
 async fn handle_boxed(handler: &RequestHandler, request: Request) -> Response {
     Box::pin(handler.handle(request)).await

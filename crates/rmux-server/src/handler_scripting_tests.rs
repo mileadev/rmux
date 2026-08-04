@@ -444,3 +444,12 @@ mod command_alias;
 
 #[path = "handler_scripting_tests/command_blocks.rs"]
 mod command_blocks;
+
+#[path = "handler_scripting_tests/parser_flags.rs"]
+mod parser_flags;
+
+#[path = "handler_scripting_tests/parser_option_flags.rs"]
+mod parser_option_flags;
+
+#[path = "handler_scripting_tests/select_layout_flags.rs"]
+mod select_layout_flags;

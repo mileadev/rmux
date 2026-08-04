@@ -12,7 +12,7 @@ use super::{
     DeferredInitialPaneConsoleInputAction, DeferredInitialPaneIdentity, DeferredInitialPaneInput,
     DeferredInitialPaneInputDrain, DeferredInitialPaneInputFlush, DeferredInitialPaneSpawn,
     HandlerState, InitialPaneSpawnOptions, PaneExitMetadata, PaneLifecycleSpawn, PaneOutputSpawn,
-    StartingPane,
+    PasteDelimiters, StartingPane, WindowNameApplication,
 };
 
 const STARTING_PANE_INPUT_MAX_BYTES: usize = 64 * 1024;
@@ -66,12 +66,25 @@ impl HandlerState {
             requested_cwd,
         )?;
         crate::terminal::validate_windows_process_command_for_profile(&profile, spawn.command)?;
-        let automatic_window_name = profile.automatic_window_name(spawn.command);
         let runtime_window_name = profile.runtime_window_name(spawn.command);
+        let initial_window_name = if crate::automatic_rename::automatic_rename_enabled(
+            &self.options,
+            session_name,
+            pane.window_index,
+        ) {
+            profile.automatic_window_name(spawn.command)
+        } else {
+            runtime_window_name.clone()
+        };
         let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
         let respawn_shell = profile.shell().to_path_buf();
-        self.apply_automatic_window_name(session_name, pane.window_index, automatic_window_name)?;
+        self.apply_window_name(
+            session_name,
+            pane.window_index,
+            initial_window_name,
+            WindowNameApplication::Initial,
+        )?;
         self.terminals.insert_pending_session(
             runtime_session_name.clone(),
             crate::terminal::SessionBaseEnvironment::from_profile(&profile),
@@ -364,15 +377,22 @@ impl HandlerState {
         );
         self.add_message(message.clone());
         let bytes = format!("{message}\r\n").into_bytes();
-        let _ =
-            self.append_bytes_to_runtime_pane_transcript(&runtime_session_name, pane_id, &bytes);
-        if let Some(sender) = self
-            .pane_outputs
-            .get(&runtime_session_name)
-            .and_then(|panes| panes.get(&pane_id))
-        {
-            let _ = sender.send_for_generation(Some(identity.generation()), bytes);
-            let _ = sender.send_for_generation(Some(identity.generation()), Vec::new());
+        let published = self
+            .publish_bytes_to_runtime_pane_transcript(
+                &runtime_session_name,
+                pane_id,
+                Some(identity.generation()),
+                bytes,
+            )
+            .unwrap_or(false);
+        if published {
+            if let Some(sender) = self
+                .pane_outputs
+                .get(&runtime_session_name)
+                .and_then(|panes| panes.get(&pane_id))
+            {
+                let _ = sender.send_for_generation(Some(identity.generation()), Vec::new());
+            }
         }
         let metadata = PaneExitMetadata {
             status: Some(1),
@@ -458,6 +478,28 @@ impl HandlerState {
             window_index,
             pane_index,
             DeferredInitialPaneInput::Bytes(bytes.to_vec()),
+        )
+    }
+
+    pub(crate) fn queue_starting_pane_paste_input(
+        &mut self,
+        session_name: &SessionName,
+        window_index: u32,
+        pane_index: u32,
+        bytes: &[u8],
+        delimiters: PasteDelimiters,
+    ) -> Result<bool, RmuxError> {
+        if bytes.is_empty() {
+            return Ok(false);
+        }
+        self.queue_starting_pane_input_entry(
+            session_name,
+            window_index,
+            pane_index,
+            DeferredInitialPaneInput::Paste {
+                bytes: bytes.to_vec(),
+                delimiters,
+            },
         )
     }
 

@@ -143,6 +143,92 @@ fn cross_session_join_pane_renumbers_colliding_source_pane_index() -> Result<(),
     Ok(())
 }
 
+#[test]
+fn source_file_join_and_move_renumber_destroyed_source() -> Result<(), Box<dyn Error>> {
+    for command in ["join-pane", "move-pane"] {
+        let harness = CliHarness::new(&format!("source-file-{command}-renumber"))?;
+        let mut daemon = harness.start_hidden_daemon()?;
+        create_renumber_transfer_source(&harness, "alpha")?;
+        let config = harness.tmpdir().join(format!("{command}-renumber.conf"));
+        fs::write(&config, format!("{command} -d -s alpha:1.0 -t alpha:0.0\n"))?;
+
+        assert_success(
+            &harness.run(&["source-file", config.to_str().expect("UTF-8 config path")])?,
+        );
+        assert_contiguous_windows(&harness, "alpha")?;
+        terminate_child(daemon.child_mut())?;
+    }
+    Ok(())
+}
+
+#[test]
+fn startup_join_and_move_renumber_destroyed_source() -> Result<(), Box<dyn Error>> {
+    for command in ["join-pane", "move-pane"] {
+        let harness = CliHarness::new(&format!("startup-{command}-renumber"))?;
+        let config = harness.tmpdir().join(format!("startup-{command}.conf"));
+        fs::write(
+            &config,
+            format!(
+                "new-session -d -s alpha sleep 60\n\
+                 new-window -d -t alpha:1 -n SOURCE sleep 60\n\
+                 new-window -d -t alpha:2 -n SURVIVOR sleep 60\n\
+                 set-option -t alpha renumber-windows on\n\
+                 {command} -d -s alpha:1.0 -t alpha:0.0\n"
+            ),
+        )?;
+
+        assert_success(&harness.run(&[
+            "-f",
+            config.to_str().expect("UTF-8 startup config path"),
+            "new-session",
+            "-d",
+            "-s",
+            "boot",
+            "sleep",
+            "60",
+        ])?);
+        assert_contiguous_windows(&harness, "alpha")?;
+    }
+    Ok(())
+}
+
+fn create_renumber_transfer_source(
+    harness: &CliHarness,
+    session: &str,
+) -> Result<(), Box<dyn Error>> {
+    assert_success(&harness.run(&["new-session", "-d", "-s", session, "sleep", "60"])?);
+    assert_success(&harness.run(&[
+        "new-window",
+        "-d",
+        "-t",
+        &format!("{session}:1"),
+        "-n",
+        "SOURCE",
+        "sleep",
+        "60",
+    ])?);
+    assert_success(&harness.run(&[
+        "new-window",
+        "-d",
+        "-t",
+        &format!("{session}:2"),
+        "-n",
+        "SURVIVOR",
+        "sleep",
+        "60",
+    ])?);
+    assert_success(&harness.run(&["set-option", "-t", session, "renumber-windows", "on"])?);
+    Ok(())
+}
+
+fn assert_contiguous_windows(harness: &CliHarness, session: &str) -> Result<(), Box<dyn Error>> {
+    let listed = harness.run(&["list-windows", "-t", session, "-F", "#{window_index}"])?;
+    assert_eq!(listed.status.code(), Some(0), "{}", stderr(&listed));
+    assert_eq!(stdout(&listed), "0\n1\n");
+    assert!(stderr(&listed).is_empty());
+    Ok(())
+}
+
 fn wait_for_file_contents(
     path: &Path,
     expected: &str,

@@ -17,6 +17,8 @@ mod pane_transfer;
 mod pane_transfer_cross;
 #[path = "session/pane_transfer_shared.rs"]
 mod pane_transfer_shared;
+#[path = "session/recency.rs"]
+mod recency;
 #[path = "session/resize.rs"]
 mod resize;
 #[path = "session/store.rs"]
@@ -28,6 +30,7 @@ mod types;
 #[path = "session/window_ops.rs"]
 mod window_ops;
 
+pub use recency::SessionRecency;
 pub use store::SessionStore;
 use target_error::{invalid_pane_target, invalid_window_target};
 pub(crate) use types::WindowIdAllocator;
@@ -46,11 +49,16 @@ pub struct Session {
     winlink_alert_flags: BTreeMap<u32, AlertFlags>,
     active_window: u32,
     last_window: Option<u32>,
+    /// First grouped-peer winlink by stable identity, retained until real local navigation.
+    group_initial_window_id: Option<WindowId>,
     next_pane_id: u32,
     next_window_id: WindowIdAllocator,
     created_at: i64,
     activity_at: i64,
     last_attached_at: Option<i64>,
+    /// Internal total order behind the whole-second `activity_at`/`created_at`
+    /// pair, so same-second lifetime and interaction events stay orderable.
+    recency: SessionRecency,
     cwd: Option<PathBuf>,
 }
 
@@ -83,11 +91,13 @@ impl Session {
             winlink_alert_flags: BTreeMap::from([(window_index, AlertFlags::empty())]),
             active_window: window_index,
             last_window: None,
+            group_initial_window_id: None,
             next_pane_id: pane_id.as_u32().saturating_add(1),
             next_window_id: WindowIdAllocator::new(window_id.as_u32().saturating_add(1)),
             created_at: now,
             activity_at: now,
             last_attached_at: None,
+            recency: SessionRecency::next(),
             cwd: None,
         }
     }
@@ -487,7 +497,11 @@ impl Session {
         Ok(selected)
     }
 
-    /// Updates the backing terminal size and recalculates pane geometry for all windows.
+    /// Updates the terminal and content sizes together for all windows.
+    ///
+    /// This is the explicit/manual-size path. Attached clients should use
+    /// [`Session::resize_active_window_geometry`] so status rows never enter a
+    /// window layout.
     pub fn resize_terminal(&mut self, size: TerminalSize) {
         self.terminal_size = size;
         for window in self.windows.values_mut() {
@@ -495,14 +509,23 @@ impl Session {
         }
     }
 
-    /// Updates the backing terminal size and recalculates only the active window geometry.
+    /// Updates only the external terminal size used to render this session.
+    pub fn set_terminal_size(&mut self, size: TerminalSize) {
+        self.terminal_size = size;
+    }
+
+    /// Updates the external terminal and active-window content geometry.
     ///
     /// Attached clients drive the size of the window they are currently viewing. Inactive
     /// windows can have independent policies and may share a runtime with another session, so
     /// resizing every window here would leak the active window's size into unrelated runtimes.
-    pub fn resize_active_window_terminal(&mut self, size: TerminalSize) {
-        self.terminal_size = size;
-        self.window_mut().set_size(size);
+    pub fn resize_active_window_geometry(
+        &mut self,
+        terminal_size: TerminalSize,
+        content_size: TerminalSize,
+    ) {
+        self.terminal_size = terminal_size;
+        self.window_mut().set_size(content_size);
     }
 
     fn resolve_window_target_mut(&mut self, window_index: u32) -> Result<&mut Window, RmuxError> {
@@ -549,14 +572,15 @@ impl Session {
             }
         }
 
-        if let Some((window_index, _)) = self.windows.range(..removed_index).next_back() {
-            return *window_index;
+        if let Some(group_initial_window_id) = self.group_initial_window_id {
+            if let Some((window_index, _)) = self.windows.iter().find(|(window_index, window)| {
+                **window_index != removed_index && window.id() == group_initial_window_id
+            }) {
+                return *window_index;
+            }
         }
 
-        self.windows
-            .range((Excluded(removed_index), Unbounded))
-            .next()
-            .map(|(window_index, _)| *window_index)
+        cyclic_previous_window_index(&self.windows, removed_index)
             .expect("a non-empty session must have a replacement window")
     }
 
@@ -613,16 +637,23 @@ fn synchronized_active_window(
         }
     }
 
-    if let Some((window_index, _)) = windows.range(..previous_active).next_back() {
-        return *window_index;
-    }
-
-    windows
-        .range((Excluded(previous_active), Unbounded))
-        .next()
-        .map(|(window_index, _)| *window_index)
-        .or_else(|| windows.keys().next().copied())
+    cyclic_previous_window_index(windows, previous_active)
         .expect("group synchronization requires at least one window")
+}
+
+fn cyclic_previous_window_index(
+    windows: &BTreeMap<u32, Window>,
+    removed_index: u32,
+) -> Option<u32> {
+    windows
+        .range(..removed_index)
+        .next_back()
+        .or_else(|| {
+            windows
+                .range((Excluded(removed_index), Unbounded))
+                .next_back()
+        })
+        .map(|(window_index, _)| *window_index)
 }
 
 fn current_unix_timestamp() -> i64 {

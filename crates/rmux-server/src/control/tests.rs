@@ -15,10 +15,10 @@ use super::{
     drain_control_queue_after_eof, ensure_control_newline, extract_complete_control_lines,
     forward_control as forward_control_identity, install_control_eof_queue_lease_pause,
     pause_after_control_eof_queue_lease, wait_for_control_eof_transition, ActiveControlCommand,
-    ControlCommandResult, ControlLifecycle, ControlModeUpgrade, ControlOutputQueue,
-    ControlQueueEofCancellation, ControlServerEvent, ControlUpgradeInput, EofDrainContext,
-    CONTROL_EOF_GRACE, CONTROL_SERVER_EVENT_CAPACITY, MAX_CONTROL_LINE_BYTES,
-    MAX_QUEUED_CONTROL_LINES,
+    ControlCommandOrigin, ControlCommandResult, ControlLifecycle, ControlModeUpgrade,
+    ControlOutputQueue, ControlQueueEofCancellation, ControlServerEvent, ControlSessionAttachment,
+    ControlUpgradeInput, EofDrainContext, CONTROL_EOF_GRACE, CONTROL_SERVER_EVENT_CAPACITY,
+    MAX_CONTROL_LINE_BYTES, MAX_QUEUED_CONTROL_LINES,
 };
 use crate::daemon::ShutdownHandle;
 use crate::handler::{
@@ -110,18 +110,20 @@ async fn eof_queue_lease_pauses_are_scoped_by_handler_and_cleaned_on_drop() {
 #[test]
 fn only_control_control_eof_waits_for_an_attached_session() {
     let session_name = SessionName::new("control-eof-session").expect("valid session name");
+    let unattached = ControlSessionAttachment::new(None);
+    let attached = ControlSessionAttachment::new(Some(session_name));
 
     assert!(!control_control_waits_for_attached_session(
         ControlMode::Plain,
-        Some(&session_name),
+        &attached,
     ));
     assert!(!control_control_waits_for_attached_session(
         ControlMode::ControlControl,
-        None,
+        &unattached,
     ));
     assert!(control_control_waits_for_attached_session(
         ControlMode::ControlControl,
-        Some(&session_name),
+        &attached,
     ));
 }
 
@@ -789,6 +791,661 @@ async fn notifications_wait_until_after_the_active_command_block() {
         end_index < notification_index,
         "notifications must flush after the command block closes: {rendered:?}"
     );
+}
+
+async fn run_registered_initial_control_batch(
+    handler: Arc<RequestHandler>,
+    requester_pid: u32,
+    input: Vec<u8>,
+    initial_command_count: usize,
+) -> String {
+    let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
+    let closing = Arc::new(AtomicBool::new(false));
+    let control_id = handler
+        .register_control_with_closing(
+            requester_pid,
+            ControlModeUpgrade {
+                initial_command_count: u32::try_from(initial_command_count)
+                    .expect("test command count fits u32"),
+                mode: ControlMode::Plain,
+                terminal_context: OuterTerminalContext::default(),
+            },
+            server_event_tx,
+            Arc::clone(&closing),
+        )
+        .await;
+    let identity = ControlClientIdentity::new(requester_pid, control_id);
+    let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
+    let handler_for_control = Arc::clone(&handler);
+    let control_task = tokio::spawn(async move {
+        forward_control_identity(
+            server_stream,
+            handler_for_control,
+            identity,
+            ControlUpgradeInput::new(input, initial_command_count),
+            shutdown_rx,
+            server_event_rx,
+            ControlLifecycle {
+                closing,
+                shutdown_handle,
+            },
+        )
+        .await
+    });
+
+    let mut rendered = Vec::new();
+    read_control_to_end(&mut client_stream, &mut rendered).await;
+    control_task
+        .await
+        .expect("control task joins")
+        .expect("control forwarding succeeds");
+    handler.finish_control(requester_pid, control_id).await;
+    String::from_utf8(rendered).expect("control transcript is utf-8")
+}
+
+fn control_message_test_config(label: &str, contents: &str) -> std::path::PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+    let root = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .expect("test current directory")
+                .join("target")
+        })
+        .join("rmux-control-message-tests");
+    std::fs::create_dir_all(&root).expect("control message test directory");
+    let path = root.join(format!("{label}-{}-{nonce}.conf", std::process::id()));
+    std::fs::write(&path, contents).expect("control message test config");
+    path
+}
+
+#[tokio::test]
+async fn admitted_display_messages_are_owned_by_their_exact_control_guards() {
+    let handler = Arc::new(RequestHandler::new());
+    let session_name =
+        SessionName::new("control-message-guard-pipeline").expect("valid session name");
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: session_name.clone(),
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+
+    let commands = [
+        "display-message -- SYNC-FIRST-A",
+        "display-message -p -- PRINT-FIRST",
+        "list-sessions -F 'LIST-FIRST:#{session_name}'",
+        "display-message -- SYNC-FIRST-B",
+        "definitely-not-a-command",
+        "display-message -- SYNC-REPEAT-A",
+        "display-message -p -- PRINT-REPEAT",
+        "list-sessions -F 'LIST-REPEAT:#{session_name}'",
+        "display-message -- SYNC-REPEAT-B",
+    ];
+    let input = format!("{}\n", commands.join("\n")).into_bytes();
+    let rendered =
+        run_registered_initial_control_batch(Arc::clone(&handler), 42_430, input, commands.len())
+            .await;
+    let transcript = parse_strict_control_transcript(&rendered);
+
+    assert_eq!(transcript.frames.len(), commands.len(), "{rendered:?}");
+    assert_message_owned_once(&transcript, 0, "SYNC-FIRST-A");
+    assert_message_owned_once(&transcript, 3, "SYNC-FIRST-B");
+    assert_message_owned_once(&transcript, 5, "SYNC-REPEAT-A");
+    assert_message_owned_once(&transcript, 8, "SYNC-REPEAT-B");
+    assert_eq!(
+        transcript.frames[1].payload,
+        ["PRINT-FIRST"],
+        "{rendered:?}"
+    );
+    assert!(
+        transcript.frames[2]
+            .payload
+            .iter()
+            .any(|line| line == &format!("LIST-FIRST:{session_name}")),
+        "{rendered:?}"
+    );
+    assert_eq!(
+        transcript.frames[4].terminal,
+        TestGuardTerminal::Error,
+        "{rendered:?}"
+    );
+    assert_eq!(
+        transcript.frames[6].payload,
+        ["PRINT-REPEAT"],
+        "{rendered:?}"
+    );
+    assert!(
+        transcript.frames[7]
+            .payload
+            .iter()
+            .any(|line| line == &format!("LIST-REPEAT:{session_name}")),
+        "{rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn queued_display_messages_stay_once_inside_the_admitted_control_guard() {
+    let handler = Arc::new(RequestHandler::new());
+    let input = b"display-message -- QUEUE-SYNC-A ; \
+                  display-message -p -- QUEUE-PRINT ; \
+                  display-message -- QUEUE-SYNC-B\n"
+        .to_vec();
+    let rendered =
+        run_registered_initial_control_batch(Arc::clone(&handler), 42_431, input, 1).await;
+    let transcript = parse_strict_control_transcript(&rendered);
+
+    assert_eq!(transcript.frames.len(), 1, "{rendered:?}");
+    assert_message_owned_once(&transcript, 0, "QUEUE-SYNC-A");
+    assert_message_owned_once(&transcript, 0, "QUEUE-SYNC-B");
+    assert_eq!(
+        transcript.frames[0].payload,
+        ["QUEUE-PRINT"],
+        "{rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn sourced_and_conditional_display_messages_get_distinct_child_guards() {
+    // Fresh tmux 3.7b oracle:
+    // source-file: parent end, then one flags-preserving guard per sourced command.
+    // if-shell -F: parent end, then one guard for the selected branch.
+    let source = control_message_test_config(
+        "source-child-ownership",
+        "display-message -- SOURCE-CHILD-A\n\
+         display-message -- SOURCE-CHILD-B\n",
+    );
+    let handler = Arc::new(RequestHandler::new());
+    let commands = [
+        format!("source-file {}", source.display()),
+        "if-shell -F 1 'display-message -- IF-TRUE-CHILD' \
+         'display-message -- IF-TRUE-UNSELECTED'"
+            .to_owned(),
+        "if -F 0 'display-message -- IF-FALSE-UNSELECTED' \
+         'display-message -- IF-FALSE-CHILD'"
+            .to_owned(),
+        "display-message -d 0 -- DIRECT-AFTER-CHILDREN".to_owned(),
+    ];
+    let input = format!("{}\n", commands.join("\n")).into_bytes();
+    let rendered =
+        run_registered_initial_control_batch(Arc::clone(&handler), 42_433, input, commands.len())
+            .await;
+    let transcript = parse_strict_control_transcript(&rendered);
+
+    assert_eq!(transcript.frames.len(), 8, "{rendered:?}");
+    assert!(
+        transcript.frames[0].notifications.is_empty(),
+        "{rendered:?}"
+    );
+    assert_message_owned_once(&transcript, 1, "SOURCE-CHILD-A");
+    assert_message_owned_once(&transcript, 2, "SOURCE-CHILD-B");
+    assert!(
+        transcript.frames[3].notifications.is_empty(),
+        "{rendered:?}"
+    );
+    assert_message_owned_once(&transcript, 4, "IF-TRUE-CHILD");
+    assert!(
+        transcript.frames[5].notifications.is_empty(),
+        "{rendered:?}"
+    );
+    assert_message_owned_once(&transcript, 6, "IF-FALSE-CHILD");
+    assert_message_owned_once(&transcript, 7, "DIRECT-AFTER-CHILDREN");
+    assert!(
+        transcript.frames.iter().all(|frame| frame.guard.flags == 0),
+        "initial parent and synchronous children retain flag 0: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("IF-TRUE-UNSELECTED") && !rendered.contains("IF-FALSE-UNSELECTED"),
+        "{rendered:?}"
+    );
+
+    std::fs::remove_file(source).expect("remove source child config");
+}
+
+#[tokio::test]
+async fn sourced_command_alias_keeps_the_sourced_child_owner() {
+    let source = control_message_test_config(
+        "source-child-command-alias",
+        "announce SOURCE-ALIAS-CHILD\n",
+    );
+    let handler = Arc::new(RequestHandler::new());
+    let commands = [
+        "set-option -s 'command-alias[100]' 'announce=display-message --'".to_owned(),
+        format!("source-file {}", source.display()),
+    ];
+    let input = format!("{}\n", commands.join("\n")).into_bytes();
+    let rendered =
+        run_registered_initial_control_batch(Arc::clone(&handler), 42_436, input, commands.len())
+            .await;
+    let transcript = parse_strict_control_transcript(&rendered);
+
+    assert_eq!(transcript.frames.len(), 3, "{rendered:?}");
+    assert!(
+        transcript.frames[1].notifications.is_empty(),
+        "{rendered:?}"
+    );
+    assert_message_owned_once(&transcript, 2, "SOURCE-ALIAS-CHILD");
+
+    std::fs::remove_file(source).expect("remove source command-alias config");
+}
+
+#[tokio::test]
+async fn command_alias_to_if_shell_keeps_the_selected_child_owner() {
+    let handler = Arc::new(RequestHandler::new());
+    let commands = [
+        "set-option -s 'command-alias[101]' 'choose=if-shell -F 1'".to_owned(),
+        "choose 'display-message -- IF-COMMAND-ALIAS-CHILD'".to_owned(),
+    ];
+    let input = format!("{}\n", commands.join("\n")).into_bytes();
+    let rendered =
+        run_registered_initial_control_batch(Arc::clone(&handler), 42_437, input, commands.len())
+            .await;
+    let transcript = parse_strict_control_transcript(&rendered);
+
+    assert_eq!(transcript.frames.len(), 3, "{rendered:?}");
+    assert!(
+        transcript.frames[1].notifications.is_empty(),
+        "{rendered:?}"
+    );
+    assert_message_owned_once(&transcript, 2, "IF-COMMAND-ALIAS-CHILD");
+}
+
+#[tokio::test]
+async fn sourced_runtime_error_stays_in_its_child_guard_after_prior_message() {
+    // The invalid target is a runtime command failure, not a parse error: tmux
+    // first closes source-file, then ends the display child and errors the
+    // following child.
+    let source = control_message_test_config(
+        "source-child-error",
+        "display-message -- SOURCE-BEFORE-ERROR\n\
+         kill-pane -t missing-source-session:0.0\n",
+    );
+    let handler = Arc::new(RequestHandler::new());
+    let input = format!("source-file {}\n", source.display()).into_bytes();
+    let rendered =
+        run_registered_initial_control_batch(Arc::clone(&handler), 42_434, input, 1).await;
+    let transcript = parse_strict_control_transcript(&rendered);
+
+    assert_eq!(transcript.frames.len(), 3, "{rendered:?}");
+    assert_eq!(
+        transcript.frames[0].terminal,
+        TestGuardTerminal::End,
+        "{rendered:?}"
+    );
+    assert!(
+        transcript.frames[0].notifications.is_empty(),
+        "{rendered:?}"
+    );
+    assert_message_owned_once(&transcript, 1, "SOURCE-BEFORE-ERROR");
+    assert_eq!(
+        transcript.frames[2].terminal,
+        TestGuardTerminal::Error,
+        "{rendered:?}"
+    );
+    assert!(
+        transcript.frames[2]
+            .payload
+            .iter()
+            .any(|line| line.contains("missing-source-session")),
+        "{rendered:?}"
+    );
+
+    std::fs::remove_file(source).expect("remove source error config");
+}
+
+#[tokio::test]
+async fn conditional_runtime_error_stays_in_its_child_guard_after_prior_message() {
+    let handler = Arc::new(RequestHandler::new());
+    let input = b"if-shell -F 1 'display-message -- IF-BEFORE-ERROR ; \
+                  kill-pane -t missing-if-session:0.0'\n"
+        .to_vec();
+    let rendered =
+        run_registered_initial_control_batch(Arc::clone(&handler), 42_438, input, 1).await;
+    let transcript = parse_strict_control_transcript(&rendered);
+
+    assert_eq!(transcript.frames.len(), 3, "{rendered:?}");
+    assert_eq!(
+        transcript.frames[0].terminal,
+        TestGuardTerminal::End,
+        "{rendered:?}"
+    );
+    assert_message_owned_once(&transcript, 1, "IF-BEFORE-ERROR");
+    assert_eq!(
+        transcript.frames[2].terminal,
+        TestGuardTerminal::Error,
+        "{rendered:?}"
+    );
+    assert!(
+        transcript.frames[2]
+            .payload
+            .iter()
+            .any(|line| line.contains("missing-if-session")),
+        "{rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn inserted_child_frames_exceed_channel_capacity_without_fifo_loss() {
+    const CHILD_COUNT: usize = CONTROL_SERVER_EVENT_CAPACITY / 2;
+
+    let contents = (0..CHILD_COUNT)
+        .map(|index| format!("display-message -- SOURCE-FIFO-{index:03}\n"))
+        .collect::<String>();
+    let source = control_message_test_config("source-child-fifo", &contents);
+    let handler = Arc::new(RequestHandler::new());
+    let input = format!("source-file {}\n", source.display()).into_bytes();
+    let rendered =
+        run_registered_initial_control_batch(Arc::clone(&handler), 42_439, input, 1).await;
+    let transcript = parse_strict_control_transcript(&rendered);
+
+    assert_eq!(transcript.frames.len(), CHILD_COUNT + 1, "{rendered:?}");
+    assert!(
+        transcript.frames[0].notifications.is_empty(),
+        "{rendered:?}"
+    );
+    for (index, frame) in transcript.frames.iter().skip(1).enumerate() {
+        assert_eq!(
+            frame.notifications,
+            [format!("%message SOURCE-FIFO-{index:03}")],
+            "child {index} lost, duplicated, or reordered: {rendered:?}"
+        );
+    }
+    assert!(
+        transcript
+            .asynchronous_notifications
+            .iter()
+            .all(|line| !line.starts_with("%message ")),
+        "{rendered:?}"
+    );
+
+    std::fs::remove_file(source).expect("remove source FIFO config");
+}
+
+#[tokio::test]
+async fn rejected_synchronous_insertion_errors_the_parent_without_an_orphan_guard() {
+    let inserted =
+        "start-server ;".repeat(crate::handler::TEST_CONTROL_QUEUE_INSERTED_COMMAND_LIMIT + 1);
+    let handler = Arc::new(RequestHandler::new());
+    let input = format!("if-shell -F 1 '{inserted}'\n").into_bytes();
+    let rendered =
+        run_registered_initial_control_batch(Arc::clone(&handler), 42_440, input, 1).await;
+    let transcript = parse_strict_control_transcript(&rendered);
+
+    assert_eq!(transcript.frames.len(), 1, "{rendered:?}");
+    assert_eq!(
+        transcript.frames[0].terminal,
+        TestGuardTerminal::Error,
+        "{rendered:?}"
+    );
+    assert!(
+        transcript.frames[0]
+            .payload
+            .iter()
+            .any(|line| line.contains("inserted too many commands")),
+        "{rendered:?}"
+    );
+    assert!(
+        transcript
+            .asynchronous_notifications
+            .iter()
+            .all(|line| !line.starts_with("%message ")),
+        "{rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn direct_display_forms_remain_in_their_admitted_guards() {
+    let handler = Arc::new(RequestHandler::new());
+    let commands = [
+        "display -- DIRECT-ALIAS",
+        "display-mes -- DIRECT-PREFIX",
+        "display-message -d 0 -- DIRECT-EXT-DURATION",
+        "display-message -F 'DIRECT-EXT-FORMAT'",
+        "display-message -- DIRECT-REPEAT",
+        "display-message -- DIRECT-REPEAT",
+    ];
+    let input = format!("{}\n", commands.join("\n")).into_bytes();
+    let rendered =
+        run_registered_initial_control_batch(Arc::clone(&handler), 42_435, input, commands.len())
+            .await;
+    let transcript = parse_strict_control_transcript(&rendered);
+
+    assert_eq!(transcript.frames.len(), commands.len(), "{rendered:?}");
+    for (index, token) in [
+        "DIRECT-ALIAS",
+        "DIRECT-PREFIX",
+        "DIRECT-EXT-DURATION",
+        "DIRECT-EXT-FORMAT",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_message_owned_once(&transcript, index, token);
+    }
+    assert_eq!(
+        transcript.frames[4].notifications,
+        ["%message DIRECT-REPEAT"],
+        "{rendered:?}"
+    );
+    assert_eq!(
+        transcript.frames[5].notifications,
+        ["%message DIRECT-REPEAT"],
+        "{rendered:?}"
+    );
+    assert_eq!(
+        transcript
+            .frames
+            .iter()
+            .flat_map(|frame| frame.notifications.iter())
+            .filter(|line| line.as_str() == "%message DIRECT-REPEAT")
+            .count(),
+        2,
+        "{rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn immediate_run_shell_commands_get_one_child_guard_per_nesting_level() {
+    // Fresh tmux 3.7b oracle: each run-shell -C level closes its current
+    // guard before the inserted callback begins in a new guard.
+    let handler = Arc::new(RequestHandler::new());
+    let session_name =
+        SessionName::new("control-message-run-shell-nesting").expect("valid session name");
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name,
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+
+    let commands = [
+        "run-shell -C 'display-message -- RUN-C-NEST-1'",
+        "run-shell -C \"run-shell -C 'display-message -- RUN-C-NEST-2'\"",
+        "run-shell -C \"run-shell -C \\\"run-shell -C \
+         'display-message -- RUN-C-NEST-3'\\\"\"",
+    ];
+    let input = format!("{}\n", commands.join("\n")).into_bytes();
+    let rendered =
+        run_registered_initial_control_batch(Arc::clone(&handler), 42_441, input, commands.len())
+            .await;
+    let transcript = parse_strict_control_transcript(&rendered);
+
+    assert_eq!(transcript.frames.len(), 9, "{rendered:?}");
+    for parent in [0, 2, 3, 5, 6, 7] {
+        assert!(
+            transcript.frames[parent].notifications.is_empty(),
+            "run-shell parent/level {parent} captured its child: {rendered:?}"
+        );
+    }
+    assert_message_owned_once(&transcript, 1, "RUN-C-NEST-1");
+    assert_message_owned_once(&transcript, 4, "RUN-C-NEST-2");
+    assert_message_owned_once(&transcript, 8, "RUN-C-NEST-3");
+    assert!(
+        transcript.frames.iter().all(|frame| frame.guard.flags == 0),
+        "initial parents and synchronous callbacks retain flag 0: {rendered:?}"
+    );
+    assert!(
+        transcript
+            .asynchronous_notifications
+            .iter()
+            .all(|line| !line.starts_with("%message ")),
+        "{rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn immediate_run_shell_callback_error_gets_its_own_child_guard() {
+    let handler = Arc::new(RequestHandler::new());
+    let session_name =
+        SessionName::new("control-message-run-shell-error").expect("valid session name");
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name,
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+
+    let input = b"run-shell -C 'display-message -- RUN-C-BEFORE-ERROR ; \
+                  kill-pane -t missing-run-session:0.0'\n"
+        .to_vec();
+    let rendered =
+        run_registered_initial_control_batch(Arc::clone(&handler), 42_442, input, 1).await;
+    let transcript = parse_strict_control_transcript(&rendered);
+
+    assert_eq!(transcript.frames.len(), 3, "{rendered:?}");
+    assert_eq!(
+        transcript.frames[0].terminal,
+        TestGuardTerminal::End,
+        "{rendered:?}"
+    );
+    assert!(
+        transcript.frames[0].notifications.is_empty(),
+        "{rendered:?}"
+    );
+    assert_message_owned_once(&transcript, 1, "RUN-C-BEFORE-ERROR");
+    assert_eq!(
+        transcript.frames[2].terminal,
+        TestGuardTerminal::Error,
+        "{rendered:?}"
+    );
+    assert!(
+        transcript.frames[2]
+            .payload
+            .iter()
+            .any(|line| line.contains("missing-run-session")),
+        "{rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn delayed_run_shell_control_message_remains_asynchronous_product_divergence() {
+    // Frozen tmux 3.7b gives the delayed `run-shell -C` callback its own
+    // control guard. RMUX did not do so before W13-M30, and this fix must not
+    // annex that delayed notification to the already-closed parent guard.
+    let handler = Arc::new(RequestHandler::new());
+    let session_name =
+        SessionName::new("control-message-guard-delayed").expect("valid session name");
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: session_name.clone(),
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+
+    let requester_pid = 42_432;
+    let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
+    let closing = Arc::new(AtomicBool::new(false));
+    let control_id = handler
+        .register_control_with_closing(
+            requester_pid,
+            ControlModeUpgrade {
+                initial_command_count: 2,
+                mode: ControlMode::Plain,
+                terminal_context: OuterTerminalContext::default(),
+            },
+            server_event_tx,
+            Arc::clone(&closing),
+        )
+        .await;
+    let identity = ControlClientIdentity::new(requester_pid, control_id);
+    let input = format!(
+        "attach-session -t {session_name}\n\
+         run-shell -d 0.05 -C \"display-message -- DELAYED-RUN-SHELL-MESSAGE\"\n"
+    )
+    .into_bytes();
+    let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
+    let handler_for_control = Arc::clone(&handler);
+    let control_task = tokio::spawn(async move {
+        forward_control_identity(
+            server_stream,
+            handler_for_control,
+            identity,
+            ControlUpgradeInput::new(input, 2),
+            shutdown_rx,
+            server_event_rx,
+            ControlLifecycle {
+                closing,
+                shutdown_handle,
+            },
+        )
+        .await
+    });
+
+    let mut rendered = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    tokio::time::timeout(CONTROL_TEST_TIMEOUT, async {
+        loop {
+            let bytes_read = client_stream
+                .read(&mut buffer)
+                .await
+                .expect("control output reads");
+            assert_ne!(
+                bytes_read, 0,
+                "control stream closed before delayed notification"
+            );
+            rendered.extend_from_slice(&buffer[..bytes_read]);
+            if String::from_utf8_lossy(&rendered).contains("%message DELAYED-RUN-SHELL-MESSAGE") {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("delayed run-shell notification arrives before timeout");
+
+    client_stream
+        .write_all(b"\n")
+        .await
+        .expect("empty command exits control mode");
+    read_control_to_end(&mut client_stream, &mut rendered).await;
+    control_task
+        .await
+        .expect("control task joins")
+        .expect("control forwarding succeeds");
+    handler.finish_control(requester_pid, control_id).await;
+
+    let rendered = String::from_utf8(rendered).expect("control transcript is utf-8");
+    let transcript = parse_strict_control_transcript(&rendered);
+    assert_eq!(transcript.frames.len(), 2, "{rendered:?}");
+    assert_message_asynchronous_once(&transcript, "DELAYED-RUN-SHELL-MESSAGE");
 }
 
 #[tokio::test]
@@ -2047,6 +2704,47 @@ async fn stdin_command_after_upgrade_uses_flags_one_after_initial_ack() {
 }
 
 #[tokio::test]
+async fn completed_unattached_initial_command_exits_with_stdin_open_and_discards_follow_on_frames()
+{
+    let handler = Arc::new(RequestHandler::new());
+    let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (_server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
+    let closing = Arc::new(AtomicBool::new(false));
+    let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
+
+    let control_task = tokio::spawn(forward_control(
+        server_stream,
+        Arc::clone(&handler),
+        4242,
+        ControlUpgradeInput::new(
+            b"display-message -p INITIAL\ndisplay-message -p SHOULD-NOT-RUN\n".to_vec(),
+            1,
+        ),
+        shutdown_rx,
+        server_event_rx,
+        ControlLifecycle {
+            closing,
+            shutdown_handle,
+        },
+    ));
+
+    let mut rendered = Vec::new();
+    read_control_to_end(&mut client_stream, &mut rendered).await;
+    control_task
+        .await
+        .expect("forward control task joins")
+        .expect("forward control succeeds");
+
+    let rendered = String::from_utf8(rendered).expect("utf-8 control stream");
+    assert!(rendered.contains("INITIAL\n"), "{rendered:?}");
+    assert!(!rendered.contains("SHOULD-NOT-RUN"), "{rendered:?}");
+    assert_eq!(parse_guard_lines(&rendered, "%begin ").len(), 1);
+    assert_eq!(parse_guard_lines(&rendered, "%end ").len(), 1);
+    assert!(rendered.ends_with("%exit\n"), "{rendered:?}");
+}
+
+#[tokio::test]
 async fn immediate_socket_eof_preserves_fast_attach_query_payloads_and_guards() {
     let handler = Arc::new(RequestHandler::new());
     let session_name =
@@ -2130,6 +2828,104 @@ async fn immediate_socket_eof_preserves_fast_attach_query_payloads_and_guards() 
         rendered.ends_with("%exit\n"),
         "EOF remains the final control record: {rendered:?}"
     );
+}
+
+#[tokio::test]
+async fn plain_control_eof_keeps_ready_existing_session_attach_before_exit() {
+    let handler = Arc::new(RequestHandler::new());
+    let requester_pid = 42_431;
+    let session_name =
+        SessionName::new("plain-control-eof-attach-race").expect("valid session name");
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: session_name.clone(),
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+
+    let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (event_tx, event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
+    let closing = Arc::new(AtomicBool::new(false));
+    let control_id = handler
+        .register_control_with_closing(
+            requester_pid,
+            ControlModeUpgrade {
+                initial_command_count: 1,
+                mode: ControlMode::Plain,
+                terminal_context: OuterTerminalContext::default(),
+            },
+            event_tx,
+            Arc::clone(&closing),
+        )
+        .await;
+    let identity = ControlClientIdentity::new(requester_pid, control_id);
+    let eof_pause = install_control_eof_queue_lease_pause(&handler, identity);
+    let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
+    let _requester_access_guard =
+        handler.begin_test_detached_requester_access(requester_pid, AccessMode::ReadWrite);
+    let command = format!("attach-session -t {session_name}\n");
+    let handler_for_control = Arc::clone(&handler);
+    let control_task = tokio::spawn(async move {
+        let result = forward_control_identity(
+            server_stream,
+            Arc::clone(&handler_for_control),
+            identity,
+            ControlUpgradeInput::with_mode(command.into_bytes(), 1, ControlMode::Plain),
+            shutdown_rx,
+            event_rx,
+            ControlLifecycle {
+                closing,
+                shutdown_handle,
+            },
+        )
+        .await;
+        handler_for_control
+            .finish_control(requester_pid, control_id)
+            .await;
+        result
+    });
+
+    client_stream
+        .shutdown()
+        .await
+        .expect("client write half closes immediately");
+    tokio::time::timeout(CONTROL_TEST_TIMEOUT, eof_pause.reached.notified())
+        .await
+        .expect("forward loop observes EOF while attach is active");
+    tokio::time::timeout(CONTROL_TEST_TIMEOUT, async {
+        loop {
+            if handler.control_session_name(requester_pid).await.as_ref() == Some(&session_name) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("attach commits while the forward loop remains paused");
+    eof_pause.release.notify_one();
+
+    let mut rendered = Vec::new();
+    read_control_to_end(&mut client_stream, &mut rendered).await;
+    control_task
+        .await
+        .expect("forward control task joins")
+        .expect("forward control succeeds");
+
+    let rendered = String::from_utf8(rendered).expect("utf-8 control stream");
+    let records = rendered.lines().collect::<Vec<_>>();
+    assert_eq!(records.len(), 4, "{rendered:?}");
+    assert!(records[0].starts_with("%begin "), "{rendered:?}");
+    assert!(records[1].starts_with("%end "), "{rendered:?}");
+    assert_eq!(
+        records[2],
+        format!("%session-changed $0 {session_name}"),
+        "{rendered:?}"
+    );
+    assert_eq!(records[3], "%exit", "{rendered:?}");
 }
 
 #[tokio::test]
@@ -2815,6 +3611,9 @@ async fn dropping_active_control_command_aborts_inflight_task() {
         timestamp: 0,
         command_number: 1,
         guard_flag: 0,
+        origin: ControlCommandOrigin::Initial {
+            completes_batch: true,
+        },
         eof_cancellation: ControlQueueEofCancellation::new(ControlClientIdentity::new(4242, 1)),
         task: Some(task),
     });
@@ -3059,11 +3858,158 @@ fn assert_initial_control_frame_then_exit(rendered: &[u8]) {
     );
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct TestGuardTuple {
     time_secs: i64,
     command_number: u64,
     flags: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestGuardTerminal {
+    End,
+    Error,
+}
+
+#[derive(Debug)]
+struct TestControlFrame {
+    guard: TestGuardTuple,
+    terminal: TestGuardTerminal,
+    payload: Vec<String>,
+    notifications: Vec<String>,
+}
+
+#[derive(Debug)]
+struct TestControlTranscript {
+    frames: Vec<TestControlFrame>,
+    asynchronous_notifications: Vec<String>,
+}
+
+fn parse_strict_control_transcript(output: &str) -> TestControlTranscript {
+    struct OpenFrame {
+        guard: TestGuardTuple,
+        payload: Vec<String>,
+        notifications: Vec<String>,
+    }
+
+    let mut frames = Vec::new();
+    let mut asynchronous_notifications = Vec::new();
+    let mut current: Option<OpenFrame> = None;
+    for line in output.lines() {
+        if let Some(guard) = parse_guard_tuple(line, "%begin ") {
+            assert!(
+                current.is_none(),
+                "nested control guard {guard:?} in {output:?}"
+            );
+            current = Some(OpenFrame {
+                guard,
+                payload: Vec::new(),
+                notifications: Vec::new(),
+            });
+            continue;
+        }
+        let terminal = parse_guard_tuple(line, "%end ")
+            .map(|guard| (guard, TestGuardTerminal::End))
+            .or_else(|| {
+                parse_guard_tuple(line, "%error ").map(|guard| (guard, TestGuardTerminal::Error))
+            });
+        if let Some((guard, terminal)) = terminal {
+            let open = current
+                .take()
+                .unwrap_or_else(|| panic!("orphan terminal guard {guard:?} in {output:?}"));
+            assert_eq!(
+                open.guard, guard,
+                "terminal tuple differs from its begin in {output:?}"
+            );
+            frames.push(TestControlFrame {
+                guard,
+                terminal,
+                payload: open.payload,
+                notifications: open.notifications,
+            });
+            continue;
+        }
+        if line.starts_with('%') {
+            if let Some(open) = current.as_mut() {
+                open.notifications.push(line.to_owned());
+            } else {
+                asynchronous_notifications.push(line.to_owned());
+            }
+        } else if let Some(open) = current.as_mut() {
+            open.payload.push(line.to_owned());
+        } else if !line.is_empty() {
+            panic!("control payload escaped its guard: {line:?} in {output:?}");
+        }
+    }
+    assert!(current.is_none(), "unclosed control guard in {output:?}");
+    assert!(
+        frames
+            .windows(2)
+            .all(|pair| pair[0].guard.command_number < pair[1].guard.command_number),
+        "control command numbers are not strictly monotone in {output:?}"
+    );
+    TestControlTranscript {
+        frames,
+        asynchronous_notifications,
+    }
+}
+
+fn assert_message_owned_once(
+    transcript: &TestControlTranscript,
+    expected_frame: usize,
+    token: &str,
+) {
+    let expected_line = format!("%message {token}");
+    let owned = transcript
+        .frames
+        .iter()
+        .enumerate()
+        .flat_map(|(index, frame)| {
+            frame
+                .notifications
+                .iter()
+                .filter(|line| *line == &expected_line)
+                .map(move |_| index)
+        })
+        .collect::<Vec<_>>();
+    let asynchronous = transcript
+        .asynchronous_notifications
+        .iter()
+        .filter(|line| *line == &expected_line)
+        .count();
+    assert_eq!(
+        owned.len() + asynchronous,
+        1,
+        "{expected_line:?} must be emitted exactly once: {transcript:?}"
+    );
+    assert_eq!(
+        owned,
+        [expected_frame],
+        "{expected_line:?} must belong to frame {expected_frame}: {transcript:?}"
+    );
+}
+
+fn assert_message_asynchronous_once(transcript: &TestControlTranscript, token: &str) {
+    let expected_line = format!("%message {token}");
+    let owned = transcript
+        .frames
+        .iter()
+        .flat_map(|frame| &frame.notifications)
+        .filter(|line| *line == &expected_line)
+        .count();
+    let asynchronous = transcript
+        .asynchronous_notifications
+        .iter()
+        .filter(|line| *line == &expected_line)
+        .count();
+    assert_eq!(
+        owned, 0,
+        "{expected_line:?} must not enter a command guard: {transcript:?}"
+    );
+    assert_eq!(
+        asynchronous, 1,
+        "{expected_line:?} must remain one asynchronous notification: {transcript:?}"
+    );
 }
 
 fn parse_guard_lines(output: &str, prefix: &str) -> Vec<TestGuardTuple> {

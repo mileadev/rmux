@@ -152,13 +152,12 @@ async fn pane_terminal_size(
 
 async fn set_attached_geometry(handler: &RequestHandler, attach_pid: u32) {
     let mut active_attach = handler.active_attach.lock().await;
-    let size_sequence = active_attach.next_size_sequence;
-    active_attach.next_size_sequence = size_sequence.saturating_add(1);
+    let size_sequence = handler.next_client_size_sequence();
     let active = active_attach
         .by_pid
         .get_mut(&attach_pid)
         .expect("attached test client exists");
-    active.client_size = SWITCH_SIZE;
+    active.set_declared_client_size(SWITCH_SIZE);
     active.client_pixels = Some(TerminalPixels::new(1170, 780));
     active.size_sequence = size_sequence;
     drop(active_attach);
@@ -290,6 +289,56 @@ fn switch_request(target: String) -> SwitchClientExt3Request {
         skip_environment_update: false,
         zoom: false,
     }
+}
+
+#[tokio::test]
+async fn control_switch_accepts_the_canonical_list_clients_name() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("switch-canonical-control-alpha");
+    let beta = session_name("switch-canonical-control-beta");
+    create_session(&handler, alpha.clone()).await;
+    create_session(&handler, beta.clone()).await;
+    let control_pid = 94_450;
+    let (event_tx, mut event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
+    let _control_id = handler
+        .register_control_with_closing(
+            control_pid,
+            ControlModeUpgrade {
+                mode: ControlMode::Plain,
+                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
+                initial_command_count: 0,
+            },
+            event_tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+    handler
+        .set_control_session(control_pid, Some(alpha))
+        .await
+        .expect("initial control session set succeeds");
+    assert!(matches!(
+        event_rx.try_recv(),
+        Ok(ControlServerEvent::SessionChanged(Some(_))
+            | ControlServerEvent::SessionChangedAt { .. })
+    ));
+
+    let mut request = switch_request(beta.to_string());
+    request.target_client = Some(format!("client-{control_pid}"));
+    let response = handler
+        .handle_switch_client_ext3(control_pid, request)
+        .await;
+    assert!(
+        matches!(response, Response::SwitchClient(_)),
+        "{response:?}"
+    );
+    let active_control = handler.active_control.lock().await;
+    assert_eq!(
+        active_control
+            .by_pid
+            .get(&control_pid)
+            .and_then(|active| active.session_name.as_ref()),
+        Some(&beta)
+    );
 }
 
 #[tokio::test]
@@ -841,8 +890,194 @@ async fn closed_control_switch_preserves_environment_selection_and_touch() {
         LifecycleEvent::ClientDetached {
             session_name,
             client_name: Some(client_name),
-        } if session_name == alpha && client_name == control_pid.to_string()
+        } if session_name == alpha
+            && client_name == crate::client_names::control_client_name(control_pid)
     ));
+}
+
+#[tokio::test]
+async fn control_switch_resize_failure_preserves_session_identity_and_event_stream() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("switch-atomic-resize-alpha");
+    let beta = session_name("switch-atomic-resize-beta");
+    create_session(&handler, alpha.clone()).await;
+    create_session(&handler, beta.clone()).await;
+    let target_window = create_runtime_window(&handler, &beta).await;
+    let (alpha_id, before_session) = {
+        let state = handler.state.lock().await;
+        (
+            state.sessions.session(&alpha).expect("alpha exists").id(),
+            state.sessions.session(&beta).expect("beta exists").clone(),
+        )
+    };
+    let before_terminal_size = pane_terminal_size(&handler, &beta, target_window).await;
+    let control_pid = 94_500;
+    let (event_tx, mut event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
+    let control_id = handler
+        .register_control_with_closing(
+            control_pid,
+            ControlModeUpgrade {
+                mode: ControlMode::Plain,
+                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
+                initial_command_count: 0,
+            },
+            event_tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+    handler
+        .set_control_session(control_pid, Some(alpha.clone()))
+        .await
+        .expect("initial control session set succeeds");
+    assert!(matches!(
+        event_rx.try_recv(),
+        Ok(ControlServerEvent::SessionChanged(Some(_))
+            | ControlServerEvent::SessionChangedAt { .. })
+    ));
+    {
+        let mut active_control = handler.active_control.lock().await;
+        let active = active_control
+            .by_pid
+            .get_mut(&control_pid)
+            .expect("control client remains registered");
+        active.client_width = SWITCH_SIZE.cols;
+        active.client_height = SWITCH_SIZE.rows;
+        // A control client only owns a size once it has announced one; this
+        // stands in for the `refresh-client -C` that announced SWITCH_SIZE.
+        active.size_declared = true;
+    }
+    handler.state.lock().await.fail_next_resize_for_test();
+
+    let response = handler
+        .handle_switch_client_ext3(
+            control_pid,
+            switch_request(format!("{beta}:{target_window}")),
+        )
+        .await;
+    assert!(matches!(response, Response::Error(_)), "{response:?}");
+
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(state.sessions.session(&beta), Some(&before_session));
+    }
+    assert_eq!(
+        pane_terminal_size(&handler, &beta, target_window).await,
+        before_terminal_size
+    );
+    {
+        let active_control = handler.active_control.lock().await;
+        let active = active_control
+            .by_pid
+            .get(&control_pid)
+            .expect("failed switch preserves control registration");
+        assert_eq!(active.id, control_id);
+        assert_eq!(active.session_name.as_ref(), Some(&alpha));
+        assert_eq!(active.session_id, Some(alpha_id));
+        assert_eq!(active.last_session, None);
+        assert_eq!(active.last_session_id, None);
+    }
+    assert!(matches!(
+        event_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn control_switch_success_commits_environment_touch_selection_and_event() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("switch-success-control-alpha");
+    let beta = session_name("switch-success-control-beta");
+    create_session(&handler, alpha.clone()).await;
+    create_session(&handler, beta.clone()).await;
+    let target_window = create_runtime_window(&handler, &beta).await;
+    let requester = spawn_environment_child("switch-success-control-after").await;
+    let control_pid = requester.0.id();
+    let (event_tx, mut event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
+    let control_id = handler
+        .register_control_with_closing(
+            control_pid,
+            ControlModeUpgrade {
+                mode: ControlMode::Plain,
+                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
+                initial_command_count: 0,
+            },
+            event_tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+    handler
+        .set_control_session(control_pid, Some(alpha.clone()))
+        .await
+        .expect("initial control session set succeeds");
+    assert!(event_rx.try_recv().is_ok());
+    {
+        let mut state = handler.state.lock().await;
+        state.environment.set(
+            ScopeSelector::Session(beta.clone()),
+            "DISPLAY".to_owned(),
+            "switch-success-control-before".to_owned(),
+        );
+        assert_eq!(
+            state
+                .sessions
+                .session(&beta)
+                .expect("beta exists")
+                .last_attached_at(),
+            None
+        );
+    }
+    {
+        let mut active_control = handler.active_control.lock().await;
+        let active = active_control
+            .by_pid
+            .get_mut(&control_pid)
+            .expect("control client remains registered");
+        active.client_width = SWITCH_SIZE.cols;
+        active.client_height = SWITCH_SIZE.rows;
+        // A control client only owns a size once it has announced one; this
+        // stands in for the `refresh-client -C` that announced SWITCH_SIZE.
+        active.size_declared = true;
+    }
+
+    let response = handler
+        .handle_switch_client_ext3(
+            control_pid,
+            switch_request(format!("{beta}:{target_window}")),
+        )
+        .await;
+    assert!(
+        matches!(response, Response::SwitchClient(_)),
+        "{response:?}"
+    );
+    assert!(matches!(
+        event_rx.try_recv(),
+        Ok(ControlServerEvent::SessionChanged(Some(ref session_name))
+            | ControlServerEvent::SessionChangedAt {
+                ref session_name,
+                ..
+            }) if session_name == &beta
+    ));
+    {
+        let state = handler.state.lock().await;
+        let target = state.sessions.session(&beta).expect("beta survives");
+        assert_eq!(target.active_window_index(), target_window);
+        assert_eq!(target.window().size(), SWITCH_SIZE);
+        assert!(target.last_attached_at().is_some());
+        assert_eq!(
+            state.environment.session_value(&beta, "DISPLAY"),
+            Some("switch-success-control-after")
+        );
+    }
+    {
+        let active_control = handler.active_control.lock().await;
+        let active = active_control
+            .by_pid
+            .get(&control_pid)
+            .expect("control client remains registered");
+        assert_eq!(active.id, control_id);
+        assert_eq!(active.session_name.as_ref(), Some(&beta));
+        assert_eq!(active.last_session.as_ref(), Some(&alpha));
+    }
 }
 
 #[tokio::test]

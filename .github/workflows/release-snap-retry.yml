@@ -48,7 +48,7 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ inputs.expected_source_sha }}
+          ref: ${{ github.workflow_sha }}
           persist-credentials: false
       - id: prepare
         uses: ./.github/actions/release-channel-retry-prepare
@@ -104,14 +104,21 @@ jobs:
       - name: Verify exact prepared retry artifact identity
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          scripts/release/actions-artifact.py verify
-          --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID"
-          --artifact-id "${{ needs.prepare.outputs.bundle_artifact_id }}"
-          --name "rmux-downstream-snap_candidate-retry-bundle-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}"
-          --expected-source-sha "${{ inputs.expected_source_sha }}"
-          --expected-digest "${{ needs.prepare.outputs.bundle_artifact_digest }}"
-          --max-attempts 1
+          RMUX_CHANNEL: snap_candidate
+          RMUX_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+          RMUX_RELEASE_ID: ${{ inputs.release_id }}
+          RMUX_RELEASE_REF: ${{ inputs.release_ref }}
+          RMUX_REQUEST_IDEMPOTENCY_KEY: ${{ inputs.request_idempotency_key }}
+        run: |
+          set -euo pipefail
+          scripts/release/prepare-channel-retry.py validate-identity-inputs --from-env
+          scripts/release/actions-artifact.py verify \
+            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
+            --artifact-id "${{ needs.prepare.outputs.bundle_artifact_id }}" \
+            --name "rmux-downstream-snap_candidate-retry-bundle-$RMUX_SOURCE_SHA-$RMUX_RELEASE_ID" \
+            --expected-source-sha "$RMUX_SOURCE_SHA" \
+            --expected-digest "${{ needs.prepare.outputs.bundle_artifact_digest }}" \
+            --max-attempts 1
 
       - name: Download only the exact prepared retry artifact ID
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
@@ -121,16 +128,17 @@ jobs:
           path: ${{ runner.temp }}/rmux-snap-retry-prepared
 
       - name: Revalidate retry authority and original payload bytes
+        env:
+          RMUX_CHANNEL: snap_candidate
+          RMUX_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+          RMUX_RELEASE_ID: ${{ inputs.release_id }}
+          RMUX_RELEASE_REF: ${{ inputs.release_ref }}
+          RMUX_REQUEST_IDEMPOTENCY_KEY: ${{ inputs.request_idempotency_key }}
         run: |
           set -euo pipefail
           scripts/release/assert-release-capability.py downstream_channels
-          scripts/release/prepare-channel-retry.py verify-prepared \
-            --prepared "$RUNNER_TEMP/rmux-snap-retry-prepared" \
-            --channel snap_candidate \
-            --source-sha "${{ inputs.expected_source_sha }}" \
-            --release-id "${{ inputs.release_id }}" \
-            --release-ref "${{ inputs.release_ref }}" \
-            --idempotency-key "${{ inputs.request_idempotency_key }}"
+          scripts/release/prepare-channel-retry.py verify-prepared --from-env \
+            --prepared "$RUNNER_TEMP/rmux-snap-retry-prepared"
 
       - id: decision
         name: Resolve exact Snap candidate retry authority

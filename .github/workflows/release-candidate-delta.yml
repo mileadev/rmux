@@ -59,9 +59,9 @@ jobs:
     timeout-minutes: 90
     strategy:
       fail-fast: false
-      max-parallel: 3
+      max-parallel: 4
       matrix:
-        section: [static, cli, tmux]
+        section: [static, xterm, cli, tmux]
     env:
       CARGO_BUILD_JOBS: "4"
       RUST_MIN_STACK: "8388608"
@@ -163,7 +163,7 @@ jobs:
       - name: Verify Nix binary version
         run: |
           set -euo pipefail
-          expected="$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"
+          expected="$(python3 -c 'import pathlib,sys; sys.path.insert(0, "scripts"); import toml_reader; print(toml_reader.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))["workspace"]["package"]["version"])')"
           test "$(nix run . -- -V)" = "rmux $expected"
 
   windows-ctrl-matrix:

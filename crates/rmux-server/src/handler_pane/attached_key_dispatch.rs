@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use rmux_core::key_code_lookup_bits;
-use rmux_proto::{ErrorResponse, OptionName, PaneTarget, Response, RmuxError, Target};
+use rmux_proto::{OptionName, PaneTarget, RmuxError, Target};
 use tracing::warn;
 
 use super::super::copy_mode_support::key_binding::direct_copy_mode_command;
@@ -10,10 +10,8 @@ use super::{attached_status_message_for_error, display_time, AttachedKeyDispatch
 use crate::key_table::{
     default_key_table_name, lookup_attached_key_table_binding, lookup_key_table_binding,
     matches_prefix_key, session_option_key, session_option_u64, should_drop_unbound_prefix_key,
-    step03_prefix_binding, Step03PrefixBinding, COPY_MODE_TABLE, COPY_MODE_VI_TABLE, PREFIX_TABLE,
+    COPY_MODE_TABLE, COPY_MODE_VI_TABLE, PREFIX_TABLE,
 };
-use crate::pane_terminals::session_not_found;
-use crate::renderer;
 
 #[path = "attached_key_dispatch/commands.rs"]
 mod commands;
@@ -113,6 +111,7 @@ impl RequestHandler {
                 active.identity(attach_pid),
                 active.session_name.clone(),
                 active.session_id,
+                active.client_name.clone(),
                 active.key_table_name.clone(),
                 active.key_table_set_at,
                 active.key_table_generation,
@@ -127,6 +126,7 @@ impl RequestHandler {
             key_table_identity,
             session_name,
             session_id,
+            client_name,
             current_table_name,
             key_table_set_at,
             key_table_generation,
@@ -144,7 +144,6 @@ impl RequestHandler {
             binding,
             should_enter_prefix,
             should_clear_before_dispatch,
-            from_prefix_table,
         ) = {
             let state = self.state.lock().await;
             if live_session_id.is_some()
@@ -198,10 +197,8 @@ impl RequestHandler {
                     None,
                     true,
                     should_clear,
-                    false,
                 )
             } else {
-                let from_prefix_table = table_name == PREFIX_TABLE;
                 let lookup_binding = if attached_live_input {
                     lookup_attached_key_table_binding
                 } else {
@@ -227,7 +224,6 @@ impl RequestHandler {
                     binding,
                     false,
                     should_clear,
-                    from_prefix_table,
                 )
             }
         };
@@ -402,20 +398,6 @@ impl RequestHandler {
             );
         }
 
-        if from_prefix_table {
-            if let Some(action) = step03_prefix_binding(lookup_key) {
-                if let Err(error) = self.dispatch_step03_prefix_action(action, target).await {
-                    if attached_live_input {
-                        self.report_attached_command_error(&session_name, attach_pid, &error)
-                            .await;
-                        return Ok(true);
-                    }
-                    return Err(error);
-                }
-                return Ok(true);
-            }
-        }
-
         if let Some(command) = direct_copy_mode_command(binding.commands()) {
             Box::pin(self.execute_direct_copy_mode_binding(
                 requester_pid,
@@ -437,6 +419,7 @@ impl RequestHandler {
                 requester_pid,
                 session_name: session_name.clone(),
                 session_id,
+                client_name,
                 attached_live_input,
                 dispatch_target,
                 mouse_target,
@@ -465,7 +448,7 @@ impl RequestHandler {
         .await
     }
 
-    async fn report_attached_command_error(
+    pub(in crate::handler) async fn report_attached_command_error(
         &self,
         session_name: &rmux_proto::SessionName,
         attach_pid: u32,
@@ -478,115 +461,23 @@ impl RequestHandler {
         );
 
         let message = attached_status_message_for_error(error);
-        let (overlay_frame, clear_frame, duration) = {
+        let duration = {
             let mut state = self.state.lock().await;
             state.add_message(message.clone());
             let Some(session) = state.sessions.session(session_name) else {
                 return;
             };
-            let mut overlay_frame =
-                renderer::render_display_panes_clear(session, &state.options, &state);
-            overlay_frame.extend_from_slice(
-                renderer::render_status_message(session, &state.options, &message).as_slice(),
-            );
-            let clear_frame = renderer::render_display_panes_clear(session, &state.options, &state);
-            let duration = display_time(&state.options, session_name);
-            (overlay_frame, clear_frame, duration)
+            let _ = session;
+            display_time(&state.options, session_name)
         };
 
         let _ = self
-            .send_attached_overlay(session_name, overlay_frame, clear_frame, duration)
+            .send_attached_overlay(
+                session_name,
+                message,
+                (!duration.is_zero()).then_some(duration),
+                crate::handler::attach_support::TransientMessageInputPolicy::DismissAndForward,
+            )
             .await;
-    }
-
-    async fn dispatch_step03_prefix_action(
-        &self,
-        action: Step03PrefixBinding,
-        target: &PaneTarget,
-    ) -> Result<(), RmuxError> {
-        match action {
-            Step03PrefixBinding::SelectPaneNext | Step03PrefixBinding::SelectPanePrevious => {
-                let target = {
-                    let state = self.state.lock().await;
-                    let session = state
-                        .sessions
-                        .session(target.session_name())
-                        .ok_or_else(|| session_not_found(target.session_name()))?;
-                    let window = session.window_at(target.window_index()).ok_or_else(|| {
-                        RmuxError::invalid_target(
-                            target.to_string(),
-                            "window index does not exist in session",
-                        )
-                    })?;
-                    let panes = window.panes();
-                    let active = window.active_pane_index();
-                    let Some(position) = panes.iter().position(|pane| pane.index() == active)
-                    else {
-                        return Err(RmuxError::invalid_target(
-                            target.to_string(),
-                            "active pane index does not exist in window",
-                        ));
-                    };
-                    let selected_position = match action {
-                        Step03PrefixBinding::SelectPaneNext => (position + 1) % panes.len(),
-                        Step03PrefixBinding::SelectPanePrevious => {
-                            (position + panes.len() - 1) % panes.len()
-                        }
-                        _ => unreachable!("action filtered by outer match"),
-                    };
-                    PaneTarget::with_window(
-                        target.session_name().clone(),
-                        target.window_index(),
-                        panes[selected_position].index(),
-                    )
-                };
-                let response = self
-                    .handle_select_pane(rmux_proto::SelectPaneRequest {
-                        target,
-                        title: None,
-                        style: None,
-                        input_disabled: None,
-                        preserve_zoom: false,
-                    })
-                    .await;
-                match response {
-                    Response::SelectPane(_) => Ok(()),
-                    Response::Error(ErrorResponse { error }) => Err(error),
-                    _ => Err(RmuxError::Server(
-                        "select-pane prefix binding returned unexpected response".to_owned(),
-                    )),
-                }
-            }
-            Step03PrefixBinding::NextWindow => {
-                let response = self
-                    .handle_next_window(rmux_proto::NextWindowRequest {
-                        target: target.session_name().clone(),
-                        alerts_only: false,
-                    })
-                    .await;
-                match response {
-                    Response::NextWindow(_) => Ok(()),
-                    Response::Error(ErrorResponse { error }) => Err(error),
-                    _ => Err(RmuxError::Server(
-                        "next-window prefix binding returned unexpected response".to_owned(),
-                    )),
-                }
-            }
-            Step03PrefixBinding::PreviousWindow => {
-                let response = self
-                    .handle_previous_window(rmux_proto::PreviousWindowRequest {
-                        target: target.session_name().clone(),
-                        alerts_only: false,
-                    })
-                    .await;
-                match response {
-                    Response::PreviousWindow(_) => Ok(()),
-                    Response::Error(ErrorResponse { error }) => Err(error),
-                    _ => Err(RmuxError::Server(
-                        "previous-window prefix binding returned unexpected response".to_owned(),
-                    )),
-                }
-            }
-        }
     }
 }

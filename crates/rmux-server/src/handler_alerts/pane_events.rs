@@ -322,10 +322,11 @@ impl RequestHandler {
         self.pause_before_pane_alert_final_apply().await;
 
         let attached_counts = self.attached_counts_snapshot().await;
-        let (plans, automatic_name_refreshes, inactive_output_refreshes) = {
+        let (plans, automatic_name_refreshes, automatic_rename_events, inactive_output_refreshes) = {
             let mut state = self.state.lock().await;
             let mut plans = Vec::new();
             let mut automatic_name_refreshes = HashSet::new();
+            let mut automatic_rename_events = Vec::new();
             for (window_id, pending) in window_alerts {
                 let silence_was_reset = silence_resets.contains(&window_id);
                 let mut flags = AlertFlags::empty();
@@ -348,11 +349,12 @@ impl RequestHandler {
                     pane_target.window_index(),
                 );
 
-                automatic_name_refreshes.extend(
-                    Self::sync_automatic_window_name_for_window_target_locked(
-                        &mut state, &target, window_id,
-                    ),
-                );
+                if let Some(change) = Self::sync_automatic_window_name_for_window_target_locked(
+                    &mut state, &target, window_id,
+                ) {
+                    automatic_name_refreshes.extend(change.refresh_sessions);
+                    automatic_rename_events.push(change.lifecycle_event);
+                }
 
                 // Name synchronization may update linked/grouped models. Resolve again before
                 // assigning flags or preparing alert hooks.
@@ -408,9 +410,25 @@ impl RequestHandler {
                         .map(|session| session.name().clone())
                 })
                 .collect::<HashSet<_>>();
-            (plans, automatic_name_refreshes, inactive_output_refreshes)
+            (
+                plans,
+                automatic_name_refreshes,
+                automatic_rename_events,
+                inactive_output_refreshes,
+            )
         };
 
+        for lifecycle_event in automatic_rename_events {
+            let lifecycle_event = {
+                let mut state = self.state.lock().await;
+                sequence_prepared_lifecycle_event(&mut state, lifecycle_event)
+            };
+            if wait_for_lifecycle_hooks {
+                self.emit_prepared_and_wait(lifecycle_event).await;
+            } else {
+                self.emit_prepared(lifecycle_event).await;
+            }
+        }
         for session_name in automatic_name_refreshes {
             self.refresh_attached_session(&session_name).await;
         }
@@ -466,27 +484,43 @@ impl RequestHandler {
                 session.active_window_index() != window_index
                     || session.active_pane_id() != Some(event.pane_id)
             });
+        // The active pane's title and OSC 7 path reach the outer terminal only
+        // through a re-render: the attach prelude carries the expanded
+        // `set-titles-string` and the pane's path, and no other path re-emits
+        // them, so a program that retitles itself or changes directory never
+        // updated its host (issue #182).
+        let outer_identity_changed = event.title_changed || event.path_changed;
         // A pane toggling its mouse-tracking mode must refresh attached
         // clients even when it is the active pane: the refresh rebuilds the
         // outer terminal, whose transition diff emits the outer mouse
         // enable/disable for pane-driven tracking (issue #93).
-        let inactive_refresh_sessions = if refresh_for_inactive_pane_output
+        let redraws_every_linked_session = refresh_for_inactive_pane_output
             || event.mouse_mode_changed
-            || event.alternate_mode_changed
-        {
-            state
-                .window_linked_session_family_list(pane_target.session_name(), window_index)
-                .into_iter()
-                .filter_map(|session_name| {
-                    state
-                        .sessions
-                        .session(&session_name)
-                        .map(rmux_core::Session::id)
-                })
-                .collect()
+            || event.alternate_mode_changed;
+        let linked_sessions = if redraws_every_linked_session || outer_identity_changed {
+            state.window_linked_session_family_list(pane_target.session_name(), window_index)
         } else {
             Vec::new()
         };
+        let inactive_refresh_sessions = linked_sessions
+            .into_iter()
+            // A session with `set-titles off` writes neither OSC 0 nor OSC 7,
+            // so an outer-identity change alone must cost it no redraw — not
+            // even when it shares the window with a session that has it on.
+            .filter(|session_name| {
+                redraws_every_linked_session
+                    || state
+                        .options
+                        .resolve(Some(session_name), OptionName::SetTitles)
+                        == Some("on")
+            })
+            .filter_map(|session_name| {
+                state
+                    .sessions
+                    .session(&session_name)
+                    .map(rmux_core::Session::id)
+            })
+            .collect();
         let set_clipboard_on = matches!(
             state.options.resolve(None, OptionName::SetClipboard),
             Some("on")

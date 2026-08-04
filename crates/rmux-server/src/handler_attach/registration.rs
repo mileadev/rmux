@@ -7,7 +7,8 @@ use rmux_core::LifecycleEvent;
 #[cfg(test)]
 use tokio::sync::mpsc;
 
-use crate::handler::RequestHandler;
+use crate::client_names::attached_client_name;
+use crate::handler::{current_client_activity_timestamp, RequestHandler};
 use crate::mouse::ClientMouseState;
 #[cfg(test)]
 use crate::outer_terminal::OuterTerminalContext;
@@ -18,7 +19,17 @@ use crate::server_access::{
     current_owner_uid, pause_before_access_registration, AccessRegistrationKind,
 };
 
-use super::state::{ActiveAttach, ActiveAttachIdentity, AttachRegistration};
+use super::state::{
+    ActiveAttach, ActiveAttachIdentity, AttachClientSizeProvenance, AttachRegistration,
+};
+
+#[cfg(test)]
+struct TestAttachRegistration {
+    client_name: String,
+    closing: Arc<AtomicBool>,
+    terminal_context: OuterTerminalContext,
+    flags: super::ClientFlags,
+}
 
 impl RequestHandler {
     #[cfg(test)]
@@ -66,26 +77,83 @@ impl RequestHandler {
         terminal_context: OuterTerminalContext,
         flags: super::ClientFlags,
     ) -> u64 {
-        self.register_attach_with_access(
+        let client_name = attached_client_name(requester_pid);
+        self.register_attach_with_closing_and_client_name(
             requester_pid,
             session_name,
-            None,
-            AttachRegistration {
-                control_tx,
-                control_backlog: Arc::new(AtomicUsize::new(0)),
+            control_tx,
+            TestAttachRegistration {
+                client_name,
                 closing,
-                persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
                 terminal_context,
                 flags,
-                render_stream: false,
-                uid: current_owner_uid(),
-                user: self.server_owner_identity(),
-                can_write: true,
-                client_size: None,
             },
         )
         .await
-        .expect("test attach registration session must remain current")
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn register_attach_with_client_name(
+        &self,
+        requester_pid: u32,
+        client_name: String,
+        session_name: rmux_proto::SessionName,
+        control_tx: mpsc::UnboundedSender<AttachControl>,
+    ) -> u64 {
+        self.register_attach_with_closing_and_client_name(
+            requester_pid,
+            session_name,
+            control_tx,
+            TestAttachRegistration {
+                client_name,
+                closing: Arc::new(AtomicBool::new(false)),
+                terminal_context: OuterTerminalContext::default(),
+                flags: super::ClientFlags::default(),
+            },
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn register_attach_with_closing_and_client_name(
+        &self,
+        requester_pid: u32,
+        session_name: rmux_proto::SessionName,
+        control_tx: mpsc::UnboundedSender<AttachControl>,
+        registration: TestAttachRegistration,
+    ) -> u64 {
+        let TestAttachRegistration {
+            client_name,
+            closing,
+            terminal_context,
+            flags,
+        } = registration;
+        let attach_id = self
+            .register_attach_identity(
+                requester_pid,
+                session_name,
+                None,
+                AttachRegistration {
+                    control_tx,
+                    control_backlog: Arc::new(AtomicUsize::new(0)),
+                    closing,
+                    persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
+                    terminal_context,
+                    client_title: None,
+                    flags,
+                    render_stream: false,
+                    uid: current_owner_uid(),
+                    user: self.server_owner_identity(),
+                    can_write: true,
+                    client_size: None,
+                },
+                None,
+                client_name,
+            )
+            .await
+            .map(ActiveAttachIdentity::attach_id)
+            .expect("test attach registration session must remain current");
+        attach_id
     }
 
     #[cfg(test)]
@@ -113,19 +181,43 @@ impl RequestHandler {
         expected_session_id: Option<rmux_proto::SessionId>,
         registration: AttachRegistration,
     ) -> Option<ActiveAttachIdentity> {
+        let client_name = attached_client_name(requester_pid);
         self.register_attach_identity(
             requester_pid,
             session_name,
             expected_session_id,
             registration,
             None,
+            client_name,
         )
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn register_attach_identity_with_server_access(
         &self,
         requester_pid: u32,
+        session_name: rmux_proto::SessionName,
+        expected_session_id: Option<rmux_proto::SessionId>,
+        registration: AttachRegistration,
+        admission: ServerAccessAdmission,
+    ) -> Option<ActiveAttachIdentity> {
+        let client_name = attached_client_name(requester_pid);
+        self.register_attach_identity_with_server_access_and_client_name(
+            requester_pid,
+            client_name,
+            session_name,
+            expected_session_id,
+            registration,
+            admission,
+        )
+        .await
+    }
+
+    pub(crate) async fn register_attach_identity_with_server_access_and_client_name(
+        &self,
+        requester_pid: u32,
+        client_name: String,
         session_name: rmux_proto::SessionName,
         expected_session_id: Option<rmux_proto::SessionId>,
         registration: AttachRegistration,
@@ -137,6 +229,7 @@ impl RequestHandler {
             expected_session_id,
             registration,
             Some(admission),
+            client_name,
         )
         .await
     }
@@ -148,6 +241,7 @@ impl RequestHandler {
         expected_session_id: Option<rmux_proto::SessionId>,
         registration: AttachRegistration,
         admission: Option<ServerAccessAdmission>,
+        client_name: String,
     ) -> Option<ActiveAttachIdentity> {
         #[cfg(test)]
         if admission.is_some() {
@@ -166,9 +260,18 @@ impl RequestHandler {
             return None;
         }
         let active_window_index = Some(session.active_window_index());
-        let client_size = registration
-            .client_size
-            .unwrap_or_else(|| session.window().size());
+        // A client that declared no size still needs an outer terminal anchor,
+        // because `client_size` is outer geometry everywhere it is read. The
+        // session's own terminal size is that anchor; its window size is the
+        // content geometry already reduced by the status rows, and storing it
+        // here made every consumer subtract those rows a second time.
+        let (client_size, client_size_provenance) = match registration.client_size {
+            Some(client_size) => (client_size, AttachClientSizeProvenance::Declared),
+            None => (
+                session.terminal_size(),
+                AttachClientSizeProvenance::InferredFromSession,
+            ),
+        };
         let attach_id = {
             let mut active_attach = self.active_attach.lock().await;
             // Keep the client-state lock across policy revalidation and publication.
@@ -194,11 +297,8 @@ impl RequestHandler {
             };
             let attach_id = active_attach.next_id;
             active_attach.next_id += 1;
-            let size_sequence = active_attach.next_size_sequence;
-            active_attach.next_size_sequence = active_attach.next_size_sequence.saturating_add(1);
-            let activity_sequence = active_attach.next_activity_sequence;
-            active_attach.next_activity_sequence =
-                active_attach.next_activity_sequence.saturating_add(1);
+            let size_sequence = self.next_client_size_sequence();
+            let activity_sequence = self.next_client_activity_sequence();
             let control_backlog = registration.control_backlog;
             let control_tx = AttachControlSender::new(
                 registration.control_tx,
@@ -210,6 +310,7 @@ impl RequestHandler {
                 requester_pid,
                 ActiveAttach {
                     id: attach_id,
+                    client_name,
                     session_name,
                     session_id,
                     last_session: None,
@@ -227,10 +328,13 @@ impl RequestHandler {
                     closing: registration.closing,
                     emit_detached_on_finish: false,
                     terminal_context: registration.terminal_context,
+                    client_title: registration.client_title.unwrap_or_default(),
                     client_size,
+                    client_size_provenance,
                     client_pixels: None,
                     size_sequence,
                     last_activity_sequence: activity_sequence,
+                    activity_at: current_client_activity_timestamp(),
                     persistent_overlay_epoch: registration.persistent_overlay_epoch,
                     render_generation: 0,
                     overlay_generation: 0,
@@ -252,6 +356,8 @@ impl RequestHandler {
                     mode_tree_frame: None,
                     overlay: None,
                     display_panes: None,
+                    transient_message: None,
+                    transient_terminal_prefix: Vec::new(),
                 },
             ) {
                 active_attach.forget_attached_client_windows(requester_pid);
@@ -279,22 +385,53 @@ impl RequestHandler {
             state.key_bindings.unref_table(&table_name);
         }
 
+        let identity = ActiveAttachIdentity::new(requester_pid, attach_id, session_id);
+        self.pause_before_attach_registration_activity().await;
+
+        // Publication released the state lock, so `attached_session_name` may
+        // now address a different session: the captured one can have been
+        // destroyed and its name reused, or it can still be right here under a
+        // new name. Credit the attach only while this registration is still the
+        // live one for the client and still owns the exact session lifetime it
+        // published, which is the identity boundary
+        // `record_attached_input_activity` already enforces for the input this
+        // registration is about to start accepting — and, like that path, take
+        // the store key off the attach rather than the captured name, because a
+        // rename moves the key without ending the lifetime that was attached
+        // to. Handler lock order is state before active_attach.
         let mut state = self.state.lock().await;
-        if let Some(session) = state.sessions.session_mut(&attached_session_name) {
-            session.touch_attached();
+        let active_attach = self.active_attach.lock().await;
+        let live_session_name = active_attach
+            .by_pid
+            .get(&requester_pid)
+            .filter(|active| {
+                identity.matches_active_lifetime(active, session_id)
+                    && !active.closing.load(Ordering::SeqCst)
+            })
+            .map(|active| active.session_name.clone());
+        if let Some(live_session_name) = live_session_name.as_ref() {
+            if let Some(session) = state
+                .sessions
+                .session_mut(live_session_name)
+                .filter(|session| session.id() == session_id)
+            {
+                session.touch_attached();
+            }
         }
+        drop(active_attach);
         drop(state);
-        self.refresh_clock_overlays_for_session(&attached_session_name)
+        // The overlay belongs to the same session this just credited. With no
+        // live attach left there is nothing to resolve a current name from, so
+        // fall back to the captured one, which is what an unattached refresh
+        // has always addressed.
+        let overlay_session_name = live_session_name.unwrap_or(attached_session_name);
+        self.refresh_clock_overlays_for_session(&overlay_session_name)
             .await;
-        Some(ActiveAttachIdentity::new(
-            requester_pid,
-            attach_id,
-            session_id,
-        ))
+        Some(identity)
     }
 
     pub(crate) async fn finish_attach(&self, requester_pid: u32, attach_id: u64) {
-        let (removed_session, removed_key_table, removed_overlay, emit_detached) = {
+        let (removed_session, removed_key_table, removed_overlay, detached_client_name) = {
             let mut active_attach = self.active_attach.lock().await;
             if active_attach
                 .by_pid
@@ -310,12 +447,12 @@ impl RequestHandler {
                             Some((active.session_name, active.session_id)),
                             active.key_table_name,
                             active.overlay,
-                            emit_detached,
+                            emit_detached.then_some(active.client_name),
                         )
                     })
-                    .unwrap_or((None, None, None, false))
+                    .unwrap_or((None, None, None, None))
             } else {
-                (None, None, None, false)
+                (None, None, None, None)
             }
         };
         if removed_session.is_some() {
@@ -327,15 +464,15 @@ impl RequestHandler {
             state.key_bindings.unref_table(&table_name);
         }
         if let Some((session_name, session_id)) = removed_session {
-            if emit_detached {
+            if let Some(client_name) = detached_client_name {
                 self.emit(LifecycleEvent::ClientDetached {
                     session_name: session_name.clone(),
-                    client_name: Some(requester_pid.to_string()),
+                    client_name: Some(client_name),
                 })
                 .await;
             }
             if let Ok(Some(target)) = self.reconcile_attached_session_size(&session_name).await {
-                self.emit(LifecycleEvent::WindowResized { target }).await;
+                self.emit_applied_window_resize(target).await;
             }
             self.destroy_unattached_sessions(vec![(session_name, session_id)])
                 .await;
@@ -372,5 +509,22 @@ impl RequestHandler {
         self.active_attach_identity(attach_pid)
             .await
             .expect("test attach must be registered")
+    }
+
+    /// What the server believes a registered client's outer terminal shows.
+    ///
+    /// Listener-level tests live outside `crate::handler`, so this is how they
+    /// read the per-client title memory the connection loop seeded.
+    #[cfg(test)]
+    pub(crate) async fn remembered_client_title_for_test(&self, attach_pid: u32) -> Option<String> {
+        self.active_attach
+            .lock()
+            .await
+            .by_pid
+            .get(&attach_pid)
+            .expect("test attach must be registered")
+            .client_title
+            .title()
+            .map(str::to_owned)
     }
 }

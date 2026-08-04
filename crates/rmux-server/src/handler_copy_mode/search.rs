@@ -1,19 +1,11 @@
 use std::time::Duration;
 
-use tokio::sync::oneshot;
+use rmux_proto::RmuxError;
 
-use rmux_proto::{PaneTarget, RmuxError};
-
-use super::super::attach_support::ActiveAttachIdentity;
-use super::super::prompt_support::{
-    CommandPromptPlan, PromptField, PromptQueueResult, PromptStartOutcome, PromptType,
-};
-use super::super::scripting_support::QueueExecutionContext;
 use super::super::RequestHandler;
 use crate::copy_mode::{CopyModeCommandContext, CopyModeCommandOutcome};
 use crate::pane_transcript::SharedPaneTranscript;
 
-const COPY_MODE_PROMPT_TEMPLATE: &str = "display-message -p -- '%%'";
 const COPY_MODE_SEARCH_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,120 +30,7 @@ impl CopyModeSearchCommandResult {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum AttachedCopyModeSearchDirection {
-    Forward,
-    Backward,
-}
-
 impl RequestHandler {
-    pub(super) async fn start_copy_mode_search_prompt(
-        &self,
-        attach_pid: u32,
-        target: PaneTarget,
-        direction: AttachedCopyModeSearchDirection,
-    ) -> Result<(), RmuxError> {
-        self.start_copy_mode_search_prompt_with_identity(None, attach_pid, target, direction)
-            .await
-    }
-
-    pub(super) async fn start_copy_mode_search_prompt_for_identity(
-        &self,
-        identity: ActiveAttachIdentity,
-        target: PaneTarget,
-        direction: AttachedCopyModeSearchDirection,
-    ) -> Result<(), RmuxError> {
-        self.start_copy_mode_search_prompt_with_identity(
-            Some(identity),
-            identity.attach_pid(),
-            target,
-            direction,
-        )
-        .await
-    }
-
-    async fn start_copy_mode_search_prompt_with_identity(
-        &self,
-        identity: Option<ActiveAttachIdentity>,
-        attach_pid: u32,
-        target: PaneTarget,
-        direction: AttachedCopyModeSearchDirection,
-    ) -> Result<(), RmuxError> {
-        let origin = self.capture_requester_origin(attach_pid).await;
-        let plan = CommandPromptPlan {
-            origin,
-            target_client: None,
-            context: QueueExecutionContext::without_caller_cwd(),
-            fields: vec![PromptField {
-                prompt: match direction {
-                    AttachedCopyModeSearchDirection::Forward => "(search down) ".to_owned(),
-                    AttachedCopyModeSearchDirection::Backward => "(search up) ".to_owned(),
-                },
-                input: String::new(),
-            }],
-            template: COPY_MODE_PROMPT_TEMPLATE.to_owned(),
-            flags: 0,
-            prompt_type: PromptType::Search,
-            background: false,
-            format_values: Vec::new(),
-        };
-
-        let outcome = match identity {
-            Some(identity) => {
-                self.start_command_prompt_for_identity(identity, plan)
-                    .await?
-            }
-            None => self.start_command_prompt(plan).await?,
-        };
-        if let PromptStartOutcome::Waiting(rx) = outcome {
-            let handler = self.clone();
-            tokio::spawn(async move {
-                handler
-                    .await_copy_mode_search_prompt(identity, attach_pid, target, direction, rx)
-                    .await;
-            });
-        }
-        Ok(())
-    }
-
-    async fn await_copy_mode_search_prompt(
-        &self,
-        identity: Option<ActiveAttachIdentity>,
-        attach_pid: u32,
-        target: PaneTarget,
-        direction: AttachedCopyModeSearchDirection,
-        rx: oneshot::Receiver<PromptQueueResult>,
-    ) {
-        let Ok(result) = rx.await else {
-            return;
-        };
-        let _access = result
-            .origin
-            .as_ref()
-            .map(|origin| self.begin_requester_origin_access(origin));
-        let Some(responses) = result.responses else {
-            return;
-        };
-        let Some(query) = responses.first().filter(|query| !query.is_empty()) else {
-            return;
-        };
-        let command = match direction {
-            AttachedCopyModeSearchDirection::Forward => "search-forward",
-            AttachedCopyModeSearchDirection::Backward => "search-backward",
-        };
-        let args = vec!["--".to_owned(), query.clone()];
-        let _ = match identity {
-            Some(identity) => {
-                self.execute_copy_mode_command_for_identity(identity, target, command, &args, 1)
-                    .await
-            }
-            None => {
-                self.execute_copy_mode_command(attach_pid, target, command, &args, 1)
-                    .await
-            }
-        };
-    }
-
     pub(super) async fn execute_copy_mode_search_command(
         &self,
         target_transcript: &SharedPaneTranscript,

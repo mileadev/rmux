@@ -372,6 +372,18 @@ impl PtyMaster {
         self.io.try_clone()
     }
 
+    /// Returns whether byte writes reach a Windows ConPTY child verbatim.
+    ///
+    /// Older Windows builds run ConPTY without passthrough mode and consume
+    /// bracketed-paste delimiters written through the input pipe. Callers that
+    /// must preserve those delimiters can inject Unicode console records
+    /// instead. Modern passthrough ConPTYs preserve the byte stream directly.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn preserves_verbatim_input(&self) -> bool {
+        self.io.pty.uses_passthrough()
+    }
+
     /// Consumes this master handle into its I/O endpoint.
     #[must_use]
     pub fn into_io(self) -> PtyIo {
@@ -412,6 +424,24 @@ impl PtyMaster {
     #[cfg(any(unix, windows))]
     pub fn write_all_with_timeout(&self, bytes: &[u8], timeout: Duration) -> io::Result<()> {
         self.io.write_all_with_timeout(bytes, timeout)
+    }
+
+    /// Writes all bytes to the ConPTY master with one bounded recovery window
+    /// after an inactivity timeout.
+    ///
+    /// The recovery preserves byte order across a cancelled overlapped write.
+    /// A destination that remains blocked for `recovery_grace` returns a
+    /// timeout instead of retrying indefinitely.
+    #[cfg(windows)]
+    pub fn write_all_with_stall_recovery(
+        &self,
+        bytes: &[u8],
+        timeout: Duration,
+        recovery_grace: Duration,
+    ) -> io::Result<()> {
+        self.io
+            .pty
+            .write_all_with_stall_recovery(bytes, timeout, recovery_grace)
     }
 
     /// Attempts to write bytes to a nonblocking Unix PTY master without waiting.

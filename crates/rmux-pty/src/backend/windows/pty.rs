@@ -82,6 +82,16 @@ impl WindowsPty {
         input_writer.write_all_with_timeout(bytes, timeout)
     }
 
+    pub(crate) fn write_all_with_stall_recovery(
+        &self,
+        bytes: &[u8],
+        timeout: Duration,
+        recovery_grace: Duration,
+    ) -> io::Result<()> {
+        let input_writer = self.input_writer()?;
+        input_writer.write_all_with_stall_recovery(bytes, timeout, recovery_grace)
+    }
+
     fn output_read_handle(&self) -> io::Result<OwnedHandle> {
         let state = self
             .state

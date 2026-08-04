@@ -163,6 +163,28 @@ runs:
         sudo apt-get update
         sudo apt-get install -y binutils cpio rpm createrepo-c
 
+    - name: Install the pinned Linux glibc linker toolchain
+      if: runner.os == 'Linux'
+      shell: bash
+      env:
+        RMUX_LINUX_GLIBC_FLOOR: "2.31"
+      run: |
+        set -euo pipefail
+        tools="$RUNNER_TEMP/rmux-linux-glibc-tools"
+        cache="$RUNNER_TEMP/rmux-cargo-zigbuild-cache"
+        test ! -e "$tools"
+        test ! -e "$cache"
+        scripts/release/install-linux-glibc-build-tools.sh \
+          "$tools" \
+          "$CANONICAL_BUNDLE/linux-glibc-build-tools.txt"
+        echo "$tools/bin" >> "$GITHUB_PATH"
+        {
+          echo "CARGO_ZIGBUILD_PYTHON_PATH=$tools/bin/python"
+          echo "CARGO_ZIGBUILD_CACHE_DIR=$cache"
+          echo "RMUX_LINUX_GLIBC_FLOOR=2.31"
+          echo "RMUX_MAX_SUPPORTED_GLIBC=2.31"
+        } >> "$GITHUB_ENV"
+
     - name: Build and package Unix assets once
       if: runner.os != 'Windows'
       shell: bash
@@ -191,6 +213,19 @@ runs:
             --skip-build \
             --reuse-release-binary
         fi
+
+    - name: Smoke Linux release binaries on the glibc 2.31 baseline
+      if: runner.os == 'Linux'
+      shell: bash
+      env:
+        RMUX_TARGET_TRIPLE: ${{ inputs.target-triple }}
+      run: |
+        set -euo pipefail
+        release_dir="$CARGO_TARGET_DIR/$RMUX_TARGET_TRIPLE/release"
+        scripts/smoke-linux-glibc-baseline.sh \
+          "$release_dir/rmux" \
+          "$release_dir/rmux-full" \
+          "$release_dir/rmux-daemon"
 
     - name: Build and package Windows assets once
       if: runner.os == 'Windows'
@@ -394,6 +429,11 @@ runs:
         mkdir -p "$provenance"
         cp "$CANONICAL_BUNDLE/canonical-build-record.json" "$provenance/"
         cp "$CANONICAL_BUNDLE/rustc-vV.txt" "$provenance/"
+        if [[ "$RUNNER_OS" == Linux ]]; then
+          cp "$CANONICAL_BUNDLE/linux-glibc-build-tools.txt" "$provenance/"
+        else
+          test ! -e "$CANONICAL_BUNDLE/linux-glibc-build-tools.txt"
+        fi
         cp "$RMUX_ATTESTATION_BUNDLE" "$provenance/build-provenance.sigstore.json"
         scripts/release/canonical-artifact-binding.py create \
           --source-sha "$RMUX_EXPECTED_SOURCE_SHA" \

@@ -8,12 +8,15 @@ use rmux_proto::{
 };
 
 use super::mode_tree_support::ModeTreeActionIdentity;
-use super::pane_support::{prepare_pane_input_write, write_bytes_to_target_io, PaneInputLiveness};
+use super::pane_support::{
+    prepare_pane_bracketed_paste_write, prepare_pane_input_write, write_bytes_to_target_io,
+    PaneInputLiveness,
+};
 use super::RequestHandler;
 use crate::buffer_file_io;
 use crate::outer_terminal::OuterTerminal;
 use crate::pane_io::AttachControl;
-use crate::pane_terminals::{session_not_found, PaneCaptureRequest};
+use crate::pane_terminals::{session_not_found, PaneCaptureRequest, PasteDelimiters};
 
 #[path = "handler_buffer/capture_format.rs"]
 mod capture_format;
@@ -235,7 +238,13 @@ impl RequestHandler {
             return match post_commit
                 .run_durable(async move {
                     if let Err(result) = handler
-                        .write_ordered_paste_payload(&target, pane_id, expected_requester, payload)
+                        .write_ordered_paste_payload(
+                            &target,
+                            pane_id,
+                            expected_requester,
+                            payload,
+                            bracketed_mode,
+                        )
                         .await
                     {
                         return result;
@@ -278,7 +287,13 @@ impl RequestHandler {
         }
 
         if let Err(result) = self
-            .write_ordered_paste_payload(&request.target, pane_id, expected_requester, payload)
+            .write_ordered_paste_payload(
+                &request.target,
+                pane_id,
+                expected_requester,
+                payload,
+                bracketed_mode,
+            )
             .await
         {
             return result;
@@ -295,6 +310,7 @@ impl RequestHandler {
         pane_id: rmux_proto::PaneId,
         expected_requester: Option<ModeTreeActionIdentity>,
         payload: Vec<u8>,
+        bracketed: bool,
     ) -> Result<(), OrderedPasteBufferResult> {
         let session_name = target.session_name().clone();
         let window_index = target.window_index();
@@ -343,10 +359,27 @@ impl RequestHandler {
                     },
                 )));
             }
-            prepare_pane_input_write(&mut state, target, &payload, PaneInputLiveness::RejectDead)
-                .map_err(|error| {
-                    OrderedPasteBufferResult::Completed(Response::Error(ErrorResponse { error }))
-                })?
+            let prepared = if bracketed {
+                prepare_pane_bracketed_paste_write(
+                    &mut state,
+                    target,
+                    &payload,
+                    PaneInputLiveness::RejectDead,
+                    PasteDelimiters::Wrapped,
+                )
+            } else {
+                // Without an effective envelope `paste-buffer` inserts the
+                // buffer as input, which is the byte-oriented path's contract.
+                prepare_pane_input_write(
+                    &mut state,
+                    target,
+                    &payload,
+                    PaneInputLiveness::RejectDead,
+                )
+            };
+            prepared.map_err(|error| {
+                OrderedPasteBufferResult::Completed(Response::Error(ErrorResponse { error }))
+            })?
         };
         write_bytes_to_target_io(write, payload)
             .await

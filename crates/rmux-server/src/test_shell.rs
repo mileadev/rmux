@@ -45,14 +45,19 @@ pub(crate) fn powershell_quote_path(path: &Path) -> String {
 
 #[cfg(windows)]
 pub(crate) fn powershell_encoded_command(script: &str) -> String {
+    format!(
+        "powershell.exe -NoProfile -NonInteractive -EncodedCommand {}",
+        encode_powershell_script(script)
+    )
+}
+
+#[cfg(windows)]
+fn encode_powershell_script(script: &str) -> String {
     let bytes = script
         .encode_utf16()
         .flat_map(u16::to_le_bytes)
         .collect::<Vec<_>>();
-    format!(
-        "powershell.exe -NoProfile -NonInteractive -EncodedCommand {}",
-        base64_encode(&bytes)
-    )
+    base64_encode(&bytes)
 }
 
 #[cfg(windows)]
@@ -79,3 +84,12 @@ fn base64_encode(bytes: &[u8]) -> String {
     }
     encoded
 }
+
+/// The real-child final-sink harness.
+///
+/// Split out of this module because it carries a slot protocol, two child
+/// scripts and their diagnostics, none of which the shell-quoting helpers
+/// above need to know about.
+#[cfg(any(unix, windows))]
+#[path = "test_shell/final_sink.rs"]
+pub(crate) mod final_sink;

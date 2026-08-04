@@ -90,9 +90,7 @@ impl ScreenWriter for Screen {
         let upper = self.cursor_y;
         let lower = self.rlower;
         let lines = n.max(1).min(lower.saturating_sub(upper).saturating_add(1));
-        for _ in 0..lines {
-            self.grid.scroll_region_down(upper, lower, bg);
-        }
+        self.grid.insert_lines(upper, lower, lines, bg);
     }
 
     fn delete_line(&mut self, n: u32, bg: i32) {
@@ -211,9 +209,16 @@ impl ScreenWriter for Screen {
         let sx = self.grid.sx();
         let count = n.max(1).min(sx.saturating_sub(x));
         let blank = self.blank_cell(bg);
+        let clears_whole_line = x == 0 && count == sx;
+        if clears_whole_line {
+            self.grid.break_wrap_before_visible_line(self.cursor_y);
+        }
         if let Some(line) = self.current_line_mut() {
             line.delete_cells(x, count, &blank);
             Self::repair_wide_cells_on_line(line, sx, bg);
+            if clears_whole_line {
+                line.set_wrapped(false);
+            }
             line.touch();
         }
     }
@@ -425,13 +430,17 @@ impl ScreenWriter for Screen {
     }
 
     fn set_window_name(&mut self, name: &str) {
-        if self.title_rename_enabled {
+        if self.title_rename_enabled && self.window_name != name {
             self.window_name = name.to_owned();
+            self.bump_metadata_revision();
         }
     }
 
     fn set_path(&mut self, path: &str) {
-        self.path = path.to_owned();
+        if self.path != path {
+            self.path = path.to_owned();
+            self.bump_metadata_revision();
+        }
     }
 
     fn save_cursor(&mut self) {
@@ -485,6 +494,7 @@ impl ScreenWriter for Screen {
         self.title_stack.clear();
         self.active_hyperlink = 0;
         self.hyperlinks.reset();
+        self.bump_metadata_revision();
     }
 
     fn start_sync(&mut self) {
@@ -503,9 +513,11 @@ impl ScreenWriter for Screen {
         let (internal_id, uri) = Self::parse_hyperlink(data);
         if uri.is_empty() {
             self.active_hyperlink = 0;
+            self.bump_metadata_revision();
             return;
         }
         self.active_hyperlink = self.hyperlinks.put(&uri, internal_id.as_deref());
+        self.bump_metadata_revision();
     }
 
     fn current_hyperlink_id(&self) -> u32 {
@@ -569,6 +581,7 @@ impl ScreenWriter for Screen {
             self.title_stack.drain(0..excess);
         }
         self.title_stack.push(self.title.clone());
+        self.bump_metadata_revision();
     }
 
     fn pop_title(&mut self) {
@@ -577,6 +590,7 @@ impl ScreenWriter for Screen {
         }
         if let Some(title) = self.title_stack.pop() {
             self.title = title;
+            self.bump_metadata_revision();
         }
     }
 

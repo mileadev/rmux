@@ -68,6 +68,15 @@ async fn select_layout_even_layouts_apply_tmux_geometry_through_the_handler() {
     for expected_pane in [1, 1] {
         split_pane_zero(&handler, &alpha, expected_pane).await;
     }
+    let active_before = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&alpha)
+            .expect("session exists")
+            .window()
+            .active_pane_index()
+    };
 
     let even_horizontal = handler
         .handle(Request::SelectLayout(SelectLayoutRequest {
@@ -89,16 +98,17 @@ async fn select_layout_even_layouts_apply_tmux_geometry_through_the_handler() {
         assert_eq!(window.layout(), LayoutName::EvenHorizontal);
         assert_eq!(
             window.pane(0).expect("pane 0 exists").geometry(),
-            PaneGeometry::new(0, 0, 32, 40)
+            PaneGeometry::new(0, 0, 33, 40)
         );
         assert_eq!(
             window.pane(1).expect("pane 1 exists").geometry(),
-            PaneGeometry::new(33, 0, 32, 40)
+            PaneGeometry::new(34, 0, 33, 40)
         );
         assert_eq!(
             window.pane(2).expect("pane 2 exists").geometry(),
-            PaneGeometry::new(66, 0, 34, 40)
+            PaneGeometry::new(68, 0, 32, 40)
         );
+        assert_eq!(window.active_pane_index(), active_before);
     }
 
     let even_vertical = handler
@@ -120,16 +130,64 @@ async fn select_layout_even_layouts_apply_tmux_geometry_through_the_handler() {
     assert_eq!(window.layout(), LayoutName::EvenVertical);
     assert_eq!(
         window.pane(0).expect("pane 0 exists").geometry(),
-        PaneGeometry::new(0, 0, 100, 12)
+        PaneGeometry::new(0, 0, 100, 13)
     );
     assert_eq!(
         window.pane(1).expect("pane 1 exists").geometry(),
-        PaneGeometry::new(0, 13, 100, 12)
+        PaneGeometry::new(0, 14, 100, 13)
     );
     assert_eq!(
         window.pane(2).expect("pane 2 exists").geometry(),
-        PaneGeometry::new(0, 26, 100, 14)
+        PaneGeometry::new(0, 28, 100, 12)
     );
+    assert_eq!(window.active_pane_index(), active_before);
+    drop(state);
+
+    for (layout, expected) in [
+        (
+            LayoutName::MainHorizontal,
+            [
+                PaneGeometry::new(0, 0, 100, 24),
+                PaneGeometry::new(0, 25, 50, 15),
+                PaneGeometry::new(51, 25, 49, 15),
+            ],
+        ),
+        (
+            LayoutName::MainVertical,
+            [
+                PaneGeometry::new(0, 0, 80, 40),
+                PaneGeometry::new(81, 0, 19, 20),
+                PaneGeometry::new(81, 21, 19, 19),
+            ],
+        ),
+    ] {
+        let response = handler
+            .handle(Request::SelectLayout(SelectLayoutRequest {
+                target: SelectLayoutTarget::Window(WindowTarget::new(alpha.clone())),
+                layout,
+            }))
+            .await;
+        assert_eq!(
+            response,
+            Response::SelectLayout(rmux_proto::SelectLayoutResponse { layout })
+        );
+
+        let state = handler.state.lock().await;
+        let window = state
+            .sessions
+            .session(&alpha)
+            .expect("session exists")
+            .window();
+        assert_eq!(
+            window
+                .panes()
+                .iter()
+                .map(|pane| pane.geometry())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(window.active_pane_index(), active_before);
+    }
 }
 
 #[tokio::test]

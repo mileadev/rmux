@@ -1,4 +1,5 @@
 use super::*;
+use crate::client_names::attached_client_name;
 
 #[tokio::test]
 async fn attached_resize_emits_client_resized_hook_with_client_context() {
@@ -30,7 +31,10 @@ async fn attached_resize_emits_client_resized_hook_with_client_context() {
                 scope: ScopeSelector::Global,
                 hook: rmux_proto::HookName::ClientResized,
                 command: Some(
-                    "if-shell -F '#{==:#{hook_client}:#{hook_session_name},101:resize-hook}' 'set-buffer -b client-resized ok' 'set-buffer -b client-resized bad'".to_owned(),
+                    format!(
+                        "if-shell -F '#{{==:#{{hook_client}}:#{{hook_session_name}},{}:resize-hook}}' 'set-buffer -b client-resized ok' 'set-buffer -b client-resized bad'",
+                        attached_client_name(101)
+                    ),
                 ),
                 lifecycle: rmux_proto::HookLifecycle::Persistent,
                 append: false,
@@ -151,10 +155,10 @@ async fn window_size_policy_reconciles_attached_client_sizes() {
     .await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize {
+        content_size_for_default_status(TerminalSize {
             cols: 120,
             rows: 40
-        },
+        }),
         "default latest policy should use the most recently attached client"
     );
 
@@ -162,24 +166,24 @@ async fn window_size_policy_reconciles_attached_client_sizes() {
         register_sized_attach(&handler, 202, &session, TerminalSize { cols: 80, rows: 20 }).await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize { cols: 80, rows: 20 },
+        content_size_for_default_status(TerminalSize { cols: 80, rows: 20 }),
         "latest policy should follow the newest attach"
     );
 
     set_window_size_policy(&handler, &session, "largest").await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize {
+        content_size_for_default_status(TerminalSize {
             cols: 120,
             rows: 40
-        },
+        }),
         "largest policy must select the largest live attached client"
     );
 
     set_window_size_policy(&handler, &session, "smallest").await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize { cols: 80, rows: 20 },
+        content_size_for_default_status(TerminalSize { cols: 80, rows: 20 }),
         "smallest policy must select the smallest live attached client"
     );
 
@@ -196,17 +200,17 @@ async fn window_size_policy_reconciles_attached_client_sizes() {
         .expect("manual client resize is accepted");
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize { cols: 80, rows: 20 },
+        content_size_for_default_status(TerminalSize { cols: 80, rows: 20 }),
         "manual policy must not auto-resize the window"
     );
 
     set_window_size_policy(&handler, &session, "latest").await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize {
+        content_size_for_default_status(TerminalSize {
             cols: 140,
             rows: 45
-        },
+        }),
         "latest policy should use the most recently resized client"
     );
 }
@@ -240,10 +244,10 @@ async fn refresh_client_ignore_size_transitions_reconcile_largest_policy() {
     set_window_size_policy(&handler, &session, "largest").await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize {
+        content_size_for_default_status(TerminalSize {
             cols: 120,
             rows: 40
-        }
+        })
     );
 
     let ignored = handler
@@ -252,7 +256,7 @@ async fn refresh_client_ignore_size_transitions_reconcile_largest_policy() {
     assert!(matches!(ignored, Response::RefreshClient(_)), "{ignored:?}");
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize { cols: 80, rows: 20 },
+        content_size_for_default_status(TerminalSize { cols: 80, rows: 20 }),
         "adding ignore-size must immediately remove the client from largest-policy candidates"
     );
 
@@ -269,10 +273,10 @@ async fn refresh_client_ignore_size_transitions_reconcile_largest_policy() {
     );
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize {
+        content_size_for_default_status(TerminalSize {
             cols: 120,
             rows: 40
-        },
+        }),
         "removing ignore-size through the -F alias must restore the client as a candidate"
     );
 }
@@ -329,12 +333,12 @@ async fn refresh_client_ignore_size_reconcile_preserves_same_pid_replacement_ide
     ));
     assert_eq!(
         attached_session_size(&handler, &alpha).await,
-        TerminalSize { cols: 80, rows: 20 },
+        content_size_for_default_status(TerminalSize { cols: 80, rows: 20 }),
         "the original session must reconcile after its large client is replaced"
     );
     assert_eq!(
         attached_session_size(&handler, &beta).await,
-        TerminalSize { cols: 95, rows: 26 },
+        content_size_for_default_status(TerminalSize { cols: 95, rows: 26 }),
         "the stale refresh must never resize the replacement client's session"
     );
     let active_attach = handler.active_attach.lock().await;
@@ -379,17 +383,17 @@ async fn largest_and_smallest_window_size_policies_compose_dimensions_like_tmux(
     set_window_size_policy(&handler, &session, "largest").await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize {
+        content_size_for_default_status(TerminalSize {
             cols: 120,
             rows: 50
-        },
+        }),
         "largest policy must take the maximum width and maximum height independently"
     );
 
     set_window_size_policy(&handler, &session, "smallest").await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize { cols: 80, rows: 20 },
+        content_size_for_default_status(TerminalSize { cols: 80, rows: 20 }),
         "smallest policy must take the minimum width and minimum height independently"
     );
 }
@@ -429,10 +433,10 @@ async fn attach_session_initial_client_size_respects_window_size_policy() {
     assert!(outcome.attach.is_some());
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize {
+        content_size_for_default_status(TerminalSize {
             cols: 160,
             rows: 40
-        },
+        }),
         "initial attach must not shrink a largest-policy window below the largest live client"
     );
 
@@ -447,7 +451,7 @@ async fn attach_session_initial_client_size_respects_window_size_policy() {
     assert!(outcome.attach.is_some());
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize { cols: 72, rows: 18 },
+        content_size_for_default_status(TerminalSize { cols: 72, rows: 18 }),
         "initial attach must be considered by smallest-policy selection"
     );
 
@@ -515,18 +519,18 @@ async fn latest_window_size_recovers_when_small_client_finishes() {
         register_sized_attach(&handler, 202, &session, TerminalSize { cols: 72, rows: 18 }).await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize { cols: 72, rows: 18 }
+        content_size_for_default_status(TerminalSize { cols: 72, rows: 18 })
     );
 
     handler.finish_attach(202, small_id).await;
 
-    wait_for_client_detached_event(&mut events, "202").await;
+    wait_for_client_detached_event(&mut events, &attached_client_name(202)).await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize {
+        content_size_for_default_status(TerminalSize {
             cols: 160,
             rows: 40
-        },
+        }),
         "latest policy must fall back to the remaining latest live client"
     );
 }
@@ -560,23 +564,23 @@ async fn refresh_prunes_dead_attach_and_recomputes_latest_size() {
         register_sized_attach(&handler, 202, &session, TerminalSize { cols: 72, rows: 18 }).await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize { cols: 72, rows: 18 }
+        content_size_for_default_status(TerminalSize { cols: 72, rows: 18 })
     );
 
     drop(small_rx);
     handler.refresh_attached_session(&session).await;
 
-    wait_for_client_detached_event(&mut events, "202").await;
+    wait_for_client_detached_event(&mut events, &attached_client_name(202)).await;
     assert!(
         !handler.active_attach.lock().await.by_pid.contains_key(&202),
         "dead attach must be removed before size reconciliation"
     );
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize {
+        content_size_for_default_status(TerminalSize {
             cols: 160,
             rows: 40
-        },
+        }),
         "stale smallest client must not keep the window stuck small"
     );
 }
@@ -610,23 +614,23 @@ async fn targeted_refresh_prunes_dead_attach_and_recomputes_latest_size() {
         register_sized_attach(&handler, 202, &session, TerminalSize { cols: 72, rows: 18 }).await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize { cols: 72, rows: 18 }
+        content_size_for_default_status(TerminalSize { cols: 72, rows: 18 })
     );
 
     drop(small_rx);
     handler.refresh_attached_client(202, &session).await;
 
-    wait_for_client_detached_event(&mut events, "202").await;
+    wait_for_client_detached_event(&mut events, &attached_client_name(202)).await;
     assert!(
         !handler.active_attach.lock().await.by_pid.contains_key(&202),
         "targeted refresh must remove dead attach clients through the shared stale-client path"
     );
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize {
+        content_size_for_default_status(TerminalSize {
             cols: 160,
             rows: 40
-        },
+        }),
         "targeted refresh must not leave latest policy stuck on the stale client size"
     );
 }
@@ -660,7 +664,7 @@ async fn targeted_base_refresh_prunes_dead_attach_and_recomputes_latest_size() {
         register_sized_attach(&handler, 202, &session, TerminalSize { cols: 72, rows: 18 }).await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize { cols: 72, rows: 18 }
+        content_size_for_default_status(TerminalSize { cols: 72, rows: 18 })
     );
 
     drop(small_rx);
@@ -668,17 +672,17 @@ async fn targeted_base_refresh_prunes_dead_attach_and_recomputes_latest_size() {
         .refresh_attached_client_base_only(202, &session)
         .await;
 
-    wait_for_client_detached_event(&mut events, "202").await;
+    wait_for_client_detached_event(&mut events, &attached_client_name(202)).await;
     assert!(
         !handler.active_attach.lock().await.by_pid.contains_key(&202),
         "targeted base refresh must remove dead attach clients through the shared stale-client path"
     );
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize {
+        content_size_for_default_status(TerminalSize {
             cols: 160,
             rows: 40
-        },
+        }),
         "targeted base refresh must not leave latest policy stuck on the stale client size"
     );
 }
@@ -717,10 +721,10 @@ async fn ignore_size_clients_update_their_render_size_without_resizing_session()
     .await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize {
+        content_size_for_default_status(TerminalSize {
             cols: 160,
             rows: 40
-        },
+        }),
         "ignore-size attach must not become the latest window-size candidate"
     );
 
@@ -739,10 +743,10 @@ async fn ignore_size_clients_update_their_render_size_without_resizing_session()
     }
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize {
+        content_size_for_default_status(TerminalSize {
             cols: 160,
             rows: 40
-        },
+        }),
         "ignore-size client resize must not resize the session"
     );
 }
@@ -785,10 +789,10 @@ async fn read_only_initial_attach_size_is_not_a_window_size_candidate() {
     assert!(outcome.attach.is_some());
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize {
+        content_size_for_default_status(TerminalSize {
             cols: 160,
             rows: 40
-        },
+        }),
         "read-only implies ignore-size and must not shrink the session during attach"
     );
 }
@@ -822,7 +826,7 @@ async fn detach_client_recomputes_window_size_before_detached_event() {
         register_sized_attach(&handler, 202, &session, TerminalSize { cols: 72, rows: 18 }).await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize { cols: 72, rows: 18 }
+        content_size_for_default_status(TerminalSize { cols: 72, rows: 18 })
     );
 
     let response = handler
@@ -842,13 +846,13 @@ async fn detach_client_recomputes_window_size_before_detached_event() {
         matches!(control, AttachControl::Detach)
     })
     .await;
-    wait_for_client_detached_event(&mut events, "202").await;
+    wait_for_client_detached_event(&mut events, &attached_client_name(202)).await;
     assert_eq!(
         attached_session_size(&handler, &session).await,
-        TerminalSize {
+        content_size_for_default_status(TerminalSize {
             cols: 160,
             rows: 40
-        },
+        }),
         "closing detached clients must be excluded from latest-policy resize selection immediately"
     );
 }
@@ -918,7 +922,7 @@ async fn aggressive_resize_tracks_only_linked_windows_that_are_current() {
         .expect("aggressive linked current sessions reconcile");
     assert_eq!(
         attached_session_size(&handler, &alpha).await,
-        TerminalSize { cols: 72, rows: 18 },
+        content_size_for_default_status(TerminalSize { cols: 72, rows: 18 }),
         "aggressive-resize must include other sessions where the linked window is current"
     );
 
@@ -932,10 +936,10 @@ async fn aggressive_resize_tracks_only_linked_windows_that_are_current() {
     ));
     assert_eq!(
         attached_session_size(&handler, &alpha).await,
-        TerminalSize {
+        content_size_for_default_status(TerminalSize {
             cols: 160,
             rows: 40
-        },
+        }),
         "selecting away from the linked window must recompute affected aggressive-resize sessions"
     );
 }
@@ -1568,6 +1572,7 @@ async fn register_sized_attach_with_flags(
                 closing: Arc::new(AtomicBool::new(false)),
                 persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
                 terminal_context: OuterTerminalContext::default(),
+                client_title: None,
                 flags,
                 render_stream: false,
                 uid,
@@ -1661,6 +1666,13 @@ async fn attached_session_size(handler: &RequestHandler, session: &SessionName) 
         .expect("session exists")
         .window()
         .size()
+}
+
+const fn content_size_for_default_status(terminal_size: TerminalSize) -> TerminalSize {
+    TerminalSize {
+        cols: terminal_size.cols,
+        rows: terminal_size.rows.saturating_sub(1),
+    }
 }
 
 async fn wait_for_client_detached_event(

@@ -304,21 +304,6 @@ async fn resize_window_propagates_linked_slots_to_their_session_group_peers() {
     }
 }
 
-async fn create_session_with_size(handler: &RequestHandler, name: &str, size: TerminalSize) {
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name(name),
-            detached: true,
-            size: Some(size),
-            environment: None,
-        }))
-        .await;
-    assert!(
-        matches!(created, Response::NewSession(_)),
-        "expected new-session success, got {created:?}"
-    );
-}
-
 #[tokio::test]
 async fn resize_window_largest_smallest_with_attached_clients_still_use_client_sizes() {
     let handler = RequestHandler::new();
@@ -341,10 +326,10 @@ async fn resize_window_largest_smallest_with_attached_clients_still_use_client_s
             .by_pid
             .get_mut(&42)
             .expect("registered attach must exist");
-        active.client_size = TerminalSize {
+        active.set_declared_client_size(TerminalSize {
             cols: 100,
             rows: 30,
-        };
+        });
     }
 
     for adjustment in [
@@ -380,11 +365,14 @@ async fn resize_window_largest_smallest_with_attached_clients_still_use_client_s
             .session(&alpha)
             .and_then(|session| session.window_at(0))
             .expect("window exists");
+        // The client owns an outer 100x30 terminal and `status` defaults to
+        // `on`, so the window content is 100x29. tmux 3.7b measured with a real
+        // 100x30 PTY client: `resize-window -A` and `-a` both land on 100x29.
         assert_eq!(
             window.size(),
             TerminalSize {
                 cols: 100,
-                rows: 30
+                rows: 29
             }
         );
     }
@@ -412,6 +400,145 @@ async fn resize_window_clamps_relative_adjustments_to_a_minimum_size_of_one() {
     let window = session.window_at(0).expect("window 0 should exist");
     assert_eq!(window.size().cols, 1);
     assert_eq!(window.size().rows, 3);
+}
+
+#[tokio::test]
+async fn resize_window_keeps_multi_pane_geometry_at_the_tmux_viable_minimum() {
+    let handler = RequestHandler::new();
+
+    for (name, initial, direction, expected) in [
+        (
+            "vertical-minimum",
+            TerminalSize { cols: 10, rows: 3 },
+            SplitDirection::Vertical,
+            TerminalSize { cols: 1, rows: 3 },
+        ),
+        (
+            "horizontal-minimum",
+            TerminalSize { cols: 3, rows: 10 },
+            SplitDirection::Horizontal,
+            TerminalSize { cols: 3, rows: 1 },
+        ),
+    ] {
+        let session_name = session_name(name);
+        create_session_with_size(&handler, name, initial).await;
+
+        let split = handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Session(session_name.clone()),
+                direction,
+                before: false,
+                environment: None,
+            }))
+            .await;
+        assert!(
+            matches!(split, Response::SplitWindow(_)),
+            "split must succeed for {name}: {split:?}"
+        );
+
+        for _ in 0..2 {
+            let response = handler
+                .handle(Request::ResizeWindow(ResizeWindowRequest {
+                    target: WindowTarget::with_window(session_name.clone(), 0),
+                    width: Some(1),
+                    height: Some(1),
+                    adjustment: None,
+                }))
+                .await;
+            assert!(
+                matches!(response, Response::ResizeWindow(_)),
+                "resize must succeed for {name}: {response:?}"
+            );
+
+            let state = handler.state.lock().await;
+            let window = state
+                .sessions
+                .session(&session_name)
+                .and_then(|session| session.window_at(0))
+                .expect("window exists");
+            assert_eq!(window.size(), expected, "session={name}");
+            assert!(
+                window.panes().iter().all(|pane| {
+                    let geometry = pane.geometry();
+                    geometry.cols() >= 1 && geometry.rows() >= 1
+                }),
+                "session={name} panes={:?}",
+                window.panes()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn select_layout_expands_a_minimum_window_to_the_named_tree_minimum() {
+    let handler = RequestHandler::new();
+    let name = "select-layout-minimum";
+    let session_name = session_name(name);
+    create_session_with_size(&handler, name, TerminalSize { cols: 3, rows: 10 }).await;
+
+    let split = handler
+        .handle(Request::SplitWindow(SplitWindowRequest {
+            target: SplitWindowTarget::Session(session_name.clone()),
+            direction: SplitDirection::Vertical,
+            before: false,
+            environment: None,
+        }))
+        .await;
+    assert!(
+        matches!(split, Response::SplitWindow(_)),
+        "split must succeed: {split:?}"
+    );
+
+    let resized = handler
+        .handle(Request::ResizeWindow(ResizeWindowRequest {
+            target: WindowTarget::with_window(session_name.clone(), 0),
+            width: Some(3),
+            height: Some(1),
+            adjustment: None,
+        }))
+        .await;
+    assert!(
+        matches!(resized, Response::ResizeWindow(_)),
+        "resize must succeed: {resized:?}"
+    );
+
+    for _ in 0..2 {
+        let selected = handler
+            .handle(Request::SelectLayout(SelectLayoutRequest {
+                target: SelectLayoutTarget::Window(WindowTarget::with_window(
+                    session_name.clone(),
+                    0,
+                )),
+                layout: LayoutName::EvenVertical,
+            }))
+            .await;
+        assert!(
+            matches!(
+                selected,
+                Response::SelectLayout(response) if response.layout == LayoutName::EvenVertical
+            ),
+            "select-layout must succeed: {selected:?}"
+        );
+
+        let state = handler.state.lock().await;
+        let window = state
+            .sessions
+            .session(&session_name)
+            .and_then(|session| session.window_at(0))
+            .expect("window exists");
+        assert_eq!(window.size(), TerminalSize { cols: 3, rows: 3 });
+        assert_eq!(
+            window
+                .panes()
+                .iter()
+                .map(|pane| pane.geometry())
+                .collect::<Vec<_>>(),
+            vec![
+                rmux_core::PaneGeometry::new(0, 0, 3, 1),
+                rmux_core::PaneGeometry::new(0, 2, 3, 1),
+            ]
+        );
+    }
 }
 
 #[tokio::test]

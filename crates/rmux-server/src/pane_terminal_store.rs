@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::ExitStatus;
 
 use rmux_core::PaneId;
-use rmux_proto::{PaneTarget, RmuxError, SessionName, TerminalPixels, TerminalSize};
+use rmux_proto::{PaneTarget, RmuxError, SessionName, TerminalPixels};
 use rmux_pty::PtyMaster;
 #[cfg(unix)]
 use tracing::{debug, warn};
@@ -20,7 +20,7 @@ pub(super) struct PaneTerminalStore {
     sessions: HashMap<SessionName, HashMap<PaneId, PaneTerminal>>,
     session_environments: HashMap<SessionName, SessionBaseEnvironment>,
     #[cfg(test)]
-    fail_next_resize: bool,
+    fail_next_resizes: usize,
 }
 
 impl PaneTerminalStore {
@@ -125,12 +125,11 @@ impl PaneTerminalStore {
         &mut self,
         session_name: &SessionName,
         pane_geometries: &[SessionPane],
-        session_size: TerminalSize,
         terminal_pixels: Option<TerminalPixels>,
     ) -> Result<(), RmuxError> {
         #[cfg(test)]
-        if self.fail_next_resize {
-            self.fail_next_resize = false;
+        if self.fail_next_resizes > 0 {
+            self.fail_next_resizes -= 1;
             return Err(RmuxError::Server(
                 "injected pane terminal resize failure".to_owned(),
             ));
@@ -150,7 +149,7 @@ impl PaneTerminalStore {
             terminal
                 .resize(pty_geometry_from_layout(
                     pane.geometry,
-                    session_size,
+                    pane.window_size,
                     terminal_pixels,
                 ))
                 .map_err(|error| {
@@ -592,8 +591,8 @@ impl PaneTerminalStore {
     }
 
     #[cfg(test)]
-    pub(super) fn fail_next_resize_for_test(&mut self) {
-        self.fail_next_resize = true;
+    pub(super) fn fail_resizes_for_test(&mut self, count: usize) {
+        self.fail_next_resizes = count;
     }
 }
 

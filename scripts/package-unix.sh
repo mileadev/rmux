@@ -193,11 +193,12 @@ fi
 validate_platform_label "$platform_label"
 
 profile_dir="debug"
-cargo_args=(build --locked --target "$target")
+cargo_args=(build --locked)
 if [ "$configuration" = "release" ]; then
   profile_dir="release"
   cargo_args+=(--release)
 fi
+compatible_build=("$repo_root/scripts/release/cargo-build-compatible.sh" --target "$target" --)
 
 target_dir="${CARGO_TARGET_DIR:-target}"
 binary="$target_dir/$target/$profile_dir/rmux"
@@ -206,10 +207,10 @@ daemon_binary="$target_dir/$target/$profile_dir/rmux-daemon"
 completion_cache="${RMUX_COMPLETIONS_DIR:-$target_dir/$target/$profile_dir/completions}"
 
 if [ "$skip_build" -eq 0 ]; then
-  cargo "${cargo_args[@]}" --package rmux --bin rmux
+  "${compatible_build[@]}" "${cargo_args[@]}" --package rmux --bin rmux
   cp "$binary" "$helper_binary"
-  cargo "${cargo_args[@]}" --package rmux --features tiny-cli --bin rmux
-  cargo "${cargo_args[@]}" --package rmux --bin rmux-daemon
+  "${compatible_build[@]}" "${cargo_args[@]}" --package rmux --features tiny-cli --bin rmux
+  "${compatible_build[@]}" "${cargo_args[@]}" --package rmux --bin rmux-daemon
 elif [ "$allow_stale_binary" -eq 0 ]; then
   die "--skip-build is local-only packaging; pass --allow-stale-binary to acknowledge that"
 fi
@@ -298,6 +299,28 @@ daemon_binary_sha256="$(sha256_file "$packaged_daemon")"
 binary_bytes="$(wc -c < "$packaged_binary" | tr -d ' ')"
 helper_binary_bytes="$(wc -c < "$packaged_helper" | tr -d ' ')"
 daemon_binary_bytes="$(wc -c < "$packaged_daemon" | tr -d ' ')"
+glibc_metadata_fields=""
+package_glibc_min=""
+case "$target" in
+  *-unknown-linux-gnu)
+    glibc_floor_script="$repo_root/scripts/glibc-symbol-floor.sh"
+    binary_glibc_min="$($glibc_floor_script "$packaged_binary")"
+    helper_binary_glibc_min="$($glibc_floor_script "$packaged_helper")"
+    daemon_binary_glibc_min="$($glibc_floor_script "$packaged_daemon")"
+    package_glibc_min="$($glibc_floor_script "$packaged_binary" "$packaged_helper" "$packaged_daemon")"
+    max_supported_glibc="${RMUX_MAX_SUPPORTED_GLIBC:-2.31}"
+    case "$max_supported_glibc" in ''|*[!0-9.]*|.*|*.|*..*) die "invalid RMUX_MAX_SUPPORTED_GLIBC: $max_supported_glibc" ;; esac
+    if [ "$(printf '%s\n%s\n' "$package_glibc_min" "$max_supported_glibc" | LC_ALL=C sort -V | tail -n 1)" != "$max_supported_glibc" ]; then
+      die "packaged binaries require GLIBC_$package_glibc_min, newer than supported GLIBC_$max_supported_glibc; rebuild in the oldest supported sysroot"
+    fi
+    glibc_metadata_fields="$(printf '%s\n' \
+      "  \"binary_glibc_min\": \"$binary_glibc_min\"," \
+      "  \"helper_binary_glibc_min\": \"$helper_binary_glibc_min\"," \
+      "  \"daemon_binary_glibc_min\": \"$daemon_binary_glibc_min\"," \
+      "  \"package_glibc_min\": \"$package_glibc_min\"," \
+      "  \"max_supported_glibc\": \"$max_supported_glibc\",")"
+    ;;
+esac
 git_commit="$(git rev-parse HEAD)"
 git_dirty=false
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
@@ -322,6 +345,7 @@ cat > "$stage_dir/share/rmux/artifact-metadata.json" <<EOF
   "daemon_binary_path": "bin/rmux-daemon",
   "daemon_binary_sha256": "$daemon_binary_sha256",
   "daemon_binary_bytes": $daemon_binary_bytes,
+$glibc_metadata_fields
   "rmux_version": "$version",
   "git_commit": "$git_commit",
   "git_dirty": $git_dirty,
@@ -363,4 +387,5 @@ printf 'sha256=%s\n' "$archive_sha256"
 printf 'binary_sha256=%s\n' "$binary_sha256"
 printf 'helper_binary_sha256=%s\n' "$helper_binary_sha256"
 printf 'daemon_binary_sha256=%s\n' "$daemon_binary_sha256"
+[ -z "$package_glibc_min" ] || printf 'glibc_min=%s\n' "$package_glibc_min"
 printf 'release_artifact=%s\n' "$release_artifact"

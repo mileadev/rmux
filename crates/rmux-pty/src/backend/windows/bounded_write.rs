@@ -21,6 +21,18 @@ enum CancellationOutcome {
     Cancelled,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WriteChunkOutcome {
+    Progress(usize),
+    Stalled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WriteStallPhase {
+    Primary,
+    Recovery,
+}
+
 #[derive(Debug)]
 pub(super) struct OverlappedPipeWriter {
     handle: OwnedHandle,
@@ -47,41 +59,72 @@ impl OverlappedPipeWriter {
         })
     }
 
-    pub(super) fn write_all_with_timeout(
+    pub(super) fn write_all_with_timeout(&self, bytes: &[u8], timeout: Duration) -> io::Result<()> {
+        self.write_all_with_stall_recovery_observed(bytes, timeout, Duration::ZERO, || {})
+    }
+
+    pub(super) fn write_all_with_stall_recovery(
+        &self,
+        bytes: &[u8],
+        timeout: Duration,
+        recovery_grace: Duration,
+    ) -> io::Result<()> {
+        self.write_all_with_stall_recovery_observed(bytes, timeout, recovery_grace, || {})
+    }
+
+    fn write_all_with_stall_recovery_observed(
         &self,
         mut bytes: &[u8],
         timeout: Duration,
+        recovery_grace: Duration,
+        mut observe_stall: impl FnMut(),
     ) -> io::Result<()> {
         let _operation = self
             .operation
             .lock()
             .map_err(|_| io::Error::other("ConPTY input writer mutex poisoned"))?;
         let mut last_progress = Instant::now();
+        let mut phase = WriteStallPhase::Primary;
         while !bytes.is_empty() {
-            let remaining = timeout.saturating_sub(last_progress.elapsed());
+            let phase_timeout = match phase {
+                WriteStallPhase::Primary => timeout,
+                WriteStallPhase::Recovery => recovery_grace,
+            };
+            let remaining = phase_timeout.saturating_sub(last_progress.elapsed());
             if remaining.is_zero() {
-                return Err(write_timeout(timeout));
+                if begin_stall_recovery(&mut phase, recovery_grace) {
+                    last_progress = Instant::now();
+                    observe_stall();
+                    continue;
+                }
+                return Err(write_timeout(timeout, recovery_grace));
             }
             let chunk_len = bytes.len().min(WRITE_CHUNK_SIZE);
-            let bytes_written = self.write_chunk(&bytes[..chunk_len], remaining, timeout)?;
-            if bytes_written == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "ConPTY input pipe accepted zero bytes",
-                ));
+            match self.write_chunk(&bytes[..chunk_len], remaining)? {
+                WriteChunkOutcome::Progress(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "ConPTY input pipe accepted zero bytes",
+                    ));
+                }
+                WriteChunkOutcome::Progress(bytes_written) => {
+                    bytes = &bytes[bytes_written..];
+                    last_progress = Instant::now();
+                    phase = WriteStallPhase::Primary;
+                }
+                WriteChunkOutcome::Stalled => {
+                    if !begin_stall_recovery(&mut phase, recovery_grace) {
+                        return Err(write_timeout(timeout, recovery_grace));
+                    }
+                    last_progress = Instant::now();
+                    observe_stall();
+                }
             }
-            bytes = &bytes[bytes_written..];
-            last_progress = Instant::now();
         }
         Ok(())
     }
 
-    fn write_chunk(
-        &self,
-        bytes: &[u8],
-        remaining: Duration,
-        timeout: Duration,
-    ) -> io::Result<usize> {
+    fn write_chunk(&self, bytes: &[u8], remaining: Duration) -> io::Result<WriteChunkOutcome> {
         let reset = unsafe {
             // SAFETY: `event` is a live manual-reset event and writes are
             // serialized by `operation`.
@@ -109,7 +152,9 @@ impl OverlappedPipeWriter {
             )
         };
         if started != 0 {
-            return self.completed_transfer(&overlapped);
+            return self
+                .completed_transfer(&overlapped)
+                .map(WriteChunkOutcome::Progress);
         }
 
         let error = last_error_code();
@@ -125,10 +170,14 @@ impl OverlappedPipeWriter {
                 wait_timeout_millis(remaining),
             )
         } {
-            WAIT_OBJECT_0 => self.completed_transfer(&overlapped),
+            WAIT_OBJECT_0 => self
+                .completed_transfer(&overlapped)
+                .map(WriteChunkOutcome::Progress),
             WAIT_TIMEOUT => match self.cancel_and_drain(&overlapped)? {
-                CancellationOutcome::Completed(transferred) => Ok(transferred),
-                CancellationOutcome::Cancelled => Err(write_timeout(timeout)),
+                CancellationOutcome::Completed(transferred) => {
+                    Ok(WriteChunkOutcome::Progress(transferred))
+                }
+                CancellationOutcome::Cancelled => Ok(WriteChunkOutcome::Stalled),
             },
             WAIT_FAILED => {
                 let wait_error = last_os_error();
@@ -206,10 +255,22 @@ impl OverlappedPipeWriter {
     }
 }
 
-fn write_timeout(timeout: Duration) -> io::Error {
+fn begin_stall_recovery(phase: &mut WriteStallPhase, recovery_grace: Duration) -> bool {
+    if *phase != WriteStallPhase::Primary || recovery_grace.is_zero() {
+        return false;
+    }
+    *phase = WriteStallPhase::Recovery;
+    true
+}
+
+fn write_timeout(timeout: Duration, recovery_grace: Duration) -> io::Error {
+    let total_stall = timeout.saturating_add(recovery_grace);
     io::Error::new(
         io::ErrorKind::TimedOut,
-        format!("PTY write made no progress for {} ms", timeout.as_millis()),
+        format!(
+            "PTY write made no progress for {} ms",
+            total_stall.as_millis()
+        ),
     )
 }
 
@@ -308,13 +369,17 @@ mod tests {
     }
 
     #[test]
-    fn bounded_write_times_out_on_non_draining_pipe() {
+    fn stall_recovery_times_out_on_non_draining_pipe() {
         let (writer, mut read) = writer_and_reader(4096);
         let payload = vec![b'x'; 16 * 1024 * 1024];
         let started = std::time::Instant::now();
 
         let error = writer
-            .write_all_with_timeout(&payload, Duration::from_millis(50))
+            .write_all_with_stall_recovery(
+                &payload,
+                Duration::from_millis(25),
+                Duration::from_millis(25),
+            )
             .expect_err("full pipe should time out");
 
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
@@ -331,35 +396,42 @@ mod tests {
     }
 
     #[test]
-    fn timed_out_write_is_drained_before_the_writer_is_reused() {
+    fn transient_stall_recovery_preserves_order_and_writer_lifetime() {
         let (writer, mut read) = writer_and_reader(4096);
-        let stalled_payload = vec![b'x'; 64 * 1024];
-
-        let error = writer
-            .write_all_with_timeout(&stalled_payload, Duration::from_millis(20))
-            .expect_err("full pipe should time out");
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-
+        let payload = (0..16 * 1024 * 1024)
+            .map(|index| u8::try_from(index % 251).expect("pattern byte fits"))
+            .collect::<Vec<_>>();
+        let mut expected = payload.clone();
+        let follow_on = b"RMUX-AFTER-RECOVERY";
+        expected.extend_from_slice(follow_on);
+        let (stalled_tx, stalled_rx) = std::sync::mpsc::channel();
         let reader = thread::spawn(move || {
+            stalled_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("writer did not report its first transient stall");
             let mut received = Vec::new();
             read.read_to_end(&mut received)
-                .expect("read accepted prefix and sentinel");
+                .expect("read recovered payload");
             received
         });
-        let sentinel = b"RMUX-WRITER-REUSED";
+
         writer
-            .write_all_with_timeout(sentinel, Duration::from_secs(2))
-            .expect("writer should remain usable after cancellation");
+            .write_all_with_stall_recovery_observed(
+                &payload,
+                Duration::from_millis(20),
+                Duration::from_secs(2),
+                || {
+                    let _ = stalled_tx.send(());
+                },
+            )
+            .expect("draining after the first stall should recover");
+        writer
+            .write_all_with_timeout(follow_on, Duration::from_secs(1))
+            .expect("writer should remain usable after transient recovery");
         drop(writer);
 
         let received = reader.join().expect("reader");
-        assert!(received.ends_with(sentinel));
-        assert!(
-            received[..received.len() - sentinel.len()]
-                .iter()
-                .all(|byte| *byte == b'x'),
-            "a timed-out write may leave only its accepted prefix"
-        );
+        assert_eq!(received, expected);
     }
 
     #[test]
@@ -503,15 +575,20 @@ mod tests {
     }
 
     #[test]
-    fn bounded_write_preserves_broken_pipe_error() {
+    fn stall_recovery_does_not_retry_a_dead_destination() {
         let pipe = create_conpty_input_pipe(4096).expect("pipe");
         let writer = OverlappedPipeWriter::new(pipe.write).expect("writer");
         drop(pipe.read);
+        let started = Instant::now();
 
         let error = writer
-            .write_all_with_timeout(b"x", Duration::from_secs(1))
+            .write_all_with_stall_recovery(b"x", Duration::from_millis(25), Duration::from_secs(1))
             .expect_err("closed pipe should fail");
 
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a dead destination must bypass transient stall recovery"
+        );
     }
 }

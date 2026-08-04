@@ -41,10 +41,44 @@ fn select_layout_accepts_old_layout_flag() {
 }
 
 #[test]
-fn select_layout_rejects_old_layout_flag_with_layout_argument() {
-    let error = parse_args(&["select-layout", "-o", "tiled"]).unwrap_err();
+fn select_layout_accepts_tmux_mode_clusters_and_preserves_all_flags() {
+    for arguments in [
+        &["select-layout", "-En", "-t", "alpha:0"][..],
+        &["select-layout", "-nE", "-t", "alpha:0"][..],
+        &["select-layout", "-E", "-n", "-t", "alpha:0"][..],
+        &["select-layout", "-Enop", "-t", "alpha:0", "tiled"][..],
+    ] {
+        let cli = parse_args(arguments)
+            .unwrap_or_else(|error| panic!("{arguments:?} should parse like tmux 3.7b: {error}"));
 
-    assert!(error.to_string().contains("too many arguments"));
+        match cli.command.expect("parsed command") {
+            super::Command::SelectLayout(args) => {
+                assert!(args.next, "-n must survive parsing for {arguments:?}");
+                assert_eq!(args.target.as_ref().expect("target").to_string(), "alpha:0");
+                if arguments.contains(&"-Enop") {
+                    assert!(args.spread);
+                    assert!(args.old);
+                    assert!(args.previous);
+                    assert_eq!(args.layout.as_deref(), Some("tiled"));
+                }
+            }
+            _ => panic!("expected SelectLayout command"),
+        }
+    }
+}
+
+#[test]
+fn select_layout_old_mode_defers_its_optional_operand_to_runtime() {
+    let cli = parse_args(&["select-layout", "-o", "tiled"])
+        .expect("tmux accepts one operand with -o and validates it as a custom layout");
+
+    match cli.command.expect("parsed command") {
+        super::Command::SelectLayout(args) => {
+            assert!(args.old);
+            assert_eq!(args.layout.as_deref(), Some("tiled"));
+        }
+        _ => panic!("expected SelectLayout command"),
+    }
 }
 
 #[test]

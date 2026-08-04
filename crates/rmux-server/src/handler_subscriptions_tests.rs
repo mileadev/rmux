@@ -279,7 +279,7 @@ async fn exited_pane_subscription_stays_alive_after_eof_until_cleanup() {
     };
 
     handler
-        .drain_exited_pane_output_subscriptions(pane.clone())
+        .drain_exited_pane_output_subscriptions(pane.clone(), None)
         .await;
 
     let empty_before_eof = handler
@@ -376,7 +376,7 @@ async fn empty_server_shutdown_waits_for_exited_pane_subscription_drain() {
     };
 
     handler
-        .drain_exited_pane_output_subscriptions(pane.clone())
+        .drain_exited_pane_output_subscriptions(pane.clone(), None)
         .await;
     assert!(
         !handler.request_shutdown_if_server_empty().await,
@@ -425,7 +425,7 @@ async fn empty_server_shutdown_waits_for_exited_pane_subscription_drain() {
 }
 
 #[test]
-fn exited_pane_drain_idle_tracks_subscription_touch() {
+fn exited_pane_drain_idle_tracks_explicit_progress_not_subscription_touch() {
     let mut subscriptions = OutputSubscriptionState::new(SubscriptionLimits::default());
     let pane = PaneOutputSubscriptionKey::new(
         SessionName::new("runtime").expect("valid session name"),
@@ -437,7 +437,7 @@ fn exited_pane_drain_idle_tracks_subscription_touch() {
         .subscribe(5, pane.clone(), created)
         .expect("subscription is within limits");
 
-    assert!(subscriptions.begin_pane_drain(pane.clone()));
+    assert!(subscriptions.begin_pane_drain(pane.clone(), None, created));
     assert_eq!(
         subscriptions.pane_drain_idle_for(&pane, created),
         Some(Duration::ZERO)
@@ -450,8 +450,54 @@ fn exited_pane_drain_idle_tracks_subscription_touch() {
         .expect("subscription should still be live");
     assert_eq!(
         subscriptions.pane_drain_idle_for(&pane, touched + Duration::from_millis(25)),
+        Some(Duration::from_millis(5_025))
+    );
+
+    subscriptions.note_pane_drain_progress(&pane, touched);
+    assert_eq!(
+        subscriptions.pane_drain_idle_for(&pane, touched + Duration::from_millis(25)),
         Some(Duration::from_millis(25))
     );
+}
+
+#[test]
+fn stale_drain_timeout_observation_does_not_expire_new_progress() {
+    let mut subscriptions = OutputSubscriptionState::new(SubscriptionLimits::default());
+    let pane = PaneOutputSubscriptionKey::new(
+        SessionName::new("runtime").expect("valid session name"),
+        PaneId::new(43),
+    );
+    let started = Instant::now();
+    subscriptions
+        .registry
+        .subscribe(5, pane.clone(), started)
+        .expect("subscription is within limits");
+    assert!(subscriptions.begin_pane_drain(pane.clone(), None, started));
+
+    let stale_observation = started + Duration::from_secs(2);
+    assert_eq!(
+        subscriptions.pane_drain_idle_for(&pane, stale_observation),
+        Some(Duration::from_secs(2))
+    );
+
+    let progress = stale_observation + Duration::from_millis(1);
+    subscriptions.note_pane_drain_progress(&pane, progress);
+    assert!(
+        !subscriptions.expire_pane_drain_if_idle(
+            &pane,
+            progress + Duration::from_millis(1),
+            Duration::from_secs(2),
+        ),
+        "expiration must revalidate progress observed after the stale timeout check"
+    );
+    assert!(subscriptions.pane_is_draining(&pane));
+
+    assert!(subscriptions.expire_pane_drain_if_idle(
+        &pane,
+        progress + Duration::from_secs(2),
+        Duration::from_secs(2),
+    ));
+    assert!(!subscriptions.pane_is_draining(&pane));
 }
 
 #[tokio::test]
@@ -479,7 +525,7 @@ async fn exited_pane_subscription_auto_cleans_after_drain_timeout() {
     };
 
     handler
-        .drain_exited_pane_output_subscriptions(pane.clone())
+        .drain_exited_pane_output_subscriptions(pane.clone(), None)
         .await;
     sender.send(b"tail".to_vec());
     sender.send(Vec::new());
@@ -583,7 +629,7 @@ async fn oldest_subscription_can_attach_to_retained_exited_pane_output() {
 }
 
 #[tokio::test]
-async fn oldest_subscription_by_id_can_attach_to_retained_exited_pane_output() {
+async fn oldest_subscription_by_id_follows_retained_output_across_a_stale_session_alias() {
     let handler = RequestHandler::new();
     let connection_id = 56;
     let session_name = SessionName::new("gone-by-id").expect("valid session name");
@@ -603,7 +649,10 @@ async fn oldest_subscription_by_id_can_attach_to_retained_exited_pane_output() {
         .handle_subscribe_pane_output_ref(
             connection_id,
             SubscribePaneOutputRefRequest {
-                target: PaneTargetRef::by_id(session_name, pane_id),
+                target: PaneTargetRef::by_id(
+                    SessionName::new("stale-gone-by-id").expect("valid stale session name"),
+                    pane_id,
+                ),
                 start: PaneOutputSubscriptionStart::Oldest,
             },
         )

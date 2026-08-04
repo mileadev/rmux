@@ -159,7 +159,9 @@ fn tmux_ledger_gate_reads_authoritative_inventories_and_named_divergence_tests()
     }
     for exhaustive_guard in [
         "PRODUCT_DIVERGENCE_TEST",
+        "PRODUCT_DIVERGENCE_SUFFIX",
         "git\", \"ls-files\"",
+        "path.stem.endswith(PRODUCT_DIVERGENCE_SUFFIX)",
         "has no allowlist entry",
         "stale product-divergence references",
         "reference points to an untracked path",
@@ -190,39 +192,33 @@ fn winget_portable_archive_preserves_the_private_runtime_layout() {
 #[test]
 fn release_line_changelog_records_the_exact_detached_wire_version() {
     let changelog = include_str!("../CHANGELOG.md");
-    let wire_cut_release = changelog_release_section(changelog, "0.9.0");
-    let expected = format!(
-        "detached RPC frame envelope from wire version 3 to {}",
-        rmux_proto::RMUX_WIRE_VERSION
-    );
-    let normalized = wire_cut_release
+    let initial_wire_cut = changelog_release_section(changelog, "0.9.0")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-
     assert!(
-        normalized.contains(&expected),
-        "0.9.0 changelog must record the current detached wire version: {expected}"
+        initial_wire_cut.contains("detached RPC frame envelope from wire version 3 to 5"),
+        "0.9.0 changelog must retain its historical wire 3 to 5 cut"
     );
     assert!(
-        normalized.contains("already-running pre-0.9 server must be restarted"),
+        initial_wire_cut.contains("already-running pre-0.9 server must be restarted"),
         "0.9.0 changelog must tell operators that this hard wire cut requires a server restart"
     );
 
     let current_version = env!("CARGO_PKG_VERSION");
-    if current_version != "0.9.0" {
-        let current_release = changelog_release_section(changelog, current_version)
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(
-            current_release.contains(&format!(
-                "wire version {} unchanged",
-                rmux_proto::RMUX_WIRE_VERSION
-            )),
-            "{current_version} changelog must record the unchanged detached wire version"
-        );
-    }
+    let current_release = changelog_release_section(changelog, current_version)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(rmux_proto::RMUX_WIRE_VERSION, 8);
+    assert!(
+        current_release.contains("wire version 5 to wire version 8"),
+        "{current_version} changelog must record the current detached wire cut"
+    );
+    assert!(
+        current_release.contains("pre-0.10 daemon must be restarted"),
+        "{current_version} changelog must document the required daemon restart"
+    );
 }
 
 fn changelog_release_section<'a>(changelog: &'a str, version: &str) -> &'a str {
@@ -570,6 +566,7 @@ fn release_workflows_bind_perf_and_do_not_mask_snap_or_ctrl_failures() {
 fn github_windows_tests_keep_debug_daemons_inside_the_runner_job() {
     let ci = include_str!("../.github/workflows/ci.yml");
     let release = include_str!("../.github/workflows/release.yml");
+    let release_gate = include_str!("../scripts/release-review-gate-windows.ps1");
     let opt_in = "RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB: \"1\"";
 
     assert_eq!(
@@ -581,6 +578,108 @@ fn github_windows_tests_keep_debug_daemons_inside_the_runner_job() {
         release.matches(opt_in).count(),
         2,
         "both GitHub-hosted Windows release test surfaces must opt into the runner-owned job"
+    );
+    assert!(
+        release_gate.contains("$env:RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB = \"1\""),
+        "the native Windows release gate must opt into its caller-owned job"
+    );
+}
+
+#[test]
+fn live_ci_owns_the_portable_macos_and_windows_release_smokes() {
+    let ci = include_str!("../.github/workflows/ci.yml");
+    let legacy = include_str!("../.github/workflows/release.yml");
+    let windows_gate = include_str!("../scripts/release-review-gate-windows.ps1");
+    let triggers = ci
+        .split_once("\npermissions:\n")
+        .map(|(triggers, _)| triggers)
+        .expect("bounded CI triggers");
+
+    for trigger in [
+        "\n  push:\n",
+        "\n  pull_request:\n",
+        "\n  workflow_dispatch:\n",
+    ] {
+        assert!(
+            triggers.contains(trigger),
+            "portable platform smokes lost live CI trigger {trigger:?}"
+        );
+    }
+
+    let macos = ci
+        .split("\n  platform-runtime:\n")
+        .nth(1)
+        .expect("live macOS platform runtime job")
+        .split("\n  windows-test-archive:\n")
+        .next()
+        .expect("bounded macOS platform runtime job");
+    let windows = ci
+        .split("\n  windows-test-build:\n")
+        .nth(1)
+        .expect("live Windows test build job")
+        .split("\n  windows-tests:\n")
+        .next()
+        .expect("bounded Windows test build job");
+
+    for (name, job) in [("macOS", macos), ("Windows", windows)] {
+        assert!(
+            !job.lines()
+                .any(|line| matches!(line.trim(), "if: false" | "if: ${{ false }}")),
+            "{name} portable smoke job is conditioned by false"
+        );
+        assert!(
+            job.contains(
+                "if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.release_qualification) }}"
+            ),
+            "{name} portable smoke is no longer part of the protected fast run"
+        );
+        assert!(
+            !job.contains("self-hosted"),
+            "{name} portable smoke must stay on GitHub-hosted runners"
+        );
+    }
+
+    for runner in ["macos-15-intel", "macos-15"] {
+        assert!(
+            macos.contains(runner),
+            "macOS PTY smoke lost hosted runner {runner}"
+        );
+    }
+    assert!(macos.contains("run: scripts/smoke-macos.sh"));
+    assert!(
+        !macos.contains("--require-expect"),
+        "the portable macOS gate must not require an interactive attach diagnostic"
+    );
+
+    assert!(windows.contains("runs-on: windows-latest"));
+    assert!(windows.contains(
+        "run: ./scripts/release-review-gate-windows.ps1 -TargetDir target -EndpointSmokeOnly"
+    ));
+    assert!(
+        !windows.contains("-RunCtrlMatrixSmoke"),
+        "the protected fast run must not require the interactive Ctrl diagnostic"
+    );
+    for required in [
+        "[switch]$EndpointSmokeOnly",
+        "if ($EndpointSmokeOnly)",
+        "Invoke-WindowsEndpointSmoke",
+    ] {
+        assert!(
+            windows_gate.contains(required),
+            "Windows endpoint-only gate lost {required:?}"
+        );
+    }
+
+    let legacy_source_gate = legacy
+        .split("\n  source-gates:\n")
+        .nth(1)
+        .expect("legacy source gate")
+        .split("\n  build:\n")
+        .next()
+        .expect("bounded legacy source gate");
+    assert!(
+        legacy_source_gate.contains("if: ${{ false }}"),
+        "the legacy release workflow must remain disabled"
     );
 }
 
@@ -670,6 +769,8 @@ fn ci_builds_windows_tests_once_and_runs_eighteen_hosted_shards() {
         "name: Windows build, lint, docs, and smoke",
         "runs-on: windows-latest",
         "cargo test --workspace --doc --locked",
+        "name: cargo test downstream public API contracts",
+        "cargo test --locked -p rmux-proto -p rmux-sdk --test public_api_extensibility -- --test-threads=1",
         "cargo clippy --workspace --all-targets --locked -- -D warnings",
         "key: cargo-windows-latest-platform-runtime-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}",
     ] {
@@ -685,6 +786,7 @@ fn ci_builds_windows_tests_once_and_runs_eighteen_hosted_shards() {
         "shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]",
         "--extract-to \"$env:GITHUB_WORKSPACE\"",
         "--extract-overwrite",
+        "--filterset \"not binary(public_api_extensibility)\"",
         "--partition \"slice:${{ matrix.shard }}/18\"",
         "--retries 0",
         "--test-threads num-cpus",
@@ -813,8 +915,8 @@ fn ci_defers_release_review_until_the_protected_fast_lane_finishes() {
         "name: Release review (${{ matrix.section }})",
         "needs: [linux-source-gates, windows-tests-gate]",
         "startsWith(github.ref, 'refs/tags/v')",
-        "max-parallel: 6",
-        "section: [static, lint, server, cli, tmux, runtime-sdk]",
+        "max-parallel: 7",
+        "section: [static, lint, server, xterm, cli, tmux, runtime-sdk]",
         "CARGO_BUILD_JOBS: \"4\"",
         "if: matrix.section == 'tmux'",
         "--section ${{ matrix.section }}",
@@ -847,7 +949,7 @@ fn ci_defers_release_review_until_the_protected_fast_lane_finishes() {
         "workflow_call:",
         "Candidate release delta gate",
         "--evidence-mode candidate-delta",
-        "section: [static, cli, tmux]",
+        "section: [static, xterm, cli, tmux]",
         "run-id: ${{ inputs.fast_run_id }}",
     ] {
         assert!(
@@ -855,6 +957,62 @@ fn ci_defers_release_review_until_the_protected_fast_lane_finishes() {
             "candidate delta lost deduplication invariant {required:?}"
         );
     }
+}
+
+#[test]
+fn xterm_oracle_inputs_and_filter_are_release_policy() {
+    let contract: serde_json::Value =
+        serde_json::from_str(include_str!("../.github/release/candidate-contract.json"))
+            .expect("candidate contract");
+    let policy_paths = contract["policy_paths"]
+        .as_array()
+        .expect("policy_paths array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    for path in [
+        "tests/xterm-oracle/package-lock.json",
+        "tests/xterm-oracle/package.json",
+        "tests/xterm-oracle/recovery-oracle.mjs",
+    ] {
+        assert!(
+            policy_paths.contains(&path),
+            "candidate policy root omitted xterm oracle input {path}"
+        );
+    }
+
+    let unix = include_str!("../scripts/release-review-gate.sh");
+    assert!(
+        unix.contains(
+            "scripts/assert-cargo-filter-nonempty.sh 1 -- test -p rmux-server --lib --locked"
+        ) && unix.contains("pane_recovery::tests::keyframes_converge_in_independent_xterm_oracle"),
+        "Unix xterm oracle may silently select zero tests"
+    );
+
+    let windows = include_str!("../scripts/release-review-gate-windows.ps1");
+    assert!(
+        windows.contains(
+            "Assert-CargoFilter 1 @(\n        \"test\", \"-p\", \"rmux-server\", \"--lib\", \"--locked\","
+        ) && windows.contains(
+            "\"pane_recovery::tests::keyframes_converge_in_independent_xterm_oracle\""
+        ),
+        "Windows xterm oracle may silently select zero tests"
+    );
+}
+
+#[test]
+fn release_review_gates_match_daemon_stack_budget() {
+    let unix = include_str!("../scripts/release-review-gate.sh");
+    let windows = include_str!("../scripts/release-review-gate-windows.ps1");
+    let daemon_runtime = include_str!("../src/server_runtime.rs");
+
+    assert!(unix.contains("export RUST_MIN_STACK=8388608"));
+    assert!(unix.contains("printf 'rust-min-stack=%s\\n' \"$RUST_MIN_STACK\""));
+    assert!(windows.contains("$env:RUST_MIN_STACK = \"8388608\""));
+    assert!(windows.contains("Write-Host \"rust-min-stack=$env:RUST_MIN_STACK\""));
+    assert!(
+        daemon_runtime.contains("const DAEMON_WORKER_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;")
+    );
 }
 
 #[test]
@@ -1363,6 +1521,8 @@ fn release_publication_waits_for_native_and_package_validations() {
         assert!(retention_step.contains(required_architecture));
     }
     let repository_step = &prepare[repository_generation..];
+    assert!(repository_step
+        .contains("--previous-repository-dir target/package-repository-history/debian"));
     assert_eq!(
         repository_step
             .matches("--input-dir target/package-repository-inputs")
@@ -1376,6 +1536,9 @@ fn release_publication_waits_for_native_and_package_validations() {
         assert!(repository_step.contains(generated_architecture));
     }
     assert!(repository_step.contains("--rpm-signing-version \"$PACKAGE_VERSION\""));
+    assert!(
+        repository_step.contains("--previous-repository-dir target/package-repository-history/rpm")
+    );
     for public_mutation in ["--draft=false", "git push", "choco push", "action-publish"] {
         assert!(
             !prepare.contains(public_mutation),
@@ -1766,6 +1929,8 @@ fn perf_current_and_darwin_baseline_validation_fail_closed_on_identity_drift() {
     assert!(baseline_check.contains("does not match expected"));
     assert!(baseline_check.contains("personal home path leaked"));
     assert!(baseline_check.contains("must be repository-relative"));
+    assert!(baseline_check.contains("baseline must be recorded from exact release tag"));
+    assert!(baseline_check.contains("baseline/source git identities do not match"));
     assert!(baseline_generator.contains("write_portable_source"));
     assert!(baseline_generator.contains("python3 scripts/check-perf-baseline.py"));
     assert!(baseline_generator.contains("\"$json_path\""));
@@ -1780,6 +1945,20 @@ fn perf_current_and_darwin_baseline_validation_fail_closed_on_identity_drift() {
             include_str!("../benches/perf/baselines/release-0.9.0-linux.json"),
         ),
     ] {
+        let baseline_json: serde_json::Value =
+            serde_json::from_str(baseline).expect("perf baseline JSON");
+        assert_eq!(
+            baseline_json["git"]["commit"], "b2f80522bae2927e22d81e5c902b727623f934d0",
+            "{name} perf baseline is not anchored to the v0.9.0 commit"
+        );
+        assert_eq!(
+            baseline_json["git"]["describe"], "v0.9.0",
+            "{name} perf baseline is not anchored to the v0.9.0 tag"
+        );
+        assert_eq!(
+            baseline_json["source"]["git"], baseline_json["git"],
+            "{name} baseline/source git identities differ"
+        );
         assert!(
             !baseline.contains("/Users/") && !baseline.contains("/home/"),
             "{name} perf baseline leaked a personal home path"
@@ -1789,6 +1968,80 @@ fn perf_current_and_darwin_baseline_validation_fail_closed_on_identity_drift() {
     assert!(gate.contains("run this mandatory comparison on the baseline owner host"));
     assert!(gate.contains("perf-gate=portable-budget enforcement=absolute-budgets"));
     assert!(gate.contains("scripts/check-perf-current.py"));
+}
+
+#[test]
+#[cfg(unix)]
+fn perf_baseline_validator_rejects_relabelled_or_reused_artifacts() {
+    let root = temp_dir("perf-baseline-provenance");
+    let fixture = root.join("baseline.json");
+    let original: serde_json::Value =
+        serde_json::from_str(include_str!("../benches/perf/baselines/release-0.9.0.json"))
+            .expect("perf baseline JSON");
+    fs::write(
+        &fixture,
+        serde_json::to_vec(&original).expect("serialize perf baseline"),
+    )
+    .expect("write perf baseline fixture");
+    let fixture_arg = fixture.to_string_lossy().into_owned();
+    let accepted = run(
+        "scripts/check-perf-baseline.py",
+        &[&fixture_arg, "--expected-platform", "darwin"],
+    );
+    assert!(accepted.status.success(), "{}", stderr(&accepted));
+
+    for (label, pointer, replacement) in [
+        (
+            "stale invocation",
+            "/source/provenance/invocation",
+            serde_json::json!("baseline:release-0.9.0:8df9d92300000000000000000000000000000000"),
+        ),
+        (
+            "wrong generator",
+            "/source/provenance/generator",
+            serde_json::json!("other-generator"),
+        ),
+        (
+            "reused build",
+            "/source/provenance/build_mode",
+            serde_json::json!("reused"),
+        ),
+        (
+            "wrong source platform",
+            "/source/provenance/expected_platform",
+            serde_json::json!("linux"),
+        ),
+        (
+            "stale source binary",
+            "/source/binary/version",
+            serde_json::json!("rmux 0.8.0"),
+        ),
+        (
+            "stale wrapper version",
+            "/versions/rmux",
+            serde_json::json!("rmux 0.8.0"),
+        ),
+    ] {
+        let mut mutated = original.clone();
+        *mutated
+            .pointer_mut(pointer)
+            .unwrap_or_else(|| panic!("missing JSON pointer {pointer}")) = replacement;
+        fs::write(
+            &fixture,
+            serde_json::to_vec(&mutated).expect("serialize mutated perf baseline"),
+        )
+        .expect("write mutated perf baseline fixture");
+        let rejected = run(
+            "scripts/check-perf-baseline.py",
+            &[&fixture_arg, "--expected-platform", "darwin"],
+        );
+        assert!(
+            !rejected.status.success(),
+            "{label} unexpectedly passed validation"
+        );
+    }
+
+    fs::remove_dir_all(root).expect("remove perf baseline fixture");
 }
 
 #[test]
@@ -1860,10 +2113,170 @@ fn packaged_artifact_metadata_never_embeds_builder_paths() {
 }
 
 #[test]
+fn linux_release_builds_pin_and_enforce_the_glibc_231_contract() {
+    let requirements = include_str!("../scripts/release/linux-glibc-build-requirements.txt");
+    for required in ["cargo-zigbuild==0.23.0", "ziglang==0.15.2"] {
+        assert!(
+            requirements.contains(required),
+            "requirements lost {required}"
+        );
+    }
+    assert_eq!(requirements.matches("--hash=sha256:").count(), 4);
+
+    let installer = include_str!("../scripts/release/install-linux-glibc-build-tools.sh");
+    for required in [
+        "--no-deps",
+        "--only-binary=:all:",
+        "--require-hashes",
+        "cargo-zigbuild 0.23.0",
+        "zig_version\" = \"0.15.2",
+    ] {
+        assert!(installer.contains(required), "installer lost {required}");
+    }
+
+    let compatible = include_str!("../scripts/release/cargo-build-compatible.sh");
+    for required in [
+        "[ \"$1\" = \"build\" ]",
+        "cargo zigbuild --target \"$target.$glibc_floor\"",
+        "cargo build --target \"$target\"",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "+crt-static",
+    ] {
+        assert!(
+            compatible.contains(required),
+            "build helper lost {required}"
+        );
+    }
+
+    let smoke = include_str!("../scripts/smoke-linux-glibc-baseline.sh");
+    for required in [
+        "ubuntu:20.04@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214",
+        "--network none",
+        "--read-only",
+        "--cap-drop ALL",
+        "--security-opt no-new-privileges",
+        "chmod 0755 \"$work_dir\"",
+        "glibc 2.31",
+    ] {
+        assert!(smoke.contains(required), "baseline smoke lost {required}");
+    }
+
+    for producer in [
+        include_str!("../scripts/package-unix.sh"),
+        include_str!("../scripts/package-debian.sh"),
+        include_str!("../scripts/package-rpm.sh"),
+    ] {
+        assert!(producer.contains("release/cargo-build-compatible.sh"));
+        assert!(producer.contains("RMUX_MAX_SUPPORTED_GLIBC:-2.31"));
+    }
+
+    for workflow in [
+        include_str!("../.github/actions/canonical-build/action.yml"),
+        include_str!("../.github/workflows/release.yml"),
+    ] {
+        for required in [
+            "install-linux-glibc-build-tools.sh",
+            "CARGO_ZIGBUILD_PYTHON_PATH=",
+            "RMUX_LINUX_GLIBC_FLOOR=2.31",
+            "RMUX_MAX_SUPPORTED_GLIBC=2.31",
+            "smoke-linux-glibc-baseline.sh",
+        ] {
+            assert!(
+                workflow.contains(required),
+                "release workflow lost {required}"
+            );
+        }
+    }
+    assert!(
+        include_str!("../.github/actions/canonical-build/action.yml")
+            .contains("linux-glibc-build-tools.txt\" \"$provenance/")
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn compatible_builder_routes_only_linux_gnu_through_the_pinned_floor() {
+    let root = temp_dir("compatible-builder");
+    let fake_bin = root.join("bin");
+    let cargo_log = root.join("cargo.log");
+    fs::create_dir(&fake_bin).expect("create fake bin");
+    let fake_cargo = fake_bin.join("cargo");
+    fs::write(
+        &fake_cargo,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$FAKE_CARGO_LOG\"\n",
+    )
+    .expect("write fake cargo");
+    make_executable(&fake_cargo);
+    let fake_zigbuild = fake_bin.join("cargo-zigbuild");
+    fs::write(&fake_zigbuild, "#!/bin/sh\nexit 0\n").expect("write fake cargo-zigbuild");
+    make_executable(&fake_zigbuild);
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let helper = repo_root().join("scripts/release/cargo-build-compatible.sh");
+
+    let linux = Command::new(&helper)
+        .args([
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "--",
+            "build",
+            "--locked",
+            "--release",
+        ])
+        .env("PATH", &path)
+        .env("FAKE_CARGO_LOG", &cargo_log)
+        .env("RMUX_LINUX_GLIBC_FLOOR", "2.31")
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .output()
+        .expect("run Linux compatible build");
+    assert!(linux.status.success(), "{}", stderr(&linux));
+    assert_eq!(
+        fs::read_to_string(&cargo_log).expect("read Linux cargo arguments"),
+        "zigbuild\n--target\nx86_64-unknown-linux-gnu.2.31\n--locked\n--release\n"
+    );
+
+    let macos = Command::new(&helper)
+        .args(["--target", "x86_64-apple-darwin", "--", "build", "--locked"])
+        .env("PATH", &path)
+        .env("FAKE_CARGO_LOG", &cargo_log)
+        .env("RMUX_LINUX_GLIBC_FLOOR", "2.31")
+        .output()
+        .expect("run macOS compatible build");
+    assert!(macos.status.success(), "{}", stderr(&macos));
+    assert_eq!(
+        fs::read_to_string(&cargo_log).expect("read macOS cargo arguments"),
+        "build\n--target\nx86_64-apple-darwin\n--locked\n"
+    );
+
+    let bypass = Command::new(&helper)
+        .args([
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "--",
+            "build",
+            "--release",
+        ])
+        .env("PATH", &path)
+        .env("RMUX_LINUX_GLIBC_FLOOR", "2.31")
+        .env("RUSTFLAGS", "-C linker=/usr/bin/cc")
+        .output()
+        .expect("run rejected linker bypass");
+    assert!(!bypass.status.success());
+    assert!(stderr(&bypass).contains("override cargo-zigbuild's dynamic glibc linker contract"));
+
+    fs::remove_dir_all(root).expect("remove compatible build fixture");
+}
+
+#[test]
 fn distro_package_glibc_floor_is_derived_and_verified_for_all_binaries() {
+    let unix = include_str!("../scripts/package-unix.sh");
     let deb = include_str!("../scripts/package-debian.sh");
     let rpm = include_str!("../scripts/package-rpm.sh");
-    for producer in [deb, rpm] {
+    for producer in [unix, deb, rpm] {
         for required in [
             "binary_glibc_min",
             "helper_binary_glibc_min",
@@ -1877,8 +2290,10 @@ fn distro_package_glibc_floor_is_derived_and_verified_for_all_binaries() {
     }
     assert!(deb.contains("Depends: libc6 (>= $package_glibc_min)"));
     assert!(rpm.contains("Requires: glibc >= $package_glibc_min"));
+    assert!(unix.contains("newer than supported GLIBC_"));
     assert!(deb.contains("newer than supported GLIBC_"));
     assert!(rpm.contains("newer than supported GLIBC_"));
+    assert!(include_str!("../scripts/verify-package.sh").contains("newer than supported GLIBC_"));
     assert!(
         include_str!("../scripts/verify-debian-package.sh").contains("older than imported GLIBC_")
     );
@@ -1961,6 +2376,191 @@ fn rss_fd_detector_does_not_match_foreign_process_arguments() {
         .expect("run RSS/FD scanner self-test");
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(stdout(&output).contains("process scanner self-test passed"));
+}
+
+#[test]
+#[cfg(unix)]
+fn rpm_repository_refuses_to_clean_unmanaged_output_directories() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_dir("rpm-repository-output-guard");
+    let tools = root.join("tools");
+    let input = root.join("input");
+    fs::create_dir_all(&tools).expect("create fake tool directory");
+    fs::create_dir_all(&input).expect("create RPM input directory");
+    fs::write(input.join("rmux-0.9.0-1.x86_64.rpm"), b"rpm").expect("write fake RPM");
+
+    let createrepo = tools.join("createrepo_c");
+    fs::write(
+        &createrepo,
+        "#!/bin/sh\nset -eu\nmkdir -p \"$1/repodata\"\nprintf metadata > \"$1/repodata/repomd.xml\"\n",
+    )
+    .expect("write fake createrepo");
+    make_executable(&createrepo);
+    let path = format!(
+        "{}:{}",
+        tools.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let run = |current_dir: &Path, output: &Path| {
+        Command::new(repo_root().join("scripts/generate-rpm-repository.sh"))
+            .args(["--input-dir"])
+            .arg(&input)
+            .args(["--output-dir"])
+            .arg(output)
+            .env("PATH", &path)
+            .current_dir(current_dir)
+            .output()
+            .expect("run RPM repository generator")
+    };
+    let assert_rejected_without_removal = |result: &Output, sentinel: &Path| {
+        assert!(
+            !result.status.success(),
+            "unsafe output directory was accepted"
+        );
+        assert!(
+            stderr(result).contains("--output-dir"),
+            "{}",
+            stderr(result)
+        );
+        assert_eq!(
+            fs::read(sentinel).expect("read protected sentinel"),
+            b"keep",
+            "unsafe output validation ran after destructive cleanup"
+        );
+    };
+
+    let traversal = root.join("traversal");
+    fs::create_dir_all(traversal.join("child")).expect("create traversal fixture");
+    let traversal_sentinel = traversal.join("keep.txt");
+    fs::write(&traversal_sentinel, b"keep").expect("write traversal sentinel");
+    let result = run(&root, &traversal.join("child/.."));
+    assert_rejected_without_removal(&result, &traversal_sentinel);
+
+    let relative_parent = root.join("relative-parent");
+    let relative_work = relative_parent.join("work");
+    fs::create_dir_all(&relative_work).expect("create relative traversal fixture");
+    let relative_sentinel = relative_parent.join("keep.txt");
+    fs::write(&relative_sentinel, b"keep").expect("write relative traversal sentinel");
+    let result = run(&relative_work, Path::new("./.."));
+    assert_rejected_without_removal(&result, &relative_sentinel);
+
+    let symlink_target = root.join("symlink-target");
+    fs::create_dir_all(&symlink_target).expect("create symlink target");
+    let symlink_sentinel = symlink_target.join("keep.txt");
+    fs::write(&symlink_sentinel, b"keep").expect("write symlink sentinel");
+    let output_link = root.join("output-link");
+    symlink(&symlink_target, &output_link).expect("create output symlink");
+    let result = run(&root, &output_link);
+    assert_rejected_without_removal(&result, &symlink_sentinel);
+
+    let unmanaged = root.join("unmanaged");
+    fs::create_dir_all(&unmanaged).expect("create unmanaged output directory");
+    let unmanaged_sentinel = unmanaged.join("keep.txt");
+    fs::write(&unmanaged_sentinel, b"keep").expect("write unmanaged sentinel");
+    let result = run(&root, &unmanaged);
+    assert_rejected_without_removal(&result, &unmanaged_sentinel);
+
+    // A system RPM keyring is the shape a mistyped --output-dir most plausibly
+    // lands on: /etc/pki/rpm-gpg holds nothing but RPM-GPG-KEY-* files. This
+    // generator never writes those, so the directory must be refused, not wiped.
+    let keyring = root.join("rpm-gpg");
+    fs::create_dir_all(&keyring).expect("create keyring fixture");
+    let keyring_sentinel = keyring.join("RPM-GPG-KEY-redhat-release");
+    fs::write(&keyring_sentinel, b"keep").expect("write keyring sentinel");
+    let result = run(&root, &keyring);
+    assert_rejected_without_removal(&result, &keyring_sentinel);
+
+    // Contents that merely look plausible are not proof of a previous run: only
+    // repodata/repomd.xml, which nothing but this generator writes, unlocks the
+    // cleanup.
+    let bare_repodata = root.join("bare-repodata");
+    fs::create_dir_all(bare_repodata.join("repodata")).expect("create bare repodata fixture");
+    let bare_repodata_sentinel = bare_repodata.join("repodata/keep.txt");
+    fs::write(&bare_repodata_sentinel, b"keep").expect("write bare repodata sentinel");
+    let result = run(&root, &bare_repodata);
+    assert_rejected_without_removal(&result, &bare_repodata_sentinel);
+
+    // The published repository root is the parent of --output-dir: the build
+    // workflow generates into "$root/output/rpm" and uploads "$root/output"
+    // whole. Every entry the generator leaves behind is published verbatim, so
+    // it must create nothing beside --output-dir and no private state inside it.
+    let published_root = root.join("published");
+    let managed = published_root.join("rpm");
+    fs::create_dir_all(&published_root).expect("create published repository root");
+    let first = run(&root, &managed);
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert_eq!(
+        entry_names(&published_root),
+        vec![String::from("rpm")],
+        "the generator must not write beside --output-dir: the published repository \
+         root only admits index.html, _headers, debian/ and rpm/"
+    );
+    assert_eq!(
+        entry_names(&managed),
+        vec![
+            String::from("repodata"),
+            String::from("rmux-0.9.0-1.x86_64.rpm"),
+            String::from("rmux.repo"),
+        ],
+        "the generator must leave no private state inside the published repository"
+    );
+
+    // A directory holding a previous generation stays reusable, and the stale
+    // generation is removed rather than merged into the new one.
+    fs::write(managed.join("rmux-0.8.0-1.x86_64.rpm"), b"stale").expect("write stale generation");
+    let second = run(&root, &managed);
+    assert!(second.status.success(), "{}", stderr(&second));
+    assert!(
+        !managed.join("rmux-0.8.0-1.x86_64.rpm").exists(),
+        "a managed output directory must remain safely reusable"
+    );
+    assert_eq!(
+        entry_names(&published_root),
+        vec![String::from("rpm")],
+        "regenerating must not write beside --output-dir either"
+    );
+    assert_eq!(
+        entry_names(&managed),
+        vec![
+            String::from("repodata"),
+            String::from("rmux-0.9.0-1.x86_64.rpm"),
+            String::from("rmux.repo"),
+        ],
+        "regenerating must publish the new generation alone"
+    );
+
+    // Destroying and recreating the directory destroys the ownership evidence
+    // with it: the cleanup guard must never be attached to the path alone.
+    fs::remove_dir_all(&managed).expect("remove managed output directory");
+    fs::create_dir_all(managed.join("subdir"))
+        .expect("recreate output directory with foreign data");
+    let foreign_sentinel = managed.join("keep.txt");
+    fs::write(&foreign_sentinel, b"keep").expect("write foreign sentinel");
+    let recycled = run(&root, &managed);
+    assert_rejected_without_removal(&recycled, &foreign_sentinel);
+    assert!(
+        managed.join("subdir").is_dir(),
+        "the refused cleanup must leave the whole directory intact"
+    );
+
+    fs::remove_dir_all(root).expect("remove temp directory");
+}
+
+#[cfg(unix)]
+fn entry_names(directory: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(directory)
+        .expect("list directory")
+        .map(|entry| {
+            entry
+                .expect("read directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
 }
 
 #[test]
@@ -2335,6 +2935,11 @@ fn linux_repository_history_is_authenticated_before_retention() {
     let rejected_downgrade = run_retention("0.7.0", "amd64", "x86_64", false, false);
     assert!(!rejected_downgrade.status.success());
     assert!(stderr(&rejected_downgrade).contains("refusing to replace newer APT release"));
+
+    let rejected_republication = run_retention("0.8.0", "amd64", "x86_64", false, false);
+    assert!(!rejected_republication.status.success());
+    assert!(stderr(&rejected_republication)
+        .contains("published APT repository already contains current release 0.8.0"));
 
     fs::remove_file(staging.join("rmux_0.8.0_amd64.deb"))
         .expect("remove accepted retained package");

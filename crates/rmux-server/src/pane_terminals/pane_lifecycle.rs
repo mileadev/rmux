@@ -4,6 +4,7 @@ use std::path::Path;
 use rmux_core::{PaneId, Session};
 use rmux_proto::{
     KillPaneResponse, PaneTarget, RespawnPaneRequest, RespawnPaneResponse, RmuxError, SessionName,
+    WindowTarget,
 };
 use rmux_pty::PtyMaster;
 
@@ -16,7 +17,7 @@ use super::lifecycle_state::terminal_size_from_geometry;
 use super::{
     pane_terminal_geometry_for_session, session_not_found, HandlerState, InitialPaneSpawnOptions,
     KilledPaneHookContext, KilledPaneResult, PaneLifecycleSpawn, PaneOutputSpawn,
-    SessionTransferSnapshot, WindowSpawnOptions,
+    SessionTransferSnapshot, WindowNameApplication, WindowSpawnOptions,
 };
 
 #[path = "pane_lifecycle/preview.rs"]
@@ -228,8 +229,16 @@ impl HandlerState {
             Some(pane.id),
             requested_cwd,
         )?;
-        let automatic_window_name = profile.automatic_window_name(spawn.command);
         let runtime_window_name = profile.runtime_window_name(spawn.command);
+        let initial_window_name = if crate::automatic_rename::automatic_rename_enabled(
+            &self.options,
+            session_name,
+            pane.window_index,
+        ) {
+            profile.automatic_window_name(spawn.command)
+        } else {
+            runtime_window_name.clone()
+        };
         let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
         let respawn_shell = profile.shell().to_path_buf();
@@ -244,7 +253,12 @@ impl HandlerState {
         #[cfg(windows)]
         let exit_watcher = clone_terminal_for_exit_watcher(&terminal, session_name, pane.id)?;
 
-        self.apply_automatic_window_name(session_name, pane.window_index, automatic_window_name)?;
+        self.apply_window_name(
+            session_name,
+            pane.window_index,
+            initial_window_name,
+            WindowNameApplication::Initial,
+        )?;
 
         self.terminals
             .insert_session(runtime_session_name.clone(), pane.id, terminal)?;
@@ -291,7 +305,7 @@ impl HandlerState {
         {
             self.window_runtime_resize_count = self.window_runtime_resize_count.saturating_add(1);
         }
-        let (runtime_session_name, window_size, pane_geometries) = {
+        let (runtime_session_name, pane_geometries) = {
             let session = self
                 .sessions
                 .session(session_name)
@@ -323,29 +337,20 @@ impl HandlerState {
                             alternate_on,
                             copy_mode_active,
                         ),
+                        window_size: window.size(),
                     }
                 })
                 .collect::<Vec<_>>();
-            (runtime_session_name, window.size(), pane_geometries)
+            (runtime_session_name, pane_geometries)
         };
         let terminal_pixels = self.attached_terminal_pixels.get(session_name).copied();
-        self.terminals.resize_session(
-            &runtime_session_name,
-            &pane_geometries,
-            window_size,
-            terminal_pixels,
-        )?;
+        self.terminals
+            .resize_session(&runtime_session_name, &pane_geometries, terminal_pixels)?;
         self.resize_transcripts(&runtime_session_name, &pane_geometries);
         Ok(())
     }
 
     pub(crate) fn resize_terminals(&mut self, session_name: &SessionName) -> Result<(), RmuxError> {
-        let session_size = self
-            .sessions
-            .session(session_name)
-            .ok_or_else(|| session_not_found(session_name))?
-            .window()
-            .size();
         let terminal_pixels = self.attached_terminal_pixels.get(session_name).copied();
         for (runtime_session_name, pane_geometries) in
             self.session_pane_terminal_geometries_by_runtime(session_name)?
@@ -353,7 +358,6 @@ impl HandlerState {
             self.terminals.resize_session(
                 &runtime_session_name,
                 &pane_geometries,
-                session_size,
                 terminal_pixels,
             )?;
             self.resize_transcripts(&runtime_session_name, &pane_geometries);
@@ -434,8 +438,16 @@ impl HandlerState {
         if let Some(shell) = spawn.respawn_shell {
             profile = profile.with_respawn_shell(shell.to_path_buf());
         }
-        let automatic_window_name = profile.automatic_window_name(spawn.command);
         let runtime_window_name = profile.runtime_window_name(spawn.command);
+        let initial_window_name = if crate::automatic_rename::automatic_rename_enabled(
+            &self.options,
+            session_name,
+            window_index,
+        ) {
+            profile.automatic_window_name(spawn.command)
+        } else {
+            runtime_window_name.clone()
+        };
         let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
         let respawn_shell = profile.shell().to_path_buf();
@@ -450,7 +462,12 @@ impl HandlerState {
         #[cfg(windows)]
         let exit_watcher = clone_terminal_for_exit_watcher(&terminal, session_name, pane_id)?;
 
-        self.apply_automatic_window_name(session_name, window_index, automatic_window_name)?;
+        self.apply_window_name(
+            session_name,
+            window_index,
+            initial_window_name,
+            WindowNameApplication::Initial,
+        )?;
 
         self.terminals.insert_pane(
             runtime_session_name.clone(),
@@ -604,6 +621,7 @@ impl HandlerState {
                 removed_pane_ids,
                 affected_sessions,
                 destroyed_sessions: vec![(session_name, removed_session.id().as_u32())],
+                reindexed_windows: Vec::new(),
             });
         }
         if addressed_last_pane
@@ -653,6 +671,14 @@ impl HandlerState {
         };
         debug_assert_eq!(committed_outcome, preview_outcome);
         let removed_pane_ids = committed_outcome.removed_pane_ids().to_vec();
+        if committed_outcome.window_destroyed() {
+            let destroyed_window =
+                WindowTarget::with_window(session_name.clone(), target.window_index());
+            let _ = self.options.remove_window(&destroyed_window);
+            let _ = self.hooks.remove_window(&destroyed_window);
+            self.clear_auto_named_window(&session_name, target.window_index());
+            let _ = self.detach_window_link_slot(&session_name, target.window_index());
+        }
         let mut affected_sessions = if committed_outcome.window_destroyed() {
             vec![session_name.clone()]
         } else {
@@ -676,6 +702,19 @@ impl HandlerState {
                 }
             }
         };
+        let mut reindexed_windows = Vec::new();
+        if committed_outcome.window_destroyed() {
+            match self.renumber_windows_if_enabled(&session_name) {
+                Ok(index_map) if !index_map.is_empty() => {
+                    reindexed_windows.push((session_name.clone(), index_map));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    transfer_snapshot.restore(self);
+                    return Err(error);
+                }
+            }
+        }
 
         #[cfg(windows)]
         let terminal_pane_ids = committed_outcome
@@ -749,16 +788,6 @@ impl HandlerState {
             self.rekey_pane_options_after_session_change(&before, &affected_session)?;
         }
 
-        if committed_outcome.window_destroyed() {
-            let _ = self.detach_window_link_slot(&session_name, target.window_index());
-            let _ = self
-                .options
-                .remove_window(&rmux_proto::WindowTarget::with_window(
-                    session_name.clone(),
-                    target.window_index(),
-                ));
-        }
-
         let removed_pane_ids = self.pane_ids_no_longer_referenced(removed_pane_ids);
         Ok(KilledPaneResult {
             response: KillPaneResponse {
@@ -771,6 +800,7 @@ impl HandlerState {
             removed_pane_ids,
             affected_sessions,
             destroyed_sessions: Vec::new(),
+            reindexed_windows,
         })
     }
 
@@ -803,6 +833,7 @@ impl HandlerState {
             removed_pane_ids: result.removed_pane_ids,
             affected_sessions,
             destroyed_sessions: Vec::new(),
+            reindexed_windows: Vec::new(),
         })
     }
 
@@ -991,7 +1022,12 @@ impl HandlerState {
                 pane_exit_callback,
             },
         )?;
-        self.apply_automatic_window_name(&session_name, window_index, automatic_window_name)?;
+        self.apply_window_name(
+            &session_name,
+            window_index,
+            automatic_window_name,
+            WindowNameApplication::AutomaticUpdate,
+        )?;
         self.record_pane_lifecycle_spawn(PaneLifecycleSpawn {
             session_id,
             window_id,

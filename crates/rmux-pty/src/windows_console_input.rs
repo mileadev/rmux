@@ -20,6 +20,8 @@ use crate::ProcessId;
 
 static CONSOLE_ATTACH_LOCK: Mutex<()> = Mutex::new(());
 const LEFT_CTRL_PRESSED: u32 = 0x0008;
+const CONSOLE_TEXT_KEY_BATCH: usize = 2048;
+const VK_PACKET: u16 = 0x00e7;
 
 /// A Windows console keyboard event that can be injected into a ConPTY child.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -208,6 +210,99 @@ pub fn write_windows_console_key_batch(
     write_windows_console_records_to_handle(handle, &records)
 }
 
+/// Injects UTF-8 text as Unicode console key records into a ConPTY child.
+///
+/// This preserves terminal control sequences on older ConPTY builds which
+/// parse and consume bracketed-paste delimiters written through the raw input
+/// pipe. The console attachment remains locked across all bounded record
+/// batches so concurrent key injection cannot interleave with the text.
+pub fn write_windows_console_utf8(process_id: ProcessId, bytes: &[u8]) -> io::Result<()> {
+    let text = std::str::from_utf8(bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Windows console text is not valid UTF-8: {error}"),
+        )
+    })?;
+    if text.is_empty() {
+        return Ok(());
+    }
+
+    let _guard = CONSOLE_ATTACH_LOCK
+        .lock()
+        .map_err(|_| io::Error::other("Windows console attach lock poisoned"))?;
+    let _attachment = attach_to_process_console(process_id)?;
+    let handle = open_console_input()?;
+    let handle = handle.as_raw_handle() as HANDLE;
+    write_console_utf8_batches(text, |keys| write_console_key_batch_to_handle(handle, keys))
+}
+
+/// Splits `text` into bounded literal-key batches and hands each one to
+/// `write_batch`.
+///
+/// The record writer is a parameter purely so a test can observe the batch
+/// boundaries and the emitted code units: `WriteConsoleInputW` needs a real
+/// attached ConPTY child console, which a unit test cannot provide, and the
+/// bound itself is what keeps a large paste from being submitted as one
+/// unbounded record array.
+///
+/// A surrogate pair is never divided between two calls. Splitting purely on the
+/// bound would end a batch on a high surrogate whenever a supplementary
+/// character straddles it, submitting each half in a separate
+/// `WriteConsoleInputW` call; a reader that decodes what one call delivered
+/// then sees an unpaired half. Closing the batch one unit early keeps the pair
+/// in a single call and still respects the bound.
+fn write_console_utf8_batches<W>(text: &str, mut write_batch: W) -> io::Result<()>
+where
+    W: FnMut(&[WindowsConsoleKeyEvent]) -> io::Result<()>,
+{
+    let mut keys = Vec::with_capacity(CONSOLE_TEXT_KEY_BATCH);
+    for code_unit in text.encode_utf16() {
+        if keys.len() == CONSOLE_TEXT_KEY_BATCH - 1 && is_high_surrogate(code_unit) {
+            write_batch(&keys)?;
+            keys.clear();
+        }
+        keys.push(literal_console_key(code_unit));
+        if keys.len() == CONSOLE_TEXT_KEY_BATCH {
+            write_batch(&keys)?;
+            keys.clear();
+        }
+    }
+    write_batch(&keys)
+}
+
+const fn is_high_surrogate(code_unit: u16) -> bool {
+    matches!(code_unit, 0xd800..=0xdbff)
+}
+
+fn write_console_key_batch_to_handle(
+    handle: HANDLE,
+    keys: &[WindowsConsoleKeyEvent],
+) -> io::Result<()> {
+    let mut records = Vec::with_capacity(keys.len().saturating_mul(2));
+    for key in keys {
+        records.extend(key_event_records(*key));
+    }
+    write_windows_console_records_to_handle(handle, &records)
+}
+
+const fn literal_console_key(code_unit: u16) -> WindowsConsoleKeyEvent {
+    let (virtual_key_code, virtual_scan_code, control_key_state) = match code_unit {
+        0 => (b'@' as u16, 0, LEFT_CTRL_PRESSED),
+        0x08 => (0x08, 0x0e, 0),
+        0x09 => (0x09, 0x0f, 0),
+        0x0a | 0x0d => (0x0d, 0x1c, 0),
+        0x1b => (0x1b, 0x01, 0),
+        _ => (VK_PACKET, 0, 0),
+    };
+    WindowsConsoleKeyEvent::new(
+        virtual_key_code,
+        virtual_scan_code,
+        code_unit,
+        control_key_state,
+        1,
+    )
+}
+
 /// Writes a left-button mouse drag into a ConPTY child console.
 ///
 /// Coordinates are zero-based console-cell positions. This mirrors a real
@@ -236,17 +331,25 @@ pub fn write_windows_console_mouse_drag(
     )
 }
 
-/// Writes a Windows console key and, only when the pane console is in processed
-/// input mode, follows it with a scoped console interrupt.
+/// Writes a Windows console key and reports whether the pane console is in
+/// processed input mode, i.e. whether the caller must follow the key record
+/// with [`send_windows_console_interrupt`].
 ///
 /// Raw console/TUI applications commonly disable processed input and expect to
 /// receive Ctrl-C as a character. Cooked shells keep processed input enabled and
 /// expect Ctrl-C to interrupt the foreground program. This mirrors that native
 /// split instead of hard-coding one behavior for every Windows pane.
-pub fn write_windows_console_key_then_interrupt_if_processed(
+///
+/// The interrupt is left to the caller because the key record and the interrupt
+/// are two separate observable effects: a caller that retries a transient
+/// console failure must retry them independently. One physical Ctrl-C must
+/// produce one key record and one console interrupt — replaying the pair is
+/// observable by handlers that intentionally survive the first interrupt and
+/// can turn a single keystroke into a forced exit.
+pub fn write_windows_console_key_reporting_processed_input(
     process_id: ProcessId,
     key: WindowsConsoleKeyEvent,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let _guard = CONSOLE_ATTACH_LOCK
         .lock()
         .map_err(|_| io::Error::other("Windows console attach lock poisoned"))?;
@@ -255,13 +358,7 @@ pub fn write_windows_console_key_then_interrupt_if_processed(
     let mode = console_input_mode(handle.as_raw_handle() as HANDLE)?;
     trace_windows_key_injection(process_id, key);
     write_windows_console_key_to_handle(handle.as_raw_handle() as HANDLE, key)?;
-    if mode & ENABLE_PROCESSED_INPUT != 0 {
-        // One physical Ctrl-C must produce one console interrupt. Retrying the
-        // event here is observable by handlers that intentionally survive the
-        // first interrupt and can turn a single keystroke into a forced exit.
-        send_windows_console_interrupt_attached(process_id)?;
-    }
-    Ok(())
+    Ok(mode & ENABLE_PROCESSED_INPUT != 0)
 }
 
 /// Sends a native Ctrl-C interrupt to a Windows ConPTY child console.
@@ -660,6 +757,158 @@ fn last_os_error() -> io::Error {
 mod tests {
     use super::*;
     use windows_sys::Win32::System::Console::ENABLE_LINE_INPUT;
+
+    #[test]
+    fn literal_console_keys_preserve_bracketed_utf16_text() {
+        let text = "\u{1b}[200~alpha\r\nβ😀\u{1b}[201~";
+        let keys = text
+            .encode_utf16()
+            .map(literal_console_key)
+            .collect::<Vec<_>>();
+        let actual = keys
+            .iter()
+            .map(|key| key.unicode_char())
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, text.encode_utf16().collect::<Vec<_>>());
+        assert_eq!(keys[0].virtual_key_code(), 0x1b);
+        assert_eq!(keys[0].virtual_scan_code(), 0x01);
+        let lf = keys
+            .iter()
+            .find(|key| key.unicode_char() == b'\n' as u16)
+            .expect("LF key");
+        assert_eq!(lf.virtual_key_code(), 0x0d);
+        assert_eq!(lf.virtual_scan_code(), 0x1c);
+        assert_eq!(lf.control_key_state(), 0);
+
+        for literal in ['A', '-', '[', '~', 'é', '🦀'] {
+            let mut encoded = [0_u16; 2];
+            for code_unit in literal.encode_utf16(&mut encoded) {
+                let key = literal_console_key(*code_unit);
+                assert_eq!(
+                    key.virtual_key_code(),
+                    VK_PACKET,
+                    "U+{code_unit:04X} must not alias a navigation or modifier key"
+                );
+                assert_eq!(key.virtual_scan_code(), 0);
+            }
+        }
+    }
+
+    /// The bound is pinned as a literal, not read from
+    /// [`CONSOLE_TEXT_KEY_BATCH`]: a test that derives its payload from the
+    /// constant follows the constant, so raising or removing the bound would
+    /// leave it green while an arbitrarily large record array reached
+    /// `WriteConsoleInputW` in a single call.
+    const PINNED_BATCH: usize = 2048;
+
+    /// Collects the code units of every batch the writer seam emits.
+    fn batched_code_units(text: &str) -> Vec<Vec<u16>> {
+        let mut batches = Vec::new();
+        write_console_utf8_batches(text, |keys| {
+            batches.push(keys.iter().map(|key| key.unicode_char()).collect());
+            Ok(())
+        })
+        .expect("the recording writer never fails");
+        batches
+    }
+
+    /// One code unit past the bound, with the surrogate pair away from it.
+    fn text_crossing_the_batch_bound() -> String {
+        let mut text = String::from("😀");
+        while text.encode_utf16().count() < PINNED_BATCH + 1 {
+            text.push('a');
+        }
+        text
+    }
+
+    /// No batch may exceed the bound, and none may end on a high surrogate:
+    /// that half's pair would be submitted in a separate call.
+    fn assert_batches_are_bounded_and_whole(batches: &[Vec<u16>]) {
+        for (index, batch) in batches.iter().enumerate() {
+            assert!(
+                batch.len() <= PINNED_BATCH,
+                "batch {index} holds {} code units, past the 2048 bound",
+                batch.len()
+            );
+            assert!(
+                !batch.last().copied().is_some_and(is_high_surrogate),
+                "batch {index} ends on a high surrogate, dividing a pair across \
+                 two WriteConsoleInputW calls"
+            );
+        }
+    }
+
+    #[test]
+    fn console_text_is_written_in_bounded_batches_without_losing_code_units() {
+        assert_eq!(
+            CONSOLE_TEXT_KEY_BATCH, PINNED_BATCH,
+            "the console record batch bound is a contract, not an implementation detail"
+        );
+        let text = text_crossing_the_batch_bound();
+        let expected = text.encode_utf16().collect::<Vec<_>>();
+        assert_eq!(expected.len(), PINNED_BATCH + 1);
+
+        let batches = batched_code_units(&text);
+
+        assert_eq!(
+            batches.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![PINNED_BATCH, 1],
+            "a payload one unit past the bound must produce exactly 2048 + 1"
+        );
+        assert_eq!(
+            batches.concat(),
+            expected,
+            "batching must not truncate or reorder the paste"
+        );
+        assert_batches_are_bounded_and_whole(&batches);
+    }
+
+    #[test]
+    fn a_surrogate_pair_astride_the_batch_bound_is_never_divided_between_writer_calls() {
+        // 2047 ASCII units then the pair, so splitting on the bound alone would
+        // end batch one on the high half.
+        let mut text = "a".repeat(PINNED_BATCH - 1);
+        text.push('😀');
+        let expected = text.encode_utf16().collect::<Vec<_>>();
+        assert_eq!(expected.len(), PINNED_BATCH + 1);
+
+        let batches = batched_code_units(&text);
+
+        assert_eq!(
+            batches.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![PINNED_BATCH - 1, 2],
+            "the batch must close one unit early so the pair stays in one call"
+        );
+        assert_eq!(
+            batches.concat(),
+            expected,
+            "closing early must not truncate or reorder the paste"
+        );
+        assert_eq!(
+            batches[1],
+            vec![0xd83d, 0xde00],
+            "both halves must reach the same WriteConsoleInputW call, in order"
+        );
+        assert_batches_are_bounded_and_whole(&batches);
+    }
+
+    /// The early close is for pairs only: an ordinary BMP payload must still
+    /// fill every batch to the bound.
+    #[test]
+    fn a_bmp_payload_still_fills_each_batch_to_the_bound() {
+        let text = "β".repeat(PINNED_BATCH * 2 + 5);
+
+        let batches = batched_code_units(&text);
+
+        assert_eq!(
+            batches.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![PINNED_BATCH, PINNED_BATCH, 5],
+            "only a straddling surrogate pair may close a batch early"
+        );
+        assert_eq!(batches.concat(), text.encode_utf16().collect::<Vec<_>>());
+        assert_batches_are_bounded_and_whole(&batches);
+    }
 
     #[test]
     fn ctrl_d_eot_is_suppressible_cooked_event_without_scan_code() {

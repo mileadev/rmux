@@ -8,6 +8,7 @@ use rmux_proto::{OptionName, PaneTarget, RmuxError, Target};
 use rmux_pty::WindowsConsoleKeyEvent;
 
 use super::super::{
+    mode_tree_support::ModeTreeInputError,
     prompt_support::{decode_prompt_key, PromptInputEvent},
     RequestHandler,
 };
@@ -20,7 +21,7 @@ use super::pane_prompt_input::{
 };
 use super::{io_other, resolve_input_target, AttachedKeyDispatch};
 use crate::client_flags::ClientFlags;
-use crate::handler::attach_support::ActiveAttachIdentity;
+use crate::handler::attach_support::{ActiveAttachIdentity, TransientMessageInput};
 use crate::handler::overlay_support::AttachedOverlayInput;
 use crate::input_keys::{decode_extended_key, decode_mouse, ExtendedKeyDecode, MouseDecode};
 use crate::key_table::{decode_attached_key, AttachedKeyDecode};
@@ -48,12 +49,18 @@ mod synchronized;
 #[path = "attached_input/terminal_response.rs"]
 mod terminal_response;
 
+pub(in crate::handler) use palette_response::{
+    decode_pane_bound_terminal_string, PaneBoundTerminalStringDecode,
+};
 pub(in crate::handler) use retained::{
     retain_partial_attached_control_input, retain_partial_attached_escape_input,
 };
 use synchronized::{
     prepare_attached_bracketed_paste_forwards, prepare_attached_key_forwards,
     write_prepared_attached_pane_forwards,
+};
+pub(in crate::handler) use terminal_response::{
+    decode_attached_terminal_control_after_append, TerminalResponseDecode,
 };
 
 fn ensure_session_identity(
@@ -160,10 +167,32 @@ impl RequestHandler {
         }
 
         let _ = self
-            .handle_mode_tree_key_event_for_identity(identity, fallback_event)
-            .await
-            .map_err(io_other)?;
+            .handle_attached_mode_tree_key_event(identity, fallback_event)
+            .await?;
         Ok(())
+    }
+
+    async fn handle_attached_mode_tree_key_event(
+        &self,
+        identity: ActiveAttachIdentity,
+        event: PromptInputEvent,
+    ) -> io::Result<bool> {
+        match self
+            .handle_mode_tree_key_event_for_identity(identity, event)
+            .await
+        {
+            Ok(handled) => Ok(handled),
+            Err(ModeTreeInputError::Fatal(error)) => Err(io_other(error)),
+            Err(ModeTreeInputError::UserCommandAfterModeExit(error)) => {
+                let session_name = self
+                    .attached_session_name_for_identity(identity)
+                    .await
+                    .map_err(io_other)?;
+                self.report_attached_command_error(&session_name, identity.attach_pid(), &error)
+                    .await;
+                Ok(true)
+            }
+        }
     }
 
     async fn handle_attached_live_key(
@@ -201,17 +230,11 @@ impl RequestHandler {
             .attached_input_target_identity(identity)
             .await
             .map_err(io_other)?;
-        if self
-            .handle_attached_copy_mode_key_event_for_identity(
-                identity,
-                target.clone(),
-                decode_prompt_key(key),
-            )
-            .await
-            .map_err(io_other)?
-        {
-            return Ok(true);
-        }
+        // No copy-mode shim ahead of the tables: in copy mode the
+        // copy-mode / copy-mode-vi table is the only authority, exactly as
+        // tmux 3.7b behaves and as the detached `send-keys -X` path already
+        // did. `dispatch_attached_key_inner` resolves the binding and swallows
+        // the key when the table leaves it unbound.
         let handled = self
             .dispatch_attached_key_inner(
                 &target,
@@ -438,9 +461,8 @@ impl RequestHandler {
                     };
                     offset += consumed;
                     let _ = self
-                        .handle_mode_tree_key_event_for_identity(identity, event)
-                        .await
-                        .map_err(io_other)?;
+                        .handle_attached_mode_tree_key_event(identity, event)
+                        .await?;
                 }
             }
             if self.prompt_active_for_identity(identity).await
@@ -830,6 +852,35 @@ impl RequestHandler {
                 .await;
         }
 
+        match self
+            .handle_transient_message_input_for_identity(identity, pending_input, &[])
+            .await
+        {
+            // The message may have expired before this identity-guarded
+            // operation. Continue with the ordinary flush rules so retained
+            // bytes are neither dropped nor left stuck.
+            TransientMessageInput::Inactive => {
+                let residual = self
+                    .take_transient_terminal_prefix_for_identity(identity)
+                    .await;
+                if !residual.is_empty() {
+                    pending_input.extend(residual);
+                    return Ok(false);
+                }
+            }
+            TransientMessageInput::Consumed => return Ok(false),
+            TransientMessageInput::TerminalControls(controls) => {
+                return self
+                    .handle_transient_terminal_controls(identity, controls)
+                    .await;
+            }
+            TransientMessageInput::Dismissed(bytes) => {
+                return self
+                    .handle_attached_live_input_inner_for_identity(identity, pending_input, &bytes)
+                    .await;
+            }
+        }
+
         if pending_input.first() == Some(&b'\x1b')
             && self.prompt_active_for_identity(identity).await
         {
@@ -933,14 +984,21 @@ impl RequestHandler {
                 self.exit_clock_mode_for_attached_identity(&target, identity, target_session_id)
                     .await
                     .map_err(io_other)?
-            } else {
-                self.handle_attached_copy_mode_key_event_for_identity(
-                    identity,
-                    target,
-                    PromptInputEvent::Escape,
-                )
+            } else if self
+                .target_is_in_copy_mode(&target)
                 .await
                 .map_err(io_other)?
+            {
+                // A lone ESC never decodes into a key -- `decode_attached_key`
+                // answers `Partial` for it -- so copy mode has to name the key
+                // itself. Route it through the live key path so that
+                // `bind -T copy-mode Escape ...` wins, the same shape the
+                // mode-tree branch above already uses.
+                let escape = key_string_lookup_string("Escape")
+                    .ok_or_else(|| io_other("Escape key is unavailable"))?;
+                self.handle_attached_live_key(identity, escape).await?
+            } else {
+                false
             };
             if consumed_by_mode {
                 return if let Some(remaining) = bytes.get(1..).filter(|bytes| !bytes.is_empty()) {
@@ -1036,6 +1094,15 @@ impl RequestHandler {
         &self,
         identity: crate::handler::attach_support::ActiveAttachIdentity,
     ) -> Result<(rmux_proto::SessionName, rmux_proto::SessionId), RmuxError> {
+        self.attached_session_identity_and_client_name_for_identity(identity)
+            .await
+            .map(|(session_name, session_id, _)| (session_name, session_id))
+    }
+
+    pub(crate) async fn attached_session_identity_and_client_name_for_identity(
+        &self,
+        identity: crate::handler::attach_support::ActiveAttachIdentity,
+    ) -> Result<(rmux_proto::SessionName, rmux_proto::SessionId, String), RmuxError> {
         let active_attach = self.active_attach.lock().await;
         active_attach
             .by_pid
@@ -1044,7 +1111,13 @@ impl RequestHandler {
                 identity.matches_active(active)
                     && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
             })
-            .map(|active| (active.session_name.clone(), active.session_id))
+            .map(|active| {
+                (
+                    active.session_name.clone(),
+                    active.session_id,
+                    active.client_name.clone(),
+                )
+            })
             .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))
     }
 

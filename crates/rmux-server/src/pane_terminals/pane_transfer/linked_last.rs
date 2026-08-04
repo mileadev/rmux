@@ -22,6 +22,10 @@ impl HandlerState {
     ) -> Result<JoinPaneResponse, RmuxError> {
         let source_session_name = request.source.session_name().clone();
         let destination_session_name = request.target.session_name().clone();
+        let source_family_sessions = self.window_linked_session_family_list(
+            request.source.session_name(),
+            request.source.window_index(),
+        );
         let source_pane_options = self.pane_explicit_option_entries(&request.source)?;
         let destination_family_options = pane_option_snapshots_for_transfer(
             self,
@@ -87,6 +91,10 @@ impl HandlerState {
                 return Err(error);
             }
         };
+        if let Err(error) = self.renumber_transfer_source_sessions(&source_family_sessions) {
+            snapshot.restore(self);
+            return Err(error);
+        }
         let affected_sessions = match synchronize_cross_session_transfer_families(
             self,
             &[(

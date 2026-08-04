@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rmux_core::{HookStore, LifecycleEvent, SessionStore, WindowId};
 use rmux_proto::{PaneTarget, SessionName, Target, WindowTarget};
 
 use super::super::{
     defer_lifecycle_event, prepare_deferred_lifecycle_event, DeferredLifecycleEvent,
-    QueuedLifecycleEvent,
+    QueuedLifecycleEvent, SelectionTransitionSnapshot,
 };
 use crate::hook_runtime::ExactPaneHookTarget;
 use crate::pane_terminals::HandlerState;
@@ -267,10 +267,65 @@ impl KillPaneLifecycleBatch {
         }
     }
 
+    /// Sequences one event that was deferred before the kill, dispatching its
+    /// hooks from the same pre-kill snapshot the batch uses.
+    ///
+    /// Deferring the dispatch keeps a failed kill attempt free of side effects,
+    /// so the caller can retry it without consuming one-shot hooks.
+    pub(super) fn prepare_deferred(
+        &mut self,
+        state: &mut HandlerState,
+        deferred: DeferredLifecycleEvent,
+    ) -> QueuedLifecycleEvent {
+        prepare_deferred_lifecycle_event(state, &mut self.hook_snapshot, deferred)
+    }
+
     pub(super) fn prepare_committed(
+        self,
+        state: &mut HandlerState,
+        destroyed_sessions: &[(SessionName, u32)],
+    ) -> Vec<QueuedLifecycleEvent> {
+        self.prepare_committed_inner(state, destroyed_sessions, None)
+    }
+
+    pub(super) fn prepare_explicit_committed(
+        self,
+        state: &mut HandlerState,
+        destroyed_sessions: &[(SessionName, u32)],
+        selection_before: &SelectionTransitionSnapshot,
+        layout_target: WindowTarget,
+        window_destroyed: bool,
+    ) -> (Vec<QueuedLifecycleEvent>, Vec<QueuedLifecycleEvent>) {
+        if window_destroyed {
+            return (
+                self.prepare_window_destroyed_committed(
+                    state,
+                    destroyed_sessions,
+                    selection_before,
+                ),
+                Vec::new(),
+            );
+        }
+        (
+            self.prepare_committed(state, destroyed_sessions),
+            selection_before.prepare_surviving_kill_pane_changes(state, layout_target),
+        )
+    }
+
+    pub(super) fn prepare_window_destroyed_committed(
+        self,
+        state: &mut HandlerState,
+        destroyed_sessions: &[(SessionName, u32)],
+        selection_before: &SelectionTransitionSnapshot,
+    ) -> Vec<QueuedLifecycleEvent> {
+        self.prepare_committed_inner(state, destroyed_sessions, Some(selection_before))
+    }
+
+    fn prepare_committed_inner(
         mut self,
         state: &mut HandlerState,
         destroyed_sessions: &[(SessionName, u32)],
+        selection_before: Option<&SelectionTransitionSnapshot>,
     ) -> Vec<QueuedLifecycleEvent> {
         self.deferred_windows.retain(|window| {
             state
@@ -291,10 +346,18 @@ impl KillPaneLifecycleBatch {
                 .len()
                 .saturating_add(ordered_sessions.len()),
         );
+        let mut selection_notified = HashSet::new();
         let remaining_windows = if self.deferred_windows.is_empty() {
             Vec::new()
         } else {
             let first = self.deferred_windows.remove(0);
+            prepare_window_removal_selection(
+                state,
+                selection_before,
+                &mut selection_notified,
+                &first,
+                &mut prepared,
+            );
             prepared.push(prepare_deferred_lifecycle_event(
                 state,
                 &mut self.hook_snapshot,
@@ -318,6 +381,13 @@ impl KillPaneLifecycleBatch {
             let _ = state.hooks.remove_session(&session_name);
         }
         for window in remaining_windows {
+            prepare_window_removal_selection(
+                state,
+                selection_before,
+                &mut selection_notified,
+                &window,
+                &mut prepared,
+            );
             prepared.push(prepare_deferred_lifecycle_event(
                 state,
                 &mut self.hook_snapshot,
@@ -326,4 +396,21 @@ impl KillPaneLifecycleBatch {
         }
         prepared
     }
+}
+
+fn prepare_window_removal_selection(
+    state: &mut HandlerState,
+    selection_before: Option<&SelectionTransitionSnapshot>,
+    selection_notified: &mut HashSet<SessionName>,
+    window: &DeferredWindowUnlinked,
+    prepared: &mut Vec<QueuedLifecycleEvent>,
+) {
+    let Some(selection_before) = selection_before else {
+        return;
+    };
+    let session_name = window.target.session_name();
+    if !selection_notified.insert(session_name.clone()) {
+        return;
+    }
+    prepared.extend(selection_before.prepare_session_window_change(state, session_name));
 }

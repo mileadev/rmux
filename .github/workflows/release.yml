@@ -225,6 +225,28 @@ jobs:
       - name: Fetch locked dependencies
         run: cargo fetch --locked
 
+      - name: Install the pinned Linux glibc linker toolchain
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          RMUX_LINUX_GLIBC_FLOOR: "2.31"
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/rmux-linux-glibc-tools"
+          cache="$RUNNER_TEMP/rmux-cargo-zigbuild-cache"
+          test ! -e "$tools"
+          test ! -e "$cache"
+          scripts/release/install-linux-glibc-build-tools.sh \
+            "$tools" \
+            "$RUNNER_TEMP/rmux-linux-glibc-build-tools.txt"
+          echo "$tools/bin" >> "$GITHUB_PATH"
+          {
+            echo "CARGO_ZIGBUILD_PYTHON_PATH=$tools/bin/python"
+            echo "CARGO_ZIGBUILD_CACHE_DIR=$cache"
+            echo "RMUX_LINUX_GLIBC_FLOOR=2.31"
+            echo "RMUX_MAX_SUPPORTED_GLIBC=2.31"
+          } >> "$GITHUB_ENV"
+
       - name: Windows MSVC clippy
         if: runner.os == 'Windows'
         shell: pwsh
@@ -232,7 +254,9 @@ jobs:
 
       - name: Build rmux
         shell: bash
-        run: cargo build --package rmux --locked --profile "$BUILD_PROFILE" --target "$TARGET"
+        run: >-
+          scripts/release/cargo-build-compatible.sh --target "$TARGET" --
+          build --package rmux --locked --profile "$BUILD_PROFILE"
 
       - name: Install Linux package tooling
         if: runner.os == 'Linux'
@@ -253,8 +277,8 @@ jobs:
           if [[ "$TARGET" == *-unknown-linux-gnu ]]; then
             glibc_floor="$(scripts/glibc-symbol-floor.sh "$bin")"
             echo "max GLIBC symbol: GLIBC_$glibc_floor"
-            if [[ "$(printf '%s\n' "$glibc_floor" "2.35" | sort -V | tail -n 1)" != "2.35" ]]; then
-              echo "Linux release binary requires GLIBC_$glibc_floor; expected GLIBC_2.35 or older" >&2
+            if [[ "$(printf '%s\n' "$glibc_floor" "2.31" | sort -V | tail -n 1)" != "2.31" ]]; then
+              echo "Linux release binary requires GLIBC_$glibc_floor; expected GLIBC_2.31 or older" >&2
               exit 1
             fi
           fi
@@ -401,6 +425,17 @@ jobs:
             --output-dir dist
           archive="$(ls dist/rmux-*.tar.gz | head -n 1)"
           scripts/verify-package.sh "$archive" --checksums dist/SHA256SUMS.txt --run-binary --require-release-artifact
+
+      - name: Smoke Linux release binaries on the glibc 2.31 baseline
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_dir="target/$TARGET/$PROFILE_DIR"
+          scripts/smoke-linux-glibc-baseline.sh \
+            "$release_dir/rmux" \
+            "$release_dir/rmux-full" \
+            "$release_dir/rmux-daemon"
 
       - name: Create Linux distro packages
         if: runner.os == 'Linux'
@@ -940,6 +975,7 @@ jobs:
           scripts/generate-apt-repository.sh \
             --input-dir target/package-repository-inputs \
             --output-dir target/package-repositories/debian \
+            --previous-repository-dir target/package-repository-history/debian \
             --suite stable \
             --component main \
             --architecture amd64 \
@@ -948,6 +984,7 @@ jobs:
           scripts/generate-rpm-repository.sh \
             --input-dir target/package-repository-inputs \
             --output-dir target/package-repositories/rpm \
+            --previous-repository-dir target/package-repository-history/rpm \
             --baseurl https://packages.rmux.io/rpm \
             --gpg-key-url https://packages.rmux.io/rpm/RPM-GPG-KEY-rmux \
             --repo-gpg-key-url https://packages.rmux.io/rpm/RPM-GPG-KEY-rmux-repository \

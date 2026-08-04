@@ -5,6 +5,7 @@
 
 use rmux_proto::TerminalSize;
 
+use crate::input::OscColourSlot;
 use crate::screen::Screen;
 use crate::terminal::TerminalParser;
 use crate::terminal_passthrough::TerminalPassthrough;
@@ -78,6 +79,16 @@ impl TerminalScreen {
         self.parser.feed(bytes);
     }
 
+    /// Returns and clears whether the latest feeds used terminal-parser state
+    /// that an ANSI recovery keyframe cannot reconstruct.
+    ///
+    /// Callers publishing raw continuation bytes must replace that
+    /// continuation with an authoritative post-dispatch keyframe.
+    #[must_use]
+    pub fn take_recovery_rebase_required(&mut self) -> bool {
+        self.parser.take_recovery_rebase_required()
+    }
+
     /// Returns and drains terminal replies generated while parsing PTY output.
     pub fn take_replies(&mut self) -> Vec<u8> {
         self.parser.take_replies()
@@ -87,6 +98,65 @@ impl TerminalScreen {
     #[must_use]
     pub fn pending_bytes(&self) -> Vec<u8> {
         self.parser.pending_bytes()
+    }
+
+    /// Borrows bytes buffered inside an incomplete parser state.
+    #[must_use]
+    pub fn pending_bytes_ref(&self) -> &[u8] {
+        self.parser.pending_bytes_ref()
+    }
+
+    /// Clones renderer state, including bounded scrollback and saved buffers.
+    #[must_use]
+    pub fn clone_recovery_screen(&self) -> Screen {
+        self.parser.clone_recovery_screen()
+    }
+
+    /// Returns ANSI restoring the parser's active rendition and character sets.
+    #[must_use]
+    pub fn active_cell_state_ansi(&self) -> Vec<u8> {
+        self.parser.active_cell_state_ansi()
+    }
+
+    /// Returns bounded ANSI for the active rendition and whether metadata was
+    /// represented completely.
+    #[must_use]
+    pub fn active_cell_state_ansi_bounded(&self, max_hyperlink_bytes: usize) -> (Vec<u8>, bool) {
+        self.parser
+            .active_cell_state_ansi_bounded(max_hyperlink_bytes)
+    }
+
+    /// Returns ANSI restoring the rendition saved by DECSC/SCP.
+    #[must_use]
+    pub fn saved_cell_state_ansi(&self) -> Vec<u8> {
+        self.parser.saved_cell_state_ansi()
+    }
+
+    /// Returns bounded ANSI for the saved rendition and whether metadata was
+    /// represented completely.
+    #[must_use]
+    pub fn saved_cell_state_ansi_bounded(&self, max_hyperlink_bytes: usize) -> (Vec<u8>, bool) {
+        self.parser
+            .saved_cell_state_ansi_bounded(max_hyperlink_bytes)
+    }
+
+    /// Returns the cursor and origin mode saved by DECSC/SCP.
+    #[must_use]
+    pub fn saved_cursor_state(&self) -> (u32, u32, bool) {
+        self.parser.saved_cursor_state()
+    }
+
+    /// Returns ANSI restoring parser-owned state that has a faithful terminal
+    /// representation, such as application-defined dynamic colours.
+    #[must_use]
+    pub fn recovery_parser_state_ansi(&self) -> Vec<u8> {
+        self.parser.recovery_parser_state_ansi()
+    }
+
+    /// Returns an application-defined OSC 10/11/12 colour.
+    #[must_use]
+    pub fn dynamic_colour(&self, slot: OscColourSlot) -> Option<&str> {
+        self.parser.dynamic_colour(slot)
     }
 
     /// Returns whether the parser ground timeout is currently armed.

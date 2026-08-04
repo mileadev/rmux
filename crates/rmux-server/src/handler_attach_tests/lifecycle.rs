@@ -142,6 +142,10 @@ async fn attached_display_message_print_reports_client_size_and_cursor_position(
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    handler
+        .handle_attached_resize(requester_pid, TerminalSize { cols: 80, rows: 24 })
+        .await
+        .expect("attached terminal geometry is applied");
     let target = PaneTarget::new(alpha.clone(), 0);
 
     replace_transcript_contents(
@@ -504,7 +508,7 @@ async fn attached_live_input_preserves_split_utf8_sequences() {
     #[cfg(windows)]
     let _control_rx = create_line_echo_attached_session(&handler, requester_pid, &alpha).await;
     #[cfg(not(windows))]
-    let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let _control_rx = create_attached_session_in_utf8_locale(&handler, requester_pid, &alpha).await;
     let target = PaneTarget::new(alpha.clone(), 0);
     #[cfg(not(windows))]
     prepare_attached_shell_prompt(&handler, &target).await;

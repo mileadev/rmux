@@ -18,12 +18,17 @@ use crate::input_keys::{encode_key_with_backspace, encode_mouse_event, ExtendedK
 use crate::keys::parse_key_code;
 #[cfg(windows)]
 use crate::pane_terminals::DeferredInitialPaneConsoleInputAction;
-use crate::pane_terminals::{session_not_found, HandlerState};
+use crate::pane_terminals::{session_not_found, HandlerState, PasteDelimiters};
 
 #[cfg(unix)]
 const IMMEDIATE_PANE_INPUT_MAX_BYTES: usize = 256;
 #[cfg(any(unix, windows))]
 const PANE_INPUT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(windows)]
+const PANE_INPUT_WRITE_RECOVERY_GRACE: Duration = Duration::from_millis(500);
+/// Canonical error for a pane input write whose target process is gone.
+/// `PaneTerminalStore::clone_pane_master_if_alive` reports the same text.
+const DEAD_PANE_INPUT_ERROR: &str = "target pane has exited";
 
 pub(in crate::handler) struct PaneInputWrite {
     session_name: SessionName,
@@ -40,11 +45,30 @@ impl PaneInputWrite {
 
 enum PaneInputSink {
     Pty(PtyMaster),
+    #[cfg(windows)]
+    ConsoleUtf8(ProcessId),
     Disabled,
     #[cfg(windows)]
     QueuedStarting,
     #[cfg(test)]
     CapturedForTest,
+}
+
+#[cfg(windows)]
+pub(in crate::handler) const LEGACY_CONPTY_NON_UTF8_BRACKETED_PASTE_ERROR: &str =
+    "cannot preserve bracketed paste containing non-UTF-8 bytes on this Windows host";
+
+/// Where a pasted body is written on Windows.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::handler) enum WindowsPasteSink {
+    /// The pane's ConPTY input pipe.
+    Pty,
+    /// Console text records written straight into the pane's input buffer.
+    ConsoleUtf8,
+    /// The payload cannot be represented as console records and would lose its
+    /// envelope on the pipe.
+    RejectNonUtf8,
 }
 
 #[cfg(windows)]
@@ -108,6 +132,33 @@ pub(in crate::handler) fn prepare_pane_input_write(
     bytes: &[u8],
     liveness: PaneInputLiveness,
 ) -> Result<PaneInputWrite, RmuxError> {
+    prepare_pane_input_write_with_encoding(state, target, bytes, liveness, None)
+}
+
+/// Prepares a write for a pasted body, which must reach the destination byte
+/// for byte.
+///
+/// `delimiters` says whether the payload carries the bracketed-paste envelope
+/// the destination announced. It is not what selects the Windows sink — a
+/// legacy ConPTY consumes control sequences from the raw input pipe whether or
+/// not an envelope surrounds them — only what an unrepresentable payload means.
+pub(in crate::handler) fn prepare_pane_bracketed_paste_write(
+    state: &mut HandlerState,
+    target: &PaneTarget,
+    bytes: &[u8],
+    liveness: PaneInputLiveness,
+    delimiters: PasteDelimiters,
+) -> Result<PaneInputWrite, RmuxError> {
+    prepare_pane_input_write_with_encoding(state, target, bytes, liveness, Some(delimiters))
+}
+
+fn prepare_pane_input_write_with_encoding(
+    state: &mut HandlerState,
+    target: &PaneTarget,
+    bytes: &[u8],
+    liveness: PaneInputLiveness,
+    paste: Option<PasteDelimiters>,
+) -> Result<PaneInputWrite, RmuxError> {
     let session_name = target.session_name().clone();
     let window_index = target.window_index();
     let pane_index = target.pane_index();
@@ -132,7 +183,17 @@ pub(in crate::handler) fn prepare_pane_input_write(
         });
     }
     #[cfg(windows)]
-    if state.queue_starting_pane_input(&session_name, window_index, pane_index, bytes)? {
+    if if let Some(delimiters) = paste {
+        state.queue_starting_pane_paste_input(
+            &session_name,
+            window_index,
+            pane_index,
+            bytes,
+            delimiters,
+        )?
+    } else {
+        state.queue_starting_pane_input(&session_name, window_index, pane_index, bytes)?
+    } {
         return Ok(PaneInputWrite {
             session_name,
             window_index,
@@ -148,6 +209,30 @@ pub(in crate::handler) fn prepare_pane_input_write(
             state.clone_pane_master(&session_name, window_index, pane_index)?
         }
     };
+    #[cfg(windows)]
+    if let Some(delimiters) = paste {
+        match windows_paste_sink(master.preserves_verbatim_input(), bytes, delimiters) {
+            WindowsPasteSink::Pty => {}
+            WindowsPasteSink::ConsoleUtf8 => {
+                let raw_pid = state.pane_pid_in_window(&session_name, window_index, pane_index)?;
+                let pid = ProcessId::new(raw_pid)
+                    .map_err(|error| RmuxError::Server(error.to_string()))?;
+                return Ok(PaneInputWrite {
+                    session_name,
+                    window_index,
+                    pane_index,
+                    sink: PaneInputSink::ConsoleUtf8(pid),
+                });
+            }
+            WindowsPasteSink::RejectNonUtf8 => {
+                return Err(RmuxError::Message(
+                    LEGACY_CONPTY_NON_UTF8_BRACKETED_PASTE_ERROR.to_owned(),
+                ));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = paste;
     #[cfg(not(any(test, windows)))]
     let _ = bytes;
     Ok(PaneInputWrite {
@@ -156,6 +241,36 @@ pub(in crate::handler) fn prepare_pane_input_write(
         pane_index,
         sink: PaneInputSink::Pty(master),
     })
+}
+
+/// Chooses the sink a pasted body reaches its destination through.
+///
+/// The decision is the host's ConPTY capability, never the destination's own
+/// bracketed-paste mode: a legacy build's input state machine parses and
+/// consumes control sequences from the raw pipe, so an unaware destination
+/// loses a pasted `ESC[…` exactly as an aware one loses its delimiters. Only a
+/// payload the console records cannot carry still depends on `delimiters`.
+#[cfg(windows)]
+pub(in crate::handler) fn windows_paste_sink(
+    preserves_verbatim_input: bool,
+    bytes: &[u8],
+    delimiters: PasteDelimiters,
+) -> WindowsPasteSink {
+    if preserves_verbatim_input {
+        return WindowsPasteSink::Pty;
+    }
+    if std::str::from_utf8(bytes).is_ok() {
+        return WindowsPasteSink::ConsoleUtf8;
+    }
+    match delimiters {
+        // The console path is the only one that keeps an envelope on this
+        // host, so a paste it cannot represent must be refused rather than
+        // silently delivered to the destination as live input.
+        PasteDelimiters::Wrapped => WindowsPasteSink::RejectNonUtf8,
+        // A bare body has no envelope to lose. Refusing it would turn input
+        // that the byte-oriented path has always carried into an error.
+        PasteDelimiters::Bare => WindowsPasteSink::Pty,
+    }
 }
 
 pub(super) fn prepare_attached_pane_input_writes(
@@ -785,6 +900,15 @@ pub(in crate::handler) async fn write_bytes_to_target_io(
     write: PaneInputWrite,
     bytes: Vec<u8>,
 ) -> Result<(), RmuxError> {
+    write_bytes_to_target_io_classified(write, bytes)
+        .await
+        .map_err(PaneInputWriteFailure::into_error)
+}
+
+async fn write_bytes_to_target_io_classified(
+    write: PaneInputWrite,
+    bytes: Vec<u8>,
+) -> Result<(), PaneInputWriteFailure> {
     if bytes.is_empty() {
         return Ok(());
     }
@@ -798,15 +922,32 @@ pub(in crate::handler) async fn write_bytes_to_target_io(
         PaneInputSink::Disabled => Ok(()),
         #[cfg(windows)]
         PaneInputSink::QueuedStarting => Ok(()),
+        #[cfg(windows)]
+        PaneInputSink::ConsoleUtf8(pid) => {
+            tokio::task::spawn_blocking(move || rmux_pty::write_windows_console_utf8(pid, &bytes))
+                .await
+                .map_err(|error| {
+                    PaneInputWriteFailure::other(RmuxError::Server(format!(
+                        "pane console text task failed: {error}"
+                    )))
+                })?
+                .map_err(|error| {
+                    PaneInputWriteFailure::from_console(
+                        &error,
+                        &session_name,
+                        window_index,
+                        pane_index,
+                    )
+                })
+        }
         PaneInputSink::Pty(master) => match write_pane_bytes(master, bytes).await {
             Ok(()) => Ok(()),
-            Err(error) if is_dead_pane_write_error(&error) => {
-                Err(RmuxError::Server("target pane has exited".to_owned()))
-            }
-            Err(error) => Err(RmuxError::Server(format!(
-                "failed to write to pane {}:{}.{}: {}",
-                session_name, window_index, pane_index, error
-            ))),
+            Err(error) => Err(PaneInputWriteFailure::from_pty(
+                error,
+                &session_name,
+                window_index,
+                pane_index,
+            )),
         },
         #[cfg(test)]
         PaneInputSink::CapturedForTest => Ok(()),
@@ -817,14 +958,106 @@ pub(in crate::handler) async fn write_attached_bytes_to_target_io(
     write: PaneInputWrite,
     bytes: Vec<u8>,
 ) -> Result<(), RmuxError> {
-    match write_bytes_to_target_io(write, bytes).await {
-        Err(error) if is_dead_pane_input_error(&error) => Ok(()),
-        result => result,
+    match write_bytes_to_target_io_classified(write, bytes).await {
+        Ok(()) => Ok(()),
+        Err(failure) => failure.into_attached_result(),
     }
 }
 
-fn is_dead_pane_input_error(error: &RmuxError) -> bool {
-    matches!(error, RmuxError::Server(message) if message == "target pane has exited")
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PaneInputFailureKind {
+    PaneGone,
+    #[cfg(any(windows, test))]
+    Congested,
+    Other,
+}
+
+#[derive(Debug)]
+struct PaneInputWriteFailure {
+    kind: PaneInputFailureKind,
+    error: RmuxError,
+}
+
+impl PaneInputWriteFailure {
+    fn from_pty(
+        error: io::Error,
+        session_name: &SessionName,
+        window_index: u32,
+        pane_index: u32,
+    ) -> Self {
+        if is_dead_pane_write_error(&error) {
+            return Self::pane_gone();
+        }
+        #[cfg(windows)]
+        if error.kind() == io::ErrorKind::TimedOut {
+            return Self::congested(RmuxError::Server(format!(
+                "failed to write to pane {session_name}:{window_index}.{pane_index}: {error}"
+            )));
+        }
+        Self::other(RmuxError::Server(format!(
+            "failed to write to pane {session_name}:{window_index}.{pane_index}: {error}"
+        )))
+    }
+
+    #[cfg(any(windows, test))]
+    fn from_console(
+        error: &io::Error,
+        session_name: &SessionName,
+        window_index: u32,
+        pane_index: u32,
+    ) -> Self {
+        if is_dead_pane_console_input_error(error) {
+            return Self::pane_gone();
+        }
+        let congested = error.kind() == io::ErrorKind::TimedOut;
+        let error = RmuxError::Server(format!(
+            "failed to write console input to pane \
+             {session_name}:{window_index}.{pane_index}: {error}"
+        ));
+        if congested {
+            return Self::congested(error);
+        }
+        Self::other(error)
+    }
+
+    fn pane_gone() -> Self {
+        Self {
+            kind: PaneInputFailureKind::PaneGone,
+            error: RmuxError::Server(DEAD_PANE_INPUT_ERROR.to_owned()),
+        }
+    }
+
+    #[cfg(any(windows, test))]
+    fn congested(error: RmuxError) -> Self {
+        Self {
+            kind: PaneInputFailureKind::Congested,
+            error,
+        }
+    }
+
+    fn other(error: RmuxError) -> Self {
+        Self {
+            kind: PaneInputFailureKind::Other,
+            error,
+        }
+    }
+
+    fn into_error(self) -> RmuxError {
+        self.error
+    }
+
+    /// Attached input is best-effort once it leaves the state lock: a pane may
+    /// exit or stop draining between target resolution and the write. Drop only
+    /// that input in those two typed cases; command paths still receive
+    /// [`Self::into_error`], and every other failure still closes the attach.
+    fn into_attached_result(self) -> Result<(), RmuxError> {
+        match self.kind {
+            PaneInputFailureKind::PaneGone => Ok(()),
+            #[cfg(any(windows, test))]
+            PaneInputFailureKind::Congested => Ok(()),
+            PaneInputFailureKind::Other => Err(self.error),
+        }
+    }
 }
 
 pub(in crate::handler) fn is_dead_pane_write_error(error: &io::Error) -> bool {
@@ -844,11 +1077,53 @@ fn is_unix_pty_eio(_error: &io::Error) -> bool {
     false
 }
 
+/// Whether a Windows console injection failed because the pane's console is
+/// gone.
+///
+/// `AttachConsole` reports `ERROR_INVALID_HANDLE` for a process that has no
+/// console and `ERROR_INVALID_PARAMETER` for a process that no longer exists,
+/// and a console torn down between the attach and the injection surfaces as
+/// `ERROR_FILE_NOT_FOUND` when opening `CONIN$`. Those are the ConPTY
+/// equivalents of the broken pipe the PTY byte path already classifies as a
+/// dead pane, so they must reach callers as the same dead-pane error.
+#[cfg(any(windows, test))]
+fn is_dead_pane_console_input_error(error: &io::Error) -> bool {
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    const ERROR_INVALID_HANDLE: i32 = 6;
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+
+    is_dead_pane_write_error(error)
+        || matches!(
+            error.raw_os_error(),
+            Some(ERROR_FILE_NOT_FOUND | ERROR_INVALID_HANDLE | ERROR_INVALID_PARAMETER)
+        )
+}
+
+#[cfg(any(windows, test))]
+fn pane_console_input_failure(
+    error: &io::Error,
+    session_name: &SessionName,
+    window_index: u32,
+    pane_index: u32,
+) -> PaneInputWriteFailure {
+    PaneInputWriteFailure::from_console(error, session_name, window_index, pane_index)
+}
+
 #[cfg(windows)]
 pub(super) async fn write_windows_console_input_action_to_target_io(
     write: PaneConsoleInputWrite,
     action: WindowsConsoleInputAction,
 ) -> Result<(), RmuxError> {
+    write_windows_console_input_action_to_target_io_classified(write, action)
+        .await
+        .map_err(PaneInputWriteFailure::into_error)
+}
+
+#[cfg(windows)]
+async fn write_windows_console_input_action_to_target_io_classified(
+    write: PaneConsoleInputWrite,
+    action: WindowsConsoleInputAction,
+) -> Result<(), PaneInputWriteFailure> {
     let PaneConsoleInputWrite {
         session_name,
         window_index,
@@ -874,9 +1149,10 @@ pub(super) async fn write_windows_console_input_action_to_target_io(
                     })
                 }
                 WindowsConsoleInputAction::KeyThenInterrupt(key) => {
-                    crate::windows_console_input::write_with_transient_retry(|| {
-                        rmux_pty::write_windows_console_key_then_interrupt_if_processed(pid, key)
-                    })
+                    crate::windows_console_input::write_console_key_then_processed_interrupt(
+                        || rmux_pty::write_windows_console_key_reporting_processed_input(pid, key),
+                        || rmux_pty::send_windows_console_interrupt(pid),
+                    )
                 }
                 WindowsConsoleInputAction::Interrupt => {
                     crate::windows_console_input::write_with_transient_retry(|| {
@@ -885,12 +1161,13 @@ pub(super) async fn write_windows_console_input_action_to_target_io(
                 }
             })
             .await
-            .map_err(|error| RmuxError::Server(format!("pane console input task failed: {error}")))?
             .map_err(|error| {
-                RmuxError::Server(format!(
-                    "failed to write console input to pane {}:{}.{}: {}",
-                    session_name, window_index, pane_index, error
-                ))
+                PaneInputWriteFailure::other(RmuxError::Server(format!(
+                    "pane console input task failed: {error}"
+                )))
+            })?
+            .map_err(|error| {
+                PaneInputWriteFailure::from_console(&error, &session_name, window_index, pane_index)
             })
         }
         #[cfg(test)]
@@ -898,13 +1175,16 @@ pub(super) async fn write_windows_console_input_action_to_target_io(
     }
 }
 
+/// Console-key counterpart of [`write_attached_bytes_to_target_io`].
 #[cfg(windows)]
-pub(super) async fn write_windows_console_key_to_target_io(
+pub(super) async fn write_attached_windows_console_input_action_to_target_io(
     write: PaneConsoleInputWrite,
-    key: WindowsConsoleKeyEvent,
+    action: WindowsConsoleInputAction,
 ) -> Result<(), RmuxError> {
-    write_windows_console_input_action_to_target_io(write, WindowsConsoleInputAction::Key(key))
-        .await
+    match write_windows_console_input_action_to_target_io_classified(write, action).await {
+        Ok(()) => Ok(()),
+        Err(failure) => failure.into_attached_result(),
+    }
 }
 
 #[cfg(windows)]
@@ -974,7 +1254,18 @@ async fn write_pane_bytes(master: PtyMaster, bytes: Vec<u8>) -> std::io::Result<
 #[cfg(any(unix, windows))]
 async fn write_pane_bytes_blocking(master: PtyMaster, bytes: Vec<u8>) -> std::io::Result<()> {
     tokio::task::spawn_blocking(move || {
-        master.write_all_with_timeout(&bytes, PANE_INPUT_WRITE_TIMEOUT)
+        #[cfg(unix)]
+        {
+            master.write_all_with_timeout(&bytes, PANE_INPUT_WRITE_TIMEOUT)
+        }
+        #[cfg(windows)]
+        {
+            master.write_all_with_stall_recovery(
+                &bytes,
+                PANE_INPUT_WRITE_TIMEOUT,
+                PANE_INPUT_WRITE_RECOVERY_GRACE,
+            )
+        }
     })
     .await
     .map_err(|error| std::io::Error::other(format!("pane write task failed: {error}")))?
@@ -1113,6 +1404,119 @@ pub(super) fn expand_send_key_tokens(
 }
 
 #[cfg(test)]
+mod dead_pane_input_tests {
+    use super::*;
+
+    /// `AttachConsole`/`CONIN$` codes for a pane process that is gone.
+    const GONE_PANE_CONSOLE_ERRORS: [i32; 3] = [2, 6, 87];
+    /// `ERROR_GEN_FAILURE`: transient console churn, not a dead pane.
+    const EXHAUSTED_TRANSIENT_CONSOLE_ERROR: i32 = 31;
+
+    fn console_failure(raw_os_error: i32) -> PaneInputWriteFailure {
+        pane_console_input_failure(
+            &io::Error::from_raw_os_error(raw_os_error),
+            &SessionName::new("console-input").expect("valid session"),
+            0,
+            0,
+        )
+    }
+
+    #[test]
+    fn attached_input_survives_a_console_write_to_a_pane_that_exited() {
+        for raw_os_error in GONE_PANE_CONSOLE_ERRORS {
+            let failure = console_failure(raw_os_error);
+            assert!(
+                failure.into_attached_result().is_ok(),
+                "a console key written to a pane that exited must not end the \
+                 attach connection (os error {raw_os_error})"
+            );
+        }
+    }
+
+    #[test]
+    fn console_writes_report_the_same_dead_pane_error_as_pane_bytes() {
+        for raw_os_error in GONE_PANE_CONSOLE_ERRORS {
+            let failure = console_failure(raw_os_error);
+            assert_eq!(
+                failure.kind,
+                PaneInputFailureKind::PaneGone,
+                "os error {raw_os_error} must retain a typed dead-pane classification"
+            );
+            assert_eq!(
+                failure.into_error(),
+                RmuxError::Server(DEAD_PANE_INPUT_ERROR.to_owned()),
+                "os error {raw_os_error} must reach send-keys as the canonical dead-pane error"
+            );
+        }
+    }
+
+    #[test]
+    fn other_console_write_failures_stay_reportable() {
+        let failure = console_failure(EXHAUSTED_TRANSIENT_CONSOLE_ERROR);
+
+        assert!(
+            failure
+                .error
+                .to_string()
+                .contains("failed to write console input to pane console-input:0.0"),
+            "unexpected error: {}",
+            failure.error
+        );
+        assert_eq!(failure.kind, PaneInputFailureKind::Other);
+        assert!(failure.into_attached_result().is_err());
+    }
+
+    #[test]
+    fn attached_input_drops_conpty_congestion_without_hiding_command_failure() {
+        let session = SessionName::new("console-input").expect("valid session");
+        let attached_failure = PaneInputWriteFailure::from_console(
+            &io::Error::new(io::ErrorKind::TimedOut, "transient ConPTY congestion"),
+            &session,
+            0,
+            0,
+        );
+        assert_eq!(
+            attached_failure.kind,
+            PaneInputFailureKind::Congested,
+            "timeout must remain distinct from a dead pane"
+        );
+        assert!(
+            attached_failure.into_attached_result().is_ok(),
+            "a congested pane drops only the current attached input"
+        );
+
+        let command_failure = PaneInputWriteFailure::from_console(
+            &io::Error::new(io::ErrorKind::TimedOut, "transient ConPTY congestion"),
+            &session,
+            0,
+            0,
+        );
+        assert!(
+            command_failure
+                .into_error()
+                .to_string()
+                .contains("transient ConPTY congestion"),
+            "command paths must still report the timeout"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn attached_pty_timeout_uses_the_same_typed_congestion_policy() {
+        let session = SessionName::new("conpty-input").expect("valid session");
+        let failure = PaneInputWriteFailure::from_pty(
+            io::Error::new(io::ErrorKind::TimedOut, "ConPTY input stalled"),
+            &session,
+            0,
+            0,
+        );
+
+        assert_eq!(failure.kind, PaneInputFailureKind::Congested);
+        assert!(failure.into_attached_result().is_ok());
+    }
+}
+
+#[cfg(test)]
 mod mouse_geometry_tests {
     use rmux_core::PaneGeometry;
     use rmux_proto::{OptionName, ScopeSelector, SetOptionMode, TerminalSize, WindowTarget};
@@ -1127,6 +1531,14 @@ mod mouse_geometry_tests {
             .sessions
             .create_session(session_name.clone(), TerminalSize { cols: 20, rows: 8 })
             .expect("session creation");
+        state
+            .sessions
+            .session_mut(&session_name)
+            .expect("created session")
+            .resize_active_window_geometry(
+                TerminalSize { cols: 20, rows: 8 },
+                TerminalSize { cols: 20, rows: 7 },
+            );
         let window = WindowTarget::with_window(session_name.clone(), 0);
         for (option, value) in [
             (OptionName::PaneScrollbars, "on"),
@@ -1172,7 +1584,7 @@ mod tests {
 
 #[cfg(all(test, windows))]
 mod windows_tests {
-    use crate::pane_terminals::DeferredInitialPaneConsoleInputAction;
+    use crate::pane_terminals::{DeferredInitialPaneConsoleInputAction, PasteDelimiters};
     use rmux_proto::ProcessCommand;
     use rmux_pty::WindowsConsoleKeyEvent;
 
@@ -1256,6 +1668,63 @@ mod windows_tests {
         assert_eq!(
             super::windows_ctrl_d_console_key(true),
             WindowsConsoleKeyEvent::ctrl_d()
+        );
+    }
+
+    #[test]
+    fn legacy_conpty_routes_valid_utf8_and_rejects_unrepresentable_paste() {
+        let bracketed = b"\x1b[200~alpha\r\nbeta\x1b[201~";
+
+        assert_eq!(
+            super::windows_paste_sink(false, bracketed, PasteDelimiters::Wrapped),
+            super::WindowsPasteSink::ConsoleUtf8
+        );
+        assert_eq!(
+            super::windows_paste_sink(true, bracketed, PasteDelimiters::Wrapped),
+            super::WindowsPasteSink::Pty,
+            "passthrough ConPTY must retain the byte-oriented path"
+        );
+        assert_eq!(
+            super::windows_paste_sink(
+                false,
+                b"\x1b[200~invalid \xff\x1b[201~",
+                PasteDelimiters::Wrapped
+            ),
+            super::WindowsPasteSink::RejectNonUtf8,
+            "legacy ConPTY must not silently strip the paste delimiters"
+        );
+    }
+
+    /// A legacy ConPTY's input state machine parses and consumes the control
+    /// sequences inside a pasted body, so a destination that never announced
+    /// `?2004h` loses `ESC[9;2u` exactly as an aware one loses its delimiters.
+    /// Selecting the sink from the destination's mode is what left the bare
+    /// body on the raw pipe.
+    #[test]
+    fn a_bare_paste_body_takes_the_same_console_sink_as_a_wrapped_one() {
+        let body = "alpha\r\n\u{1b}[9;2u \u{1b}[<64;2;2M omega".as_bytes();
+
+        assert_eq!(
+            super::windows_paste_sink(false, body, PasteDelimiters::Bare),
+            super::WindowsPasteSink::ConsoleUtf8,
+            "a bare body must not be left on the sequence-consuming raw pipe"
+        );
+        assert_eq!(
+            super::windows_paste_sink(true, body, PasteDelimiters::Bare),
+            super::WindowsPasteSink::Pty,
+            "a passthrough ConPTY already carries the body verbatim"
+        );
+    }
+
+    /// The asymmetry the disposition exists for: refusing a paste protects an
+    /// envelope this host cannot otherwise keep, and a bare body has none. It
+    /// must therefore keep the path that has always carried it rather than
+    /// become an error.
+    #[test]
+    fn a_bare_paste_body_that_is_not_utf8_keeps_the_byte_oriented_path() {
+        assert_eq!(
+            super::windows_paste_sink(false, b"invalid \xff bytes", PasteDelimiters::Bare),
+            super::WindowsPasteSink::Pty
         );
     }
 

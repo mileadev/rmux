@@ -49,6 +49,17 @@ fn capture_pane_request(
     }
 }
 
+fn capture_stdout(response: Response) -> Vec<u8> {
+    let Response::CapturePane(response) = response else {
+        panic!("expected capture-pane response, got {response:?}");
+    };
+    response
+        .command_output()
+        .expect("capture-pane -p returns command output")
+        .stdout()
+        .to_vec()
+}
+
 fn set_buffer_request(name: &str, content: &[u8]) -> SetBufferRequest {
     SetBufferRequest {
         name: Some(name.to_owned()),
@@ -149,6 +160,114 @@ async fn target_action_capture_resolves_raw_target_server_side() {
         .command_output()
         .expect("capture-pane -p returns command output");
     assert_eq!(output.stdout(), b"target-capture\n");
+}
+
+#[tokio::test]
+async fn direct_and_target_action_capture_join_stop_at_active_alternate_boundary() {
+    let handler = RequestHandler::new();
+    create_session_with_size(&handler, "alpha", TerminalSize { cols: 8, rows: 2 }).await;
+    let target = PaneTarget::with_window(session_name("alpha"), 0, 0);
+    replace_transcript_contents(
+        &handler,
+        &target,
+        TerminalSize { cols: 8, rows: 2 },
+        b"abcdefghijkl\r\n\x1b[?1049h\x1b[HVIM",
+    )
+    .await;
+
+    let mut direct = capture_pane_request(target, None, None, true, None);
+    direct.join_wrapped = true;
+    direct.start_is_absolute = true;
+    let direct = handler.handle(Request::CapturePane(Box::new(direct))).await;
+    assert_eq!(capture_stdout(direct), b"abcdefgh\nVIM\n\n");
+
+    let target_action = handler
+        .handle(Request::CapturePaneTargetAction(Box::new(
+            CapturePaneTargetActionRequest {
+                target: Some("alpha:0.0".to_owned()),
+                start: None,
+                end: None,
+                print: true,
+                buffer_name: None,
+                alternate: false,
+                escape_ansi: false,
+                escape_sequences: false,
+                include_format: false,
+                hyperlinks: false,
+                line_numbers: false,
+                join_wrapped: true,
+                use_mode_screen: false,
+                preserve_trailing_spaces: false,
+                do_not_trim_spaces: false,
+                pending_input: false,
+                quiet: false,
+                start_is_absolute: true,
+                end_is_absolute: false,
+            },
+        )))
+        .await;
+    assert_eq!(capture_stdout(target_action), b"abcdefgh\nVIM\n\n");
+
+    let queued = handler
+        .parse_control_commands("capture-pane -pJ -S - -t alpha:0.0")
+        .await
+        .expect("queued capture-pane parses");
+    let queued = handler
+        .execute_parsed_commands_for_test(std::process::id(), queued)
+        .await
+        .expect("queued capture-pane executes");
+    assert_eq!(queued.stdout(), b"abcdefgh\nVIM\n\n");
+}
+
+#[tokio::test]
+async fn named_capture_buffer_keeps_dch_field_boundary_like_tmux_3_7b() {
+    let handler = RequestHandler::new();
+    let size = TerminalSize { cols: 12, rows: 8 };
+    create_session_with_size(&handler, "mutations", size).await;
+    let target = PaneTarget::with_window(session_name("mutations"), 0, 0);
+    replace_transcript_contents(
+        &handler,
+        &target,
+        size,
+        b"ABCDEFGHIJKLmnopqrstuvwx012345678\r\nNXT\r\nEND\
+          \x1b[r\x1b[2;1H\x1b[99P",
+    )
+    .await;
+
+    let mut capture = capture_pane_request(target, None, None, false, Some("mutation-consumer"));
+    capture.join_wrapped = true;
+    let response = handler
+        .handle(Request::CapturePane(Box::new(capture)))
+        .await;
+    let Response::CapturePane(response) = response else {
+        panic!("expected capture-pane buffer response, got {response:?}");
+    };
+    assert_eq!(response.buffer_name.as_deref(), Some("mutation-consumer"));
+
+    let shown = handler
+        .handle(Request::ShowBuffer(ShowBufferRequest {
+            name: Some("mutation-consumer".to_owned()),
+        }))
+        .await;
+    let bytes = shown
+        .command_output()
+        .expect("show-buffer returns captured bytes")
+        .stdout()
+        .to_vec();
+    let nonempty = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        nonempty,
+        [
+            b"ABCDEFGHIJKL".as_slice(),
+            b"012345678".as_slice(),
+            b"NXT".as_slice(),
+            b"END".as_slice(),
+        ]
+    );
 }
 
 async fn replace_transcript_contents(

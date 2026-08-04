@@ -31,6 +31,7 @@ pub(super) fn content_geometry(
         .unwrap_or_else(|| {
             PaneGeometry::new(0, 0, session.window().size().cols, status.content_rows())
         });
+    let pane = crate::pane_visible_geometry::clip_pane_geometry(pane, status.content_rows());
     Ok(PaneGeometry::new(
         pane.x(),
         pane.y().saturating_add(status.content_y_offset()),

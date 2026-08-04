@@ -52,6 +52,12 @@ pub(crate) struct QueuedLifecycleEvent {
     publication_discarded: bool,
 }
 
+impl QueuedLifecycleEvent {
+    pub(in crate::handler) fn suppress_control_effects(&mut self) {
+        self.control_effects_dispatched = true;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StableLifecycleTargetIdentity {
     Session {
@@ -728,14 +734,14 @@ impl RequestHandler {
 
     pub(crate) async fn emit_client_attached_identity(
         &self,
-        requester_pid: u32,
+        client_name: String,
         session_name: rmux_proto::SessionName,
         session_id: SessionId,
     ) {
         self.emit_for_session_identity(
             LifecycleEvent::ClientAttached {
                 session_name: session_name.clone(),
-                client_name: Some(requester_pid.to_string()),
+                client_name: Some(client_name),
             },
             &session_name,
             session_id,
@@ -743,21 +749,32 @@ impl RequestHandler {
         .await;
     }
 
+    /// Reports that the client named `client_name` moved to another session,
+    /// then publishes the window geometry that move applied.
+    ///
+    /// tmux 3.7b, measured 2026-07-25 on both halves of `switch-client` with
+    /// `window-size largest`: a control client watching the session a PTY client
+    /// left receives `%client-session-changed` and then the source
+    /// `%layout-change`, and a control client already on the destination
+    /// receives `%client-session-changed` and then the destination
+    /// `%layout-change @1 aefe,101x41,0,0,1 ...`. Draining the geometry queue
+    /// here is what keeps every arm of every switch in that order.
     pub(in crate::handler) async fn emit_client_session_changed(
         &self,
-        requester_pid: u32,
+        client_name: String,
         session_name: rmux_proto::SessionName,
         session_id: SessionId,
     ) {
         self.emit_for_session_identity(
             LifecycleEvent::ClientSessionChanged {
                 session_name: session_name.clone(),
-                client_name: Some(requester_pid.to_string()),
+                client_name: Some(client_name),
             },
             &session_name,
             session_id,
         )
         .await;
+        self.publish_applied_window_resizes().await;
     }
 
     pub(in crate::handler) async fn emit_for_session_identity(
@@ -1352,6 +1369,9 @@ pub(in crate::handler) fn prepare_lifecycle_event(
     state: &mut crate::pane_terminals::HandlerState,
     event: &LifecycleEvent,
 ) -> QueuedLifecycleEvent {
+    if let LifecycleEvent::WindowLayoutChanged { target } = event {
+        state.claim_applied_resize_layout_change(target);
+    }
     let event = prepare_unsequenced_lifecycle_event(state, event);
     sequence_prepared_lifecycle_event(state, event)
 }

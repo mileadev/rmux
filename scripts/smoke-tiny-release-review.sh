@@ -501,7 +501,8 @@ EOF
     die "empty attach left a usable daemon"
   fi
 
-  "$RMUX" -L "$preexisting_empty" start-server >/dev/null
+  "$RMUX" -L "$preexisting_empty" \
+    start-server ';' set-option -g exit-empty off >/dev/null
   "$RMUX" -L "$preexisting_empty" set-buffer -b tiny-empty-sentinel alive >/dev/null
   run_capture preexisting_empty_attach -L "$preexisting_empty" attach-session
   [ "$(cat "$SMOKE_ROOT/preexisting_empty_attach.rc")" != "0" ] ||

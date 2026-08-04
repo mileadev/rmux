@@ -65,24 +65,43 @@ async fn parsed_queue_display_message_rejects_multiple_message_arguments() {
 }
 
 #[tokio::test]
-async fn parsed_queue_display_message_rejects_inert_delay_and_no_format_flags() {
+async fn parsed_queue_display_message_accepts_delay_and_ignore_input_flags() {
     let handler = RequestHandler::new();
 
-    for (command, flag) in [
-        ("display-message -d0 -p hello", "-d"),
-        ("display-message -pN hello", "-N"),
+    for command in [
+        "display-message -d0 -p hello",
+        "display-message -pN hello",
+        "display-message -pd1 hello",
     ] {
         let parsed = CommandParser::new()
             .parse(command)
             .expect("generic command parser preserves display-message flags");
+        let output = handler
+            .execute_parsed_commands_for_test(std::process::id(), parsed)
+            .await
+            .expect("tmux display-message timing flags execute");
+        assert_eq!(output.stdout(), b"hello\n");
+    }
+}
+
+#[tokio::test]
+async fn parsed_queue_display_message_reports_tmux_delay_errors() {
+    let handler = RequestHandler::new();
+
+    for (value, expected) in [
+        ("-1", "delay too small"),
+        ("4294967296", "delay too large"),
+        ("1 ", "delay invalid"),
+        ("1.0", "delay invalid"),
+    ] {
+        let parsed = CommandParser::new()
+            .parse(&format!("display-message -d '{value}' -p hello"))
+            .expect("generic command parser preserves display-message delay");
         let error = handler
             .execute_parsed_commands_for_test(std::process::id(), parsed)
             .await
-            .expect_err("unimplemented display-message flag must be rejected");
-        assert_eq!(
-            error,
-            rmux_proto::RmuxError::Server(format!("command display-message: unknown flag {flag}"))
-        );
+            .expect_err("invalid display-message delay must fail");
+        assert_eq!(error, rmux_proto::RmuxError::Message(expected.to_owned()));
     }
 }
 
@@ -141,6 +160,71 @@ async fn parsed_queue_display_message_print_ignores_missing_target_client() {
         .expect("print with missing target-client still succeeds");
 
     assert_eq!(output.stdout(), b"hello\n");
+}
+
+#[tokio::test]
+async fn parsed_queue_display_message_targets_control_client_with_initiator_context() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("display-control-alpha");
+    let detached = session_name("display-control-detached");
+    for session_name in [alpha.clone(), detached.clone()] {
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name,
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+    }
+    let requester_pid = 99_613;
+    let (control_id, mut events) =
+        register_control_for_session(&handler, requester_pid, alpha.clone()).await;
+    while events.try_recv().is_ok() {}
+    let identity = ControlClientIdentity::new(requester_pid, control_id);
+    let client_name = format!("client-{requester_pid}");
+    let template = "#{session_name}|#{client_session}|#{client_name}";
+
+    let parsed = CommandParser::new()
+        .parse(&format!(
+            "display-message -p -c {requester_pid} -t {detached} '{template}'"
+        ))
+        .expect("queued control display-message parses");
+    let output = with_control_queue_identity(
+        identity,
+        handler.execute_parsed_commands_for_test(requester_pid, parsed),
+    )
+    .await
+    .expect("queued control display-message prints");
+    assert_eq!(
+        output.stdout(),
+        format!("{detached}|{alpha}|{client_name}\n").as_bytes()
+    );
+
+    let parsed = CommandParser::new()
+        .parse(&format!(
+            "display-message -c {requester_pid} -t {detached} '{template}'"
+        ))
+        .expect("queued control overlay parses");
+    with_control_queue_identity(
+        identity,
+        handler.execute_parsed_commands_for_test(requester_pid, parsed),
+    )
+    .await
+    .expect("queued control overlay executes");
+    let notification = std::iter::from_fn(|| events.try_recv().ok())
+        .find_map(|event| match event {
+            ControlServerEvent::Notification(line) => Some(line),
+            _ => None,
+        })
+        .expect("target control client receives a message notification");
+    assert_eq!(
+        notification,
+        format!("%message {detached}|{alpha}|{client_name}")
+    );
 }
 
 #[tokio::test]

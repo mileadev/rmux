@@ -376,7 +376,7 @@ async fn parsed_queue_resize_window_balanced_flags_use_attached_client_sizes() {
             .by_pid
             .get_mut(&pid)
             .expect("registered attach exists")
-            .client_size = size;
+            .set_declared_client_size(size);
     }
 
     let grow = CommandParser::new()
@@ -393,11 +393,15 @@ async fn parsed_queue_resize_window_balanced_flags_use_attached_client_sizes() {
             .session(&alpha)
             .and_then(|session| session.window_at(0))
             .expect("window exists after -A");
+        // Outer terminals of 160x40 and 72x18 with `status` defaulting to `on`
+        // give content candidates of 160x39 and 72x17, and each dimension keeps
+        // its own extreme. tmux 3.7b measured with real PTY clients of both
+        // sizes: `-A` lands on 160x39 and `-a` on 72x17.
         assert_eq!(
             window.size(),
             TerminalSize {
                 cols: 160,
-                rows: 40
+                rows: 39
             }
         );
     }
@@ -416,7 +420,7 @@ async fn parsed_queue_resize_window_balanced_flags_use_attached_client_sizes() {
         .session(&alpha)
         .and_then(|session| session.window_at(0))
         .expect("window exists after -a");
-    assert_eq!(window.size(), TerminalSize { cols: 72, rows: 18 });
+    assert_eq!(window.size(), TerminalSize { cols: 72, rows: 17 });
 }
 
 #[tokio::test]

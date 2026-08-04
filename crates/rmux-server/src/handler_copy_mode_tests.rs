@@ -893,6 +893,63 @@ async fn copy_pipe_without_command_uses_copy_command_option() {
 }
 
 #[tokio::test]
+async fn copy_pipe_hands_the_copy_command_non_ascii_selections_byte_exactly() {
+    // Issue #177. RMUX must write the selection to the copy-command child as
+    // raw UTF-8, byte for byte, exactly like tmux — it is the command, not
+    // RMUX, that owns its input encoding. Every glyph in the needle below is
+    // multi-byte in UTF-8 (box drawing, a Latin-1 accent, CJK), so any
+    // code-page transcode on this path changes the bytes that reach the child.
+    const NEEDLE: &str = "needle ╭─│╯ café 日本";
+
+    let handler = RequestHandler::new();
+    let size = TerminalSize { cols: 60, rows: 4 };
+    let target = create_session(&handler, "copy-command-utf8", size).await;
+    let output_path = unique_copy_pipe_output_path("utf8");
+    set_copy_command(&handler, stdin_to_file_command(&output_path)).await;
+
+    replace_transcript_contents(
+        &handler,
+        &target,
+        size,
+        format!("alpha\r\n{NEEDLE}\r\nomega\r\n").as_bytes(),
+    )
+    .await;
+    wait_for_capture(&handler, &target, NEEDLE, false).await;
+
+    assert!(matches!(
+        enter_copy_mode(&handler, &target, false).await,
+        Response::CopyMode(_)
+    ));
+    assert!(matches!(
+        send_copy_mode_command(&handler, &target, &["search-backward", "--", "needle"]).await,
+        Response::SendKeys(_)
+    ));
+    assert!(matches!(
+        send_copy_mode_command(&handler, &target, &["select-line"]).await,
+        Response::SendKeys(_)
+    ));
+    assert!(matches!(
+        send_copy_mode_command(&handler, &target, &["copy-pipe-and-cancel"]).await,
+        Response::SendKeys(_)
+    ));
+
+    wait_for_file_contents(&output_path, NEEDLE).await;
+    let piped = fs::read(&output_path).expect("copy-pipe output is readable");
+    let _ = fs::remove_file(&output_path);
+
+    assert!(
+        piped
+            .windows(NEEDLE.len())
+            .any(|window| window == NEEDLE.as_bytes()),
+        "copy-pipe delivered {piped:?}, which does not contain the selection's UTF-8 bytes"
+    );
+    assert!(
+        String::from_utf8(piped).is_ok(),
+        "copy-pipe delivered bytes that are not valid UTF-8"
+    );
+}
+
+#[tokio::test]
 async fn copy_pipe_explicit_command_overrides_copy_command_option() {
     let handler = RequestHandler::new();
     let target = create_session(

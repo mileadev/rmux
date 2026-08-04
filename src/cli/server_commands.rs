@@ -1,6 +1,10 @@
 use std::path::Path;
 
-use rmux_client::{connect, ClientError, Connection, StartServerError};
+#[cfg(not(windows))]
+use rmux_client::connect;
+use rmux_client::ClientError;
+#[cfg(windows)]
+use rmux_client::{connect_for_server_shutdown, Connection};
 use rmux_client::{connect_or_absent, ConnectResult};
 use rmux_proto::RmuxError;
 #[cfg(windows)]
@@ -8,8 +12,8 @@ use rmux_proto::CAPABILITY_DAEMON_STATUS;
 use rmux_proto::{ListSessionsRequest, RMUX_WIRE_VERSION};
 
 use super::{
-    expect_command_output, resolve_session_target_or_current, run_command, run_command_resolved,
-    run_payload_command, ExitFailure, StartupOptions,
+    connect_with_startserver, expect_command_output, resolve_session_target_or_current,
+    run_command, run_command_resolved, run_payload_command, ExitFailure, StartupOptions,
 };
 #[cfg(not(windows))]
 use super::{expect_command_success, write_command_output};
@@ -19,15 +23,7 @@ pub(super) fn run_start_server(
     socket_path: &Path,
     startup: StartupOptions,
 ) -> Result<i32, ExitFailure> {
-    let mut connection = Connection::start_server(
-        socket_path,
-        startup.no_start_server,
-        startup.config,
-    )
-    .map_err(|error| match error {
-        StartServerError::Client(error) => ExitFailure::from_client_connect(socket_path, error),
-        StartServerError::AutoStart(error) => ExitFailure::from_auto_start(error),
-    })?;
+    let mut connection = connect_with_startserver(socket_path, startup)?;
     let response = connection
         .list_sessions(ListSessionsRequest {
             format: None,
@@ -42,18 +38,18 @@ pub(super) fn run_start_server(
 
 #[cfg(windows)]
 pub(super) fn run_kill_server(socket_path: &Path) -> Result<i32, ExitFailure> {
-    let mut connection = connect(socket_path)
+    let (mut connection, selected_socket_path) = connect_for_server_shutdown(socket_path)
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
     match probe_kill_server_compatible(&mut connection) {
         Ok(()) => {}
         Err(error) if kill_server_connection_closed(&error) => {
             drop(connection);
-            wait_for_killed_server_socket_cleanup(socket_path)?;
+            wait_for_killed_server_socket_cleanup(&selected_socket_path)?;
             return Ok(0);
         }
         Err(error) => {
             if let Some(wire_version) = legacy_shutdown_fallback_wire_version(&error) {
-                return run_legacy_wire_kill_server(socket_path, wire_version);
+                return run_legacy_wire_kill_server(&selected_socket_path, wire_version);
             }
             return Err(ExitFailure::from_client(error));
         }
@@ -62,11 +58,11 @@ pub(super) fn run_kill_server(socket_path: &Path) -> Result<i32, ExitFailure> {
     drop(connection);
     match shutdown {
         Ok(()) => {
-            wait_for_killed_server_socket_cleanup(socket_path)?;
+            wait_for_killed_server_socket_cleanup(&selected_socket_path)?;
             Ok(0)
         }
         Err(error) if kill_server_connection_closed(&error) => {
-            wait_for_killed_server_socket_cleanup(socket_path)?;
+            wait_for_killed_server_socket_cleanup(&selected_socket_path)?;
             Ok(0)
         }
         Err(error) => Err(ExitFailure::from_client(error)),

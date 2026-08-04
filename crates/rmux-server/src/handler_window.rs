@@ -2,17 +2,21 @@ use std::collections::{HashMap, HashSet};
 
 use rmux_core::{LifecycleEvent, PaneId};
 use rmux_proto::{
-    ErrorResponse, HookName, MoveWindowRequest, MoveWindowResponse, PaneTarget, Response,
-    RmuxError, ScopeSelector, SessionName, Target, WindowTarget,
+    ErrorResponse, HookName, KillSessionRequest, MoveWindowRequest, MoveWindowResponse, PaneTarget,
+    Response, RmuxError, ScopeSelector, SessionName, Target, UnlinkWindowRequest,
+    UnlinkWindowResponse, WindowTarget,
 };
 
 #[cfg(windows)]
 use super::pane_support::format_references_pane_pid;
 use super::{
-    attach_support::{surviving_attached_resize_targets, SessionDetachOnDestroy},
+    attach_support::{
+        linked_window_client_content_size, surviving_attached_resize_targets,
+        AttachedWindowSizePolicy, SessionDetachOnDestroy,
+    },
     client_environment_snapshot, client_spawn_environment,
     scripting_support::render_start_directory_template,
-    PaneOutputSubscriptionKeySnapshot, RequestHandler,
+    PaneOutputSubscriptionKeySnapshot, RequestHandler, SelectionTransitionSnapshot,
 };
 use crate::hook_runtime::{lifecycle_hooks_disabled, PendingInlineHookFormat};
 use crate::pane_terminals::{
@@ -104,6 +108,31 @@ fn changed_active_window_ids(
     changed
 }
 
+fn swap_selection_session_order(
+    state: &HandlerState,
+    request: &rmux_proto::SwapWindowRequest,
+) -> Vec<SessionName> {
+    let mut seen_session_ids = HashSet::new();
+    let mut ordered_sessions = Vec::new();
+    for target in [&request.target, &request.source] {
+        for session_name in
+            state.window_linked_session_family_list(target.session_name(), target.window_index())
+        {
+            let Some(session_id) = state
+                .sessions
+                .session(&session_name)
+                .map(rmux_core::Session::id)
+            else {
+                continue;
+            };
+            if seen_session_ids.insert(session_id) {
+                ordered_sessions.push(session_name);
+            }
+        }
+    }
+    ordered_sessions
+}
+
 impl RequestHandler {
     #[cfg(test)]
     pub(in crate::handler) fn install_kill_window_commit_pause(
@@ -174,7 +203,7 @@ impl RequestHandler {
         if wait_for_deferred_pane_pid {
             self.wait_for_windows_deferred_all_pane_pids().await;
         }
-        let (response, linked_event) = {
+        let (response, lifecycle_events) = {
             let mut state = self.state.lock().await;
             if let Err(error) = super::require_expected_session_identity(&state, &session_name) {
                 return Response::Error(ErrorResponse { error });
@@ -211,6 +240,7 @@ impl RequestHandler {
                     pane_exit_callback: Some(self.pane_exit_callback()),
                 },
             };
+            let selection_before = SelectionTransitionSnapshot::capture(&state);
             let result = match request.target_window_index {
                 Some(window_index) => state.create_window_at_requested_index(
                     &session_name,
@@ -240,16 +270,20 @@ impl RequestHandler {
                         &[],
                         timer_targets,
                     );
-                    let linked_event = super::prepare_lifecycle_event_if_enabled(
+                    let mut lifecycle_events = selection_before.prepare_session_window_changes(
+                        &mut state,
+                        std::slice::from_ref(&session_name),
+                    );
+                    lifecycle_events.extend(super::prepare_lifecycle_event_if_enabled(
                         &mut state,
                         &LifecycleEvent::WindowLinked {
                             session_name: session_name.clone(),
                             target: Some(response.target.clone()),
                         },
-                    );
-                    (Response::NewWindow(response), linked_event)
+                    ));
+                    (Response::NewWindow(response), lifecycle_events)
                 }
-                Err(error) => (Response::Error(ErrorResponse { error }), None),
+                Err(error) => (Response::Error(ErrorResponse { error }), Vec::new()),
             }
         };
 
@@ -274,9 +308,11 @@ impl RequestHandler {
                     ))),
                     PendingInlineHookFormat::AfterCommand,
                 );
-                if let Some(linked_event) = linked_event {
+                if !lifecycle_events.is_empty() {
                     self.pause_before_window_lifecycle_emit().await;
-                    self.emit_prepared(linked_event).await;
+                    for event in lifecycle_events {
+                        self.emit_prepared(event).await;
+                    }
                 }
             }
             self.refresh_attached_session(&session_name).await;
@@ -320,6 +356,7 @@ impl RequestHandler {
                 &affected_session_candidates,
             );
             let active_window_ids_before = active_window_ids_by_session(&state);
+            let selection_before = SelectionTransitionSnapshot::capture(&state);
             let grouped_peer_sessions = state
                 .sessions
                 .session_group_members(&session_name)
@@ -373,10 +410,17 @@ impl RequestHandler {
                                     left.target.window_index().cmp(&right.target.window_index())
                                 })
                         });
+                        let mut selection_notified = HashSet::new();
                         for removed_window in ordered_windows {
                             let removed_session = removed_window.target.session_name();
                             let destroyed_session_id =
                                 destroyed_session_ids.get(removed_session).copied();
+                            if selection_notified.insert(removed_session.clone()) {
+                                events.extend(
+                                    selection_before
+                                        .prepare_session_window_change(&mut state, removed_session),
+                                );
+                            }
                             if grouped_peer_sessions.contains(removed_session) {
                                 if let Some(session_id) = destroyed_session_id {
                                     events.push(super::prepare_lifecycle_event(
@@ -869,7 +913,7 @@ impl RequestHandler {
             removed_destination_pane_ids,
             mut refresh_sessions,
             resize_window_ids,
-            linked_event,
+            lifecycle_events,
             subscriptions_removed,
         ) = {
             let mut state = self.state.lock().await;
@@ -884,6 +928,7 @@ impl RequestHandler {
                 ],
             );
             let active_window_ids_before = active_window_ids_by_session(&state);
+            let selection_before = SelectionTransitionSnapshot::capture(&state);
             let mut resize_window_ids = [
                 state
                     .sessions
@@ -943,13 +988,19 @@ impl RequestHandler {
                         reindexed_windows,
                         deadline_fanout,
                     );
-                    let linked_event = super::prepare_lifecycle_event_if_enabled(
+                    let mut lifecycle_events = super::prepare_lifecycle_event_if_enabled(
                         &mut state,
                         &LifecycleEvent::WindowLinked {
                             session_name: result.response.target.session_name().clone(),
                             target: Some(result.response.target.clone()),
                         },
-                    );
+                    )
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                    lifecycle_events.extend(selection_before.prepare_session_window_changes(
+                        &mut state,
+                        std::slice::from_ref(result.response.target.session_name()),
+                    ));
                     let subscriptions_removed = self.apply_pane_output_subscription_reconciliation(
                         subscription_keys.reconcile_after(&state),
                     );
@@ -958,7 +1009,7 @@ impl RequestHandler {
                         result.removed_pane_ids,
                         refresh_sessions,
                         resize_window_ids,
-                        linked_event,
+                        lifecycle_events,
                         subscriptions_removed,
                     )
                 }
@@ -967,7 +1018,7 @@ impl RequestHandler {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
-                    None,
+                    Vec::new(),
                     false,
                 ),
             }
@@ -979,9 +1030,11 @@ impl RequestHandler {
 
         if matches!(response, Response::LinkWindow(_)) {
             self.forget_pane_snapshot_coalescers(&removed_destination_pane_ids);
-            if let Some(linked_event) = linked_event {
+            if !lifecycle_events.is_empty() {
                 self.pause_before_window_lifecycle_emit().await;
-                self.emit_prepared(linked_event).await;
+                for event in lifecycle_events {
+                    self.emit_prepared(event).await;
+                }
             }
             let resize_targets = {
                 let state = self.state.lock().await;
@@ -1097,18 +1150,18 @@ impl RequestHandler {
         Response::MoveWindow(committed.response)
     }
 
-    pub(super) async fn handle_unlink_window(
-        &self,
-        request: rmux_proto::UnlinkWindowRequest,
-    ) -> Response {
+    pub(super) async fn handle_unlink_window(&self, request: UnlinkWindowRequest) -> Response {
         let session_name = request.target.session_name().clone();
         self.pause_before_window_lifecycle_mutation().await;
+        if let Some(response) = self.destroy_session_for_only_linked_window(&request).await {
+            return response;
+        }
         let (
             response,
             removed_pane_ids,
             refresh_sessions,
             resize_targets,
-            lifecycle_event,
+            lifecycle_events,
             subscriptions_removed,
         ) = {
             let mut state = self.state.lock().await;
@@ -1137,6 +1190,7 @@ impl RequestHandler {
                 .collect();
             let timer_mutation =
                 self.plan_window_mutation_silence_timers_locked(&state, timer_sessions);
+            let selection_before = SelectionTransitionSnapshot::capture(&state);
             match state.unlink_window(request.target, request.kill_if_last) {
                 Ok(result) => {
                     state.retire_removed_lifecycle_targets();
@@ -1161,10 +1215,14 @@ impl RequestHandler {
                         &result.reindexed_windows,
                         Vec::new(),
                     );
-                    let lifecycle_event = if lifecycle_hooks_disabled() {
-                        None
+                    let lifecycle_events = if lifecycle_hooks_disabled() {
+                        Vec::new()
                     } else {
-                        Some(super::prepare_lifecycle_event(
+                        let mut events = selection_before.prepare_session_window_changes(
+                            &mut state,
+                            std::slice::from_ref(&session_name),
+                        );
+                        events.push(super::prepare_lifecycle_event(
                             &mut state,
                             &LifecycleEvent::WindowUnlinked {
                                 session_name: session_name.clone(),
@@ -1172,7 +1230,8 @@ impl RequestHandler {
                                 window_id: Some(result.removed_window.window_id),
                                 window_name: Some(result.removed_window.window_name.clone()),
                             },
-                        ))
+                        ));
+                        events
                     };
                     let subscriptions_removed = self.apply_pane_output_subscription_reconciliation(
                         subscription_keys.reconcile_after(&state),
@@ -1182,7 +1241,7 @@ impl RequestHandler {
                         result.removed_pane_ids,
                         refresh_sessions,
                         resize_targets,
-                        lifecycle_event,
+                        lifecycle_events,
                         subscriptions_removed,
                     )
                 }
@@ -1191,7 +1250,7 @@ impl RequestHandler {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
-                    None,
+                    Vec::new(),
                     false,
                 ),
             }
@@ -1204,7 +1263,7 @@ impl RequestHandler {
         if matches!(response, Response::UnlinkWindow(_)) {
             self.pause_before_window_lifecycle_emit().await;
             self.forget_pane_snapshot_coalescers(&removed_pane_ids);
-            if let Some(lifecycle_event) = lifecycle_event {
+            for lifecycle_event in lifecycle_events {
                 self.emit_prepared(lifecycle_event).await;
             }
             for resize_target in resize_targets {
@@ -1223,14 +1282,60 @@ impl RequestHandler {
         response
     }
 
+    async fn destroy_session_for_only_linked_window(
+        &self,
+        request: &UnlinkWindowRequest,
+    ) -> Option<Response> {
+        let (session_id, window_id) = {
+            let state = self.state.lock().await;
+            if let Err(error) = super::require_expected_window_identity(&state, &request.target) {
+                return Some(Response::Error(ErrorResponse { error }));
+            }
+            let session = state.sessions.session(request.target.session_name())?;
+            let link_count = state
+                .window_link_count(request.target.session_name(), request.target.window_index());
+            if session.windows().len() != 1 || (link_count <= 1 && !request.kill_if_last) {
+                return None;
+            }
+            let window = session.window_at(request.target.window_index())?;
+            (session.id(), window.id())
+        };
+        let target = request.target.clone();
+        let response = self
+            .handle_kill_session_if_only_linked_window_identity(
+                KillSessionRequest {
+                    target: target.session_name().clone(),
+                    kill_all_except_target: false,
+                    clear_alerts: false,
+                    kill_group: false,
+                },
+                session_id,
+                window_id,
+                request.kill_if_last,
+            )
+            .await?;
+        Some(match response {
+            Response::KillSession(_) => Response::UnlinkWindow(UnlinkWindowResponse { target }),
+            other => other,
+        })
+    }
+
     pub(super) async fn handle_swap_window(
         &self,
         request: rmux_proto::SwapWindowRequest,
     ) -> Response {
-        let (response, mut refresh_sessions, resize_window_ids) = {
+        let (response, mut refresh_sessions, resize_window_ids, lifecycle_events) = {
             let mut state = self.state.lock().await;
             if let Err(error) = require_expected_swap_window_identity(&state, &request) {
                 return Response::Error(ErrorResponse { error });
+            }
+            if request.source.session_name() == request.target.session_name()
+                && request.source.window_index() == request.target.window_index()
+            {
+                return Response::SwapWindow(rmux_proto::SwapWindowResponse {
+                    source: request.source,
+                    target: request.target,
+                });
             }
             let subscription_keys = PaneOutputSubscriptionKeySnapshot::capture_related(
                 &state,
@@ -1239,6 +1344,8 @@ impl RequestHandler {
                     request.target.session_name().clone(),
                 ],
             );
+            let selection_before = SelectionTransitionSnapshot::capture(&state);
+            let preferred_selection_sessions = swap_selection_session_order(&state, &request);
             let active_window_ids_before = active_window_ids_by_session(&state);
             let mut resize_window_ids = [&request.source, &request.target]
                 .into_iter()
@@ -1295,14 +1402,18 @@ impl RequestHandler {
                     resize_window_ids.sort_by_key(|window_id| window_id.as_u32());
                     resize_window_ids.dedup();
                     self.rekey_pane_output_subscriptions(&subscription_keys.rekeys_after(&state));
+                    let lifecycle_events = selection_before
+                        .prepare_session_window_changes(&mut state, &preferred_selection_sessions);
                     (
                         Response::SwapWindow(response),
                         refresh_sessions,
                         resize_window_ids,
+                        lifecycle_events,
                     )
                 }
                 Err(error) => (
                     Response::Error(ErrorResponse { error }),
+                    Vec::new(),
                     Vec::new(),
                     Vec::new(),
                 ),
@@ -1310,6 +1421,12 @@ impl RequestHandler {
         };
 
         if matches!(response, Response::SwapWindow(_)) {
+            if !lifecycle_events.is_empty() {
+                self.pause_before_window_lifecycle_emit().await;
+                for event in lifecycle_events {
+                    self.emit_prepared(event).await;
+                }
+            }
             let resize_targets = {
                 let state = self.state.lock().await;
                 let resize_targets = surviving_attached_resize_targets(&state, resize_window_ids);
@@ -1400,11 +1517,10 @@ impl RequestHandler {
                 Some(Target::Window(target.clone())),
                 PendingInlineHookFormat::AfterCommand,
             );
-            self.emit(LifecycleEvent::WindowLayoutChanged {
-                target: target.clone(),
-            })
-            .await;
-            self.emit(LifecycleEvent::WindowResized { target }).await;
+            // tmux 3.7b's `cmd_resize_window_exec` calls `resize_window()`
+            // unconditionally, so `resize-window` publishes even when the
+            // requested size equals the current one.
+            self.emit_applied_window_resize(target).await;
             for refresh_session in refresh_sessions {
                 self.refresh_attached_session(&refresh_session).await;
             }
@@ -1502,19 +1618,28 @@ impl RequestHandler {
         response
     }
 
+    /// Turns `resize-window -A` / `-a` into the explicit content geometry the
+    /// eligible clients of every linked session imply.
+    ///
+    /// `-A` is `window-size largest` applied once and `-a` is
+    /// `window-size smallest` applied once, so both go through the same
+    /// selector as the automatic policies: an `ignore-size`, read-only,
+    /// suspended or closing client owns nothing, and the winning client's outer
+    /// terminal rows lose the status rows exactly once before they land in the
+    /// window's *content* geometry.
     async fn resolve_resize_window_linked_session_size(
         &self,
         mut request: rmux_proto::ResizeWindowRequest,
     ) -> Result<rmux_proto::ResizeWindowRequest, rmux_proto::RmuxError> {
         use rmux_proto::ResizeWindowAdjustment::{LargestLinkedSession, SmallestLinkedSession};
 
-        let largest = match request.adjustment {
-            Some(LargestLinkedSession) => true,
-            Some(SmallestLinkedSession) => false,
+        let policy = match request.adjustment {
+            Some(LargestLinkedSession) => AttachedWindowSizePolicy::Largest,
+            Some(SmallestLinkedSession) => AttachedWindowSizePolicy::Smallest,
             _ => return Ok(request),
         };
 
-        let (linked_sessions, fallback_size) = {
+        let selected = {
             let state = self.state.lock().await;
             let session = state
                 .sessions
@@ -1530,43 +1655,15 @@ impl RequestHandler {
                         "window index does not exist in session",
                     )
                 })?;
-            (
-                state.window_linked_sessions_list(
-                    request.target.session_name(),
-                    request.target.window_index(),
-                ),
-                session.terminal_size(),
-            )
-        };
-        let linked_sessions = linked_sessions.into_iter().collect::<HashSet<_>>();
-        let selected = {
+            let fallback_size = session.terminal_size();
             let active_attach = self.active_attach.lock().await;
-            let sizes = active_attach
-                .by_pid
-                .values()
-                .filter(|active| {
-                    !active.suspended && linked_sessions.contains(&active.session_name)
-                })
-                .map(|active| active.client_size);
-            if largest {
-                sizes.max_by_key(resize_window_size_rank)
-            } else {
-                sizes.min_by_key(resize_window_size_rank)
-            }
-        }
-        .unwrap_or(fallback_size);
+            linked_window_client_content_size(&state, &active_attach, &request.target, policy)
+                .unwrap_or(fallback_size)
+        };
 
         request.width = Some(selected.cols);
         request.height = Some(selected.rows);
         request.adjustment = None;
         Ok(request)
     }
-}
-
-fn resize_window_size_rank(size: &rmux_proto::TerminalSize) -> (u32, u16, u16) {
-    (
-        u32::from(size.cols) * u32::from(size.rows),
-        size.cols,
-        size.rows,
-    )
 }

@@ -39,6 +39,9 @@ mod session_leases;
 #[path = "handler_tests/clients.rs"]
 mod clients;
 
+#[path = "handler_tests/list_clients_session_id.rs"]
+mod list_clients_session_id;
+
 #[path = "handler_tests/panes.rs"]
 mod panes;
 

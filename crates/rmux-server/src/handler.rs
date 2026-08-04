@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex as StdMutex;
 use std::sync::{Arc, Weak};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmux_core::events::{PaneSnapshotCoalescerRegistry, SubscriptionLimits};
 use rmux_ipc::PeerIdentity;
@@ -63,6 +64,8 @@ mod overlay_support;
 mod pane_output_subscription_rekeys;
 #[path = "handler_pane_state.rs"]
 mod pane_state_support;
+#[path = "handler_pane_stream.rs"]
+mod pane_stream_support;
 #[path = "handler_pane.rs"]
 mod pane_support;
 #[path = "handler/post_commit_sequencer.rs"]
@@ -90,6 +93,8 @@ mod web_request_identity;
 pub(crate) use shutdown_support::{DetachedRequestGuard, NormalRequestGuard};
 #[path = "handler/sdk_wait_quota.rs"]
 mod sdk_wait_quota;
+#[path = "handler/selection_transitions.rs"]
+mod selection_transitions;
 #[path = "handler_subscriptions.rs"]
 mod subscription_support;
 #[path = "handler_switch_target.rs"]
@@ -135,9 +140,12 @@ use attach_support::{ActiveAttachState, ClientFlags};
 pub(in crate::handler) use client_environment_support::{
     client_spawn_environment, initial_session_spawn_environment,
 };
+#[cfg(test)]
+pub(in crate::handler) use client_runtime_support::attached_client_name;
+pub(crate) use client_runtime_support::with_authenticated_connection_peer;
 pub(in crate::handler) use client_runtime_support::{
-    attached_client_matches_target, attached_client_name, client_environment_snapshot,
-    command_output_from_lines, effective_client_terminal_context, format_client_uid,
+    attached_client_matches_target, client_environment_snapshot, command_output_from_lines,
+    control_client_target_pid, effective_client_terminal_context, format_client_uid,
     format_client_user, format_requester_uid, normalize_target_client, parse_client_flags,
     parse_session_sort_order, session_selection_prefers_live_process, sort_list_clients,
     switch_target_selector_count, update_environment_from_client, ListClientSnapshot,
@@ -156,7 +164,8 @@ use control_support::ActiveControlState;
 #[cfg(all(test, unix))]
 pub(crate) use control_support::ControlRegistrationError;
 pub(crate) use control_support::{
-    with_control_queue_eof_cancellation, with_control_queue_identity, ControlClientIdentity,
+    with_control_command_response_sink, with_control_queue_eof_cancellation,
+    with_control_queue_identity, ControlClientIdentity, ControlCommandResponseSink,
     ControlQueueDrainLease, ControlQueueEofCancellation, ControlRegistration,
 };
 use exited_output_support::RetainedExitedPaneOutputs;
@@ -167,6 +176,9 @@ pub(in crate::handler) use hook_identity_support::{
 use lifecycle_dispatch_queue::LifecycleDispatchOutbox;
 #[cfg(test)]
 pub(in crate::handler) use lifecycle_support::after_hook_format_values;
+#[cfg(test)]
+pub(crate) const TEST_CONTROL_QUEUE_INSERTED_COMMAND_LIMIT: usize =
+    scripting_support::CONTROL_QUEUE_INSERTED_COMMAND_LIMIT;
 pub(in crate::handler) use lifecycle_support::UnsequencedLifecycleEvent;
 pub(in crate::handler) use lifecycle_support::{
     defer_lifecycle_event, prepare_deferred_lifecycle_event, prepare_lifecycle_event,
@@ -182,6 +194,9 @@ pub(in crate::handler) use pane_output_subscription_rekeys::{
     PaneOutputSubscriptionKeySnapshot, PaneOutputSubscriptionReconciliation,
 };
 use pane_support::PaneSnapshotRevisionRegistry;
+pub(in crate::handler) use selection_transitions::{
+    SelectionTargetTransitionSnapshot, SelectionTransitionSnapshot,
+};
 use session_lease_support::SessionLeaseStore;
 pub(crate) use session_lease_support::{
     with_session_lease_create_addressing, SessionLeaseCreateAddressing,
@@ -256,28 +271,85 @@ impl RequesterOrigin {
     }
 }
 
+/// One in-flight detached scope for a requester.
+///
+/// `peer` is present only when the connection loop opened this scope directly
+/// from an accepted stream, so it is the local peer the OS authenticated for
+/// that connection rather than anything derived from the pid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::handler) struct DetachedRequesterScope {
+    authority: DetachedRequesterAuthority,
+    peer: Option<PeerIdentity>,
+}
+
+impl DetachedRequesterScope {
+    #[must_use]
+    pub(in crate::handler) const fn new(
+        authority: DetachedRequesterAuthority,
+        peer: Option<PeerIdentity>,
+    ) -> Self {
+        Self { authority, peer }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(in crate::handler) struct DetachedRequesterAccess {
-    scopes: Vec<DetachedRequesterAuthority>,
+    scopes: Vec<DetachedRequesterScope>,
 }
 
 impl DetachedRequesterAccess {
     /// Identical nested scopes are one authority. Any identity, epoch,
     /// mode, or denied-scope disagreement is ambiguous and fails closed.
     pub(in crate::handler) fn unambiguous_admission(&self) -> Option<&ServerAccessAdmission> {
-        let first = self.scopes.first()?;
+        let first = &self.scopes.first()?.authority;
         let DetachedRequesterAuthority::Admission(admission) = first else {
             return None;
         };
         self.scopes
             .iter()
-            .all(|candidate| candidate == first)
+            .all(|candidate| &candidate.authority == first)
             .then_some(admission)
+    }
+
+    /// The local peer every scope this requester currently holds was
+    /// authenticated as.
+    ///
+    /// Concurrent scopes disagreeing on the peer, or holding none, can only
+    /// mean two different local processes reached the same pid key, so this
+    /// fails closed rather than lending one process the other's identity.
+    pub(in crate::handler) fn unambiguous_peer(&self) -> Option<&PeerIdentity> {
+        let first = self.scopes.first()?.peer.as_ref()?;
+        self.scopes
+            .iter()
+            .all(|candidate| candidate.peer.as_ref() == Some(first))
+            .then_some(first)
+    }
+
+    /// Whether two scopes on this pid were authenticated as different local
+    /// peers.
+    ///
+    /// [`Self::unambiguous_peer`] cannot say why it found nothing, and the two
+    /// reasons are not interchangeable: a pid holding no authenticated peer at
+    /// all is an in-process dispatch, while a pid holding two is a reused pid
+    /// whose requests must not borrow either peer's identity (issue #182).
+    pub(in crate::handler) fn has_conflicting_peers(&self) -> bool {
+        let mut peers = self.scopes.iter().filter_map(|scope| scope.peer.as_ref());
+        let Some(first) = peers.next() else {
+            return false;
+        };
+        peers.any(|candidate| candidate != first)
     }
 
     pub(in crate::handler) fn is_empty(&self) -> bool {
         self.scopes.is_empty()
     }
+}
+
+pub(in crate::handler) fn current_client_activity_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 #[derive(Debug)]
@@ -287,6 +359,8 @@ pub(crate) struct RequestHandler {
     clipboard_queries: Arc<StdMutex<ClipboardQueryState>>,
     active_attach_epoch: Arc<AtomicU64>,
     active_attach_forwarders: Arc<AtomicUsize>,
+    client_activity_sequence: Arc<AtomicU64>,
+    client_size_sequence: Arc<AtomicU64>,
     active_control: Arc<Mutex<ActiveControlState>>,
     silence_timers: Arc<StdMutex<HashMap<WindowTarget, alert_support::SilenceTimerState>>>,
     pane_alert_coalescer: Arc<StdMutex<alert_support::PaneAlertCoalescer>>,
@@ -304,7 +378,7 @@ pub(crate) struct RequestHandler {
     unix_socket_access: Arc<StdMutex<Option<UnixSocketAccessController>>>,
     shutdown_requested: Arc<AtomicBool>,
     shutdown_reason: Arc<StdMutex<Option<PendingShutdownReason>>>,
-    shutdown_retry_scheduled: Arc<AtomicBool>,
+    shutdown_retry_state: Arc<StdMutex<shutdown_support::ShutdownRetryState>>,
     active_detached_connections: Arc<StdMutex<HashSet<u64>>>,
     active_detached_requester_access: Arc<StdMutex<HashMap<u32, DetachedRequesterAccess>>>,
     active_detached_requests: Arc<AtomicUsize>,
@@ -353,6 +427,12 @@ pub(crate) struct RequestHandler {
     #[cfg(test)]
     pane_exit_commit_pause: Arc<StdMutex<Option<Arc<PaneExitCommitPause>>>>,
     #[cfg(test)]
+    surface_admission_pause: Arc<StdMutex<Option<Arc<SurfaceAdmissionPause>>>>,
+    #[cfg(test)]
+    surface_admission_materializations: Arc<AtomicUsize>,
+    #[cfg(test)]
+    surface_poll_materializations: Arc<AtomicUsize>,
+    #[cfg(test)]
     alert_plan_effect_pause: Arc<StdMutex<Option<Arc<AlertPlanEffectPause>>>>,
     #[cfg(test)]
     pane_alert_apply_pause: Arc<StdMutex<Option<Arc<PaneAlertApplyPause>>>>,
@@ -360,6 +440,8 @@ pub(crate) struct RequestHandler {
     attached_size_selection_pause: Arc<StdMutex<Option<Arc<AttachedSizeSelectionPause>>>>,
     #[cfg(test)]
     attached_size_apply_pause: Arc<StdMutex<Option<Arc<AttachedSizeApplyPause>>>>,
+    #[cfg(test)]
+    attach_registration_activity_pause: Arc<StdMutex<Option<Arc<AttachRegistrationActivityPause>>>>,
 }
 
 pub(crate) struct ConfigLoadingGuard {
@@ -380,6 +462,8 @@ impl Clone for RequestHandler {
             clipboard_queries: self.clipboard_queries.clone(),
             active_attach_epoch: self.active_attach_epoch.clone(),
             active_attach_forwarders: self.active_attach_forwarders.clone(),
+            client_activity_sequence: self.client_activity_sequence.clone(),
+            client_size_sequence: self.client_size_sequence.clone(),
             active_control: self.active_control.clone(),
             silence_timers: self.silence_timers.clone(),
             pane_alert_coalescer: self.pane_alert_coalescer.clone(),
@@ -397,7 +481,7 @@ impl Clone for RequestHandler {
             unix_socket_access: self.unix_socket_access.clone(),
             shutdown_requested: self.shutdown_requested.clone(),
             shutdown_reason: self.shutdown_reason.clone(),
-            shutdown_retry_scheduled: self.shutdown_retry_scheduled.clone(),
+            shutdown_retry_state: self.shutdown_retry_state.clone(),
             active_detached_connections: self.active_detached_connections.clone(),
             active_detached_requester_access: self.active_detached_requester_access.clone(),
             active_detached_requests: self.active_detached_requests.clone(),
@@ -444,6 +528,12 @@ impl Clone for RequestHandler {
             #[cfg(test)]
             pane_exit_commit_pause: self.pane_exit_commit_pause.clone(),
             #[cfg(test)]
+            surface_admission_pause: self.surface_admission_pause.clone(),
+            #[cfg(test)]
+            surface_admission_materializations: self.surface_admission_materializations.clone(),
+            #[cfg(test)]
+            surface_poll_materializations: self.surface_poll_materializations.clone(),
+            #[cfg(test)]
             alert_plan_effect_pause: self.alert_plan_effect_pause.clone(),
             #[cfg(test)]
             pane_alert_apply_pause: self.pane_alert_apply_pause.clone(),
@@ -451,6 +541,8 @@ impl Clone for RequestHandler {
             attached_size_selection_pause: self.attached_size_selection_pause.clone(),
             #[cfg(test)]
             attached_size_apply_pause: self.attached_size_apply_pause.clone(),
+            #[cfg(test)]
+            attach_registration_activity_pause: self.attach_registration_activity_pause.clone(),
         }
     }
 }
@@ -462,6 +554,8 @@ pub(crate) struct WeakRequestHandler {
     clipboard_queries: Weak<StdMutex<ClipboardQueryState>>,
     active_attach_epoch: Weak<AtomicU64>,
     active_attach_forwarders: Weak<AtomicUsize>,
+    client_activity_sequence: Weak<AtomicU64>,
+    client_size_sequence: Weak<AtomicU64>,
     active_control: Weak<Mutex<ActiveControlState>>,
     silence_timers: Weak<StdMutex<HashMap<WindowTarget, alert_support::SilenceTimerState>>>,
     pane_alert_coalescer: Weak<StdMutex<alert_support::PaneAlertCoalescer>>,
@@ -479,7 +573,7 @@ pub(crate) struct WeakRequestHandler {
     unix_socket_access: Weak<StdMutex<Option<UnixSocketAccessController>>>,
     shutdown_requested: Weak<AtomicBool>,
     shutdown_reason: Weak<StdMutex<Option<PendingShutdownReason>>>,
-    shutdown_retry_scheduled: Weak<AtomicBool>,
+    shutdown_retry_state: Weak<StdMutex<shutdown_support::ShutdownRetryState>>,
     active_detached_connections: Weak<StdMutex<HashSet<u64>>>,
     active_detached_requester_access: Weak<StdMutex<HashMap<u32, DetachedRequesterAccess>>>,
     active_detached_requests: Weak<AtomicUsize>,
@@ -522,6 +616,8 @@ impl WeakRequestHandler {
             clipboard_queries: self.clipboard_queries.upgrade()?,
             active_attach_epoch: self.active_attach_epoch.upgrade()?,
             active_attach_forwarders: self.active_attach_forwarders.upgrade()?,
+            client_activity_sequence: self.client_activity_sequence.upgrade()?,
+            client_size_sequence: self.client_size_sequence.upgrade()?,
             active_control: self.active_control.upgrade()?,
             silence_timers: self.silence_timers.upgrade()?,
             pane_alert_coalescer: self.pane_alert_coalescer.upgrade()?,
@@ -539,7 +635,7 @@ impl WeakRequestHandler {
             unix_socket_access: self.unix_socket_access.upgrade()?,
             shutdown_requested: self.shutdown_requested.upgrade()?,
             shutdown_reason: self.shutdown_reason.upgrade()?,
-            shutdown_retry_scheduled: self.shutdown_retry_scheduled.upgrade()?,
+            shutdown_retry_state: self.shutdown_retry_state.upgrade()?,
             active_detached_connections: self.active_detached_connections.upgrade()?,
             active_detached_requester_access: self.active_detached_requester_access.upgrade()?,
             active_detached_requests: self.active_detached_requests.upgrade()?,
@@ -586,6 +682,12 @@ impl WeakRequestHandler {
             #[cfg(test)]
             pane_exit_commit_pause: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
+            surface_admission_pause: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            surface_admission_materializations: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            surface_poll_materializations: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
             alert_plan_effect_pause: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             pane_alert_apply_pause: Arc::new(StdMutex::new(None)),
@@ -593,6 +695,8 @@ impl WeakRequestHandler {
             attached_size_selection_pause: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             attached_size_apply_pause: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            attach_registration_activity_pause: Arc::new(StdMutex::new(None)),
         })
     }
 }
@@ -607,6 +711,13 @@ struct PasteBufferDeletePause {
 #[cfg(test)]
 #[derive(Debug, Default)]
 struct WindowLifecycleMutationPause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct AttachRegistrationActivityPause {
     reached: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -660,6 +771,13 @@ struct PaneOptionJournalPause {
 #[derive(Debug, Default)]
 struct PaneExitCommitPause {
     output_drain_started: tokio::sync::Notify,
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct SurfaceAdmissionPause {
     reached: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -806,6 +924,8 @@ impl RequestHandler {
             clipboard_queries: Arc::new(StdMutex::new(ClipboardQueryState::default())),
             active_attach_epoch: Arc::new(AtomicU64::new(0)),
             active_attach_forwarders: Arc::new(AtomicUsize::new(0)),
+            client_activity_sequence: Arc::new(AtomicU64::new(0)),
+            client_size_sequence: Arc::new(AtomicU64::new(0)),
             active_control: Arc::new(Mutex::new(ActiveControlState::default())),
             silence_timers: Arc::new(StdMutex::new(HashMap::new())),
             pane_alert_coalescer: Arc::new(StdMutex::new(
@@ -827,7 +947,9 @@ impl RequestHandler {
             unix_socket_access: Arc::new(StdMutex::new(None)),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             shutdown_reason: Arc::new(StdMutex::new(None)),
-            shutdown_retry_scheduled: Arc::new(AtomicBool::new(false)),
+            shutdown_retry_state: Arc::new(StdMutex::new(
+                shutdown_support::ShutdownRetryState::new(),
+            )),
             active_detached_connections: Arc::new(StdMutex::new(HashSet::new())),
             active_detached_requester_access: Arc::new(StdMutex::new(HashMap::new())),
             active_detached_requests: Arc::new(AtomicUsize::new(0)),
@@ -885,6 +1007,12 @@ impl RequestHandler {
             #[cfg(test)]
             pane_exit_commit_pause: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
+            surface_admission_pause: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            surface_admission_materializations: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            surface_poll_materializations: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
             alert_plan_effect_pause: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             pane_alert_apply_pause: Arc::new(StdMutex::new(None)),
@@ -892,6 +1020,8 @@ impl RequestHandler {
             attached_size_selection_pause: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             attached_size_apply_pause: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            attach_registration_activity_pause: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -902,6 +1032,8 @@ impl RequestHandler {
             clipboard_queries: Arc::downgrade(&self.clipboard_queries),
             active_attach_epoch: Arc::downgrade(&self.active_attach_epoch),
             active_attach_forwarders: Arc::downgrade(&self.active_attach_forwarders),
+            client_activity_sequence: Arc::downgrade(&self.client_activity_sequence),
+            client_size_sequence: Arc::downgrade(&self.client_size_sequence),
             active_control: Arc::downgrade(&self.active_control),
             silence_timers: Arc::downgrade(&self.silence_timers),
             pane_alert_coalescer: Arc::downgrade(&self.pane_alert_coalescer),
@@ -919,7 +1051,7 @@ impl RequestHandler {
             unix_socket_access: Arc::downgrade(&self.unix_socket_access),
             shutdown_requested: Arc::downgrade(&self.shutdown_requested),
             shutdown_reason: Arc::downgrade(&self.shutdown_reason),
-            shutdown_retry_scheduled: Arc::downgrade(&self.shutdown_retry_scheduled),
+            shutdown_retry_state: Arc::downgrade(&self.shutdown_retry_state),
             active_detached_connections: Arc::downgrade(&self.active_detached_connections),
             active_detached_requester_access: Arc::downgrade(
                 &self.active_detached_requester_access,
@@ -958,6 +1090,19 @@ impl RequestHandler {
 
     pub(crate) fn allocate_connection_id(&self) -> u64 {
         self.next_connection_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(in crate::handler) fn next_client_activity_sequence(&self) -> u64 {
+        self.client_activity_sequence
+            .fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(in crate::handler) fn next_client_size_sequence(&self) -> u64 {
+        self.client_size_sequence.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(in crate::handler) fn current_client_size_sequence(&self) -> u64 {
+        self.client_size_sequence.load(Ordering::Relaxed)
     }
 
     pub(in crate::handler) fn bump_active_attach_epoch(&self) {
@@ -1029,6 +1174,18 @@ impl RequestHandler {
             .lock()
             .ok()
             .and_then(|server_access| server_access.admission_for_identity(&peer.user))
+    }
+
+    pub(crate) fn server_access_admission_is_current(
+        &self,
+        peer: &PeerIdentity,
+        admission: &ServerAccessAdmission,
+    ) -> bool {
+        self.server_access
+            .lock()
+            .ok()
+            .and_then(|server_access| server_access.revalidate_admission(admission, &peer.user))
+            .is_some()
     }
 
     #[cfg(test)]
@@ -1234,6 +1391,32 @@ impl RequestHandler {
     async fn pause_before_attached_size_apply(&self) {}
 
     #[cfg(test)]
+    fn install_attach_registration_activity_pause(&self) -> Arc<AttachRegistrationActivityPause> {
+        let pause = Arc::new(AttachRegistrationActivityPause::default());
+        *self
+            .attach_registration_activity_pause
+            .lock()
+            .expect("attach registration activity pause") = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    async fn pause_before_attach_registration_activity(&self) {
+        let pause = self
+            .attach_registration_activity_pause
+            .lock()
+            .expect("attach registration activity pause")
+            .take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(not(test))]
+    async fn pause_before_attach_registration_activity(&self) {}
+
+    #[cfg(test)]
     fn install_silence_timer_apply_pause(&self) -> Arc<SilenceTimerApplyPause> {
         let pause = Arc::new(SilenceTimerApplyPause::default());
         *self
@@ -1405,6 +1588,10 @@ mod zoom_tests;
 mod layout_tests;
 
 #[cfg(test)]
+#[path = "handler_layout_notification_tests.rs"]
+mod layout_notification_tests;
+
+#[cfg(test)]
 #[path = "handler_show_tests.rs"]
 mod show_tests;
 
@@ -1429,6 +1616,10 @@ mod display_message_tests;
 mod alert_tests;
 
 #[cfg(test)]
+#[path = "handler_auto_rename_notification_tests.rs"]
+mod auto_rename_notification_tests;
+
+#[cfg(test)]
 #[path = "handler_winlink_insertion_tests.rs"]
 mod winlink_insertion_tests;
 
@@ -1446,6 +1637,22 @@ mod clock_mode_tests;
 #[cfg(test)]
 #[path = "handler_control_notification_tests.rs"]
 mod control_notification_tests;
+
+#[cfg(test)]
+#[path = "handler_selection_control_notification_tests.rs"]
+mod selection_control_notification_tests;
+
+#[cfg(test)]
+#[path = "handler_explicit_kill_selection_tests.rs"]
+mod explicit_kill_selection_tests;
+
+#[cfg(test)]
+#[path = "handler_switch_selection_notification_tests.rs"]
+mod switch_selection_notification_tests;
+
+#[cfg(test)]
+#[path = "handler_natural_exit_selection_tests.rs"]
+mod natural_exit_selection_tests;
 
 #[cfg(test)]
 #[path = "handler_control_lifecycle_tests.rs"]
@@ -1487,6 +1694,9 @@ mod pane_group_transfer_tests;
 #[cfg(test)]
 #[path = "handler_pane_transfer_hook_tests.rs"]
 mod pane_transfer_hook_tests;
+#[cfg(test)]
+#[path = "handler_pane_transfer_renumber_tests.rs"]
+mod pane_transfer_renumber_tests;
 #[cfg(test)]
 #[path = "handler_pane_window_metadata_tests.rs"]
 mod pane_window_metadata_tests;

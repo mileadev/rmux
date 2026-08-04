@@ -143,7 +143,9 @@ pub(super) fn parse_queued_new_window(
                 select_existing = true;
             }
             token => {
-                let Some(cluster) = parse_compact_flag_cluster(token, "abdPkS", "ceFtn") else {
+                let Some(cluster) =
+                    parse_compact_flag_cluster("new-window", token, "abdPkS", "ceFtn")?
+                else {
                     break;
                 };
                 let _ = args.pop_front();
@@ -392,7 +394,8 @@ pub(super) fn parse_queued_if_shell(
                 )?;
             }
             token => {
-                let Some(cluster) = parse_compact_flag_cluster(token, "bF", "t") else {
+                let Some(cluster) = parse_compact_flag_cluster("if-shell", token, "bF", "t")?
+                else {
                     reject_unknown_option_before_positional("if-shell", token)?;
                     break;
                 };
@@ -498,7 +501,8 @@ pub(super) fn parse_queued_source_file(
                 target_missing_canfail = resolved.missing_canfail;
             }
             token if token.starts_with('-') => {
-                let Some(cluster) = parse_compact_flag_cluster(token, "Fnqv", "t") else {
+                let Some(cluster) = parse_compact_flag_cluster("source-file", token, "Fnqv", "t")?
+                else {
                     return Err(unsupported_flag("source-file", token));
                 };
                 let _ = args.pop_front();

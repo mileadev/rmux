@@ -6,14 +6,19 @@ use std::time::Duration;
 
 use rmux_core::LifecycleEvent;
 use rmux_os::identity::UserIdentity;
-use rmux_proto::SessionId;
+use rmux_proto::{SessionId, TerminalSize};
 use tokio::sync::{mpsc, watch};
 
 use super::{
-    client_support::SwitchTargetSelection, update_environment_from_client, QueuedLifecycleEvent,
-    RequestHandler,
+    attach_support::{switch_control_session_for_client, ControlResizeClient},
+    client_support::SwitchTargetSelection,
+    current_client_activity_timestamp, update_environment_from_client, QueuedLifecycleEvent,
+    RequestHandler, SelectionTargetTransitionSnapshot,
 };
-use crate::control::{ControlClientFlags, ControlModeUpgrade, ControlServerEvent};
+use crate::client_names::control_client_name;
+use crate::control::{
+    ControlClientFlags, ControlCommandResponseEvent, ControlModeUpgrade, ControlServerEvent,
+};
 use crate::control_notifications::{collect_control_notifications, ControlClientSnapshot};
 use crate::handler_support::{ambiguous_attached_client, attached_client_required};
 use crate::outer_terminal::OuterTerminalContext;
@@ -29,6 +34,8 @@ use crate::server_access::{
 mod session_attach;
 
 const CONTROL_QUEUE_DRAIN_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_CONTROL_CLIENT_WIDTH: u16 = 80;
+const DEFAULT_CONTROL_CLIENT_HEIGHT: u16 = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ControlRegistrationError {
@@ -58,6 +65,22 @@ pub(super) struct ActiveControlState {
 #[derive(Debug)]
 pub(super) struct ActiveControl {
     pub(super) id: u64,
+    pub(super) last_activity_sequence: u64,
+    pub(super) activity_at: i64,
+    pub(super) client_width: u16,
+    pub(super) client_height: u16,
+    /// Whether this client ever announced a size with `refresh-client -C`.
+    ///
+    /// A control client owns no window geometry until it has: tmux 3.7b's
+    /// `ignore_client_size()` skips a `CLIENT_CONTROL` client that has no
+    /// `CLIENT_SIZECHANGED`, so `client_width`/`client_height` stay at
+    /// `DEFAULT_CONTROL_CLIENT_WIDTH`/`DEFAULT_CONTROL_CLIENT_HEIGHT` — a
+    /// placeholder for reporting only — and never reach a policy. Measured
+    /// 2026-07-25 across `window-size` latest/largest/smallest/manual: a
+    /// control client attaching to a 200x50 session leaves it at 200x50 in
+    /// tmux, whether or not another client is attached.
+    pub(super) size_declared: bool,
+    pub(super) size_sequence: u64,
     pub(super) session_name: Option<rmux_proto::SessionName>,
     pub(super) session_id: Option<SessionId>,
     pub(super) last_session: Option<rmux_proto::SessionName>,
@@ -100,6 +123,13 @@ pub(crate) struct ControlClientIdentity {
     control_id: u64,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ControlCommandResponseSink {
+    identity: ControlClientIdentity,
+    sender: mpsc::Sender<ControlCommandResponseEvent>,
+    closing: Arc<AtomicBool>,
+}
+
 pub(super) struct ControlClientDetachOutcome {
     pub(in crate::handler) lifecycle_event: Option<QueuedLifecycleEvent>,
 }
@@ -114,10 +144,29 @@ enum ControlOutputStart {
     Oldest,
 }
 
+/// Whether the caller wants `client-session-changed` published at the commit
+/// point, before any window geometry the session change reconciles.
+///
+/// tmux 3.7b, measured 2026-07-25 with two control clients on one session
+/// (101x41 and 60x20, `window-size largest`): after the 101x41 client runs
+/// `switch-client -t target`, the surviving client receives
+///     %client-session-changed client-71338 $1 target
+///     %layout-change @0 a1dd,60x20,0,0,0 a1dd,60x20,0,0,0 *
+/// and the switching client receives `%session-changed $1 target` before its
+/// own `%layout-change @1 ...`. Both orders come from the same notification, so
+/// it has to be published before the reconciles.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ControlSessionChangedNotice {
+    Skip,
+    Publish,
+    PublishIfChanged,
+}
+
 struct ControlSessionUpdate<'a> {
     target_selection: Option<SwitchTargetSelection>,
     client_environment: Option<&'a HashMap<String, String>>,
     output_start: ControlOutputStart,
+    session_changed_notice: ControlSessionChangedNotice,
 }
 
 impl<'a> ControlSessionUpdate<'a> {
@@ -129,6 +178,24 @@ impl<'a> ControlSessionUpdate<'a> {
             target_selection,
             client_environment,
             output_start: ControlOutputStart::Current,
+            session_changed_notice: ControlSessionChangedNotice::Skip,
+        }
+    }
+
+    fn switched(
+        target_selection: Option<SwitchTargetSelection>,
+        client_environment: Option<&'a HashMap<String, String>>,
+    ) -> Self {
+        Self {
+            session_changed_notice: ControlSessionChangedNotice::Publish,
+            ..Self::existing(target_selection, client_environment)
+        }
+    }
+
+    fn attached_existing() -> Self {
+        Self {
+            session_changed_notice: ControlSessionChangedNotice::PublishIfChanged,
+            ..Self::existing(None, None)
         }
     }
 
@@ -137,6 +204,7 @@ impl<'a> ControlSessionUpdate<'a> {
             target_selection: None,
             client_environment: None,
             output_start: ControlOutputStart::Oldest,
+            session_changed_notice: ControlSessionChangedNotice::Skip,
         }
     }
 }
@@ -175,9 +243,36 @@ impl ControlClientIdentity {
     }
 }
 
+impl ControlCommandResponseSink {
+    pub(crate) fn new(
+        identity: ControlClientIdentity,
+        sender: mpsc::Sender<ControlCommandResponseEvent>,
+        closing: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            identity,
+            sender,
+            closing,
+        }
+    }
+
+    fn try_send(&self, event: ControlCommandResponseEvent) -> bool {
+        if self.closing.load(Ordering::SeqCst) {
+            return false;
+        }
+        if self.sender.try_send(event).is_ok() {
+            return true;
+        }
+        self.closing.store(true, Ordering::SeqCst);
+        false
+    }
+}
+
 tokio::task_local! {
     static CONTROL_QUEUE_IDENTITY: ControlClientIdentity;
     static CONTROL_QUEUE_EOF_CANCELLATION: ControlQueueEofCancellation;
+    static CONTROL_COMMAND_RESPONSE_SINK: ControlCommandResponseSink;
+    static CONTROL_COMMAND_RESPONSE_CAPTURE: ();
 }
 
 #[derive(Debug, Clone)]
@@ -252,6 +347,45 @@ where
     CONTROL_QUEUE_EOF_CANCELLATION
         .scope(cancellation, future)
         .await
+}
+
+pub(crate) async fn with_control_command_response_sink<T, F>(
+    sink: ControlCommandResponseSink,
+    future: F,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    CONTROL_COMMAND_RESPONSE_SINK.scope(sink, future).await
+}
+
+pub(in crate::handler) async fn with_control_command_response_capture<T, F>(future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    CONTROL_COMMAND_RESPONSE_CAPTURE.scope((), future).await
+}
+
+fn current_control_command_response_sink() -> Option<ControlCommandResponseSink> {
+    CONTROL_COMMAND_RESPONSE_CAPTURE.try_with(|()| ()).ok()?;
+    CONTROL_COMMAND_RESPONSE_SINK.try_with(Clone::clone).ok()
+}
+
+pub(crate) fn control_command_response_stream_is_active(identity: ControlClientIdentity) -> bool {
+    CONTROL_COMMAND_RESPONSE_SINK
+        .try_with(|sink| sink.identity == identity && !sink.closing.load(Ordering::SeqCst))
+        .unwrap_or(false)
+}
+
+pub(crate) fn send_control_command_response_event(
+    identity: ControlClientIdentity,
+    event: ControlCommandResponseEvent,
+) -> bool {
+    CONTROL_COMMAND_RESPONSE_SINK
+        .try_with(|sink| (sink.identity == identity).then(|| sink.try_send(event)))
+        .ok()
+        .flatten()
+        .unwrap_or(false)
 }
 
 pub(in crate::handler) fn current_control_queue_identity(
@@ -380,6 +514,7 @@ impl RequestHandler {
         }
         let drain_deadline = tokio::time::Instant::now() + drain_timeout;
         let (control_id, replaced_session, detached_event) = loop {
+            let activity_sequence = self.next_client_activity_sequence();
             // Session lifecycle events and the logical client replacement
             // share the established state -> active-control lock order. This
             // keeps the detach ticket at the exact replacement boundary.
@@ -430,6 +565,12 @@ impl RequestHandler {
                     requester_pid,
                     ActiveControl {
                         id: control_id,
+                        last_activity_sequence: activity_sequence,
+                        activity_at: current_client_activity_timestamp(),
+                        client_width: DEFAULT_CONTROL_CLIENT_WIDTH,
+                        client_height: DEFAULT_CONTROL_CLIENT_HEIGHT,
+                        size_declared: false,
+                        size_sequence: 0,
                         session_name: None,
                         session_id: None,
                         last_session: None,
@@ -457,7 +598,7 @@ impl RequestHandler {
                                         &mut state,
                                         &LifecycleEvent::ClientDetached {
                                             session_name: session_name.clone(),
-                                            client_name: Some(requester_pid.to_string()),
+                                            client_name: Some(control_client_name(requester_pid)),
                                         },
                                     );
                                     event.control_session_identity = Some(*session_id);
@@ -551,7 +692,7 @@ impl RequestHandler {
                                         &mut state,
                                         &LifecycleEvent::ClientDetached {
                                             session_name: session_name.clone(),
-                                            client_name: Some(requester_pid.to_string()),
+                                            client_name: Some(control_client_name(requester_pid)),
                                         },
                                     );
                                     event.control_session_identity = Some(*session_id);
@@ -567,6 +708,9 @@ impl RequestHandler {
             self.emit_prepared(event).await;
         }
         if let Some(session_identity) = removed_session {
+            let _ = self
+                .reconcile_attached_session_identity_size_and_emit(session_identity.1)
+                .await;
             self.destroy_unattached_sessions(vec![session_identity])
                 .await;
         }
@@ -993,7 +1137,11 @@ impl RequestHandler {
         .await
     }
 
-    pub(super) async fn set_control_session_for_client_identity(
+    /// `switch-client` for a control client: same commit as
+    /// the regular identity-checked control-session update, with the
+    /// `client-session-changed` notification published at the commit point so
+    /// it precedes the `%layout-change` lines the reconciles produce.
+    pub(super) async fn switch_control_session_for_client_identity(
         &self,
         requester_pid: u32,
         expected_control_id: u64,
@@ -1007,7 +1155,24 @@ impl RequestHandler {
             Some(next_session_name),
             Some(expected_session_id),
             Some(expected_control_id),
-            ControlSessionUpdate::existing(target_selection, client_environment),
+            ControlSessionUpdate::switched(target_selection, client_environment),
+        )
+        .await
+    }
+
+    pub(in crate::handler) async fn attach_existing_control_session_for_client_identity(
+        &self,
+        requester_pid: u32,
+        expected_control_id: u64,
+        next_session_name: rmux_proto::SessionName,
+        expected_session_id: SessionId,
+    ) -> Result<Option<rmux_proto::SessionName>, rmux_proto::RmuxError> {
+        self.set_control_session_with_expected_identity(
+            requester_pid,
+            Some(next_session_name),
+            Some(expected_session_id),
+            Some(expected_control_id),
+            ControlSessionUpdate::attached_existing(),
         )
         .await
     }
@@ -1083,6 +1248,7 @@ impl RequestHandler {
             .name()
             .clone();
         let pane_sequences = current_pane_output_sequences(&state, &target_session_name).ok()?;
+        let size_sequence = self.next_client_size_sequence();
         let mut active_control = self.active_control.lock().await;
         let active = active_control
             .by_pid
@@ -1101,6 +1267,7 @@ impl RequestHandler {
         if !delivered {
             return None;
         }
+        active.size_sequence = size_sequence;
         state
             .sessions
             .session_mut(&target_session_name)
@@ -1110,7 +1277,7 @@ impl RequestHandler {
             &mut state,
             &LifecycleEvent::ClientSessionChanged {
                 session_name: target_session_name.clone(),
-                client_name: Some(requester_pid.to_string()),
+                client_name: Some(control_client_name(requester_pid)),
             },
         );
         client_session_changed.control_session_identity = Some(target_session_id);
@@ -1132,6 +1299,7 @@ impl RequestHandler {
             target_selection,
             client_environment,
             output_start,
+            session_changed_notice,
         } = update;
         let exact_client_identity = expected_control_id.is_some();
         let command_name = if exact_client_identity {
@@ -1175,8 +1343,9 @@ impl RequestHandler {
                 .transpose()?,
             ControlOutputStart::Oldest => None,
         };
+        let active_attach = self.active_attach.lock().await;
         let mut active_control = self.active_control.lock().await;
-        let Some(active) = active_control.by_pid.get_mut(&requester_pid) else {
+        let Some(active) = active_control.by_pid.get(&requester_pid) else {
             return Err(attached_client_required(command_name));
         };
         if expected_control_id.is_some_and(|expected| active.id != expected)
@@ -1192,27 +1361,64 @@ impl RequestHandler {
                 .expect("a switch target selection carries a stable session identity");
             selection.validate_for_session_identity(&state, session_name, session_id)?;
         }
-        let (previous, delivered) = update_control_session(
-            active,
-            next_session_name.clone(),
-            next_session_id,
-            pane_sequences,
-        );
-        if !delivered {
-            return Err(attached_client_required(command_name));
-        }
+        let selection_transition = target_selection
+            .as_ref()
+            .map(|selection| {
+                SelectionTargetTransitionSnapshot::capture(&state, selection.window_target())
+            })
+            .transpose()?;
+        let control_size = active.size_declared.then_some(TerminalSize {
+            cols: active.client_width,
+            rows: active.client_height,
+        });
+        let session_changed =
+            active.session_name != next_session_name || active.session_id != next_session_id;
+        let previous_session_id = active.session_id;
+        let size_sequence = next_session_name
+            .as_ref()
+            .map(|_| self.next_client_size_sequence());
+        let prepared_update =
+            prepare_control_session_update(active, next_session_name.clone(), pane_sequences)
+                .ok_or_else(|| attached_client_required(command_name))?;
+        let refresh_sessions = if exact_client_identity {
+            let (session_name, session_id) = next_session_name
+                .as_ref()
+                .zip(next_session_id)
+                .expect("switch-client always carries a target session identity");
+            switch_control_session_for_client(
+                &mut state,
+                ControlResizeClient::new(
+                    &active_attach,
+                    &active_control,
+                    requester_pid,
+                    control_size,
+                    size_sequence.expect("switch-client carries a target session"),
+                ),
+                session_name,
+                session_id,
+                target_selection.as_ref(),
+            )?
+        } else {
+            Vec::new()
+        };
         if let (Some(session_name), Some(client_environment)) =
             (next_session_name.as_ref(), client_environment)
         {
             update_environment_from_client(&mut state, session_name, client_environment);
         }
-        let refresh_sessions = if let Some(selection) = target_selection.as_ref() {
-            selection
-                .apply_to_state(&mut state)
-                .expect("prevalidated switch selection remains applicable while locked")
-        } else {
-            Vec::new()
-        };
+        let active = active_control
+            .by_pid
+            .get_mut(&requester_pid)
+            .expect("validated control client remains locked");
+        let previous = commit_control_session_update(
+            active,
+            next_session_name.clone(),
+            next_session_id,
+            prepared_update,
+        );
+        if let Some(size_sequence) = size_sequence {
+            active.size_sequence = size_sequence;
+        }
         if touch_attached {
             let session_name = next_session_name
                 .as_ref()
@@ -1223,9 +1429,42 @@ impl RequestHandler {
                 .expect("target session stayed locked across the control update")
                 .touch_attached();
         }
+        let selection_events = selection_transition
+            .map(|transition| transition.prepare(&mut state))
+            .unwrap_or_default();
         drop(active_control);
+        drop(active_attach);
         drop(state);
+        for event in selection_events {
+            self.emit_prepared(event).await;
+        }
+        if session_changed_notice == ControlSessionChangedNotice::Publish
+            || (session_changed_notice == ControlSessionChangedNotice::PublishIfChanged
+                && session_changed)
+        {
+            if let (Some(session_name), Some(session_id)) =
+                (next_session_name.as_ref(), next_session_id)
+            {
+                self.emit_client_session_changed(
+                    control_client_name(requester_pid),
+                    session_name.clone(),
+                    session_id,
+                )
+                .await;
+            }
+        }
+        // The destination resize was recorded by the geometry chokepoint and is
+        // published by `emit_client_session_changed` above (or by the dispatch
+        // backstop when this update carries no session-changed notice).
+        self.publish_applied_window_resizes().await;
         self.refresh_linked_window_sessions(refresh_sessions).await;
+        if let Some(previous_session_id) =
+            previous_session_id.filter(|previous| Some(*previous) != next_session_id)
+        {
+            let _ = self
+                .reconcile_attached_session_identity_size_and_emit(previous_session_id)
+                .await;
+        }
         Ok(previous)
     }
 
@@ -1301,6 +1540,7 @@ impl RequestHandler {
         } else {
             Some(current_pane_output_sequences(&state, session_name)?)
         };
+        let size_sequence = self.next_client_size_sequence();
 
         let delivered = {
             let active = active_control
@@ -1318,6 +1558,11 @@ impl RequestHandler {
         if !delivered {
             return Err(attached_client_required("control session"));
         }
+        active_control
+            .by_pid
+            .get_mut(&identity.requester_pid())
+            .expect("delivered control client remains registered while locked")
+            .size_sequence = size_sequence;
         state
             .sessions
             .session_mut(session_name)
@@ -1445,7 +1690,7 @@ impl RequestHandler {
                         &mut state,
                         &LifecycleEvent::ClientDetached {
                             session_name: session_name.clone(),
-                            client_name: Some(requester_pid.to_string()),
+                            client_name: Some(control_client_name(requester_pid)),
                         },
                     );
                     event.control_session_identity = Some(session_id);
@@ -1478,11 +1723,20 @@ impl RequestHandler {
         deliver_control_notification(&mut active_control, requester_pid, line);
     }
 
-    pub(in crate::handler) async fn send_control_notification_to_queue(
+    pub(in crate::handler) async fn send_control_response_notification_to(
+        &self,
+        requester_pid: u32,
+        line: String,
+    ) {
+        let mut active_control = self.active_control.lock().await;
+        deliver_control_response_notification(&mut active_control, requester_pid, line);
+    }
+
+    pub(in crate::handler) async fn send_control_response_notification_to_queue(
         &self,
         identity: ControlClientIdentity,
         line: String,
-    ) {
+    ) -> bool {
         let mut active_control = self.active_control.lock().await;
         if active_control
             .by_pid
@@ -1491,8 +1745,13 @@ impl RequestHandler {
                 active.id == identity.control_id() && !active.closing.load(Ordering::SeqCst)
             })
         {
-            deliver_control_notification(&mut active_control, identity.requester_pid(), line);
+            return deliver_control_response_notification(
+                &mut active_control,
+                identity.requester_pid(),
+                line,
+            );
         }
+        false
     }
 
     pub(super) async fn dispatch_control_notifications(&self, event: &QueuedLifecycleEvent) {
@@ -1658,7 +1917,7 @@ impl RequestHandler {
                     &mut state,
                     &LifecycleEvent::ClientDetached {
                         session_name,
-                        client_name: Some(requester_pid.to_string()),
+                        client_name: Some(control_client_name(requester_pid)),
                     },
                 );
                 event.control_session_identity = session_id;
@@ -1737,6 +1996,7 @@ impl RequestHandler {
             .expect("test control identity remains registered");
         active.session_name = Some(session_name);
         active.session_id = Some(session_id);
+        active.size_sequence = self.next_client_size_sequence();
     }
 
     async fn take_startup_config_error_notifications(&self) -> Vec<String> {
@@ -1755,16 +2015,44 @@ impl RequestHandler {
     }
 }
 
-fn update_control_session(
+struct PreparedControlSessionUpdate {
+    event: ControlServerEvent,
+    permit: mpsc::OwnedPermit<ControlServerEvent>,
+}
+
+fn prepare_control_session_update(
+    active: &ActiveControl,
+    next_session_name: Option<rmux_proto::SessionName>,
+    pane_sequences: Option<Vec<(u32, u64)>>,
+) -> Option<PreparedControlSessionUpdate> {
+    if active.closing.load(Ordering::SeqCst) {
+        return None;
+    }
+    let event = match (next_session_name, pane_sequences) {
+        (Some(session_name), Some(pane_sequences)) => ControlServerEvent::SessionChangedAt {
+            session_name,
+            pane_sequences,
+        },
+        (next_session_name, None) => ControlServerEvent::SessionChanged(next_session_name),
+        (None, Some(_)) => unreachable!("pane cursors require a control session"),
+    };
+    let permit = match active.event_tx.clone().try_reserve_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            active.closing.store(true, Ordering::SeqCst);
+            return None;
+        }
+    };
+    Some(PreparedControlSessionUpdate { event, permit })
+}
+
+fn commit_control_session_update(
     active: &mut ActiveControl,
     next_session_name: Option<rmux_proto::SessionName>,
     next_session_id: Option<SessionId>,
-    pane_sequences: Option<Vec<(u32, u64)>>,
-) -> (Option<rmux_proto::SessionName>, bool) {
+    prepared: PreparedControlSessionUpdate,
+) -> Option<rmux_proto::SessionName> {
     let previous = active.session_name.clone();
-    let previous_session_id = active.session_id;
-    let previous_last_session = active.last_session.clone();
-    let previous_last_session_id = active.last_session_id;
     if let (Some(previous_session), Some(previous_session_id), Some(next_session), Some(next_id)) = (
         previous.as_ref(),
         active.session_id,
@@ -1778,22 +2066,26 @@ fn update_control_session(
     }
     active.session_name = next_session_name.clone();
     active.session_id = next_session_id;
-    let event = match (next_session_name, pane_sequences) {
-        (Some(session_name), Some(pane_sequences)) => ControlServerEvent::SessionChangedAt {
-            session_name,
-            pane_sequences,
-        },
-        (next_session_name, None) => ControlServerEvent::SessionChanged(next_session_name),
-        (None, Some(_)) => unreachable!("pane cursors require a control session"),
+    let _ = prepared.permit.send(prepared.event);
+    previous
+}
+
+fn update_control_session(
+    active: &mut ActiveControl,
+    next_session_name: Option<rmux_proto::SessionName>,
+    next_session_id: Option<SessionId>,
+    pane_sequences: Option<Vec<(u32, u64)>>,
+) -> (Option<rmux_proto::SessionName>, bool) {
+    let previous = active.session_name.clone();
+    let Some(prepared) =
+        prepare_control_session_update(active, next_session_name.clone(), pane_sequences)
+    else {
+        return (previous, false);
     };
-    let delivered = try_send_control_event(active, event);
-    if !delivered {
-        active.session_name = previous.clone();
-        active.session_id = previous_session_id;
-        active.last_session = previous_last_session;
-        active.last_session_id = previous_last_session_id;
-    }
-    (previous, delivered)
+    (
+        commit_control_session_update(active, next_session_name, next_session_id, prepared),
+        true,
+    )
 }
 
 fn current_pane_output_sequences(
@@ -1815,11 +2107,35 @@ fn deliver_control_notification(
     active_control: &mut ActiveControlState,
     requester_pid: u32,
     line: String,
-) {
+) -> bool {
     let Some(active) = active_control.by_pid.get_mut(&requester_pid) else {
-        return;
+        return false;
     };
-    let _ = try_send_control_event(active, ControlServerEvent::Notification(line));
+    try_send_control_event(active, ControlServerEvent::Notification(line))
+}
+
+fn deliver_control_response_notification(
+    active_control: &mut ActiveControlState,
+    requester_pid: u32,
+    line: String,
+) -> bool {
+    let Some(active) = active_control.by_pid.get_mut(&requester_pid) else {
+        return false;
+    };
+    let target_identity = ControlClientIdentity::new(requester_pid, active.id);
+    if let Some(sink) =
+        current_control_command_response_sink().filter(|sink| sink.identity == target_identity)
+    {
+        if active.closing.load(Ordering::SeqCst) {
+            return false;
+        }
+        if sink.try_send(ControlCommandResponseEvent::Notification(line)) {
+            return true;
+        }
+        active.closing.store(true, Ordering::SeqCst);
+        return false;
+    }
+    try_send_control_event(active, ControlServerEvent::Notification(line))
 }
 
 fn try_send_control_event(active: &ActiveControl, event: ControlServerEvent) -> bool {

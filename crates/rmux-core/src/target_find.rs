@@ -616,5 +616,8 @@ fn resolve_absolute_window_index_slot(value: &str) -> Result<Option<u32>, RmuxEr
 }
 
 #[cfg(test)]
+#[path = "target_find/session_recency_tests.rs"]
+mod session_recency_tests;
+#[cfg(test)]
 #[path = "target_find/tests.rs"]
 mod tests;

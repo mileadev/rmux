@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use rmux_os::identity::UserIdentity;
@@ -9,8 +9,7 @@ use rmux_proto::{CommandOutput, OptionName, RmuxError};
 
 use crate::handler_support::attached_client_required;
 use crate::key_table::effective_client_key_table_name;
-use crate::outer_terminal::OuterTerminal;
-use crate::pane_io::AttachControl;
+use crate::outer_terminal::{ClientTitleUpdate, OuterTerminal};
 use crate::pane_terminals::{session_not_found, HandlerState};
 use crate::server_access::current_owner_uid;
 use crate::terminal::{base_process_environment, base_process_environment_display_only};
@@ -25,7 +24,11 @@ mod list_clients;
 #[path = "handler_client_runtime/requester_access.rs"]
 mod requester_access;
 
-pub(in crate::handler) use list_clients::ListClientSnapshot;
+#[cfg(test)]
+pub(in crate::handler) use crate::client_names::attached_client_name;
+pub(in crate::handler) use crate::client_names::control_client_name;
+pub(in crate::handler) use list_clients::{AttachingClient, ListClientSnapshot};
+pub(crate) use requester_access::with_authenticated_connection_peer;
 
 pub(in crate::handler) const LIST_CLIENTS_TEMPLATE: &str = "#{client_name}: #{session_name} [#{client_width}x#{client_height} #{client_termname}]#{?#{==:#{client_uid},#{uid}},, [user #{?client_user,#{client_user},#{client_uid}}]}#{?client_flags, (#{client_flags}),}";
 
@@ -114,29 +117,18 @@ impl RequestHandler {
                 .map(|(&pid, active)| {
                     let outer_terminal =
                         OuterTerminal::resolve(&options, active.terminal_context.clone());
-                    let tty = attached_client_tty_path(pid)
-                        .map(|path| path.to_string_lossy().into_owned())
-                        .unwrap_or_default();
+                    let key_table = active
+                        .key_table_name
+                        .clone()
+                        .or_else(|| default_key_tables.get(&active.session_name).cloned());
+                    let snapshot = ListClientSnapshot::from_attached_client(pid, active)
+                        .resolved_for_render(
+                            outer_terminal.features_string(),
+                            key_table.as_deref().unwrap_or("root"),
+                        );
                     ListClientSnapshot {
-                        name: attached_client_name(pid),
-                        pid,
-                        tty,
-                        control: false,
-                        session_name: Some(active.session_name.clone()),
-                        order: active.id,
-                        width: active.client_size.cols,
-                        height: active.client_size.rows,
-                        termname: active.terminal_context.term_name().to_owned(),
-                        termtype: String::new(),
-                        termfeatures: outer_terminal.features_string(),
-                        utf8: active.terminal_context.utf8(),
-                        key_table: active
-                            .key_table_name
-                            .clone()
-                            .or_else(|| default_key_tables.get(&active.session_name).cloned()),
-                        uid: active.uid,
-                        user: active.user.clone(),
-                        flags: format_attached_client_flags(active),
+                        key_table,
+                        ..snapshot
                     }
                 })
                 .collect::<Vec<_>>()
@@ -147,14 +139,17 @@ impl RequestHandler {
                 .by_pid
                 .iter()
                 .map(|(&pid, active)| ListClientSnapshot {
-                    name: pid.to_string(),
+                    name: control_client_name(pid),
                     pid,
                     tty: String::new(),
                     control: true,
+                    session_id: active.session_id,
                     session_name: active.session_name.clone(),
                     order: active.id,
-                    width: 0,
-                    height: 0,
+                    activity_at: active.activity_at,
+                    width: active.client_width,
+                    height: None,
+                    sort_height: active.client_height,
                     termname: active.terminal_context.term_name().to_owned(),
                     termtype: String::new(),
                     termfeatures: active.terminal_context.explicit_features_string(),
@@ -199,7 +194,16 @@ impl RequestHandler {
         session_name: &rmux_proto::SessionName,
     ) -> Result<(), RmuxError> {
         let attached_count = self.attached_count(session_name).await;
-        let (prompt, terminal_context, client_size, key_table) = {
+        let (
+            prompt,
+            terminal_context,
+            client_size,
+            key_table,
+            previous_title,
+            client,
+            current_attach_id,
+            current_session_id,
+        ) = {
             let active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
@@ -209,6 +213,9 @@ impl RequestHandler {
                         && &active.session_name == session_name
                 })
                 .ok_or_else(|| attached_client_required("refresh-client"))?;
+            if active.transient_message.is_some() {
+                return Ok(());
+            }
             (
                 active
                     .prompt
@@ -217,18 +224,53 @@ impl RequestHandler {
                 active.terminal_context.clone(),
                 active.client_size,
                 active.key_table_name.clone(),
+                active.client_title.clone(),
+                ListClientSnapshot::from_attached_client(attach_pid, active),
+                active.id,
+                active.session_id,
             )
         };
         let socket_path = self.socket_path();
-        let bytes = {
+        let (bytes, client_title) = {
             let state = self.state.lock().await;
             let session = state
                 .sessions
                 .session(session_name)
                 .ok_or_else(|| session_not_found(session_name))?;
+            if session.id() != current_session_id {
+                return Err(attached_client_required("refresh-client"));
+            }
             let key_table = effective_client_key_table_name(&state, session, key_table.as_deref());
             let session = attach_support::sized_session(session, Some(client_size));
             let outer_terminal = OuterTerminal::resolve(&state.options, terminal_context);
+            // tmux re-expands `set-titles-string` on every server loop, not only
+            // when the client redraws, so a title carrying a `#(shell-command)`
+            // job, a strftime token or `#{session_alerts}` keeps up. This status
+            // tick is rmux's equivalent periodic pass; the expansion is skipped
+            // outright while `set-titles` is off (issue #182).
+            let resolved_title = crate::renderer::expand_client_title(
+                session.as_ref(),
+                &state.options,
+                &crate::renderer::ClientTitleContext {
+                    state: Some(&state),
+                    attached_count,
+                    key_table: Some(&key_table),
+                    socket_path: Some(&socket_path),
+                    client: Some(
+                        &client
+                            .resolved_for_render(outer_terminal.features_string(), &key_table)
+                            .format_bindings(),
+                    ),
+                },
+            );
+            let title_update = ClientTitleUpdate {
+                resolved: resolved_title.as_deref(),
+                // The OSC 7 path follows the active pane's own report, which
+                // only the prelude reads; the tick draws no prelude, so this
+                // client keeps whatever it was already told.
+                path: crate::outer_terminal::ClientPathUpdate::Unread,
+                previous: Some(&previous_title),
+            };
             let frame = crate::renderer::render_status_only_with_attached_count_and_prompt(
                 session.as_ref(),
                 &state.options,
@@ -241,24 +283,21 @@ impl RequestHandler {
                     ..crate::renderer::StatusRenderContext::default()
                 },
             );
-            outer_terminal.wrap_render_frame(&frame)
+            // The title sits outside the synchronized-update wrapper: it is an
+            // outer-terminal property, not part of the drawn frame.
+            let mut bytes = outer_terminal.render_client_title(title_update);
+            bytes.extend_from_slice(&outer_terminal.wrap_render_frame(&frame));
+            (bytes, outer_terminal.rendered_client_title(title_update))
         };
-        match expected_attach_id {
-            Some(attach_id) => {
-                self.send_attach_control_for_client_identity(
-                    attach_pid,
-                    attach_id,
-                    AttachControl::Write(bytes),
-                    "refresh-client",
-                )
-                .await?;
-            }
-            None => {
-                self.send_attach_control(attach_pid, AttachControl::Write(bytes), "refresh-client")
-                    .await?;
-            }
-        }
-        Ok(())
+        self.send_attached_status_if_unobscured(
+            attach_pid,
+            current_attach_id,
+            session_name,
+            current_session_id,
+            bytes,
+            client_title,
+        )
+        .await
     }
 }
 
@@ -371,13 +410,9 @@ pub(in crate::handler) fn sort_list_clients(
             SessionSortOrder::Name | SessionSortOrder::Modifier | SessionSortOrder::Order => {
                 left.name.cmp(&right.name)
             }
-            SessionSortOrder::Size => (left.width, left.height).cmp(&(right.width, right.height)),
+            SessionSortOrder::Size => left.sort_size().cmp(&right.sort_size()),
             SessionSortOrder::Creation | SessionSortOrder::Index => left.order.cmp(&right.order),
-            SessionSortOrder::Activity => left
-                .session_name
-                .as_ref()
-                .map(ToString::to_string)
-                .cmp(&right.session_name.as_ref().map(ToString::to_string)),
+            SessionSortOrder::Activity => right.activity_at.cmp(&left.activity_at),
         };
         let ordering = if reversed {
             ordering.reverse()
@@ -404,28 +439,37 @@ fn format_client_flags(flags: [Option<String>; 12]) -> String {
 pub(in crate::handler) fn format_attached_client_flags(
     active: &attach_support::ActiveAttach,
 ) -> String {
+    attached_client_flags(
+        active.flags,
+        active.suspended,
+        active.terminal_context.utf8(),
+    )
+}
+
+/// `#{client_flags}` for an attached client, from the three facts it depends
+/// on. A client attaching for the first time is not registered yet, so it has
+/// no `ActiveAttach` to read them from.
+pub(in crate::handler) fn attached_client_flags(
+    flags: ClientFlags,
+    suspended: bool,
+    utf8: bool,
+) -> String {
     format_client_flags([
         Some("attached".to_owned()),
-        client_flag(!active.suspended, "focused"),
+        client_flag(!suspended, "focused"),
         None,
+        client_flag(flags.contains(ClientFlags::IGNORESIZE), "ignore-size"),
         client_flag(
-            active.flags.contains(ClientFlags::IGNORESIZE),
-            "ignore-size",
-        ),
-        client_flag(
-            active.flags.contains(ClientFlags::NO_DETACH_ON_DESTROY),
+            flags.contains(ClientFlags::NO_DETACH_ON_DESTROY),
             "no-detach-on-destroy",
         ),
         None,
         None,
         None,
-        client_flag(active.flags.contains(ClientFlags::READONLY), "read-only"),
-        client_flag(
-            active.flags.contains(ClientFlags::ACTIVEPANE),
-            "active-pane",
-        ),
-        client_flag(active.suspended, "suspended"),
-        client_flag(active.terminal_context.utf8(), "UTF-8"),
+        client_flag(flags.contains(ClientFlags::READONLY), "read-only"),
+        client_flag(flags.contains(ClientFlags::ACTIVEPANE), "active-pane"),
+        client_flag(suspended, "suspended"),
+        client_flag(utf8, "UTF-8"),
     ])
 }
 
@@ -453,30 +497,26 @@ pub(in crate::handler) fn format_control_client_flags(
 }
 
 pub(in crate::handler) fn attached_client_matches_target(
-    attach_pid: u32,
+    client_name: &str,
     target_client: &str,
 ) -> bool {
-    let Some(tty_path) = attached_client_tty_path(attach_pid) else {
-        return false;
-    };
-    if tty_path == Path::new(target_client) {
+    let client_path = Path::new(client_name);
+    if client_path == Path::new(target_client) {
         return true;
     }
 
-    tty_path
+    client_path
         .strip_prefix("/dev")
         .ok()
         .is_some_and(|stripped| stripped == Path::new(target_client))
 }
 
-fn attached_client_tty_path(attach_pid: u32) -> Option<PathBuf> {
-    rmux_os::process::fd_path(attach_pid, 0)
-}
-
-pub(in crate::handler) fn attached_client_name(attach_pid: u32) -> String {
-    attached_client_tty_path(attach_pid)
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| attach_pid.to_string())
+pub(in crate::handler) fn control_client_target_pid(target: &str) -> Option<u32> {
+    target
+        .strip_prefix("client-")
+        .unwrap_or(target)
+        .parse()
+        .ok()
 }
 
 pub(in crate::handler) fn session_selection_prefers_live_process(pid: u32) -> bool {
@@ -517,6 +557,11 @@ pub(in crate::handler) fn effective_client_terminal_context(
         // an outer may ignore it. The on-only gate keeps the `external` default
         // from letting untrusted output drive the clipboard.
         push_unique_terminal_feature(&mut client_terminal.terminal_features, "clipboard");
+        // Title (TSL/FSL) on the same VT reasoning: Windows sets no TERM, so no
+        // terminal family supplies a title template and `set-titles on` would
+        // have nothing to write into (issue #182). Still emitted only when
+        // `set-titles` is on, which is off by default.
+        push_unique_terminal_feature(&mut client_terminal.terminal_features, "title");
     }
     if client_environment_is_windows_terminal(client_environment) {
         client_terminal.utf8 = true;
@@ -642,10 +687,13 @@ mod tests {
             pid: u32::try_from(order).unwrap_or(0),
             tty: String::new(),
             control: false,
+            session_id: None,
             session_name: None,
             order,
+            activity_at: 0,
             width: 80,
-            height: 24,
+            height: Some(24),
+            sort_height: 24,
             termname: String::new(),
             termtype: String::new(),
             termfeatures: String::new(),
@@ -677,6 +725,84 @@ mod tests {
     }
 
     #[test]
+    fn list_clients_size_sort_uses_the_hidden_control_height() {
+        let mut tall = client_snapshot("tall", 1);
+        tall.control = true;
+        tall.width = 100;
+        tall.height = None;
+        tall.sort_height = 30;
+        let mut short = client_snapshot("short", 2);
+        short.control = true;
+        short.width = 100;
+        short.height = None;
+        short.sort_height = 20;
+        let mut clients = vec![tall, short];
+
+        sort_list_clients(&mut clients, Some("size"), false);
+
+        assert_eq!(
+            clients
+                .iter()
+                .map(|client| client.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["short", "tall"]
+        );
+        assert!(
+            clients
+                .iter()
+                .all(|client| client.height_value().is_empty()),
+            "the control height remains hidden from formatting"
+        );
+    }
+
+    #[test]
+    fn list_clients_activity_sort_uses_latest_client_input_first() {
+        let mut older = client_snapshot("older", 1);
+        older.activity_at = 10;
+        let mut newer = client_snapshot("newer", 2);
+        newer.activity_at = 20;
+        let mut clients = vec![older, newer];
+
+        sort_list_clients(&mut clients, Some("activity"), false);
+        assert_eq!(
+            clients
+                .iter()
+                .map(|client| client.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newer", "older"]
+        );
+
+        sort_list_clients(&mut clients, Some("activity"), true);
+        assert_eq!(
+            clients
+                .iter()
+                .map(|client| client.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["older", "newer"]
+        );
+    }
+
+    /// The VT feature set a Windows Terminal attach ends up advertising. On
+    /// Windows the `cfg(windows)` fallback also supplies `title` (issue #182);
+    /// elsewhere only the WT_SESSION arm runs.
+    fn windows_terminal_feature_set() -> Vec<&'static str> {
+        let mut features = vec!["sync", "bpaste", "mouse", "clipboard"];
+        if cfg!(windows) {
+            features.push("title");
+        }
+        features
+    }
+
+    /// Same set when the client already advertised sync/bpaste/mouse itself.
+    fn preadvertised_windows_terminal_feature_set() -> Vec<&'static str> {
+        let mut features = vec!["SYNC", "BPASTE", "MOUSE", "clipboard"];
+        if cfg!(windows) {
+            features.push("title");
+        }
+        features
+    }
+
+    #[test]
     fn windows_terminal_environment_enables_synchronized_rendering() {
         let environment = HashMap::from([("WT_SESSION".to_owned(), "session-id".to_owned())]);
         let context = effective_client_terminal_context(
@@ -685,10 +811,7 @@ mod tests {
         );
 
         assert!(context.utf8);
-        assert_eq!(
-            context.terminal_features,
-            vec!["sync", "bpaste", "mouse", "clipboard"]
-        );
+        assert_eq!(context.terminal_features, windows_terminal_feature_set());
     }
 
     #[test]
@@ -705,7 +828,7 @@ mod tests {
         assert!(context.utf8);
         assert_eq!(
             context.terminal_features,
-            vec!["SYNC", "BPASTE", "MOUSE", "clipboard"]
+            preadvertised_windows_terminal_feature_set()
         );
     }
 
@@ -722,7 +845,7 @@ mod tests {
             &ClientTerminalContext::default(),
         );
 
-        for feature in ["sync", "bpaste", "mouse", "clipboard"] {
+        for feature in ["sync", "bpaste", "mouse", "clipboard", "title"] {
             assert!(
                 context.terminal_features.iter().any(|f| f == feature),
                 "missing {feature} for non-WT Windows outer: {:?}",

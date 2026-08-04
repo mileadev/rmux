@@ -167,6 +167,11 @@ impl HandlerState {
             );
         }
         let source_window_metadata = PaneTransferWindowMetadata::capture(self, &request.source)?;
+        let source_window_is_single_pane = source_window_metadata.source_window_is_single_pane();
+        let source_family_sessions = self.window_linked_session_family_list(
+            request.source.session_name(),
+            request.source.window_index(),
+        );
         let slots = [
             (source_session_name.clone(), request.source.window_index()),
             (target_session_name.clone(), request.target.window_index()),
@@ -210,6 +215,13 @@ impl HandlerState {
         if let Err(error) = mutation_result {
             transfer_snapshot.restore(self);
             return Err(error);
+        }
+        source_window_metadata.prune_destroyed_aliases_before_reindex(self);
+        if source_window_is_single_pane {
+            if let Err(error) = self.renumber_transfer_source_sessions(&source_family_sessions) {
+                transfer_snapshot.restore(self);
+                return Err(error);
+            }
         }
 
         let mut synchronized_slots =
@@ -313,7 +325,6 @@ impl HandlerState {
             }
         }
 
-        source_window_metadata.prune_removed_aliases(self);
         sync_pane_lifecycle_for_sessions(self, &lifecycle_sessions);
         self.clear_marked_pane_if_id(source_pane_id);
         Ok(JoinPaneResponse {

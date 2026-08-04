@@ -5,7 +5,7 @@ use rmux_proto::{
     SwapPaneRequest, SwapPaneResponse, WindowTarget,
 };
 
-use super::{session_not_found, HandlerState};
+use super::{session_mutation::PaneTransferGeometryContext, session_not_found, HandlerState};
 
 #[path = "pane_transfer/cross_session.rs"]
 mod cross_session;
@@ -78,6 +78,16 @@ impl HandlerState {
         &mut self,
         request: JoinPaneRequest,
     ) -> Result<JoinPaneResponse, RmuxError> {
+        let geometry_context = PaneTransferGeometryContext::new(&request.source, &request.target);
+        self.mutate_join_or_move_and_record_window_geometry_changes(geometry_context, |state| {
+            state.join_pane_unrecorded(request)
+        })
+    }
+
+    fn join_pane_unrecorded(
+        &mut self,
+        request: JoinPaneRequest,
+    ) -> Result<JoinPaneResponse, RmuxError> {
         if request.source == request.target {
             return Err(RmuxError::Server(
                 "source and target panes must be different".to_owned(),
@@ -107,17 +117,20 @@ impl HandlerState {
         &mut self,
         request: MovePaneRequest,
     ) -> Result<MovePaneResponse, RmuxError> {
-        let response = self.join_pane(JoinPaneRequest {
-            source: request.source,
-            target: request.target,
-            direction: request.direction,
-            detached: request.detached,
-            before: request.before,
-            full_size: request.full_size,
-            size: request.size,
-        })?;
-        Ok(MovePaneResponse {
-            target: response.target,
+        let geometry_context = PaneTransferGeometryContext::new(&request.source, &request.target);
+        self.mutate_join_or_move_and_record_window_geometry_changes(geometry_context, |state| {
+            let response = state.join_pane_unrecorded(JoinPaneRequest {
+                source: request.source,
+                target: request.target,
+                direction: request.direction,
+                detached: request.detached,
+                before: request.before,
+                full_size: request.full_size,
+                size: request.size,
+            })?;
+            Ok(MovePaneResponse {
+                target: response.target,
+            })
         })
     }
 
@@ -150,6 +163,32 @@ impl HandlerState {
             return Err(RmuxError::Server("sessions are grouped".to_owned()));
         }
 
+        let creates_window = self
+            .sessions
+            .session(request.source.session_name())
+            .and_then(|session| session.window_at(request.source.window_index()))
+            .is_some_and(|window| window.pane_count() > 1);
+        let initial_name = if !explicit_name
+            && creates_window
+            && !crate::automatic_rename::automatic_rename_enabled_for_new_window(
+                &self.options,
+                &destination_session_name,
+            ) {
+            self.pane_runtime_window_name_in_window(
+                request.source.session_name(),
+                request.source.window_index(),
+                request.source.pane_index(),
+            )?
+            .filter(|name| !name.is_empty())
+        } else {
+            None
+        };
+        if let Some(name) = initial_name.as_ref() {
+            // Feed the stored runtime name into the core creation transaction.
+            // The original request remains implicit for marker semantics.
+            request.name = Some(name.clone());
+        }
+
         let response = if shares_grouped_window_state {
             self.break_pane_within_group(request, destination_session_name)
         } else {
@@ -160,6 +199,11 @@ impl HandlerState {
             // source's auto-name marker, which would otherwise override the
             // explicit name on the next pane activity callback.
             self.clear_auto_named_window_family(
+                response.target.session_name(),
+                response.target.window_index(),
+            );
+        } else if initial_name.is_some() {
+            self.mark_auto_named_window(
                 response.target.session_name(),
                 response.target.window_index(),
             );
@@ -236,6 +280,28 @@ fn pane_index_for_id(session: &Session, window_index: u32, pane_id: PaneId) -> O
             .find(|pane| pane.id() == pane_id)
             .map(|pane| pane.index())
     })
+}
+
+fn pane_target_for_id(
+    state: &HandlerState,
+    session_name: &rmux_proto::SessionName,
+    pane_id: PaneId,
+) -> Result<PaneTarget, RmuxError> {
+    let session = state
+        .sessions
+        .session(session_name)
+        .ok_or_else(|| session_not_found(session_name))?;
+    let window_index = session.window_index_for_pane_id(pane_id).ok_or_else(|| {
+        RmuxError::Server("moved pane disappeared after pane transfer".to_owned())
+    })?;
+    let pane_index = pane_index_for_id(session, window_index, pane_id).ok_or_else(|| {
+        RmuxError::Server("moved pane index disappeared after pane transfer".to_owned())
+    })?;
+    Ok(PaneTarget::with_window(
+        session_name.clone(),
+        window_index,
+        pane_index,
+    ))
 }
 
 fn resolve_swap_targets(

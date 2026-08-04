@@ -57,6 +57,12 @@ fn apply_windows_terminal_features(context: &mut ClientTerminalContext, is_windo
     // OSC 52 before the outer terminal sees it, and an outer may ignore it. The
     // inbound relay still depends on the daemon-side `set-clipboard on` gate.
     push_unique_terminal_feature(&mut context.terminal_features, "clipboard");
+    // Advertise the title capability (TSL/FSL) on the same VT reasoning, so
+    // `set-titles on` can reach the outer terminal. Windows sets no TERM, so
+    // without this the daemon derives no terminal family and never has a title
+    // template to write into (issue #182). Nothing is emitted until
+    // `set-titles` is turned on, which is off by default.
+    push_unique_terminal_feature(&mut context.terminal_features, "title");
     // utf8 stays gated: Windows Terminal is known UTF-8, while other outers
     // are inferred from the console code page / locale elsewhere.
     if is_windows_terminal {
@@ -111,7 +117,7 @@ mod tests {
         assert!(context.utf8);
         assert_eq!(
             context.terminal_features,
-            vec!["sync", "bpaste", "mouse", "clipboard"]
+            vec!["sync", "bpaste", "mouse", "clipboard", "title"]
         );
     }
 
@@ -129,7 +135,7 @@ mod tests {
         assert!(!context.utf8);
         assert_eq!(
             context.terminal_features,
-            vec!["sync", "bpaste", "mouse", "clipboard"]
+            vec!["sync", "bpaste", "mouse", "clipboard", "title"]
         );
     }
 
@@ -146,7 +152,7 @@ mod tests {
         assert!(context.utf8);
         assert_eq!(
             context.terminal_features,
-            vec!["SYNC", "BPASTE", "MOUSE", "clipboard"]
+            vec!["SYNC", "BPASTE", "MOUSE", "clipboard", "title"]
         );
     }
 }

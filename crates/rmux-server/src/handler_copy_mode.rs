@@ -1,6 +1,5 @@
 use super::attach_support::ActiveAttachIdentity;
 use super::pane_support::resolve_input_target;
-use super::prompt_support::PromptInputEvent;
 use super::RequestHandler;
 use crate::copy_mode::{
     CopyBufferTarget, CopyModeCommandContext, CopyModePipeCommand, CopyModePrefixBehavior,
@@ -19,8 +18,6 @@ use rmux_proto::{
     SendKeysResponse,
 };
 
-#[path = "handler_copy_mode/input.rs"]
-mod input;
 #[path = "handler_copy_mode/key_binding.rs"]
 pub(in crate::handler) mod key_binding;
 #[path = "handler_copy_mode/origin.rs"]
@@ -35,7 +32,6 @@ mod search;
 #[cfg(test)]
 pub(in crate::handler) use refresh_fanout::install_copy_mode_mutation_pause;
 
-use input::{attached_copy_mode_input_action, AttachedCopyModeInputAction};
 use origin::{CopyModeCommandInvocation, CopyModeCommandOrigin, CopyModeMouseContextKind};
 use pipe_command::run_pipe_command;
 
@@ -267,87 +263,6 @@ impl RequestHandler {
             }),
             Err(error) => Response::Error(ErrorResponse { error }),
         }
-    }
-
-    pub(super) async fn handle_attached_copy_mode_key_event_for_identity(
-        &self,
-        identity: ActiveAttachIdentity,
-        target: PaneTarget,
-        event: PromptInputEvent,
-    ) -> Result<bool, RmuxError> {
-        self.handle_copy_mode_key_event(identity.attach_pid(), Some(identity), target, event, true)
-            .await
-    }
-
-    async fn handle_copy_mode_key_event(
-        &self,
-        requester_pid: u32,
-        identity: Option<ActiveAttachIdentity>,
-        target: PaneTarget,
-        event: PromptInputEvent,
-        allow_prompt: bool,
-    ) -> Result<bool, RmuxError> {
-        let expected_session_id = match identity {
-            Some(identity) => {
-                let (session_name, session_id) = self
-                    .attached_session_identity_for_identity(identity)
-                    .await?;
-                if target.session_name() != &session_name {
-                    return Err(RmuxError::Server(
-                        "attached copy-mode target changed session".to_owned(),
-                    ));
-                }
-                Some(session_id)
-            }
-            None => None,
-        };
-        let mode_keys = {
-            let state = self.state.lock().await;
-            if expected_session_id.is_some_and(|session_id| {
-                state
-                    .sessions
-                    .session(target.session_name())
-                    .is_none_or(|session| session.id() != session_id)
-            }) {
-                return Err(RmuxError::Server("attached session disappeared".to_owned()));
-            }
-            if !target_is_in_copy_mode(&state, &target) {
-                return Ok(false);
-            }
-            copy_mode_context(&state, &target, None, None).mode_keys
-        };
-
-        match attached_copy_mode_input_action(mode_keys, &event) {
-            AttachedCopyModeInputAction::Search(direction) => {
-                if !allow_prompt {
-                    return Ok(false);
-                }
-                match identity {
-                    Some(identity) => {
-                        self.start_copy_mode_search_prompt_for_identity(
-                            identity, target, direction,
-                        )
-                        .await?;
-                    }
-                    None => {
-                        self.start_copy_mode_search_prompt(requester_pid, target, direction)
-                            .await?;
-                    }
-                }
-            }
-            AttachedCopyModeInputAction::Command(command) => match identity {
-                Some(identity) => {
-                    self.execute_copy_mode_command_for_identity(identity, target, command, &[], 1)
-                        .await?;
-                }
-                None => {
-                    self.execute_copy_mode_command(requester_pid, target, command, &[], 1)
-                        .await?;
-                }
-            },
-            AttachedCopyModeInputAction::Ignore => return Ok(false),
-        }
-        Ok(true)
     }
 
     pub(super) async fn target_is_in_copy_mode(

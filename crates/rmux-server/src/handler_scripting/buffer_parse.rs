@@ -4,7 +4,7 @@ use rmux_core::{SessionStore, TargetFindContext};
 use rmux_proto::{DeleteBufferRequest, ListBuffersRequest, LoadBufferRequest, Request, RmuxError};
 
 use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
-use super::values::{missing_argument, unsupported_flag};
+use super::values::{missing_argument, reject_unknown_option_before_positional, unsupported_flag};
 use super::{implicit_pane_target, parse_pane_target};
 
 pub(super) fn parse_set_buffer(mut args: CommandTokens) -> Result<Request, RmuxError> {
@@ -40,7 +40,9 @@ pub(super) fn parse_set_buffer(mut args: CommandTokens) -> Result<Request, RmuxE
                 set_clipboard = true;
             }
             _ => {
-                let Some(cluster) = parse_compact_flag_cluster(&token, "aw", "bnt") else {
+                let Some(cluster) = parse_compact_flag_cluster("set-buffer", &token, "aw", "bnt")?
+                else {
+                    reject_unknown_option_before_positional("set-buffer", &token)?;
                     break;
                 };
                 let _ = args.optional();
@@ -300,5 +302,22 @@ mod tests {
         assert!(!request.append);
         assert!(!request.set_clipboard);
         assert_eq!(request.content, b"-aw");
+    }
+
+    #[test]
+    fn parse_set_buffer_reports_the_first_unknown_cluster_flag_like_tmux_3_7b() {
+        for (flag_token, expected) in [
+            ("-value", "command set-buffer: unknown flag -v"),
+            ("-avalue", "command set-buffer: unknown flag -v"),
+            ("-wvalue", "command set-buffer: unknown flag -v"),
+            ("-zfoo", "command set-buffer: unknown flag -z"),
+            ("-az", "command set-buffer: unknown flag -z"),
+            ("-waq", "command set-buffer: unknown flag -q"),
+            ("--foo", "command set-buffer: invalid flag --"),
+        ] {
+            let error = parse_set_buffer(CommandTokens::new(vec![token(flag_token)]))
+                .expect_err("unknown set-buffer flag must be rejected");
+            assert_eq!(error, RmuxError::Server(expected.to_owned()));
+        }
     }
 }

@@ -291,15 +291,15 @@ async fn select_layout_even_layouts_resize_panes_through_the_socket() -> Result<
         wait_for_tty_sizes(
             &pane_ttys,
             &[
+                TerminalSize { cols: 33, rows: 40 },
+                TerminalSize { cols: 33, rows: 40 },
                 TerminalSize { cols: 32, rows: 40 },
-                TerminalSize { cols: 32, rows: 40 },
-                TerminalSize { cols: 34, rows: 40 },
             ],
         )?,
         vec![
             TerminalSize { cols: 32, rows: 40 },
-            TerminalSize { cols: 32, rows: 40 },
-            TerminalSize { cols: 34, rows: 40 },
+            TerminalSize { cols: 33, rows: 40 },
+            TerminalSize { cols: 33, rows: 40 },
         ]
     );
 
@@ -322,15 +322,15 @@ async fn select_layout_even_layouts_resize_panes_through_the_socket() -> Result<
             &[
                 TerminalSize {
                     cols: 100,
-                    rows: 12,
+                    rows: 13,
+                },
+                TerminalSize {
+                    cols: 100,
+                    rows: 13,
                 },
                 TerminalSize {
                     cols: 100,
                     rows: 12,
-                },
-                TerminalSize {
-                    cols: 100,
-                    rows: 14,
                 },
             ],
         )?,
@@ -341,11 +341,11 @@ async fn select_layout_even_layouts_resize_panes_through_the_socket() -> Result<
             },
             TerminalSize {
                 cols: 100,
-                rows: 12
+                rows: 13
             },
             TerminalSize {
                 cols: 100,
-                rows: 14
+                rows: 13
             },
         ]
     );

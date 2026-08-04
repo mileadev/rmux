@@ -6,12 +6,14 @@ use rmux_proto::{
 };
 use tokio::sync::mpsc;
 
+use super::super::client_runtime_support::{AttachingClient, ListClientSnapshot};
 use super::super::{
     attach_support::attach_target_for_session, client_environment_snapshot,
     effective_client_terminal_context, parse_client_flags, update_environment_from_client,
     validate_expected_attach_identity, RequestHandler,
 };
 use super::switching::SwitchManagedClientIdentity;
+use crate::client_names::attached_client_name;
 use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::HandleOutcome;
 
@@ -158,12 +160,6 @@ impl RequestHandler {
             )
             .await;
         }
-        if let Err(error) = self
-            .resize_session_for_attach_client(&session_name, request.client_size, flags)
-            .await
-        {
-            return HandleOutcome::response(Response::Error(ErrorResponse { error }));
-        }
         let managed_client = match expected_attach {
             Some(identity) => Some(SwitchManagedClientIdentity::Attach {
                 pid: identity.attach_pid(),
@@ -171,6 +167,32 @@ impl RequestHandler {
             }),
             None => self.managed_client_for_pid(requester_pid).await,
         };
+        // An already-attached client is *moving*, and its switch commit performs
+        // that whole move — size selection, window and PTY mutation, and the
+        // delivery of the frame — inside one `state` -> `active_attach` ->
+        // `active_control` region. Sizing the destination here as well would be a
+        // second write to the same shared window from outside that region: it
+        // cannot see whether the captured generation can still receive the
+        // switch, and the commit that decides so runs afterwards. The commit
+        // re-selects from that same registration, so on the path where the
+        // command succeeds this write is also redundant.
+        //
+        // A first attach and a control client own no attach registration and
+        // deliver no switch frame, so their resize is the only one there is.
+        if !matches!(
+            managed_client,
+            Some(SwitchManagedClientIdentity::Attach { .. })
+        ) {
+            if let Err(error) = self
+                .resize_session_for_attach_client(
+                    &session_name,
+                    super::AttachResizeClient::new(request.client_size, flags),
+                )
+                .await
+            {
+                return HandleOutcome::response(Response::Error(ErrorResponse { error }));
+            }
+        }
         if let Some(client) = managed_client {
             #[cfg(test)]
             super::switching::pause_after_switch_target_identity_capture(&session_name).await;
@@ -205,22 +227,53 @@ impl RequestHandler {
             );
         }
         let attached_count = self.attached_count(&session_name).await.saturating_add(1);
+        // The identity the listener authenticated for this connection and is
+        // about to register this client under, so the frame rendered below and
+        // that registration describe one client (issue #182). An ambiguous
+        // requester is rejected here, before any frame or registration exists.
+        let (requester_uid, requester_user) = match self.attaching_client_identity(requester_pid) {
+            Ok(identity) => identity,
+            Err(error) => return HandleOutcome::response(Response::Error(ErrorResponse { error })),
+        };
         let (session_id, target) = {
             let state = self.state.lock().await;
-            let Some(session_id) = state
-                .sessions
-                .session(&session_name)
-                .map(rmux_core::Session::id)
-            else {
+            let Some(session) = state.sessions.session(&session_name) else {
                 return HandleOutcome::response(Response::Error(ErrorResponse {
                     error: RmuxError::SessionNotFound(session_name.to_string()),
                 }));
             };
+            let session_id = session.id();
+            // Registration has not published this client yet, so its record is
+            // built from the request: the first frame's title must already
+            // resolve its own `#{client_*}` values (issue #182).
+            let attaching_client = ListClientSnapshot::for_attaching_client(AttachingClient {
+                pid: requester_pid,
+                session_name: &session_name,
+                session_id,
+                // The same anchor `register_attach_identity` is about to store,
+                // so this frame and every later one expand `#{client_height}`
+                // to one value. The session's window size is content geometry
+                // with the status rows already off it; handing it to a sizeless
+                // client here would make its first title alone report the
+                // status-subtracted height.
+                size: request
+                    .client_size
+                    .unwrap_or_else(|| session.terminal_size()),
+                terminal_context: &terminal_context,
+                flags,
+                uid: requester_uid,
+                user: requester_user,
+                activity_at: crate::handler::current_client_activity_timestamp(),
+            });
             match attach_target_for_session(
                 &state,
                 &session_name,
                 attached_count,
                 &terminal_context,
+                // A fresh client's outer terminal shows nothing of ours yet, so
+                // this frame carries the first title; registration remembers it.
+                None,
+                Some(&attaching_client),
                 &self.socket_path(),
             ) {
                 Ok(target) => (session_id, target),
@@ -241,6 +294,17 @@ impl RequestHandler {
             request.client_size,
             render_stream,
         );
+        // Frozen tmux 3.7b reports a newly attached PTY by its tty path before
+        // the layout change caused by its geometry. Publish at the attach
+        // commit, while that resize is still queued, rather than at the later
+        // listener registration. Existing PTY and control clients took the
+        // managed-client arm above and publish from their switch commit.
+        self.emit_client_session_changed(
+            attached_client_name(requester_pid),
+            session_name.clone(),
+            session_id,
+        )
+        .await;
         HandleOutcome::attach(
             Response::AttachSession(AttachSessionResponse { session_name }),
             upgrade,

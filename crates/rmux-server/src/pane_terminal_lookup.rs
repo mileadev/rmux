@@ -1,5 +1,5 @@
 use rmux_core::{PaneGeometry, PaneId, SessionStore};
-use rmux_proto::{RmuxError, SessionName};
+use rmux_proto::{RmuxError, SessionName, TerminalSize};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SessionPane {
@@ -7,6 +7,7 @@ pub(crate) struct SessionPane {
     pub(crate) window_index: u32,
     pub(crate) index: u32,
     pub(crate) geometry: PaneGeometry,
+    pub(crate) window_size: TerminalSize,
 }
 
 pub(crate) fn initial_pane(
@@ -25,6 +26,7 @@ pub(crate) fn initial_pane(
             window_index: session.active_window_index(),
             index: pane.index(),
             geometry: pane.geometry(),
+            window_size: session.window().size(),
         })
         .ok_or_else(|| {
             RmuxError::Server(format!("initial pane missing for session {session_name}"))

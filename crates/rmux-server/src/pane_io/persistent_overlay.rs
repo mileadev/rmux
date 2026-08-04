@@ -3,9 +3,10 @@ use std::sync::atomic::AtomicUsize;
 
 use tokio::sync::mpsc;
 
-use super::attach_control::AttachControl;
+use super::attach_control::{AttachControl, QueuedAttachTarget};
 use super::control::try_recv_attach_control;
 use super::types::{AttachTarget, OpenAttachTarget, OverlayFrame};
+use crate::outer_terminal::RenderedClientTitle;
 
 pub(super) fn discard_stale_persistent_overlays(
     attach_controls: Option<&mut mpsc::UnboundedReceiver<AttachControl>>,
@@ -21,7 +22,10 @@ pub(super) fn discard_stale_persistent_overlays(
                     .with_target(|target| {
                         is_stale_persistent_switch(Some(barrier_state_id), target)
                     })
-                    .unwrap_or(false) => {}
+                    .unwrap_or(false) =>
+            {
+                retained_controls.extend(salvaged_client_title_control(&next_target));
+            }
             AttachControl::Overlay(overlay)
                 if overlay
                     .persistent_state_id
@@ -41,7 +45,10 @@ pub(super) fn discard_stale_persistent_overlays(
                     .with_target(|target| {
                         is_stale_persistent_switch(Some(barrier_state_id), target)
                     })
-                    .unwrap_or(false) => {}
+                    .unwrap_or(false) =>
+            {
+                deferred_controls.extend(salvaged_client_title_control(&next_target));
+            }
             AttachControl::Overlay(overlay)
                 if overlay
                     .persistent_state_id
@@ -49,6 +56,31 @@ pub(super) fn discard_stale_persistent_overlays(
             other => deferred_controls.push_back(other),
         }
     }
+}
+
+/// The outer-terminal bytes a frame owes its client, whatever happens to the
+/// frame itself.
+///
+/// OSC 0 and OSC 7 describe the terminal rather than the drawn screen — tmux
+/// writes them from its server loop, outside any redraw — and the next render
+/// deduplicates against them. Dropping them together with a stale frame would
+/// leave the outer terminal on the previous title with nothing left to correct
+/// it, which is the stranded-title half of issue #182.
+pub(super) fn undelivered_client_title_bytes(target: &AttachTarget) -> Option<&[u8]> {
+    target
+        .client_title
+        .as_ref()
+        .map(RenderedClientTitle::bytes)
+        .filter(|bytes| !bytes.is_empty())
+}
+
+/// Replaces a discarded stale switch with a write carrying only what its outer
+/// terminal is still owed, in the same queue position.
+fn salvaged_client_title_control(next_target: &QueuedAttachTarget) -> Option<AttachControl> {
+    next_target
+        .with_target(|target| undelivered_client_title_bytes(target).map(<[u8]>::to_vec))
+        .flatten()
+        .map(AttachControl::Write)
 }
 
 pub(super) fn advance_persistent_overlay_state(
@@ -119,6 +151,51 @@ pub(super) fn is_stale_persistent_switch(
         (Some(current_state_id), Some(incoming_state_id)) => incoming_state_id < current_state_id,
         _ => false,
     }
+}
+
+/// Replays the client-side overlay-barrier rules over everything a client
+/// still has queued, and returns the byte payloads its outer terminal would
+/// actually receive, oldest first.
+///
+/// This runs the production [`prime_persistent_overlay_barriers`] drain and
+/// the production [`is_stale_persistent_switch`] rule the attach loop applies
+/// before drawing a switch, so a frame this reports as delivered is one the
+/// client really draws — and one it omits is really discarded.
+#[cfg(test)]
+pub(crate) fn replay_client_visible_payloads(
+    control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
+) -> Vec<Vec<u8>> {
+    let control_backlog = AtomicUsize::new(0);
+    let mut current_state_id = None;
+    let mut deferred_controls = VecDeque::new();
+    prime_persistent_overlay_barriers(
+        &mut current_state_id,
+        Some(control_rx),
+        &mut deferred_controls,
+        &control_backlog,
+    );
+
+    let mut payloads = Vec::new();
+    for control in deferred_controls {
+        match control {
+            AttachControl::Switch(next_target) => {
+                // The same choice `apply_pending_attach_controls` makes: draw
+                // the frame, or drop it and hand over only what its outer
+                // terminal is still owed.
+                let payload = next_target.with_target(|target| {
+                    if is_stale_persistent_switch(current_state_id, target) {
+                        undelivered_client_title_bytes(target).map(<[u8]>::to_vec)
+                    } else {
+                        Some(target.render_frame.clone())
+                    }
+                });
+                payloads.extend(payload.flatten());
+            }
+            AttachControl::Write(bytes) => payloads.push(bytes),
+            _ => {}
+        }
+    }
+    payloads
 }
 
 pub(super) fn accept_persistent_overlay_state(

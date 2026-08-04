@@ -572,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_select_layout_preserves_existing_modes_and_rejects_cli_conflicts() {
+    fn queued_select_layout_uses_tmux_mode_priority_and_operand_semantics() {
         let (sessions, session_name) = select_layout_sessions();
         assert!(matches!(
             parse_select_layout_request("select-layout -E -t alpha:0", &sessions, &session_name),
@@ -602,27 +602,34 @@ mod tests {
         for command in [
             "select-layout -n -p -t alpha:0",
             "select-layout -E -n -t alpha:0",
+            "selectl -nE -t alpha:0",
+            "select-layout -Enop -t alpha:0 tiled",
         ] {
-            let error = parse_select_layout_invocation(command, &sessions, &session_name)
-                .expect_err("multiple mode flags must be rejected like the direct CLI");
-            assert_eq!(
-                error,
-                RmuxError::Server("select-layout accepts only one mode flag".to_owned())
+            assert!(
+                matches!(
+                    parse_select_layout_request(command, &sessions, &session_name),
+                    Request::NextLayout(_)
+                ),
+                "-n must govern {command}"
             );
         }
+        assert!(matches!(
+            parse_select_layout_request("select-layout -Ep -t alpha:0", &sessions, &session_name),
+            Request::PreviousLayout(_)
+        ));
+        assert!(matches!(
+            parse_select_layout_request("select-layout -Eo -t alpha:0", &sessions, &session_name),
+            Request::SpreadLayout(_)
+        ));
 
-        let error = parse_select_layout_invocation(
-            "select-layout -n -t alpha:0 tiled",
+        let Request::SelectCustomLayout(custom) = parse_select_layout_request(
+            "select-layout -o -t alpha:0 tiled",
             &sessions,
             &session_name,
-        )
-        .expect_err("a mode flag and layout must conflict like the direct CLI");
-        assert_eq!(
-            error,
-            RmuxError::Server(
-                "command select-layout: too many arguments (need at most 0)".to_owned()
-            )
-        );
+        ) else {
+            panic!("-o with an operand must defer strict custom-layout validation");
+        };
+        assert_eq!(custom.layout, "tiled");
     }
 
     #[test]
@@ -659,11 +666,11 @@ mod tests {
                 "-bQ",
             ),
             ("wait-for", &["--bogus"][..], "--bogus"),
-            ("split-window", &["-hQ", "true"][..], "-hQ"),
+            ("split-window", &["-hQ", "true"][..], "-Q"),
             ("pipe-pane", &["-IQ", "true"][..], "-IQ"),
             ("respawn-pane", &["-kQ", "true"][..], "-kQ"),
-            ("bind-key", &["-nQ", "x", "display-message ok"][..], "-nQ"),
-            ("display-panes", &["-bQ", "select-pane -t %%"][..], "-bQ"),
+            ("bind-key", &["-nQ", "x", "display-message ok"][..], "-Q"),
+            ("display-panes", &["-bQ", "select-pane -t %%"][..], "-Q"),
         ] {
             let error = parse_request_result(command, arguments, &SessionStore::default())
                 .expect_err("mixed or long unknown option must fail");

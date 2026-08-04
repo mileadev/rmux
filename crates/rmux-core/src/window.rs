@@ -214,7 +214,7 @@ impl Window {
         self.layout
     }
 
-    /// Returns the terminal size currently backing the window.
+    /// Returns the content size used by the layout tree and pane PTYs.
     #[must_use]
     pub const fn size(&self) -> TerminalSize {
         self.size
@@ -320,10 +320,9 @@ impl Window {
 
     pub(crate) fn set_size(&mut self, size: TerminalSize) {
         self.size = size;
+        self.recalculate_geometry();
         if self.zoomed {
             self.apply_zoom_geometry();
-        } else {
-            self.recalculate_geometry();
         }
     }
 

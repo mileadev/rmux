@@ -93,7 +93,13 @@ pub(super) fn probe_blocking(
             }
             Ok(None) => continue,
             Err(RmuxError::IncompleteFrame { .. }) => continue,
-            Err(_) => return Ok(None),
+            Err(error) => {
+                return Err(StartupError::PipeIo {
+                    operation: "decode probe response",
+                    pipe_name: pipe_name.to_path_buf(),
+                    source: io::Error::other(error),
+                });
+            }
         }
     }
 }

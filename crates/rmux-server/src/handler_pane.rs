@@ -55,6 +55,10 @@ pub(in crate::handler) use pane_attached_input::bracketed_paste::{
     strip_bracketed_paste_markers, strip_bracketed_paste_markers_after_append,
 };
 pub(super) use pane_attached_input::retain_partial_attached_escape_input;
+pub(in crate::handler) use pane_attached_input::{
+    decode_attached_terminal_control_after_append, decode_pane_bound_terminal_string,
+    PaneBoundTerminalStringDecode, TerminalResponseDecode,
+};
 pub(super) use pane_by_id::resolve_pane_target_ref;
 #[cfg(windows)]
 pub(in crate::handler) use pane_deferred_wait::format_references_pane_pid;
@@ -67,12 +71,19 @@ use pane_io_encoding::{
     write_bytes_to_target, write_bytes_to_targets, PaneInputWrite,
 };
 pub(super) use pane_io_encoding::{
-    prepare_pane_input_write, write_attached_bytes_to_target_io, write_bytes_to_target_io,
-    PaneInputLiveness,
+    prepare_pane_bracketed_paste_write, prepare_pane_input_write,
+    write_attached_bytes_to_target_io, write_bytes_to_target_io, PaneInputLiveness,
+};
+#[cfg(windows)]
+pub(super) use pane_io_encoding::{
+    windows_paste_sink, WindowsPasteSink, LEGACY_CONPTY_NON_UTF8_BRACKETED_PASTE_ERROR,
 };
 pub(in crate::handler) use pane_management::{SplitWindowParts, SplitWindowResponseMode};
 pub(super) use pane_prompt_input::decode_prompt_input_event;
-pub(in crate::handler) use pane_snapshot::PaneSnapshotRevisionRegistry;
+pub(in crate::handler) use pane_snapshot::{
+    collect_cells, compute_snapshot_fingerprint, cursor_coord_to_u16, CellCollectionBudget,
+    PaneSnapshotRevisionRegistry,
+};
 
 use rmux_proto::{PaneTarget, RmuxError, Target};
 

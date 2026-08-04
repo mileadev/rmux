@@ -1,9 +1,10 @@
 use rmux_core::LifecycleEvent;
-use rmux_proto::{HookName, SessionId, SessionName};
+use rmux_proto::{HookName, SessionId, SessionName, WindowTarget};
 
+use crate::client_names::control_client_name;
 use crate::hook_runtime::PendingInlineHookFormat;
 
-use super::super::RequestHandler;
+use super::super::{prepare_lifecycle_event, RequestHandler};
 
 #[cfg(test)]
 #[derive(Debug, Default)]
@@ -87,6 +88,34 @@ impl RequestHandler {
             && self
                 .prepare_created_session_control_attach(requester_pid, session_name, session_id)
                 .await;
+        if template_session.is_none() {
+            let initial_window_linked = {
+                let mut state = self.state.lock().await;
+                let initial_window = state.sessions.iter().find_map(|(current_name, session)| {
+                    (session.id() == session_id).then(|| {
+                        (
+                            current_name.clone(),
+                            WindowTarget::with_window(
+                                current_name.clone(),
+                                session.active_window_index(),
+                            ),
+                        )
+                    })
+                });
+                initial_window.map(|(current_name, target)| {
+                    prepare_lifecycle_event(
+                        &mut state,
+                        &LifecycleEvent::WindowLinked {
+                            session_name: current_name,
+                            target: Some(target),
+                        },
+                    )
+                })
+            };
+            if let Some(event) = initial_window_linked {
+                self.emit_prepared(event).await;
+            }
+        }
         self.emit_for_session_identity(
             LifecycleEvent::SessionCreated {
                 session_name: session_name.clone(),
@@ -99,7 +128,7 @@ impl RequestHandler {
             self.emit_for_session_identity(
                 LifecycleEvent::ClientSessionChanged {
                     session_name: session_name.clone(),
-                    client_name: Some(requester_pid.to_string()),
+                    client_name: Some(control_client_name(requester_pid)),
                 },
                 session_name,
                 session_id,

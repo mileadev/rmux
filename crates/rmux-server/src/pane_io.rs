@@ -15,7 +15,7 @@ use tokio::sync::watch;
 #[cfg(any(unix, windows))]
 use tokio::time::{Duration, Instant};
 
-const READ_BUFFER_SIZE: usize = 64 * 1024;
+pub(crate) const READ_BUFFER_SIZE: usize = 64 * 1024;
 #[cfg(any(unix, windows))]
 const ATTACH_INTERACTIVE_OUTPUT_WINDOW: Duration = Duration::from_millis(250);
 #[cfg(any(unix, windows))]
@@ -166,6 +166,8 @@ use exit_log::{record_attach_error, record_attach_exit, AttachExitReason};
 pub(crate) use live_render::LivePaneRender;
 #[cfg(any(unix, windows))]
 use pending_escape::PendingEscapeFlush;
+#[cfg(test)]
+pub(crate) use persistent_overlay::replay_client_visible_payloads;
 #[cfg(any(unix, windows))]
 use persistent_overlay::{
     accept_persistent_overlay_state, advance_persistent_overlay_state, clear_then_base_frame,
@@ -181,6 +183,8 @@ pub(crate) use reader::spawn_pane_output_reader;
 pub(crate) use reader::PaneOutputEofState;
 #[cfg(unix)]
 pub(crate) use reader::PaneOutputReaderTask;
+#[cfg(test)]
+pub(crate) use reader::{publish_pane_bytes_capturing_alerts, publish_pane_bytes_for_test};
 #[cfg(any(unix, windows))]
 use refresh_scheduler::{
     wait_for_refresh_deadline, AttachRefreshScheduler, AttachStatusRefreshScheduler,
@@ -192,8 +196,8 @@ pub(crate) use types::LiveAttachInputContext;
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use types::{
     pane_output_channel, AttachSessionUpgrade, AttachTarget, HandleOutcome, OverlayFrame,
-    PaneAlertCallback, PaneAlertEvent, PaneExitCallback, PaneExitEvent, PaneOutputReceiver,
-    PaneOutputSender,
+    PaneAlertCallback, PaneAlertEvent, PaneBoundary, PaneExitCallback, PaneExitEvent,
+    PaneInvalidationReason, PaneObservationItem, PaneOutputReceiver, PaneOutputSender,
 };
 #[cfg(any(unix, windows))]
 use wire::{
@@ -409,6 +413,12 @@ pub(crate) async fn forward_attach(
                 }
                 PendingAttachAction::InteractiveInput => {
                     mark_attach_interactive_input(&mut pane_refresh, &mut last_client_input_at);
+                    absorb_transient_terminal_prefix(
+                        &live_input,
+                        &mut pending_input,
+                        &mut pending_escape_flush,
+                    )
+                    .await;
                     pane_refresh.schedule_now();
                     continue;
                 }
@@ -553,6 +563,12 @@ pub(crate) async fn forward_attach(
                 }
                 PendingAttachAction::InteractiveInput => {
                     mark_attach_interactive_input(&mut pane_refresh, &mut last_client_input_at);
+                    absorb_transient_terminal_prefix(
+                        &live_input,
+                        &mut pending_input,
+                        &mut pending_escape_flush,
+                    )
+                    .await;
                     pane_refresh.schedule_now();
                     continue;
                 }
@@ -695,6 +711,12 @@ pub(crate) async fn forward_attach(
                                 &mut pane_refresh,
                                 &mut last_client_input_at,
                             );
+                            absorb_transient_terminal_prefix(
+                                &live_input,
+                                &mut pending_input,
+                                &mut pending_escape_flush,
+                            )
+                            .await;
                             pane_refresh.schedule_now();
                             continue;
                         }
@@ -878,6 +900,12 @@ pub(crate) async fn forward_attach(
                                 &mut pane_refresh,
                                 &mut last_client_input_at,
                             );
+                            absorb_transient_terminal_prefix(
+                                &live_input,
+                                &mut pending_input,
+                                &mut pending_escape_flush,
+                            )
+                            .await;
                             pane_refresh.schedule_now();
                             continue;
                         }
@@ -1045,6 +1073,12 @@ pub(crate) async fn forward_attach(
                                 &mut pane_refresh,
                                 &mut last_client_input_at,
                             );
+                            absorb_transient_terminal_prefix(
+                                &live_input,
+                                &mut pending_input,
+                                &mut pending_escape_flush,
+                            )
+                            .await;
                             pane_refresh.schedule_now();
                         }
                         Some(AttachControl::Switch(next_target)) => {
@@ -1398,6 +1432,12 @@ pub(crate) async fn forward_attach(
                                 &mut pane_refresh,
                                 &mut last_client_input_at,
                             );
+                            absorb_transient_terminal_prefix(
+                                &live_input,
+                                &mut pending_input,
+                                &mut pending_escape_flush,
+                            )
+                            .await;
                             pane_refresh.schedule_now();
                             continue;
                         }
@@ -2049,6 +2089,23 @@ async fn sync_pending_escape_flush(
     }
     let escape_time = live_input.handler.attached_escape_time().await;
     sync_pending_escape_flush_with_escape_time(pending_escape_flush, pending_input, escape_time);
+}
+
+#[cfg(any(unix, windows))]
+async fn absorb_transient_terminal_prefix(
+    live_input: &LiveAttachInputContext,
+    pending_input: &mut Vec<u8>,
+    pending_escape_flush: &mut PendingEscapeFlush,
+) {
+    let prefix = live_input
+        .handler
+        .take_transient_terminal_prefix_for_identity(live_input.identity)
+        .await;
+    if prefix.is_empty() {
+        return;
+    }
+    pending_input.extend(prefix);
+    sync_pending_escape_flush(pending_escape_flush, live_input, pending_input).await;
 }
 
 #[cfg(any(unix, windows))]

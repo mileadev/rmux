@@ -3,6 +3,26 @@ use rmux_proto::RmuxError;
 
 use super::RequestHandler;
 
+#[derive(Debug)]
+pub(in crate::handler) enum ModeTreeInputError {
+    Fatal(RmuxError),
+    UserCommandAfterModeExit(RmuxError),
+}
+
+impl ModeTreeInputError {
+    pub(in crate::handler) fn into_rmux_error(self) -> RmuxError {
+        match self {
+            Self::Fatal(error) | Self::UserCommandAfterModeExit(error) => error,
+        }
+    }
+}
+
+impl From<RmuxError> for ModeTreeInputError {
+    fn from(error: RmuxError) -> Self {
+        Self::Fatal(error)
+    }
+}
+
 #[path = "handler_mode_tree/actions.rs"]
 mod mode_tree_actions;
 #[path = "handler_mode_tree/buffer_actions.rs"]

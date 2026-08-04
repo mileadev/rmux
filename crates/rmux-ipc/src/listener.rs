@@ -42,6 +42,8 @@ pub struct LocalListener {
 pub struct LocalListener {
     pipe_name: OsString,
     pending: tokio::sync::Mutex<VecDeque<NamedPipeServer>>,
+    _legacy_guard: Option<NamedPipeServer>,
+    _registration: Option<crate::windows_endpoint_state::ManagedEndpointRegistration>,
 }
 
 #[cfg(windows)]
@@ -49,6 +51,11 @@ const NAMED_PIPE_PENDING_INSTANCES: usize = 4;
 
 impl LocalListener {
     /// Binds a local listener.
+    ///
+    /// This is a synchronous function that builds Tokio I/O resources, so it
+    /// must be called from inside a Tokio runtime: a Unix listener and the
+    /// Windows named-pipe server instances both register with the reactor and
+    /// panic with "there is no reactor running" without one.
     pub fn bind(endpoint: &LocalEndpoint) -> io::Result<Self> {
         bind_impl(endpoint)
     }
@@ -105,10 +112,26 @@ fn bind_rustix_listener(_endpoint: &LocalEndpoint) -> io::Result<LocalListener> 
 #[cfg(windows)]
 fn bind_impl(endpoint: &LocalEndpoint) -> io::Result<LocalListener> {
     let pipe_name = endpoint.as_pipe_name().to_owned();
+    let reservation =
+        crate::windows_endpoint_state::reserve_managed_endpoint_start(endpoint.as_path())?;
+    if reservation.endpoint() != endpoint {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "managed endpoint generation is no longer current",
+        ));
+    }
+    let legacy_guard = reservation
+        .legacy_endpoint()
+        .map(|endpoint| create_legacy_guard(endpoint.as_pipe_name()))
+        .transpose()?;
     let pending = create_pending_servers(&pipe_name)?;
+    let registration = crate::windows_endpoint_state::register_running(&pipe_name)?;
+    drop(reservation);
     Ok(LocalListener {
         pipe_name,
         pending: tokio::sync::Mutex::new(pending),
+        _legacy_guard: legacy_guard,
+        _registration: registration,
     })
 }
 
@@ -195,23 +218,44 @@ async fn replenish_pending_servers(listener: &LocalListener) -> io::Result<()> {
 
 #[cfg(windows)]
 fn create_server(pipe_name: &OsString, first_instance: bool) -> io::Result<NamedPipeServer> {
+    create_server_with_access(pipe_name, first_instance, PipeAccess::SameUser)
+}
+
+#[cfg(windows)]
+fn create_legacy_guard(pipe_name: &std::ffi::OsStr) -> io::Result<NamedPipeServer> {
+    create_server_with_access(pipe_name, true, PipeAccess::NamespaceGuard)
+}
+
+#[cfg(windows)]
+fn create_server_with_access(
+    pipe_name: &std::ffi::OsStr,
+    first_instance: bool,
+    access: PipeAccess,
+) -> io::Result<NamedPipeServer> {
     let mut options = ServerOptions::new();
     options.first_pipe_instance(first_instance);
-    let mut security = SameUserSecurityAttributes::new()?;
+    let mut security = PipeSecurityAttributes::new(access)?;
     // SAFETY: SECURITY_ATTRIBUTES points at a live self-owned security descriptor
     // for the duration of CreateNamedPipeW inside Tokio.
     unsafe { options.create_with_security_attributes_raw(pipe_name, security.as_mut_ptr()) }
 }
 
 #[cfg(windows)]
-struct SameUserSecurityAttributes {
+#[derive(Clone, Copy)]
+enum PipeAccess {
+    SameUser,
+    NamespaceGuard,
+}
+
+#[cfg(windows)]
+struct PipeSecurityAttributes {
     descriptor: PSECURITY_DESCRIPTOR,
     attributes: SECURITY_ATTRIBUTES,
 }
 
 #[cfg(windows)]
-impl SameUserSecurityAttributes {
-    fn new() -> io::Result<Self> {
+impl PipeSecurityAttributes {
+    fn new(access: PipeAccess) -> io::Result<Self> {
         let sid = match IdentityResolver::current()? {
             UserIdentity::Sid(sid) => sid,
             UserIdentity::Uid(_) => {
@@ -220,10 +264,12 @@ impl SameUserSecurityAttributes {
                 ));
             }
         };
-        let sddl = wide_null(&same_user_pipe_sddl(
-            sid.as_ref(),
-            current_integrity_label()?,
-        )?);
+        let integrity = current_integrity_label()?;
+        let sddl = match access {
+            PipeAccess::SameUser => same_user_pipe_sddl(sid.as_ref(), integrity)?,
+            PipeAccess::NamespaceGuard => legacy_guard_pipe_sddl(sid.as_ref(), integrity)?,
+        };
+        let sddl = wide_null(&sddl);
         let mut descriptor = std::ptr::null_mut();
 
         // SAFETY: sddl is null-terminated UTF-16 and descriptor is an out pointer
@@ -256,7 +302,7 @@ impl SameUserSecurityAttributes {
 }
 
 #[cfg(windows)]
-impl Drop for SameUserSecurityAttributes {
+impl Drop for PipeSecurityAttributes {
     fn drop(&mut self) {
         if !self.descriptor.is_null() {
             // SAFETY: descriptor came from ConvertStringSecurityDescriptorToSecurityDescriptorW.
@@ -276,6 +322,15 @@ fn same_user_pipe_sddl(sid: &str, integrity_label: &str) -> io::Result<String> {
     Ok(format!(
         "O:{sid}G:{sid}D:P(A;;GA;;;{sid})S:(ML;;NW;;;{integrity_sid})"
     ))
+}
+
+#[cfg(windows)]
+fn legacy_guard_pipe_sddl(sid: &str, integrity_label: &str) -> io::Result<String> {
+    let integrity_sid = integrity_sddl_sid(integrity_label)?;
+    // An empty protected DACL keeps the first pipe instance alive as a
+    // namespace reservation while denying every client open. This prevents an
+    // explicit legacy path from connecting to a server that will never accept.
+    Ok(format!("O:{sid}G:{sid}D:PS:(ML;;NW;;;{integrity_sid})"))
 }
 
 #[cfg(windows)]
@@ -315,6 +370,10 @@ mod tests {
         assert_eq!(
             same_user_pipe_sddl(sid, "medium").expect("medium integrity sddl"),
             "O:S-1-5-21-1000G:S-1-5-21-1000D:P(A;;GA;;;S-1-5-21-1000)S:(ML;;NW;;;ME)"
+        );
+        assert_eq!(
+            legacy_guard_pipe_sddl(sid, "medium").expect("legacy guard sddl"),
+            "O:S-1-5-21-1000G:S-1-5-21-1000D:PS:(ML;;NW;;;ME)"
         );
         assert_eq!(integrity_sddl_sid("low").expect("low integrity"), "LW");
         assert!(integrity_sddl_sid("unknown").is_err());

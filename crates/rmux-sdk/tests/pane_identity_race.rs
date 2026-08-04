@@ -9,16 +9,20 @@ use std::time::Duration;
 use rmux_proto::{
     encode_frame, CommandOutput, ErrorResponse, FrameDecoder, HandshakeResponse, KillPaneResponse,
     ListPanesResponse, ListSessionsResponse, ListWindowsResponse, PaneOutputCursor,
-    PaneOutputCursorResponse, PaneOutputEvent, PaneOutputSubscriptionId,
-    PaneOutputSubscriptionStart, PaneSnapshotCell, PaneSnapshotCursor, PaneSnapshotResponse,
-    PaneStateSnapshot, PaneStateSubscriptionId, PaneTarget, PaneTargetRef, Request,
+    PaneOutputCursorResponse, PaneOutputEvent, PaneOutputLagNotice, PaneOutputLagResponse,
+    PaneOutputSubscriptionId, PaneOutputSubscriptionStart, PaneRecentOutput, PaneSnapshotCell,
+    PaneSnapshotCursor, PaneSnapshotResponse, PaneStateSnapshot, PaneStateSubscriptionId,
+    PaneStreamCursorResponse, PaneStreamEvent, PaneStreamLifecycleEvent, PaneStreamMode,
+    PaneSurfaceFrame, PaneSurfaceSnapshot, PaneTarget, PaneTargetRef, Request,
     ResizePaneAdjustment, ResizePaneResponse, RespawnPaneResponse, Response, SelectPaneResponse,
-    SendKeysResponse, SubscribePaneOutputResponse, SubscribePaneStateResponse, TerminalSize,
-    WindowListEntry, WindowTarget, CAPABILITY_HANDSHAKE,
+    SendKeysResponse, SubscribePaneOutputResponse, SubscribePaneStateResponse,
+    SubscribePaneStreamResponse, TerminalSize, UnsubscribePaneOutputResponse, WindowListEntry,
+    WindowTarget, CAPABILITY_HANDSHAKE,
 };
 use rmux_sdk::{
-    LayoutName, Pane, PaneCloseOutcome, PaneId, PaneRef, PaneStateEvent, PaneStateEventsOptions,
-    RmuxBuilder, RmuxError, SessionId, SessionName, TerminalLoadState, TerminalSizeSpec, WindowId,
+    LayoutName, Pane, PaneCloseOutcome, PaneId, PaneOutputStart, PaneRef, PaneStateEvent,
+    PaneStateEventsOptions, RmuxBuilder, RmuxError, SessionId, SessionName, TerminalLoadState,
+    TerminalSizeSpec, WindowId,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -26,6 +30,10 @@ use tokio::net::{UnixListener, UnixStream};
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
 static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
+
+/// Request timeout for tests that must distinguish a stalled render future
+/// from a transport that gives up on an unanswered cursor poll.
+const STALL_PROOF_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[tokio::test]
 async fn stable_id_id_retries_reverse_after_inter_session_move_overlaps_scan() -> TestResult {
@@ -71,6 +79,7 @@ async fn stable_id_snapshot_never_defaults_when_inter_session_move_overlaps_scan
 async fn stable_id_render_stream_survives_inter_session_move_overlapping_open() -> TestResult {
     let socket = TestSocket::new("render-move-race")?;
     let listener = UnixListener::bind(socket.path())?;
+    let (finish_server, server_finished) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let mut peer = accept_peer(&listener).await?;
         expect_initial_preferred_lookup(&mut peer).await?;
@@ -81,13 +90,16 @@ async fn stable_id_render_stream_survives_inter_session_move_overlapping_open() 
         expect_by_id_handshake(&mut peer).await?;
         let subscription_id = expect_output_subscription(&mut peer).await?;
 
-        // The baseline and output-driven snapshots both resolve the new B
-        // location and must never inherit the stale A slot.
+        // The shared surface subscription resolves the new B location and
+        // must never inherit the stale A slot.
         expect_direct_beta_resolution(&mut peer).await?;
-        expect_snapshot(&mut peer, 41, "base").await?;
-        expect_output_event(&mut peer, subscription_id).await?;
-        expect_direct_beta_resolution(&mut peer).await?;
-        expect_snapshot(&mut peer, 42, "updated").await?;
+        let surface_id =
+            expect_surface_subscription(&mut peer, resolved_target(), resolved_slot(), 41, "base")
+                .await?;
+        expect_render_surface_update(&mut peer, subscription_id, surface_id, 42, "updated").await?;
+        server_finished
+            .await
+            .map_err(|_| "render test completion signal dropped")?;
         TestResult::Ok(())
     });
 
@@ -99,6 +111,995 @@ async fn stable_id_render_stream_survives_inter_session_move_overlapping_open() 
         .expect("output produces a render update");
     assert_eq!(update.snapshot().revision, 42);
     assert_eq!(update.snapshot().visible_text(), "updated");
+    let _ = finish_server.send(());
+    drop(render);
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn render_stream_correlates_lag_that_arrives_after_its_surface_frame() -> TestResult {
+    let socket = TestSocket::new("render-surface-before-lag")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_by_id_handshake(&mut peer).await?;
+        let output_id = expect_output_subscription(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        let surface_id =
+            expect_surface_subscription(&mut peer, resolved_target(), resolved_slot(), 41, "base")
+                .await?;
+
+        loop {
+            match peer.expect_request().await? {
+                Request::PaneOutputCursor(request) if request.subscription_id == output_id => {
+                    write_empty_output_cursor(&mut peer, output_id).await?;
+                }
+                Request::PaneStreamCursor(request) if request.subscription_id == surface_id => {
+                    peer.write_response(Response::PaneStreamCursor(Box::new(
+                        PaneStreamCursorResponse {
+                            subscription_id: surface_id,
+                            events: vec![PaneStreamEvent::SurfacePatch(Box::new(
+                                surface_frame_at("updated", 42, 2, 2),
+                            ))],
+                            limited: false,
+                        },
+                    )))
+                    .await?;
+                    break;
+                }
+                request => {
+                    return Err(format!("expected render cursor request, got {request:?}").into());
+                }
+            }
+        }
+        let request = peer.expect_request().await?;
+        let Request::PaneOutputCursor(request) = request else {
+            return Err(format!("expected correlated output drain, got {request:?}").into());
+        };
+        assert_eq!(request.subscription_id, output_id);
+        peer.write_response(Response::PaneOutputLag(Box::new(PaneOutputLagResponse {
+            subscription_id: output_id,
+            cursor: PaneOutputCursor {
+                next_sequence: 2,
+                missed_events: 1,
+            },
+            lag: PaneOutputLagNotice {
+                expected_sequence: 1,
+                resume_sequence: 2,
+                missed_events: 1,
+                newest_sequence: 1,
+                recent: PaneRecentOutput {
+                    bytes: Vec::new(),
+                    oldest_sequence: None,
+                    newest_sequence: None,
+                },
+            },
+        })))
+        .await?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_by_id(socket.path()).await?;
+    let mut render = pane.render_stream().await?.with_debounce(Duration::ZERO);
+    let update = render.next().await?.expect("surface update");
+    let lag = update
+        .lag()
+        .expect("the lag preceding the surface boundary is correlated");
+    assert_eq!(lag.expected_sequence, 1);
+    assert_eq!(lag.resume_sequence, 2);
+    drop(render);
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn render_stream_reopens_lag_tracking_after_respawn() -> TestResult {
+    let socket = TestSocket::new("render-output-eof-respawn")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let (finish_server, server_finished) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_by_id_handshake(&mut peer).await?;
+        let output_id = expect_output_subscription(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        let surface_id =
+            expect_surface_subscription(&mut peer, resolved_target(), resolved_slot(), 41, "base")
+                .await?;
+
+        let mut eof_sent = false;
+        let mut lifecycle_sent = false;
+        while !eof_sent || !lifecycle_sent {
+            match peer.expect_request().await? {
+                Request::PaneStreamCursor(request) if request.subscription_id == surface_id => {
+                    peer.write_response(Response::PaneStreamCursor(Box::new(
+                        PaneStreamCursorResponse {
+                            subscription_id: surface_id,
+                            events: vec![PaneStreamEvent::Lifecycle(
+                                PaneStreamLifecycleEvent::ProcessExited {
+                                    output_sequence: Some(1),
+                                },
+                            )],
+                            limited: false,
+                        },
+                    )))
+                    .await?;
+                    lifecycle_sent = true;
+                }
+                Request::PaneOutputCursor(request) if request.subscription_id == output_id => {
+                    write_output_eof(&mut peer, output_id, 1).await?;
+                    eof_sent = true;
+                }
+                request => {
+                    return Err(format!("expected render cursor request, got {request:?}").into());
+                }
+            }
+        }
+
+        let request = peer.expect_request().await?;
+        let Request::PaneStreamCursor(request) = request else {
+            return Err(format!("expected respawn surface reset, got {request:?}").into());
+        };
+        assert_eq!(request.subscription_id, surface_id);
+        peer.write_response(Response::PaneStreamCursor(Box::new(
+            PaneStreamCursorResponse {
+                subscription_id: surface_id,
+                events: vec![PaneStreamEvent::SurfaceReset(Box::new(
+                    surface_frame_at_epoch("respawned", 42, 2, 2, 2),
+                ))],
+                limited: false,
+            },
+        )))
+        .await?;
+
+        expect_direct_beta_resolution(&mut peer).await?;
+        let request = peer.expect_request().await?;
+        let Request::SubscribePaneOutputRef(request) = request else {
+            return Err(
+                format!("expected first respawn output subscription, got {request:?}").into(),
+            );
+        };
+        assert_eq!(request.target, resolved_target());
+        assert_eq!(request.start, PaneOutputSubscriptionStart::Now);
+        peer.write_response(Response::Error(ErrorResponse {
+            error: rmux_proto::RmuxError::Server(
+                "temporary respawn subscription failure".to_owned(),
+            ),
+        }))
+        .await?;
+
+        expect_direct_beta_resolution(&mut peer).await?;
+        let reopened_output_id = PaneOutputSubscriptionId::new(29);
+        expect_output_subscription_at_cursor(
+            &mut peer,
+            resolved_target(),
+            resolved_slot(),
+            reopened_output_id,
+            2,
+        )
+        .await?;
+
+        let mut lag_sent = false;
+        let mut patch_sent = false;
+        while !patch_sent {
+            match peer.expect_request().await? {
+                Request::UnsubscribePaneOutput(request) if request.subscription_id == output_id => {
+                    peer.write_response(Response::UnsubscribePaneOutput(
+                        UnsubscribePaneOutputResponse {
+                            subscription_id: output_id,
+                            removed: true,
+                        },
+                    ))
+                    .await?;
+                }
+                Request::PaneOutputCursor(request)
+                    if request.subscription_id == reopened_output_id =>
+                {
+                    peer.write_response(Response::PaneOutputLag(Box::new(PaneOutputLagResponse {
+                        subscription_id: reopened_output_id,
+                        cursor: PaneOutputCursor {
+                            next_sequence: 3,
+                            missed_events: 1,
+                        },
+                        lag: PaneOutputLagNotice {
+                            expected_sequence: 2,
+                            resume_sequence: 3,
+                            missed_events: 1,
+                            newest_sequence: 2,
+                            recent: PaneRecentOutput {
+                                bytes: Vec::new(),
+                                oldest_sequence: None,
+                                newest_sequence: None,
+                            },
+                        },
+                    })))
+                    .await?;
+                    lag_sent = true;
+                }
+                Request::PaneStreamCursor(request) if request.subscription_id == surface_id => {
+                    if lag_sent {
+                        peer.write_response(Response::PaneStreamCursor(Box::new(
+                            PaneStreamCursorResponse {
+                                subscription_id: surface_id,
+                                events: vec![PaneStreamEvent::SurfacePatch(Box::new(
+                                    surface_frame_at_epoch("live-again", 43, 3, 3, 2),
+                                ))],
+                                limited: false,
+                            },
+                        )))
+                        .await?;
+                        patch_sent = true;
+                    } else {
+                        write_empty_surface_cursor(&mut peer, surface_id).await?;
+                    }
+                }
+                request => {
+                    return Err(format!("expected reopened render request, got {request:?}").into());
+                }
+            }
+        }
+        server_finished
+            .await
+            .map_err(|_| "render respawn completion signal dropped")?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_by_id(socket.path()).await?;
+    let mut render = pane.render_stream().await?.with_debounce(Duration::ZERO);
+    let error = render
+        .next()
+        .await
+        .expect_err("the first respawn subscription failure must propagate");
+    assert!(
+        error
+            .to_string()
+            .contains("temporary respawn subscription failure"),
+        "{error}"
+    );
+    let update = render
+        .next()
+        .await?
+        .expect("the retained surface remains live after output EOF");
+    assert_eq!(update.snapshot().revision, 42);
+    assert_eq!(update.snapshot().visible_text(), "respawned");
+    assert!(update.lag().is_none());
+
+    let update = render
+        .next()
+        .await?
+        .expect("lag tracking resumes for the respawned generation");
+    assert_eq!(update.snapshot().revision, 43);
+    assert_eq!(update.snapshot().visible_text(), "live-again");
+    let lag = update
+        .lag()
+        .expect("the reopened output stream reports the new generation lag");
+    assert_eq!(lag.expected_sequence, 2);
+    assert_eq!(lag.resume_sequence, 3);
+    let _ = finish_server.send(());
+    drop(render);
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn render_stream_does_not_reopen_after_eof_and_reset_without_lifecycle() -> TestResult {
+    let socket = TestSocket::new("render-output-eof-reset-only")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_by_id_handshake(&mut peer).await?;
+        let output_id = expect_output_subscription(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        let surface_id =
+            expect_surface_subscription(&mut peer, resolved_target(), resolved_slot(), 41, "base")
+                .await?;
+
+        loop {
+            match peer.expect_request().await? {
+                Request::PaneOutputCursor(request) if request.subscription_id == output_id => {
+                    write_output_eof(&mut peer, output_id, 1).await?;
+                    break;
+                }
+                Request::PaneStreamCursor(request) if request.subscription_id == surface_id => {
+                    write_empty_surface_cursor(&mut peer, surface_id).await?;
+                }
+                request => {
+                    return Err(format!("expected render cursor request, got {request:?}").into());
+                }
+            }
+        }
+
+        let request = peer.expect_request().await?;
+        let Request::PaneStreamCursor(request) = request else {
+            return Err(format!("EOF alone unexpectedly armed a resubscribe: {request:?}").into());
+        };
+        assert_eq!(request.subscription_id, surface_id);
+        peer.write_response(Response::PaneStreamCursor(Box::new(
+            PaneStreamCursorResponse {
+                subscription_id: surface_id,
+                events: vec![PaneStreamEvent::SurfaceReset(Box::new(
+                    surface_frame_at_epoch("reset-only", 42, 2, 2, 2),
+                ))],
+                limited: false,
+            },
+        )))
+        .await?;
+
+        let request = peer.expect_request().await?;
+        let Request::PaneStreamCursor(request) = request else {
+            return Err(format!("reset without lifecycle reopened output: {request:?}").into());
+        };
+        assert_eq!(request.subscription_id, surface_id);
+        peer.write_response(Response::PaneStreamCursor(Box::new(
+            PaneStreamCursorResponse {
+                subscription_id: surface_id,
+                events: vec![PaneStreamEvent::End(
+                    rmux_proto::PaneStreamEndReason::PaneRemoved,
+                )],
+                limited: false,
+            },
+        )))
+        .await?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_by_id(socket.path()).await?;
+    let mut render = pane.render_stream().await?.with_debounce(Duration::ZERO);
+    let update = render
+        .next()
+        .await?
+        .expect("the reset-only surface remains observable");
+    assert_eq!(update.snapshot().revision, 42);
+    assert_eq!(update.snapshot().visible_text(), "reset-only");
+    assert!(render.next().await?.is_none());
+    drop(render);
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn render_stream_emits_the_final_frame_when_output_eof_precedes_the_debounce() -> TestResult {
+    let socket = TestSocket::new("render-eof-then-frame")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let (release_end, end_released) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_by_id_handshake(&mut peer).await?;
+        let output_id = expect_output_subscription(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        let surface_id =
+            expect_surface_subscription(&mut peer, resolved_target(), resolved_slot(), 41, "base")
+                .await?;
+
+        // The pane process exits: the daemon publishes the zero-length output
+        // EOF first, then the last surface frame it produced.
+        let mut eof_sent = false;
+        loop {
+            match peer.expect_request().await? {
+                Request::PaneOutputCursor(request) if request.subscription_id == output_id => {
+                    write_output_eof(&mut peer, output_id, 1).await?;
+                    eof_sent = true;
+                }
+                Request::PaneStreamCursor(request) if request.subscription_id == surface_id => {
+                    if eof_sent {
+                        write_surface_cursor(&mut peer, surface_id, 42, "final").await?;
+                        break;
+                    }
+                    write_empty_surface_cursor(&mut peer, surface_id).await?;
+                }
+                request => {
+                    return Err(format!("expected render cursor request, got {request:?}").into());
+                }
+            }
+        }
+
+        // `remain-on-exit-format ""` produces no dead-pane reset, so nothing but
+        // the armed debounce can release the pending snapshot.
+        let request = peer.expect_request().await?;
+        let Request::PaneStreamCursor(request) = request else {
+            return Err(format!("expected a surface cursor poll, got {request:?}").into());
+        };
+        assert_eq!(request.subscription_id, surface_id);
+        end_released
+            .await
+            .map_err(|_| "render test completion signal dropped")?;
+        peer.write_response(Response::PaneStreamCursor(Box::new(
+            PaneStreamCursorResponse {
+                subscription_id: surface_id,
+                events: vec![PaneStreamEvent::End(
+                    rmux_proto::PaneStreamEndReason::PaneRemoved,
+                )],
+                limited: false,
+            },
+        )))
+        .await?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_by_id_with_timeout(socket.path(), STALL_PROOF_REQUEST_TIMEOUT).await?;
+    let mut render = pane
+        .render_stream()
+        .await?
+        .with_debounce(Duration::from_millis(250));
+    let started = std::time::Instant::now();
+    let update = tokio::time::timeout(Duration::from_secs(10), render.next())
+        .await
+        .map_err(|_| "render stream stalled after output EOF instead of honoring its debounce")??
+        .expect("the debounce releases the last frame after output EOF");
+    assert_eq!(update.snapshot().revision, 42);
+    assert_eq!(update.snapshot().visible_text(), "final");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the last frame must be released by the debounce, not by an unrelated timeout: {:?}",
+        started.elapsed()
+    );
+
+    // The forced emit must leave the stream usable: the surface end still ends it.
+    let _ = release_end.send(());
+    assert!(tokio::time::timeout(Duration::from_secs(10), render.next())
+        .await
+        .map_err(|_| "render stream stalled instead of observing its surface end")??
+        .is_none());
+    drop(render);
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn render_stream_emits_the_final_frame_when_output_eof_lands_inside_the_debounce(
+) -> TestResult {
+    let socket = TestSocket::new("render-frame-then-eof")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let (finish_server, server_finished) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_by_id_handshake(&mut peer).await?;
+        let output_id = expect_output_subscription(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        let surface_id =
+            expect_surface_subscription(&mut peer, resolved_target(), resolved_slot(), 41, "base")
+                .await?;
+
+        // Mirror ordering: the last surface frame arms the debounce first, then
+        // the zero-length output EOF lands while that debounce is still armed.
+        let mut frame_sent = false;
+        loop {
+            match peer.expect_request().await? {
+                Request::PaneOutputCursor(request) if request.subscription_id == output_id => {
+                    if frame_sent {
+                        write_output_eof(&mut peer, output_id, 1).await?;
+                        break;
+                    }
+                    write_empty_output_cursor(&mut peer, output_id).await?;
+                }
+                Request::PaneStreamCursor(request) if request.subscription_id == surface_id => {
+                    if frame_sent {
+                        write_empty_surface_cursor(&mut peer, surface_id).await?;
+                    } else {
+                        write_surface_cursor(&mut peer, surface_id, 42, "final").await?;
+                        frame_sent = true;
+                    }
+                }
+                request => {
+                    return Err(format!("expected render cursor request, got {request:?}").into());
+                }
+            }
+        }
+
+        server_finished
+            .await
+            .map_err(|_| "render test completion signal dropped")?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_by_id_with_timeout(socket.path(), STALL_PROOF_REQUEST_TIMEOUT).await?;
+    let mut render = pane
+        .render_stream()
+        .await?
+        .with_debounce(Duration::from_millis(250));
+    let started = std::time::Instant::now();
+    let update = tokio::time::timeout(Duration::from_secs(10), render.next())
+        .await
+        .map_err(|_| "render stream stalled after output EOF instead of honoring its debounce")??
+        .expect("the debounce releases the last frame after output EOF");
+    assert_eq!(update.snapshot().revision, 42);
+    assert_eq!(update.snapshot().visible_text(), "final");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the last frame must be released by the debounce, not by an unrelated timeout: {:?}",
+        started.elapsed()
+    );
+    let _ = finish_server.send(());
+    drop(render);
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn render_stream_emits_pending_frame_when_output_closes_before_surface_end() -> TestResult {
+    let socket = TestSocket::new("render-output-close-before-end")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_by_id_handshake(&mut peer).await?;
+        let output_id = expect_output_subscription(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        let surface_id =
+            expect_surface_subscription(&mut peer, resolved_target(), resolved_slot(), 41, "base")
+                .await?;
+
+        let mut frame_sent = false;
+        loop {
+            match peer.expect_request().await? {
+                Request::PaneOutputCursor(request) if request.subscription_id == output_id => {
+                    if frame_sent {
+                        write_output_subscription_closed(&mut peer).await?;
+                        break;
+                    }
+                    write_empty_output_cursor(&mut peer, output_id).await?;
+                }
+                Request::PaneStreamCursor(request) if request.subscription_id == surface_id => {
+                    if frame_sent {
+                        write_empty_surface_cursor(&mut peer, surface_id).await?;
+                    } else {
+                        write_surface_cursor(&mut peer, surface_id, 42, "final").await?;
+                        frame_sent = true;
+                    }
+                }
+                request => {
+                    return Err(format!("expected render cursor request, got {request:?}").into());
+                }
+            }
+        }
+
+        let request = peer.expect_request().await?;
+        let Request::PaneStreamCursor(request) = request else {
+            return Err(format!("expected surface end poll, got {request:?}").into());
+        };
+        assert_eq!(request.subscription_id, surface_id);
+        write_surface_end(&mut peer, surface_id).await?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_by_id_with_timeout(socket.path(), STALL_PROOF_REQUEST_TIMEOUT).await?;
+    let mut render = pane
+        .render_stream()
+        .await?
+        .with_debounce(Duration::from_secs(30));
+    let update = tokio::time::timeout(Duration::from_secs(10), render.next())
+        .await
+        .map_err(|_| "render stream stalled after output closure")??
+        .expect("the pending frame survives output closure");
+    assert_eq!(update.snapshot().revision, 42);
+    assert_eq!(update.snapshot().visible_text(), "final");
+    assert!(render.next().await?.is_none());
+    drop(render);
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn render_stream_emits_pending_frame_when_surface_end_precedes_output_close() -> TestResult {
+    let socket = TestSocket::new("render-end-before-output-close")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_by_id_handshake(&mut peer).await?;
+        let output_id = expect_output_subscription(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        let surface_id =
+            expect_surface_subscription(&mut peer, resolved_target(), resolved_slot(), 41, "base")
+                .await?;
+
+        loop {
+            match peer.expect_request().await? {
+                Request::PaneOutputCursor(request) if request.subscription_id == output_id => {
+                    write_empty_output_cursor(&mut peer, output_id).await?;
+                }
+                Request::PaneStreamCursor(request) if request.subscription_id == surface_id => {
+                    peer.write_response(Response::PaneStreamCursor(Box::new(
+                        PaneStreamCursorResponse {
+                            subscription_id: surface_id,
+                            events: vec![
+                                PaneStreamEvent::SurfacePatch(Box::new(surface_frame_at(
+                                    "final", 42, 2, 2,
+                                ))),
+                                PaneStreamEvent::End(rmux_proto::PaneStreamEndReason::PaneRemoved),
+                            ],
+                            limited: false,
+                        },
+                    )))
+                    .await?;
+                    break;
+                }
+                request => {
+                    return Err(format!("expected render cursor request, got {request:?}").into());
+                }
+            }
+        }
+
+        let request = peer.expect_request().await?;
+        let Request::PaneOutputCursor(request) = request else {
+            return Err(format!("expected correlated output drain, got {request:?}").into());
+        };
+        assert_eq!(request.subscription_id, output_id);
+        write_output_subscription_closed(&mut peer).await?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_by_id_with_timeout(socket.path(), STALL_PROOF_REQUEST_TIMEOUT).await?;
+    let mut render = pane
+        .render_stream()
+        .await?
+        .with_debounce(Duration::from_secs(30));
+    let update = tokio::time::timeout(Duration::from_secs(10), render.next())
+        .await
+        .map_err(|_| "render stream stalled while draining after surface end")??
+        .expect("the pending frame survives output closure");
+    assert_eq!(update.snapshot().revision, 42);
+    assert_eq!(update.snapshot().visible_text(), "final");
+    assert!(render.next().await?.is_none());
+    drop(render);
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn render_stream_retains_final_lag_when_output_closes_after_surface_end() -> TestResult {
+    let socket = TestSocket::new("render-final-lag-output-close")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_by_id_handshake(&mut peer).await?;
+        let output_id = expect_output_subscription(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        let surface_id =
+            expect_surface_subscription(&mut peer, resolved_target(), resolved_slot(), 41, "base")
+                .await?;
+
+        loop {
+            match peer.expect_request().await? {
+                Request::PaneOutputCursor(request) if request.subscription_id == output_id => {
+                    write_empty_output_cursor(&mut peer, output_id).await?;
+                }
+                Request::PaneStreamCursor(request) if request.subscription_id == surface_id => {
+                    peer.write_response(Response::PaneStreamCursor(Box::new(
+                        PaneStreamCursorResponse {
+                            subscription_id: surface_id,
+                            events: vec![
+                                PaneStreamEvent::SurfacePatch(Box::new(surface_frame_at(
+                                    "final", 42, 3, 3,
+                                ))),
+                                PaneStreamEvent::End(rmux_proto::PaneStreamEndReason::PaneRemoved),
+                            ],
+                            limited: false,
+                        },
+                    )))
+                    .await?;
+                    break;
+                }
+                request => {
+                    return Err(format!("expected render cursor request, got {request:?}").into());
+                }
+            }
+        }
+
+        let request = peer.expect_request().await?;
+        let Request::PaneOutputCursor(request) = request else {
+            return Err(format!("expected final lag drain, got {request:?}").into());
+        };
+        assert_eq!(request.subscription_id, output_id);
+        peer.write_response(Response::PaneOutputLag(Box::new(PaneOutputLagResponse {
+            subscription_id: output_id,
+            cursor: PaneOutputCursor {
+                next_sequence: 2,
+                missed_events: 1,
+            },
+            lag: PaneOutputLagNotice {
+                expected_sequence: 1,
+                resume_sequence: 2,
+                missed_events: 1,
+                newest_sequence: 1,
+                recent: PaneRecentOutput {
+                    bytes: Vec::new(),
+                    oldest_sequence: None,
+                    newest_sequence: None,
+                },
+            },
+        })))
+        .await?;
+
+        let request = peer.expect_request().await?;
+        let Request::PaneOutputCursor(request) = request else {
+            return Err(format!("expected output close poll, got {request:?}").into());
+        };
+        assert_eq!(request.subscription_id, output_id);
+        write_output_subscription_closed(&mut peer).await?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_by_id_with_timeout(socket.path(), STALL_PROOF_REQUEST_TIMEOUT).await?;
+    let mut render = pane
+        .render_stream()
+        .await?
+        .with_debounce(Duration::from_secs(30));
+    let update = tokio::time::timeout(Duration::from_secs(10), render.next())
+        .await
+        .map_err(|_| "render stream stalled while draining its final lag")??
+        .expect("the final frame and lag survive output closure");
+    assert_eq!(update.snapshot().revision, 42);
+    assert_eq!(update.snapshot().visible_text(), "final");
+    let lag = update
+        .lag()
+        .expect("the lag drained before output closure remains observable");
+    assert_eq!(lag.expected_sequence, 1);
+    assert_eq!(lag.resume_sequence, 2);
+    assert!(render.next().await?.is_none());
+    drop(render);
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn render_stream_ends_normally_after_output_and_surface_close() -> TestResult {
+    let socket = TestSocket::new("render-normal-close")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_by_id_handshake(&mut peer).await?;
+        let output_id = expect_output_subscription(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        let surface_id =
+            expect_surface_subscription(&mut peer, resolved_target(), resolved_slot(), 41, "base")
+                .await?;
+
+        loop {
+            match peer.expect_request().await? {
+                Request::PaneOutputCursor(request) if request.subscription_id == output_id => {
+                    write_output_subscription_closed(&mut peer).await?;
+                    break;
+                }
+                Request::PaneStreamCursor(request) if request.subscription_id == surface_id => {
+                    write_empty_surface_cursor(&mut peer, surface_id).await?;
+                }
+                request => {
+                    return Err(format!("expected render cursor request, got {request:?}").into());
+                }
+            }
+        }
+
+        let request = peer.expect_request().await?;
+        let Request::PaneStreamCursor(request) = request else {
+            return Err(format!("expected surface close poll, got {request:?}").into());
+        };
+        assert_eq!(request.subscription_id, surface_id);
+        write_surface_end(&mut peer, surface_id).await?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_by_id_with_timeout(socket.path(), STALL_PROOF_REQUEST_TIMEOUT).await?;
+    let mut render = pane.render_stream().await?;
+    assert!(tokio::time::timeout(Duration::from_secs(10), render.next())
+        .await
+        .map_err(|_| "render stream stalled during normal closure")??
+        .is_none());
+    assert!(render.next().await?.is_none());
+    drop(render);
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn render_stream_still_rejects_open_output_cursor_drift() -> TestResult {
+    let socket = TestSocket::new("render-open-output-drift")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_by_id_handshake(&mut peer).await?;
+        let output_id = expect_output_subscription(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        let surface_id =
+            expect_surface_subscription(&mut peer, resolved_target(), resolved_slot(), 41, "base")
+                .await?;
+
+        loop {
+            match peer.expect_request().await? {
+                Request::PaneOutputCursor(request) if request.subscription_id == output_id => {
+                    write_empty_output_cursor(&mut peer, output_id).await?;
+                }
+                Request::PaneStreamCursor(request) if request.subscription_id == surface_id => {
+                    peer.write_response(Response::PaneStreamCursor(Box::new(
+                        PaneStreamCursorResponse {
+                            subscription_id: surface_id,
+                            events: vec![
+                                PaneStreamEvent::SurfacePatch(Box::new(surface_frame_at(
+                                    "invalid", 42, 2, 2,
+                                ))),
+                                PaneStreamEvent::End(rmux_proto::PaneStreamEndReason::PaneRemoved),
+                            ],
+                            limited: false,
+                        },
+                    )))
+                    .await?;
+                    break;
+                }
+                request => {
+                    return Err(format!("expected render cursor request, got {request:?}").into());
+                }
+            }
+        }
+
+        for _ in 0..2 {
+            let request = peer.expect_request().await?;
+            let Request::PaneOutputCursor(request) = request else {
+                return Err(format!("expected stale output drain, got {request:?}").into());
+            };
+            assert_eq!(request.subscription_id, output_id);
+            write_empty_output_cursor(&mut peer, output_id).await?;
+        }
+        TestResult::Ok(())
+    });
+
+    let pane = pane_by_id_with_timeout(socket.path(), STALL_PROOF_REQUEST_TIMEOUT).await?;
+    let mut render = pane
+        .render_stream()
+        .await?
+        .with_debounce(Duration::from_secs(30));
+    let error = render
+        .next()
+        .await
+        .expect_err("an open output cursor behind the surface boundary must remain an error");
+    match error {
+        RmuxError::Protocol {
+            source: rmux_proto::RmuxError::Server(message),
+            ..
+        } => assert_eq!(
+            message,
+            "pane surface advanced beyond its correlated output cursor"
+        ),
+        other => return Err(format!("expected protocol drift error, got {other:?}").into()),
+    }
+    drop(render);
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn render_stream_reports_pending_lag_before_surface_end() -> TestResult {
+    let socket = TestSocket::new("render-lag-before-end")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let (finish_server, server_finished) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_by_id_handshake(&mut peer).await?;
+        let output_id = expect_output_subscription(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        let surface_id =
+            expect_surface_subscription(&mut peer, resolved_target(), resolved_slot(), 41, "base")
+                .await?;
+
+        loop {
+            match peer.expect_request().await? {
+                Request::PaneStreamCursor(request) if request.subscription_id == surface_id => {
+                    write_empty_surface_cursor(&mut peer, surface_id).await?;
+                }
+                Request::PaneOutputCursor(request) if request.subscription_id == output_id => {
+                    peer.write_response(Response::PaneOutputLag(Box::new(PaneOutputLagResponse {
+                        subscription_id: output_id,
+                        cursor: PaneOutputCursor {
+                            next_sequence: 2,
+                            missed_events: 1,
+                        },
+                        lag: PaneOutputLagNotice {
+                            expected_sequence: 1,
+                            resume_sequence: 2,
+                            missed_events: 1,
+                            newest_sequence: 1,
+                            recent: PaneRecentOutput {
+                                bytes: Vec::new(),
+                                oldest_sequence: None,
+                                newest_sequence: None,
+                            },
+                        },
+                    })))
+                    .await?;
+                    break;
+                }
+                request => {
+                    return Err(format!("expected render cursor request, got {request:?}").into());
+                }
+            }
+        }
+
+        loop {
+            match peer.expect_request().await? {
+                Request::PaneOutputCursor(request) if request.subscription_id == output_id => {
+                    write_empty_output_cursor(&mut peer, output_id).await?;
+                }
+                Request::PaneStreamCursor(request) if request.subscription_id == surface_id => {
+                    peer.write_response(Response::PaneStreamCursor(Box::new(
+                        PaneStreamCursorResponse {
+                            subscription_id: surface_id,
+                            events: vec![PaneStreamEvent::End(
+                                rmux_proto::PaneStreamEndReason::PaneRemoved,
+                            )],
+                            limited: false,
+                        },
+                    )))
+                    .await?;
+                    break;
+                }
+                request => {
+                    return Err(
+                        format!("expected surface cursor after lag, got {request:?}").into(),
+                    );
+                }
+            }
+        }
+        server_finished
+            .await
+            .map_err(|_| "render test completion signal dropped")?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_by_id(socket.path()).await?;
+    let mut render = pane.render_stream().await?.with_debounce(Duration::ZERO);
+    let update = render
+        .next()
+        .await?
+        .expect("the final lag notice remains observable");
+    assert_eq!(update.snapshot().revision, 41);
+    let lag = update
+        .lag()
+        .expect("the final update carries the lag notice");
+    assert_eq!(lag.expected_sequence, 1);
+    assert_eq!(lag.resume_sequence, 2);
+    assert!(render.next().await?.is_none());
+    let _ = finish_server.send(());
     drop(render);
     drop(pane);
     server.await??;
@@ -110,6 +1111,7 @@ async fn render_stream_resumes_a_wake_cancelled_during_debounce() -> TestResult 
     let socket = TestSocket::new("render-cancel-debounce")?;
     let listener = UnixListener::bind(socket.path())?;
     let (event_sent, mut event_observed) = tokio::sync::oneshot::channel();
+    let (finish_server, server_finished) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let mut peer = accept_peer(&listener).await?;
         expect_initial_preferred_lookup(&mut peer).await?;
@@ -118,11 +1120,14 @@ async fn render_stream_resumes_a_wake_cancelled_during_debounce() -> TestResult 
         expect_by_id_handshake(&mut peer).await?;
         let subscription_id = expect_output_subscription(&mut peer).await?;
         expect_direct_beta_resolution(&mut peer).await?;
-        expect_snapshot(&mut peer, 41, "base").await?;
-        expect_output_event(&mut peer, subscription_id).await?;
+        let surface_id =
+            expect_surface_subscription(&mut peer, resolved_target(), resolved_slot(), 41, "base")
+                .await?;
+        expect_render_surface_update(&mut peer, subscription_id, surface_id, 42, "updated").await?;
         let _ = event_sent.send(());
-        expect_direct_beta_resolution(&mut peer).await?;
-        expect_snapshot(&mut peer, 42, "updated").await?;
+        server_finished
+            .await
+            .map_err(|_| "render test completion signal dropped")?;
         TestResult::Ok(())
     });
 
@@ -158,6 +1163,7 @@ async fn render_stream_resumes_a_wake_cancelled_during_debounce() -> TestResult 
         .expect("the consumed wake remains pending after cancellation");
     assert_eq!(update.snapshot().revision, 42);
     assert_eq!(update.snapshot().visible_text(), "updated");
+    let _ = finish_server.send(());
     drop(render);
     drop(pane);
     server.await??;
@@ -165,11 +1171,12 @@ async fn render_stream_resumes_a_wake_cancelled_during_debounce() -> TestResult 
 }
 
 #[tokio::test]
-async fn render_stream_resumes_the_same_snapshot_after_cancellation() -> TestResult {
-    let socket = TestSocket::new("render-cancel-snapshot")?;
+async fn render_stream_resumes_the_same_surface_cursor_after_cancellation() -> TestResult {
+    let socket = TestSocket::new("render-cancel-surface")?;
     let listener = UnixListener::bind(socket.path())?;
-    let (snapshot_started, snapshot_observed) = tokio::sync::oneshot::channel();
-    let (release_snapshot, release) = tokio::sync::oneshot::channel();
+    let (cursor_started, cursor_observed) = tokio::sync::oneshot::channel();
+    let (release_cursor, release) = tokio::sync::oneshot::channel();
+    let (finish_server, server_finished) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let mut peer = accept_peer(&listener).await?;
         expect_initial_preferred_lookup(&mut peer).await?;
@@ -178,21 +1185,22 @@ async fn render_stream_resumes_the_same_snapshot_after_cancellation() -> TestRes
         expect_by_id_handshake(&mut peer).await?;
         let subscription_id = expect_output_subscription(&mut peer).await?;
         expect_direct_beta_resolution(&mut peer).await?;
-        expect_snapshot(&mut peer, 41, "base").await?;
-        expect_output_event(&mut peer, subscription_id).await?;
-        expect_direct_beta_resolution(&mut peer).await?;
-
-        let request = peer.expect_request().await?;
-        let Request::PaneSnapshotRef(request) = request else {
-            return Err(format!("expected cancellable pane snapshot, got {request:?}").into());
-        };
-        assert_eq!(request.target, resolved_target());
-        let _ = snapshot_started.send(());
-        release
+        let surface_id =
+            expect_surface_subscription(&mut peer, resolved_target(), resolved_slot(), 41, "base")
+                .await?;
+        expect_cancellable_surface_cursor(
+            &mut peer,
+            subscription_id,
+            surface_id,
+            cursor_started,
+            release,
+            42,
+            "updated",
+        )
+        .await?;
+        server_finished
             .await
-            .map_err(|_| "snapshot release signal dropped")?;
-        peer.write_response(Response::PaneSnapshot(snapshot_response("updated", 42)))
-            .await?;
+            .map_err(|_| "render test completion signal dropped")?;
         TestResult::Ok(())
     });
 
@@ -201,21 +1209,22 @@ async fn render_stream_resumes_the_same_snapshot_after_cancellation() -> TestRes
     let mut interrupted = Box::pin(render.next());
     tokio::select! {
         result = &mut interrupted => {
-            return Err(format!("render completed before snapshot cancellation: {result:?}").into());
+            return Err(format!("render completed before surface-cursor cancellation: {result:?}").into());
         }
-        observed = snapshot_observed => observed.map_err(|_| "server dropped snapshot signal")?,
+        observed = cursor_observed => observed.map_err(|_| "server dropped cursor signal")?,
     }
     drop(interrupted);
-    release_snapshot
+    release_cursor
         .send(())
-        .map_err(|_| "render stream dropped its pending snapshot")?;
+        .map_err(|_| "render stream dropped its pending surface cursor")?;
 
     let update = render
         .next()
         .await?
-        .expect("the in-flight snapshot remains pending after cancellation");
+        .expect("the in-flight surface cursor remains pending after cancellation");
     assert_eq!(update.snapshot().revision, 42);
     assert_eq!(update.snapshot().visible_text(), "updated");
+    let _ = finish_server.send(());
     drop(render);
     drop(pane);
     server.await??;
@@ -228,6 +1237,7 @@ async fn render_stream_resumes_an_output_cursor_cancelled_before_wake() -> TestR
     let listener = UnixListener::bind(socket.path())?;
     let (cursor_started, cursor_observed) = tokio::sync::oneshot::channel();
     let (release_cursor, release) = tokio::sync::oneshot::channel();
+    let (finish_server, server_finished) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let mut peer = accept_peer(&listener).await?;
         expect_initial_preferred_lookup(&mut peer).await?;
@@ -236,33 +1246,21 @@ async fn render_stream_resumes_an_output_cursor_cancelled_before_wake() -> TestR
         expect_by_id_handshake(&mut peer).await?;
         let subscription_id = expect_output_subscription(&mut peer).await?;
         expect_direct_beta_resolution(&mut peer).await?;
-        expect_snapshot(&mut peer, 41, "base").await?;
-
-        let request = peer.expect_request().await?;
-        let Request::PaneOutputCursor(request) = request else {
-            return Err(format!("expected cancellable output cursor, got {request:?}").into());
-        };
-        assert_eq!(request.subscription_id, subscription_id);
-        let _ = cursor_started.send(());
-        release
-            .await
-            .map_err(|_| "output cursor release signal dropped")?;
-        peer.write_response(Response::PaneOutputCursor(PaneOutputCursorResponse {
+        let surface_id =
+            expect_surface_subscription(&mut peer, resolved_target(), resolved_slot(), 41, "base")
+                .await?;
+        expect_cancellable_output_cursor(
+            &mut peer,
             subscription_id,
-            cursor: PaneOutputCursor {
-                next_sequence: 2,
-                missed_events: 0,
-            },
-            events: vec![PaneOutputEvent {
-                sequence: 1,
-                bytes: b"updated".to_vec(),
-            }],
-            limited: false,
-        }))
+            surface_id,
+            cursor_started,
+            release,
+        )
         .await?;
-
-        expect_direct_beta_resolution(&mut peer).await?;
-        expect_snapshot(&mut peer, 42, "updated").await?;
+        expect_render_surface_update(&mut peer, subscription_id, surface_id, 42, "updated").await?;
+        server_finished
+            .await
+            .map_err(|_| "render test completion signal dropped")?;
         TestResult::Ok(())
     });
 
@@ -286,6 +1284,7 @@ async fn render_stream_resumes_an_output_cursor_cancelled_before_wake() -> TestR
         .expect("the in-flight output wake remains pending after cancellation");
     assert_eq!(update.snapshot().revision, 42);
     assert_eq!(update.snapshot().visible_text(), "updated");
+    let _ = finish_server.send(());
     drop(render);
     drop(pane);
     server.await??;
@@ -446,6 +1445,44 @@ async fn stable_id_output_stream_retries_a_move_after_resolution() -> TestResult
 }
 
 #[tokio::test]
+async fn stable_id_oldest_output_stream_uses_bound_identity_without_live_preflight() -> TestResult {
+    let socket = TestSocket::new("output-oldest-bound-id")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_by_id_handshake(&mut peer).await?;
+
+        let request = peer.expect_request().await?;
+        let Request::SubscribePaneOutputRef(request) = request else {
+            return Err(format!("expected bound-id oldest subscription, got {request:?}").into());
+        };
+        assert_eq!(request.target, preferred_target());
+        assert_eq!(request.start, PaneOutputSubscriptionStart::Oldest);
+        peer.write_response(Response::SubscribePaneOutput(SubscribePaneOutputResponse {
+            subscription_id: PaneOutputSubscriptionId::new(24),
+            target: PaneTarget::with_window(preferred_session(), 0, 0),
+            pane_id: pane_id(),
+            cursor: PaneOutputCursor {
+                next_sequence: 1,
+                missed_events: 0,
+            },
+        }))
+        .await?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_by_id(socket.path()).await?;
+    let output = pane
+        .output_stream_starting_at(PaneOutputStart::Oldest)
+        .await?;
+    drop(output);
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn stable_id_render_stream_retries_an_output_move_after_resolution() -> TestResult {
     let socket = TestSocket::new("render-post-resolve")?;
     let listener = UnixListener::bind(socket.path())?;
@@ -465,7 +1502,8 @@ async fn stable_id_render_stream_retries_an_output_move_after_resolution() -> Te
         )
         .await?;
         expect_direct_source_resolution(&mut peer).await?;
-        expect_snapshot_at(&mut peer, source_target(), 43, "source").await?;
+        expect_surface_subscription(&mut peer, source_target(), source_slot(), 43, "source")
+            .await?;
         TestResult::Ok(())
     });
 
@@ -511,6 +1549,7 @@ async fn slot_resize_keeps_the_preflighted_pane_after_slot_replacement() -> Test
 async fn slot_render_stream_keeps_output_and_snapshots_on_one_identity() -> TestResult {
     let socket = TestSocket::new("render-slot-reuse")?;
     let listener = UnixListener::bind(socket.path())?;
+    let (finish_server, server_finished) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let mut peer = accept_peer(&listener).await?;
         expect_slot_lookup(&mut peer, "0:0:%7\n").await?;
@@ -525,10 +1564,18 @@ async fn slot_render_stream_keeps_output_and_snapshots_on_one_identity() -> Test
         )
         .await?;
         expect_list_panes(&mut peer, &preferred_session(), Some("0:0:%8\n0:1:%7\n")).await?;
-        expect_snapshot_at(&mut peer, preferred_target(), 41, "base").await?;
-        expect_output_event(&mut peer, subscription_id).await?;
-        expect_list_panes(&mut peer, &preferred_session(), Some("0:0:%8\n0:1:%7\n")).await?;
-        expect_snapshot_at(&mut peer, preferred_target(), 42, "updated").await?;
+        let surface_id = expect_surface_subscription(
+            &mut peer,
+            preferred_target(),
+            preferred_moved_slot(),
+            41,
+            "base",
+        )
+        .await?;
+        expect_render_surface_update(&mut peer, subscription_id, surface_id, 42, "updated").await?;
+        server_finished
+            .await
+            .map_err(|_| "render test completion signal dropped")?;
         TestResult::Ok(())
     });
 
@@ -540,6 +1587,7 @@ async fn slot_render_stream_keeps_output_and_snapshots_on_one_identity() -> Test
         .expect("output produces a render update");
     assert_eq!(update.snapshot().revision, 42);
     assert_eq!(update.snapshot().visible_text(), "updated");
+    let _ = finish_server.send(());
     drop(render);
     drop(pane);
     server.await??;
@@ -1013,9 +2061,19 @@ async fn stable_id_state_stream_retries_a_move_after_resolution() -> TestResult 
 }
 
 async fn pane_by_id(socket_path: &Path) -> TestResult<Pane> {
+    pane_by_id_with_timeout(socket_path, Duration::from_secs(2)).await
+}
+
+/// Same handle with an explicit request timeout.
+///
+/// Stream cursor polls run under this timeout, and a timed-out poll is
+/// reported as a synthetic `TransportLost` end. Tests that must observe a
+/// stalled render future therefore need a timeout far longer than the
+/// behaviour under test, otherwise the transport masks the stall.
+async fn pane_by_id_with_timeout(socket_path: &Path, timeout: Duration) -> TestResult<Pane> {
     let rmux = RmuxBuilder::new()
         .unix_socket(socket_path)
-        .default_timeout(Duration::from_secs(2))
+        .default_timeout(timeout)
         .build();
     Ok(rmux.pane_by_id(preferred_session(), pane_id()).await?)
 }
@@ -1684,6 +2742,17 @@ async fn expect_output_subscription_at(
     response_target: PaneTarget,
     subscription_id: PaneOutputSubscriptionId,
 ) -> TestResult {
+    expect_output_subscription_at_cursor(peer, expected_target, response_target, subscription_id, 1)
+        .await
+}
+
+async fn expect_output_subscription_at_cursor(
+    peer: &mut Peer,
+    expected_target: PaneTargetRef,
+    response_target: PaneTarget,
+    subscription_id: PaneOutputSubscriptionId,
+    next_sequence: u64,
+) -> TestResult {
     let request = peer.expect_request().await?;
     let Request::SubscribePaneOutputRef(request) = request else {
         return Err(format!("expected by-id output subscription, got {request:?}").into());
@@ -1696,7 +2765,7 @@ async fn expect_output_subscription_at(
         target: response_target,
         pane_id: pane_id(),
         cursor: PaneOutputCursor {
-            next_sequence: 1,
+            next_sequence,
             missed_events: 0,
         },
     }))
@@ -1757,28 +2826,267 @@ async fn expect_state_subscription_at(
     .await
 }
 
-async fn expect_output_event(
+async fn expect_surface_subscription(
+    peer: &mut Peer,
+    expected_target: PaneTargetRef,
+    response_target: PaneTarget,
+    grid_revision: u64,
+    text: &str,
+) -> TestResult<PaneOutputSubscriptionId> {
+    let subscription_id = PaneOutputSubscriptionId::new(119);
+    let request = peer.expect_request().await?;
+    let Request::SubscribePaneStream(request) = request else {
+        return Err(format!("expected surface subscription, got {request:?}").into());
+    };
+    assert_eq!(request.target, expected_target);
+    assert_eq!(request.mode, PaneStreamMode::Surface);
+    assert!(!request.include_snapshot);
+    peer.write_response(Response::SubscribePaneStream(Box::new(
+        SubscribePaneStreamResponse {
+            subscription_id,
+            target: response_target,
+            pane_id: pane_id(),
+            event: PaneStreamEvent::SurfaceReset(Box::new(surface_frame(text, grid_revision, 1))),
+        },
+    )))
+    .await?;
+    Ok(subscription_id)
+}
+
+async fn expect_render_surface_update(
+    peer: &mut Peer,
+    output_id: PaneOutputSubscriptionId,
+    surface_id: PaneOutputSubscriptionId,
+    grid_revision: u64,
+    text: &str,
+) -> TestResult {
+    loop {
+        match peer.expect_request().await? {
+            Request::PaneOutputCursor(request) if request.subscription_id == output_id => {
+                write_empty_output_cursor(peer, output_id).await?;
+            }
+            Request::PaneStreamCursor(request) if request.subscription_id == surface_id => {
+                write_surface_cursor(peer, surface_id, grid_revision, text).await?;
+                return Ok(());
+            }
+            request => {
+                return Err(format!("expected render cursor request, got {request:?}").into());
+            }
+        }
+    }
+}
+
+async fn expect_cancellable_surface_cursor(
+    peer: &mut Peer,
+    output_id: PaneOutputSubscriptionId,
+    surface_id: PaneOutputSubscriptionId,
+    cursor_started: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+    grid_revision: u64,
+    text: &str,
+) -> TestResult {
+    loop {
+        match peer.expect_request().await? {
+            Request::PaneOutputCursor(request) if request.subscription_id == output_id => {
+                write_empty_output_cursor(peer, output_id).await?;
+            }
+            Request::PaneStreamCursor(request) if request.subscription_id == surface_id => {
+                let _ = cursor_started.send(());
+                release
+                    .await
+                    .map_err(|_| "surface cursor release signal dropped")?;
+                write_surface_cursor(peer, surface_id, grid_revision, text).await?;
+                return Ok(());
+            }
+            request => {
+                return Err(format!("expected cancellable surface cursor, got {request:?}").into());
+            }
+        }
+    }
+}
+
+async fn expect_cancellable_output_cursor(
+    peer: &mut Peer,
+    output_id: PaneOutputSubscriptionId,
+    surface_id: PaneOutputSubscriptionId,
+    cursor_started: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+) -> TestResult {
+    loop {
+        match peer.expect_request().await? {
+            Request::PaneStreamCursor(request) if request.subscription_id == surface_id => {
+                write_empty_surface_cursor(peer, surface_id).await?;
+            }
+            Request::PaneOutputCursor(request) if request.subscription_id == output_id => {
+                let _ = cursor_started.send(());
+                release
+                    .await
+                    .map_err(|_| "output cursor release signal dropped")?;
+                peer.write_response(Response::PaneOutputCursor(PaneOutputCursorResponse {
+                    subscription_id: output_id,
+                    cursor: PaneOutputCursor {
+                        next_sequence: 2,
+                        missed_events: 0,
+                    },
+                    events: vec![PaneOutputEvent {
+                        sequence: 1,
+                        bytes: b"updated".to_vec(),
+                    }],
+                    limited: false,
+                }))
+                .await?;
+                return Ok(());
+            }
+            request => {
+                return Err(format!("expected cancellable output cursor, got {request:?}").into());
+            }
+        }
+    }
+}
+
+async fn write_empty_output_cursor(
     peer: &mut Peer,
     subscription_id: PaneOutputSubscriptionId,
 ) -> TestResult {
-    let request = peer.expect_request().await?;
-    let Request::PaneOutputCursor(request) = request else {
-        return Err(format!("expected pane-output cursor, got {request:?}").into());
-    };
-    assert_eq!(request.subscription_id, subscription_id);
     peer.write_response(Response::PaneOutputCursor(PaneOutputCursorResponse {
         subscription_id,
         cursor: PaneOutputCursor {
-            next_sequence: 2,
+            next_sequence: 1,
+            missed_events: 0,
+        },
+        events: Vec::new(),
+        limited: false,
+    }))
+    .await
+}
+
+async fn write_output_eof(
+    peer: &mut Peer,
+    subscription_id: PaneOutputSubscriptionId,
+    sequence: u64,
+) -> TestResult {
+    peer.write_response(Response::PaneOutputCursor(PaneOutputCursorResponse {
+        subscription_id,
+        cursor: PaneOutputCursor {
+            next_sequence: sequence.saturating_add(1),
             missed_events: 0,
         },
         events: vec![PaneOutputEvent {
-            sequence: 1,
-            bytes: b"updated".to_vec(),
+            sequence,
+            bytes: Vec::new(),
         }],
         limited: false,
     }))
     .await
+}
+
+async fn write_output_subscription_closed(peer: &mut Peer) -> TestResult {
+    peer.write_response(Response::Error(ErrorResponse {
+        error: rmux_proto::RmuxError::Server("subscription not found".to_owned()),
+    }))
+    .await
+}
+
+async fn write_empty_surface_cursor(
+    peer: &mut Peer,
+    subscription_id: PaneOutputSubscriptionId,
+) -> TestResult {
+    peer.write_response(Response::PaneStreamCursor(Box::new(
+        PaneStreamCursorResponse {
+            subscription_id,
+            events: Vec::new(),
+            limited: false,
+        },
+    )))
+    .await
+}
+
+async fn write_surface_end(
+    peer: &mut Peer,
+    subscription_id: PaneOutputSubscriptionId,
+) -> TestResult {
+    peer.write_response(Response::PaneStreamCursor(Box::new(
+        PaneStreamCursorResponse {
+            subscription_id,
+            events: vec![PaneStreamEvent::End(
+                rmux_proto::PaneStreamEndReason::PaneRemoved,
+            )],
+            limited: false,
+        },
+    )))
+    .await
+}
+
+async fn write_surface_cursor(
+    peer: &mut Peer,
+    subscription_id: PaneOutputSubscriptionId,
+    grid_revision: u64,
+    text: &str,
+) -> TestResult {
+    peer.write_response(Response::PaneStreamCursor(Box::new(
+        PaneStreamCursorResponse {
+            subscription_id,
+            events: vec![PaneStreamEvent::SurfacePatch(Box::new(surface_frame(
+                text,
+                grid_revision,
+                2,
+            )))],
+            limited: false,
+        },
+    )))
+    .await
+}
+
+fn surface_frame(text: &str, grid_revision: u64, surface_revision: u64) -> PaneSurfaceFrame {
+    surface_frame_at(text, grid_revision, surface_revision, 0)
+}
+
+fn surface_frame_at(
+    text: &str,
+    grid_revision: u64,
+    surface_revision: u64,
+    next_output_sequence: u64,
+) -> PaneSurfaceFrame {
+    surface_frame_at_epoch(
+        text,
+        grid_revision,
+        surface_revision,
+        next_output_sequence,
+        1,
+    )
+}
+
+fn surface_frame_at_epoch(
+    text: &str,
+    grid_revision: u64,
+    surface_revision: u64,
+    next_output_sequence: u64,
+    epoch: u64,
+) -> PaneSurfaceFrame {
+    let snapshot = snapshot_response(text, grid_revision);
+    PaneSurfaceFrame {
+        epoch,
+        revision: surface_revision,
+        next_output_sequence,
+        snapshot: PaneSurfaceSnapshot {
+            cols: snapshot.cols,
+            rows: snapshot.rows,
+            cells: snapshot.cells,
+            hyperlinks: Vec::new(),
+            cursor: snapshot.cursor,
+            title: String::new(),
+            path: String::new(),
+            dynamic_colors: rmux_proto::PaneSurfaceDynamicColors::default(),
+            metadata_complete: true,
+            mode_bits: 0,
+            alternate: false,
+            scroll_top: 0,
+            scroll_bottom: 0,
+            history_size: 0,
+            history_bytes: 0,
+            revision: snapshot.revision,
+        },
+    }
 }
 
 async fn expect_snapshot(peer: &mut Peer, revision: u64, text: &str) -> TestResult {

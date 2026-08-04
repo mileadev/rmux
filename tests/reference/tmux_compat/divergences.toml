@@ -89,7 +89,7 @@ tests = [
 ]
 limitations = [
   "Unix descendants that call setsid() and leave the tracked process group may survive shutdown",
-  "RMUX drains accepted background session-closed hooks that tmux 3.7b drops during final shutdown",
+  "RMUX drains background session-closed hooks within its bounded shutdown window; work still queued when that window expires is cancelled",
 ]
 
 [[entry]]
@@ -295,3 +295,86 @@ id = "C-D73"
 summary = "scroll-to-mouse without a mouse event is a safe no-op"
 inventory = "bounded"
 tests = ["crates/rmux-server/src/handler_send_keys_tests/copy_mode_mouse_origin.rs::non_mouse_scroll_to_mouse_is_a_safe_noop_product_divergence"]
+
+[[entry]]
+id = "C-D74"
+summary = "Layout mutations emit one canonical control-mode notification"
+inventory = "bounded"
+tests = ["crates/rmux-server/src/handler_layout_notification_tests.rs::layout_command_sites_keep_one_canonical_notification_per_mutation_product_divergence"]
+
+[[entry]]
+id = "C-D75"
+summary = "Delegated read-only attach rejects bindings with chained mutations"
+inventory = "bounded"
+tests = ["crates/rmux-server/src/handler_send_keys_tests/read_only_detach.rs::delegated_read_only_attach_rejects_chained_detach_binding_product_divergence"]
+
+[[entry]]
+id = "C-D76"
+summary = "Delayed command-mode jobs reject replaced stable session targets"
+inventory = "bounded"
+tests = ["tests/run_shell_context.rs::delayed_command_run_shell_rejects_replacement_session_product_divergence"]
+
+[[entry]]
+id = "C-D78"
+summary = "Joined capture preserves main-screen soft wraps across alternate-screen cycles"
+inventory = "bounded"
+evidence = ["tests/fixtures/tmux37/accepted_product_divergences.txt"]
+tests = ["crates/rmux-core/src/screen/tests.rs::joined_capture_alt_cycles_preserve_main_wrap_product_divergence"]
+
+[[entry]]
+id = "C-D79"
+summary = "Delayed display callbacks remain asynchronous instead of creating phantom control commands"
+inventory = "bounded"
+evidence = ["tests/fixtures/tmux37/accepted_product_divergences.txt"]
+tests = ["crates/rmux-server/src/control/tests.rs::delayed_run_shell_control_message_remains_asynchronous_product_divergence"]
+
+[[entry]]
+id = "C-D80"
+summary = "Explicit empty initial window names preserve caller intent"
+inventory = "bounded"
+evidence = ["tests/fixtures/tmux37/accepted_product_divergences.txt"]
+tests = ["tests/automatic_rename_initial.rs::explicit_empty_initial_names_are_preserved_product_divergence"]
+
+[[entry]]
+id = "C-D81"
+summary = "Width reflow preserves the cursor's logical-cell anchor"
+inventory = "bounded"
+evidence = ["tests/fixtures/tmux37/accepted_product_divergences.txt"]
+tests = ["crates/rmux-core/tests/parser_traces/ascii_reflow_cursor_history_anchor_product_divergence.trace"]
+limitations = [
+  "tmux 3.7b moves the cursor from logical column two to the first cell of the reflow continuation and pushes the original row into history",
+  "RMUX preserves the logical cursor anchor, so the next byte overwrites the intended cell instead of destroying the continuation",
+]
+
+[[entry]]
+id = "C-D82"
+summary = "Minimum tiled layouts return a viable grid instead of hanging"
+inventory = "bounded"
+evidence = ["tests/fixtures/tmux37/accepted_product_divergences.txt"]
+tests = ["crates/rmux-core/src/layout/tiled_tests.rs::tiled_five_and_six_pane_minimum_avoids_tmux_hang_product_divergence"]
+limitations = [
+  "tmux 3.7b does not return from select-layout tiled with five or six panes at the one-row horizontal minimum",
+  "RMUX expands the deficient height to five rows and returns a nonzero tiled grid immediately",
+]
+
+[[entry]]
+id = "C-D83"
+summary = "Width-deficient tiled rows converge coherently on the first application"
+inventory = "bounded"
+evidence = ["tests/fixtures/tmux37/accepted_product_divergences.txt"]
+tests = ["crates/rmux-core/src/layout/tiled_tests.rs::tiled_width_deficient_rows_converge_on_first_application_product_divergence"]
+limitations = [
+  "on its first application with three through six panes, tmux 3.7b expands a one-column window to three columns but leaves tiled row containers only one column wide; incomplete final rows also leave the final pane narrow",
+  "tmux repairs the rows on a second identical select-layout command; RMUX reaches the coherent three-column tree on the first application and remains idempotent",
+]
+
+[[entry]]
+id = "C-D84"
+summary = "Pane transfers reflow a width-deficient target instead of rejecting it"
+inventory = "bounded"
+evidence = ["tests/fixtures/tmux37/accepted_product_divergences.txt"]
+tests = ["crates/rmux-server/src/handler_layout_notification_tests.rs::join_and_move_reflow_minimum_target_and_publish_resize_product_divergence"]
+limitations = [
+  "tmux 3.7b rejects horizontal join-pane and move-pane into a one-column target, both within one session and across sessions, with size or position no space for a new pane",
+  "RMUX expands the target to the viable three-column minimum, completes the transfer, preserves the two existing layout notifications, and adds exactly one window-resized notification; a target already three columns wide receives no resize notification",
+]

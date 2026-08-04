@@ -577,6 +577,7 @@ fn is_lifecycle_noise(hook_name: HookName) -> bool {
             | HookName::ClientFocusOut
             | HookName::PaneSetClipboard
             | HookName::PaneTitleChanged
+            | HookName::WindowRenamed
     )
 }
 
@@ -717,6 +718,19 @@ async fn drain_attach_controls_until_idle(receiver: &mut mpsc::UnboundedReceiver
     }
 }
 
+async fn queue_alert_with_timeout(
+    handler: &RequestHandler,
+    target: WindowTarget,
+    flags: AlertFlags,
+) {
+    timeout(
+        ALERT_TEST_EVENT_TIMEOUT,
+        handler.alerts_queue_window(target, flags),
+    )
+    .await
+    .expect("alert dispatch should complete before timeout");
+}
+
 async fn drain_attach_controls_until_quiet(
     receiver: &mut mpsc::UnboundedReceiver<AttachControl>,
     quiet_for: Duration,
@@ -774,6 +788,7 @@ async fn register_clipboard_attach(
                 closing: Arc::new(AtomicBool::new(false)),
                 persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
                 terminal_context: OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
+                client_title: None,
                 flags: ClientFlags::default(),
                 render_stream: false,
                 uid,
@@ -794,6 +809,7 @@ fn clipboard_alert(session: SessionName, pane_id: PaneId) -> crate::pane_io::Pan
         bell_count: 0,
         title_changed: false,
         title_change: None,
+        path_changed: false,
         clipboard_set: true,
         clipboard_writes: vec![b"A".to_vec()],
         clipboard_queries: Vec::new(),
@@ -845,6 +861,7 @@ async fn pane_alert_event_sets_bell_and_activity_flags_and_emits_alert_hooks() {
         bell_count: 1,
         title_changed: false,
         title_change: None,
+        path_changed: false,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
         clipboard_queries: Vec::new(),
@@ -921,6 +938,7 @@ async fn pane_alert_batch_coalesces_bell_across_two_panes_in_one_window() {
             bell_count: 1,
             title_changed: false,
             title_change: None,
+            path_changed: false,
             clipboard_set: false,
             clipboard_writes: Vec::new(),
             clipboard_queries: Vec::new(),
@@ -987,6 +1005,7 @@ async fn pane_alert_callback_can_be_invoked_from_reader_thread() {
             bell_count: 0,
             title_changed: false,
             title_change: None,
+            path_changed: false,
             clipboard_set: false,
             clipboard_writes: Vec::new(),
             clipboard_queries: Vec::new(),
@@ -1023,6 +1042,7 @@ async fn pane_title_change_output_emits_lifecycle_hook_event() {
         bell_count: 0,
         title_changed: true,
         title_change: None,
+        path_changed: false,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
         clipboard_queries: Vec::new(),
@@ -1074,6 +1094,7 @@ async fn pane_state_title_alert_ignores_stale_generation() {
         bell_count: 0,
         title_changed: true,
         title_change: Some(("old".to_owned(), "current".to_owned())),
+        path_changed: false,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
         clipboard_queries: Vec::new(),
@@ -1136,6 +1157,7 @@ async fn pane_state_title_alert_ignores_stale_generation() {
         bell_count: 0,
         title_changed: true,
         title_change: Some(("current".to_owned(), "stale".to_owned())),
+        path_changed: false,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
         clipboard_queries: Vec::new(),
@@ -1383,6 +1405,7 @@ async fn pane_output_updates_activity_for_originating_pane_only() {
             bell_count: 0,
             title_changed: false,
             title_change: None,
+            path_changed: false,
             clipboard_set: false,
             clipboard_writes: Vec::new(),
             clipboard_queries: Vec::new(),
@@ -1449,6 +1472,7 @@ async fn pane_output_synchronizes_activity_across_linked_and_grouped_aliases() {
             bell_count: 0,
             title_changed: false,
             title_change: None,
+            path_changed: false,
             clipboard_set: false,
             clipboard_writes: Vec::new(),
             clipboard_queries: Vec::new(),
@@ -1505,6 +1529,7 @@ async fn pane_set_clipboard_output_emits_hook_without_activity() {
             bell_count: 0,
             title_changed: false,
             title_change: None,
+            path_changed: false,
             clipboard_set: true,
             clipboard_writes: Vec::new(),
             clipboard_queries: Vec::new(),
@@ -1547,6 +1572,7 @@ async fn pane_set_clipboard_hook_requires_set_clipboard_on() {
             bell_count: 0,
             title_changed: false,
             title_change: None,
+            path_changed: false,
             clipboard_set: true,
             clipboard_writes: Vec::new(),
             clipboard_queries: Vec::new(),
@@ -1587,6 +1613,7 @@ async fn inbound_osc52_write_creates_paste_buffer_under_set_clipboard_on() {
             bell_count: 0,
             title_changed: false,
             title_change: None,
+            path_changed: false,
             clipboard_set: true,
             clipboard_writes: vec![b"hello".to_vec()],
             clipboard_queries: Vec::new(),
@@ -1624,6 +1651,7 @@ async fn osc52_buffer_lifecycle_precedes_the_prepared_pane_alert_batch() {
             bell_count: 0,
             title_changed: true,
             title_change: None,
+            path_changed: false,
             clipboard_set: true,
             clipboard_writes: vec![b"ordered".to_vec()],
             clipboard_queries: Vec::new(),
@@ -1727,6 +1755,7 @@ async fn inbound_osc52_before_last_pane_eof_keeps_buffer_and_hook() {
         bell_count: 0,
         title_changed: false,
         title_change: None,
+        path_changed: false,
         clipboard_set: true,
         clipboard_writes: vec![b"hello-before-eof".to_vec()],
         clipboard_queries: Vec::new(),
@@ -1785,6 +1814,7 @@ async fn inbound_osc52_write_creates_no_buffer_without_set_clipboard_on() {
             bell_count: 0,
             title_changed: false,
             title_change: None,
+            path_changed: false,
             clipboard_set: true,
             clipboard_writes: vec![b"hello".to_vec()],
             clipboard_queries: Vec::new(),
@@ -1976,6 +2006,7 @@ async fn inactive_pane_osc52_is_enqueued_before_a_following_session_switch() {
             &OptionStore::default(),
             OuterTerminalContext::default(),
         ),
+        client_title: None,
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         raw_passthrough: false,
@@ -2387,6 +2418,7 @@ async fn pane_alert_callback_coalesces_inactive_pane_refreshes_by_session() {
                 closing: Arc::new(AtomicBool::new(false)),
                 persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
                 terminal_context: OuterTerminalContext::default(),
+                client_title: None,
                 flags: ClientFlags::default(),
                 render_stream: false,
                 uid,
@@ -2417,6 +2449,7 @@ async fn pane_alert_callback_coalesces_inactive_pane_refreshes_by_session() {
             bell_count: 0,
             title_changed: false,
             title_change: None,
+            path_changed: false,
             clipboard_set: false,
             clipboard_writes: Vec::new(),
             clipboard_queries: Vec::new(),
@@ -2481,6 +2514,7 @@ async fn pane_mouse_mode_alert_refreshes_the_active_attached_pane() {
                 closing: Arc::new(AtomicBool::new(false)),
                 persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
                 terminal_context: OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
+                client_title: None,
                 flags: ClientFlags::default(),
                 render_stream: false,
                 uid,
@@ -2498,6 +2532,7 @@ async fn pane_mouse_mode_alert_refreshes_the_active_attached_pane() {
         bell_count: 0,
         title_changed: false,
         title_change: None,
+        path_changed: false,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
         clipboard_queries: Vec::new(),
@@ -2575,6 +2610,7 @@ async fn pane_alert_event_updates_automatic_window_name_without_disabling_auto_r
         bell_count: 0,
         title_changed: false,
         title_change: None,
+        path_changed: false,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
         clipboard_queries: Vec::new(),
@@ -2643,6 +2679,7 @@ async fn pane_alert_event_respects_automatic_rename_off() {
             bell_count: 0,
             title_changed: false,
             title_change: None,
+            path_changed: false,
             clipboard_set: false,
             clipboard_writes: Vec::new(),
             clipboard_queries: Vec::new(),
@@ -2714,6 +2751,7 @@ async fn pane_alert_event_updates_grouped_session_window_names() {
             bell_count: 0,
             title_changed: false,
             title_change: None,
+            path_changed: false,
             clipboard_set: false,
             clipboard_writes: Vec::new(),
             clipboard_queries: Vec::new(),
@@ -2814,9 +2852,7 @@ async fn visual_bell_modes_dispatch_overlay_write_and_action_gating() {
         "off",
     )
     .await;
-    handler
-        .alerts_queue_window(current_window.clone(), rmux_core::WINDOW_BELL)
-        .await;
+    queue_alert_with_timeout(&handler, current_window.clone(), rmux_core::WINDOW_BELL).await;
     match recv_non_switch_control(&mut control_rx).await {
         AttachControl::Write(bytes) => assert_eq!(bytes, vec![0x07]),
         other => panic!("expected bell write, got {other:?}"),
@@ -2830,9 +2866,7 @@ async fn visual_bell_modes_dispatch_overlay_write_and_action_gating() {
         "on",
     )
     .await;
-    handler
-        .alerts_queue_window(current_window.clone(), rmux_core::WINDOW_BELL)
-        .await;
+    queue_alert_with_timeout(&handler, current_window.clone(), rmux_core::WINDOW_BELL).await;
     recv_visual_bell_overlay(&mut control_rx).await;
     assert_no_visual_bell_delivery(&mut control_rx).await;
 
@@ -2843,9 +2877,7 @@ async fn visual_bell_modes_dispatch_overlay_write_and_action_gating() {
         "both",
     )
     .await;
-    handler
-        .alerts_queue_window(current_window, rmux_core::WINDOW_BELL)
-        .await;
+    queue_alert_with_timeout(&handler, current_window, rmux_core::WINDOW_BELL).await;
     recv_visual_bell_write_and_overlay(&mut control_rx).await;
 
     set_option(
@@ -2855,14 +2887,15 @@ async fn visual_bell_modes_dispatch_overlay_write_and_action_gating() {
         "other",
     )
     .await;
-    handler
-        .alerts_queue_window(WindowTarget::new(session.clone()), rmux_core::WINDOW_BELL)
-        .await;
+    queue_alert_with_timeout(
+        &handler,
+        WindowTarget::new(session.clone()),
+        rmux_core::WINDOW_BELL,
+    )
+    .await;
     assert_no_visual_bell_delivery(&mut control_rx).await;
 
-    handler
-        .alerts_queue_window(other_window.clone(), rmux_core::WINDOW_BELL)
-        .await;
+    queue_alert_with_timeout(&handler, other_window.clone(), rmux_core::WINDOW_BELL).await;
     recv_visual_bell_delivery(&mut control_rx).await;
     let state = handler.state.lock().await;
     let flags = state
@@ -4239,6 +4272,7 @@ async fn window_alias_activity_resets_silence_timers_for_entire_family() {
             bell_count: 0,
             title_changed: false,
             title_change: None,
+            path_changed: false,
             clipboard_set: false,
             clipboard_writes: Vec::new(),
             clipboard_queries: Vec::new(),

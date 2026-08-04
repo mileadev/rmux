@@ -1,3 +1,4 @@
+use rmux_core::command_parser::ParsedCommand;
 use rmux_proto::request::Request;
 use rmux_proto::{
     capabilities_for_features, ControlModeResponse, ErrorResponse, HandshakeResponse, Response,
@@ -57,6 +58,28 @@ async fn pause_after_web_share_rollback_is_armed(handler: &RequestHandler) {
 }
 
 impl RequestHandler {
+    pub(crate) async fn handle_revoked_cleanup_request(
+        &self,
+        connection_id: u64,
+        request: Request,
+    ) -> Option<Response> {
+        match request {
+            Request::UnsubscribePaneOutput(request) => Some(
+                self.handle_unsubscribe_pane_output(connection_id, request)
+                    .await,
+            ),
+            Request::UnsubscribePaneStream(request) => Some(
+                self.handle_unsubscribe_pane_stream(connection_id, request)
+                    .await,
+            ),
+            Request::UnsubscribePaneState(request) => Some(
+                self.handle_unsubscribe_pane_state(connection_id, request)
+                    .await,
+            ),
+            _ => None,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) async fn handle(&self, request: Request) -> Response {
         let mut lifecycle_events = self.subscribe_lifecycle_events();
@@ -98,8 +121,14 @@ impl RequestHandler {
         let (outcome, inline_hooks) = self
             .dispatch_captured(requester_pid, connection_id, request)
             .await;
-        self.run_dispatched_hooks(requester_pid, &request_for_hooks, &outcome, inline_hooks)
-            .await;
+        self.run_dispatched_hooks(
+            requester_pid,
+            &request_for_hooks,
+            &outcome.response,
+            inline_hooks,
+            None,
+        )
+        .await;
         outcome
     }
 
@@ -122,29 +151,50 @@ impl RequestHandler {
         if undelivered_web_share.is_some() {
             pause_after_web_share_rollback_is_armed(self).await;
         }
-        self.run_dispatched_hooks(requester_pid, &request_for_hooks, &outcome, inline_hooks)
-            .await;
+        self.run_dispatched_hooks(
+            requester_pid,
+            &request_for_hooks,
+            &outcome.response,
+            inline_hooks,
+            None,
+        )
+        .await;
         (outcome, undelivered_web_share)
     }
 
-    async fn run_dispatched_hooks(
+    /// Runs everything a dispatched request still owes once its handler
+    /// returned: the applied-window-resize backstop, then its inline and
+    /// request hooks.
+    ///
+    /// Every path that dispatches a [`Request`] must finish through here.
+    /// `queued_command` carries the parsed command when the request came from a
+    /// command queue (control mode, a multi-command CLI invocation, a hook, a
+    /// key binding) and is `None` for a plain single-request connection.
+    pub(in crate::handler) async fn run_dispatched_hooks(
         &self,
         requester_pid: u32,
         request: &Request,
-        outcome: &HandleOutcome,
+        response: &Response,
         inline_hooks: Vec<PendingInlineHook>,
+        queued_command: Option<&ParsedCommand>,
     ) {
+        // Backstop for the applied-window-resize invariant: in tmux 3.7b every
+        // window whose size changed has already published
+        // `window-layout-changed` / `window-resized` by the time the command
+        // returns. Commands that publish at their own ordering point leave an
+        // empty queue here; a command that forgets is late, never silent.
+        self.publish_applied_window_resizes().await;
         let inline_hook_names = inline_hooks
             .iter()
             .map(|pending| pending.hook)
             .collect::<Vec<_>>();
-        self.run_inline_hooks(requester_pid, inline_hooks, None)
+        self.run_inline_hooks(requester_pid, inline_hooks, queued_command)
             .await;
         self.run_request_hooks(
             requester_pid,
             request,
-            &outcome.response,
-            None,
+            response,
+            queued_command,
             &inline_hook_names,
         )
         .await;
@@ -580,6 +630,17 @@ impl RequestHandler {
             Request::PaneOutputCursor(request) => HandleOutcome::response(
                 self.handle_pane_output_cursor(connection_id, request).await,
             ),
+            Request::SubscribePaneStream(request) => HandleOutcome::response(
+                self.handle_subscribe_pane_stream(connection_id, request)
+                    .await,
+            ),
+            Request::PaneStreamCursor(request) => HandleOutcome::response(
+                self.handle_pane_stream_cursor(connection_id, request).await,
+            ),
+            Request::UnsubscribePaneStream(request) => HandleOutcome::response(
+                self.handle_unsubscribe_pane_stream(connection_id, request)
+                    .await,
+            ),
             Request::SdkWaitForOutput(request) => HandleOutcome::response(
                 self.handle_sdk_wait_for_output(connection_id, request)
                     .await,
@@ -764,7 +825,7 @@ impl RequestHandler {
 // target pane's session. Commands that reference a second location (move-pane,
 // swap-pane) keep the conservative all-session wait so a still-starting
 // destination is not skipped.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn request_deferred_wait_target(request: &Request) -> Option<rmux_proto::Target> {
     use rmux_proto::{PaneTargetRef, Target};
     fn scope_from_ref(target: &PaneTargetRef) -> Target {
@@ -788,13 +849,14 @@ fn request_deferred_wait_target(request: &Request) -> Option<rmux_proto::Target>
         // layer, so keep the conservative wait to stay safe against a
         // still-starting sibling.
         Request::PaneResize(request) => Some(scope_from_ref(&request.target)),
+        Request::SubscribePaneStream(request) => Some(scope_from_ref(&request.target)),
         Request::PipePane(request) => Some(Target::Pane(request.target.clone())),
         Request::PasteBuffer(request) => Some(Target::Pane(request.target.clone())),
         _ => None,
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn request_waits_for_windows_deferred_panes(request: &Request) -> bool {
     match request {
         Request::NewWindow(request) if request.detached => return false,
@@ -858,6 +920,8 @@ fn request_waits_for_windows_deferred_panes(request: &Request) -> bool {
             | Request::SubscribePaneOutputRef(_)
             | Request::UnsubscribePaneOutput(_)
             | Request::PaneOutputCursor(_)
+            | Request::PaneStreamCursor(_)
+            | Request::UnsubscribePaneStream(_)
             | Request::SubscribePaneState(_)
             | Request::PaneStateCursor(_)
             | Request::UnsubscribePaneState(_)
@@ -893,7 +957,7 @@ fn supported_capabilities() -> Vec<&'static str> {
     capabilities_for_features(cfg!(all(any(unix, windows), feature = "web")))
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod windows_deferred_wait_tests {
     use rmux_core::PaneId;
     use rmux_proto::request::{
@@ -901,13 +965,15 @@ mod windows_deferred_wait_tests {
         PaneKillRequest, PaneRespawnRequest, PreviousWindowRequest, Request, RespawnPaneRequest,
         SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneMarkRequest, SelectPaneRequest,
         SelectWindowRequest, SplitWindowExtRequest, SplitWindowTargetActionRequest,
+        SubscribePaneStreamRequest, UnsubscribePaneStreamRequest,
     };
     use rmux_proto::{
-        PaneTarget, PaneTargetRef, ProcessCommand, SessionName, SplitDirection, SplitWindowTarget,
+        PaneOutputSubscriptionId, PaneStreamCursorRequest, PaneStreamMode, PaneTarget,
+        PaneTargetRef, ProcessCommand, SessionName, SplitDirection, SplitWindowTarget, Target,
         WindowTarget,
     };
 
-    use super::request_waits_for_windows_deferred_panes;
+    use super::{request_deferred_wait_target, request_waits_for_windows_deferred_panes};
 
     fn session_name(value: &str) -> SessionName {
         SessionName::new(value).expect("valid session name")
@@ -1092,5 +1158,30 @@ mod windows_deferred_wait_tests {
         assert!(request_waits_for_windows_deferred_panes(
             &split_window_target_action(false)
         ));
+    }
+
+    #[test]
+    fn initial_stream_subscribe_waits_for_its_conpty_but_cursor_cleanup_never_waits() {
+        let subscribe = Request::SubscribePaneStream(SubscribePaneStreamRequest {
+            target: PaneTargetRef::slot(pane_target()),
+            mode: PaneStreamMode::Raw,
+            include_snapshot: false,
+        });
+        assert!(request_waits_for_windows_deferred_panes(&subscribe));
+        assert_eq!(
+            request_deferred_wait_target(&subscribe),
+            Some(Target::Pane(pane_target())),
+            "the Windows wait must be scoped to the requested starting pane"
+        );
+
+        let subscription_id = PaneOutputSubscriptionId::new(9);
+        let cursor = Request::PaneStreamCursor(PaneStreamCursorRequest {
+            subscription_id,
+            max_events: Some(1),
+        });
+        let unsubscribe =
+            Request::UnsubscribePaneStream(UnsubscribePaneStreamRequest { subscription_id });
+        assert!(!request_waits_for_windows_deferred_panes(&cursor));
+        assert!(!request_waits_for_windows_deferred_panes(&unsubscribe));
     }
 }

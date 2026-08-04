@@ -7,11 +7,11 @@
 //! owns that check, layered on top of the existing `rmux-ipc` Windows pipe
 //! contract:
 //!
-//! * Endpoint names stay `\\.\pipe\rmux-{SID}-il-{integrity}-{label}`. This
-//!   module never invents new pipe names.
+//! * Default and label-selected endpoints resolve to a private rotating
+//!   generation. Explicit `-S`, `RMUX`, and `TMUX` pipe paths remain exact.
 //! * The same `IdentityResolver`/SID values that scope the pipe ACL also
-//!   scope the mutex's discretionary ACL, so a peer running under a
-//!   different identity cannot acquire the mutex or open the pipe.
+//!   scope the discovery state, mutex, and pipe discretionary ACLs, so a peer
+//!   running under a different identity cannot acquire or replace them.
 //! * `ServerOptions::first_pipe_instance(true)` remains the authoritative
 //!   first-instance enforcement inside `rmux-ipc`. The mutex prevents two
 //!   `rmux` callers from racing to spawn that listener; it does not
@@ -25,8 +25,9 @@
 //! 2. Otherwise acquire the per-endpoint named mutex.
 //! 3. Re-probe under the mutex. If a peer started the daemon while we were
 //!    waiting, return [`StartupOutcome::JoinedExisting`] without spawning.
-//! 4. Run the launcher closure exactly once and wait for the new daemon to
-//!    respond to the same probe.
+//! 4. Pin the selected private generation to the startup owner, run the
+//!    launcher closure exactly once, and wait for the new daemon to respond
+//!    to the same probe.
 //!
 //! Busy/not-found/no-data/access-denied/timeout errors raised by the pipe or
 //! the mutex surface as typed [`StartupError`] variants.
@@ -41,6 +42,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rmux_ipc::{BlockingLocalStream, LocalEndpoint};
+use tokio::time::sleep;
 
 use crate::bootstrap::deadline::StartupDeadline;
 
@@ -281,12 +283,15 @@ impl Error for StartupError {
 
 /// Connects to the daemon serving `pipe_name`, starting it under a
 /// per-endpoint named mutex if no live daemon is reachable.
+///
+/// Managed label endpoints may rotate after the initial probe. The launcher
+/// receives the exact reserved endpoint that the child must bind.
 pub async fn connect_or_start<L, F>(
     pipe_name: &Path,
     launcher: L,
 ) -> Result<StartupOutcome, StartupError>
 where
-    L: FnOnce() -> F,
+    L: FnOnce(&Path) -> F,
     F: Future<Output = io::Result<()>>,
 {
     connect_or_start_with(
@@ -307,7 +312,7 @@ pub async fn connect_or_start_with<L, F>(
     poll_interval: Duration,
 ) -> Result<StartupOutcome, StartupError>
 where
-    L: FnOnce() -> F,
+    L: FnOnce(&Path) -> F,
     F: Future<Output = io::Result<()>>,
 {
     connect_or_start_with_timeout(pipe_name, launcher, Some(deadline), poll_interval).await
@@ -325,7 +330,23 @@ pub async fn connect_or_start_with_timeout<L, F>(
     poll_interval: Duration,
 ) -> Result<StartupOutcome, StartupError>
 where
-    L: FnOnce() -> F,
+    L: FnOnce(&Path) -> F,
+    F: Future<Output = io::Result<()>>,
+{
+    let (outcome, _) =
+        connect_or_start_selected_with_timeout(pipe_name, launcher, deadline, poll_interval)
+            .await?;
+    Ok(outcome)
+}
+
+pub(crate) async fn connect_or_start_selected_with_timeout<L, F>(
+    pipe_name: &Path,
+    launcher: L,
+    deadline: Option<Duration>,
+    poll_interval: Duration,
+) -> Result<(StartupOutcome, LocalEndpoint), StartupError>
+where
+    L: FnOnce(&Path) -> F,
     F: Future<Output = io::Result<()>>,
 {
     let deadline = StartupDeadline::from_timeout(deadline);
@@ -333,7 +354,7 @@ where
     let endpoint = LocalEndpoint::from_path(pipe_name.to_path_buf());
 
     if let Some(stream) = probe_responsive(&endpoint, pipe_name).await? {
-        return Ok(StartupOutcome::JoinedExisting(stream));
+        return Ok((StartupOutcome::JoinedExisting(stream), endpoint));
     }
 
     let mutex_name = startup_mutex_name(pipe_name)?;
@@ -342,16 +363,45 @@ where
     if let Some(stream) = probe_responsive(&endpoint, pipe_name).await? {
         // Drop the guard implicitly at end of scope; the daemon another
         // caller started is already responsive.
-        return Ok(StartupOutcome::JoinedExisting(stream));
+        return Ok((StartupOutcome::JoinedExisting(stream), endpoint));
     }
 
-    launcher()
+    let mut reservation = reserve_endpoint_start(pipe_name)?;
+    let selected_endpoint = loop {
+        let selected_endpoint = reservation.endpoint().clone();
+        let selected_pipe = selected_endpoint.as_path();
+        if reservation.is_owner() {
+            break selected_endpoint;
+        }
+        drop(reservation);
+
+        match probe_responsive(&selected_endpoint, selected_pipe).await {
+            Ok(Some(stream)) => {
+                drop(_guard);
+                return Ok((StartupOutcome::JoinedExisting(stream), selected_endpoint));
+            }
+            Ok(None) | Err(StartupError::PipeBusy { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        if deadline.is_elapsed() {
+            return Err(StartupError::StartupTimeout {
+                pipe_name: selected_pipe.to_path_buf(),
+                waited: deadline.elapsed(),
+            });
+        }
+        sleep(deadline.sleep_for(poll_interval.max(Duration::from_millis(1)))).await;
+        reservation = reserve_endpoint_start(selected_pipe)?;
+    };
+    let selected_pipe = selected_endpoint.as_path();
+
+    launcher(selected_pipe)
         .await
         .map_err(|source| StartupError::Launcher { source })?;
 
-    let stream = wait_for_daemon(&endpoint, pipe_name, deadline, poll_interval).await?;
+    let stream =
+        wait_for_daemon(&selected_endpoint, selected_pipe, deadline, poll_interval).await?;
     drop(_guard);
-    Ok(StartupOutcome::Started(stream))
+    Ok((StartupOutcome::Started(stream), selected_endpoint))
 }
 
 /// Blocking variant of [`connect_or_start_with`] for synchronous Windows
@@ -364,9 +414,32 @@ pub fn connect_or_start_blocking_with<L>(
     poll_interval: Duration,
 ) -> Result<StartupOutcome, StartupError>
 where
-    L: FnOnce() -> io::Result<()>,
+    L: FnOnce(&Path) -> io::Result<()>,
 {
-    connect_or_start_blocking_with_timeout(pipe_name, launcher, Some(deadline), poll_interval)
+    connect_or_start_blocking_selected_with(pipe_name, launcher, deadline, poll_interval)
+        .map(|(outcome, _)| outcome)
+}
+
+/// Blocking startup that also returns the exact endpoint generation selected.
+///
+/// Managed Windows endpoints can rotate after the caller resolves its initial
+/// path. Callers that reconnect during the same invocation must retain this
+/// endpoint instead of resolving or reusing the stale candidate.
+pub fn connect_or_start_blocking_selected_with<L>(
+    pipe_name: &Path,
+    launcher: L,
+    deadline: Duration,
+    poll_interval: Duration,
+) -> Result<(StartupOutcome, LocalEndpoint), StartupError>
+where
+    L: FnOnce(&Path) -> io::Result<()>,
+{
+    connect_or_start_blocking_selected_with_timeout(
+        pipe_name,
+        launcher,
+        Some(deadline),
+        poll_interval,
+    )
 }
 
 /// Blocking variant of [`connect_or_start_with_timeout`].
@@ -377,14 +450,27 @@ pub fn connect_or_start_blocking_with_timeout<L>(
     poll_interval: Duration,
 ) -> Result<StartupOutcome, StartupError>
 where
-    L: FnOnce() -> io::Result<()>,
+    L: FnOnce(&Path) -> io::Result<()>,
+{
+    connect_or_start_blocking_selected_with_timeout(pipe_name, launcher, deadline, poll_interval)
+        .map(|(outcome, _)| outcome)
+}
+
+fn connect_or_start_blocking_selected_with_timeout<L>(
+    pipe_name: &Path,
+    launcher: L,
+    deadline: Option<Duration>,
+    poll_interval: Duration,
+) -> Result<(StartupOutcome, LocalEndpoint), StartupError>
+where
+    L: FnOnce(&Path) -> io::Result<()>,
 {
     let deadline = StartupDeadline::from_timeout(deadline);
     validate_pipe_name(pipe_name)?;
     let endpoint = LocalEndpoint::from_path(pipe_name.to_path_buf());
 
     if let Some(stream) = probe_blocking(&endpoint, pipe_name)? {
-        return Ok(StartupOutcome::JoinedExisting(stream));
+        return Ok((StartupOutcome::JoinedExisting(stream), endpoint));
     }
 
     let mutex_name = startup_mutex_name(pipe_name)?;
@@ -392,14 +478,53 @@ where
 
     if let Some(stream) = probe_blocking(&endpoint, pipe_name)? {
         drop(guard);
-        return Ok(StartupOutcome::JoinedExisting(stream));
+        return Ok((StartupOutcome::JoinedExisting(stream), endpoint));
     }
 
-    launcher().map_err(|source| StartupError::Launcher { source })?;
+    let mut reservation = reserve_endpoint_start(pipe_name)?;
+    let selected_endpoint = loop {
+        let selected_endpoint = reservation.endpoint().clone();
+        let selected_pipe = selected_endpoint.as_path();
+        if reservation.is_owner() {
+            break selected_endpoint;
+        }
+        drop(reservation);
 
-    let stream = wait_for_daemon_blocking(&endpoint, pipe_name, deadline, poll_interval)?;
+        match probe_blocking(&selected_endpoint, selected_pipe) {
+            Ok(Some(stream)) => {
+                drop(guard);
+                return Ok((StartupOutcome::JoinedExisting(stream), selected_endpoint));
+            }
+            Ok(None) | Err(StartupError::PipeBusy { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        if deadline.is_elapsed() {
+            return Err(StartupError::StartupTimeout {
+                pipe_name: selected_pipe.to_path_buf(),
+                waited: deadline.elapsed(),
+            });
+        }
+        std::thread::sleep(deadline.sleep_for(poll_interval.max(Duration::from_millis(1))));
+        reservation = reserve_endpoint_start(selected_pipe)?;
+    };
+    let selected_pipe = selected_endpoint.as_path();
+
+    launcher(selected_pipe).map_err(|source| StartupError::Launcher { source })?;
+
+    let stream =
+        wait_for_daemon_blocking(&selected_endpoint, selected_pipe, deadline, poll_interval)?;
     drop(guard);
-    Ok(StartupOutcome::Started(stream))
+    Ok((StartupOutcome::Started(stream), selected_endpoint))
+}
+
+fn reserve_endpoint_start(
+    pipe_name: &Path,
+) -> Result<rmux_ipc::ManagedEndpointStartReservation, StartupError> {
+    rmux_ipc::reserve_managed_endpoint_start(pipe_name).map_err(|source| StartupError::PipeIo {
+        operation: "reserve private endpoint generation",
+        pipe_name: pipe_name.to_path_buf(),
+        source,
+    })
 }
 
 #[cfg(test)]

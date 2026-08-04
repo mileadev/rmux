@@ -1,6 +1,10 @@
+#[path = "support/python3.rs"]
+mod python3;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,6 +18,8 @@ const DOWNSTREAM_PREPARE: &str =
     include_str!("../.github/workflows/release-downstream-prepare.yml");
 const RECEIPT: &str = include_str!("../.github/workflows/release-receipt.yml");
 const CI: &str = include_str!("../.github/workflows/ci.yml");
+const LINUX_REPOSITORY_BUILD: &str =
+    include_str!("../.github/workflows/release-linux-repository-build.yml");
 const CHANNEL_RESULT_ACTION: &str =
     include_str!("../.github/actions/release-channel-result/action.yml");
 const RECEIPT_REFERENCE_BUILDER: &str =
@@ -269,6 +275,18 @@ fn downstream_writers_keep_the_python_310_runtime_contract() {
     }
 }
 
+#[test]
+fn linux_repository_build_retains_authenticated_previous_by_hash_indexes() {
+    let authenticated = LINUX_REPOSITORY_BUILD
+        .find("scripts/retain-linux-package-history.py")
+        .expect("authenticated package history");
+    let generated = LINUX_REPOSITORY_BUILD
+        .find("\"$apt_generator\"")
+        .expect("APT repository generator");
+    assert!(authenticated < generated);
+    assert!(LINUX_REPOSITORY_BUILD.contains("--previous-repository-dir \"$root/history/debian\""));
+}
+
 #[cfg(unix)]
 #[test]
 fn crates_writer_distinguishes_missing_versions_from_download_denials() {
@@ -360,7 +378,7 @@ fn downstream_json_writer_uses_canonical_lf_bytes_on_every_platform() {
     ));
     fs::create_dir_all(&root).expect("create canonical JSON fixture directory");
     let output_path = root.join("evidence.json");
-    let output = Command::new("python3")
+    let output = python3::command()
         .args([
             "-c",
             "import pathlib,sys; sys.path.insert(0,'scripts/release'); \
@@ -848,7 +866,7 @@ fn downstream_repository_verifier_accepts_github_ruleset_arrays() {
             "repository_ids": [1249553407, 1258602064, 1259133629, 1259135161]
         }),
     );
-    let output = Command::new("python3")
+    let output = python3::command()
         .arg(repo_root().join("scripts/release/verify-downstream-repository.py"))
         .args(["fixtures", "--repository-key", "homebrew-rmux"])
         .arg("--metadata")

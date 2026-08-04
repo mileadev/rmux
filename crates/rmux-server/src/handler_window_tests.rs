@@ -1,16 +1,17 @@
 use super::RequestHandler;
 use crate::pane_io::AttachControl;
 use rmux_proto::{
-    DisplayMessageRequest, HookLifecycle, HookName, KillSessionRequest, KillWindowRequest,
-    LastPaneRequest, LastWindowRequest, LinkWindowRequest, ListPanesRequest, ListWindowsRequest,
-    MoveWindowRequest, MoveWindowTarget, NewSessionExtRequest, NewSessionRequest, NewWindowRequest,
-    NextWindowRequest, OptionName, PaneSelectRequest, PaneTarget, PaneTargetRef,
-    PreviousWindowRequest, ProcessCommand, RenameSessionRequest, RenameWindowRequest, Request,
-    ResizeWindowAdjustment, ResizeWindowRequest, ResolveTargetRequest, ResolveTargetType,
-    RespawnWindowRequest, Response, RotateWindowDirection, RotateWindowRequest, ScopeSelector,
-    SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneRequest, SelectWindowRequest,
-    SessionName, SetHookMutationRequest, SetOptionMode, SetOptionRequest, SplitDirection,
-    SplitWindowRequest, SplitWindowTarget, SwapWindowRequest, Target, TerminalSize,
+    DisplayMessageRequest, HookLifecycle, HookName, KillPaneRequest, KillSessionRequest,
+    KillWindowRequest, LastPaneRequest, LastWindowRequest, LayoutName, LinkWindowRequest,
+    ListPanesRequest, ListWindowsRequest, MoveWindowRequest, MoveWindowTarget,
+    NewSessionExtRequest, NewSessionRequest, NewWindowRequest, NextWindowRequest, OptionName,
+    PaneSelectRequest, PaneTarget, PaneTargetRef, PreviousWindowRequest, ProcessCommand,
+    RenameSessionRequest, RenameWindowRequest, Request, ResizeWindowAdjustment,
+    ResizeWindowRequest, ResolveTargetRequest, ResolveTargetType, RespawnWindowRequest, Response,
+    RotateWindowDirection, RotateWindowRequest, ScopeSelector, SelectLayoutRequest,
+    SelectLayoutTarget, SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneRequest,
+    SelectWindowRequest, SessionName, SetHookMutationRequest, SetOptionMode, SetOptionRequest,
+    SplitDirection, SplitWindowRequest, SplitWindowTarget, SwapWindowRequest, Target, TerminalSize,
     UnlinkWindowRequest, WindowTarget,
 };
 use std::fs;
@@ -170,6 +171,21 @@ async fn create_grouped_session(handler: &RequestHandler, name: &str, group_targ
     assert!(matches!(created, Response::NewSession(_)));
 }
 
+async fn create_session_with_size(handler: &RequestHandler, name: &str, size: TerminalSize) {
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: session_name(name),
+            detached: true,
+            size: Some(size),
+            environment: None,
+        }))
+        .await;
+    assert!(
+        matches!(created, Response::NewSession(_)),
+        "expected new-session success, got {created:?}"
+    );
+}
+
 async fn enable_global_monitor_silence(handler: &RequestHandler) {
     let response = handler
         .handle(Request::SetOption(SetOptionRequest {
@@ -254,6 +270,24 @@ async fn insert_window(handler: &RequestHandler, session_name: &SessionName, win
             },
         )
         .expect("window terminal insert succeeds");
+}
+
+async fn create_window_at(handler: &RequestHandler, session_name: &SessionName, window_index: u32) {
+    let response = handler
+        .handle(Request::NewWindow(Box::new(NewWindowRequest {
+            target: session_name.clone(),
+            name: None,
+            detached: true,
+            start_directory: None,
+            environment: None,
+            command: Some(quiet_window_test_command()),
+            process_command: None,
+            target_window_index: Some(window_index),
+            insert_at_target: false,
+        })))
+        .await;
+    assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
+    handler.wait_for_initial_panes_for_test().await;
 }
 
 async fn link_duplicate_window(
@@ -344,6 +378,9 @@ mod relative_metadata;
 #[path = "handler_window_tests/swap_rotate.rs"]
 mod swap_rotate;
 
+#[path = "handler_window_tests/swap_selection_notifications.rs"]
+mod swap_selection_notifications;
+
 #[path = "handler_window_tests/silence_fanout.rs"]
 mod silence_fanout;
 
@@ -367,6 +404,9 @@ mod linked_window_mutations;
 
 #[path = "handler_window_tests/resize_respawn.rs"]
 mod resize_respawn;
+
+#[path = "handler_window_tests/resize_window_client_size.rs"]
+mod resize_window_client_size;
 
 #[path = "handler_window_tests/respawn_linked_refresh.rs"]
 mod respawn_linked_refresh;

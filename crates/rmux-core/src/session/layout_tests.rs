@@ -42,15 +42,15 @@ fn even_layout_selection_is_isolated_to_the_addressed_window() {
     assert_eq!(window0.layout(), LayoutName::EvenHorizontal);
     assert_eq!(
         window0.pane(0).expect("window 0 pane 0 exists").geometry(),
-        PaneGeometry::new(0, 0, 32, 40)
+        PaneGeometry::new(0, 0, 33, 40)
     );
     assert_eq!(
         window0.pane(1).expect("window 0 pane 1 exists").geometry(),
-        PaneGeometry::new(33, 0, 32, 40)
+        PaneGeometry::new(34, 0, 33, 40)
     );
     assert_eq!(
         window0.pane(2).expect("window 0 pane 2 exists").geometry(),
-        PaneGeometry::new(66, 0, 34, 40)
+        PaneGeometry::new(68, 0, 32, 40)
     );
 
     let window1 = session.window_at(1).expect("window 1 exists");

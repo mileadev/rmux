@@ -5,7 +5,10 @@ use rmux_proto::{
     WindowTarget,
 };
 
-use super::super::{attach_support::SessionDetachOnDestroy, RequestHandler};
+use super::super::{
+    attach_support::SessionDetachOnDestroy, subscription_support::capture_pane_stream_sources,
+    RequestHandler, SelectionTransitionSnapshot,
+};
 #[cfg(windows)]
 use super::pane_io_encoding::{
     prepare_pane_console_input_write, tokens_emulate_windows_cmd_select_all,
@@ -159,7 +162,7 @@ impl RequestHandler {
     ) -> Response {
         let session_name = request.target.session_name().clone();
         let adjustment = request.adjustment;
-        let (response, window_index, refresh_sessions) = {
+        let (response, window_index, refresh_sessions, layout_changed) = {
             let mut state = self.state.lock().await;
             let target = match resolve_pane_target_ref(&state, &request.target) {
                 Ok(target) => target,
@@ -173,7 +176,7 @@ impl RequestHandler {
             let window_index = target.window_index();
             let pane_index = target.pane_index();
             let response_target = target.clone();
-            let (response, refresh_sessions) = match adjustment {
+            let (response, refresh_sessions, layout_changed) = match adjustment {
                 ResizePaneAdjustment::TrimBelow => {
                     let response = match state.trim_pane_below_cursor(&response_target) {
                         Ok(()) => Response::ResizePane(ResizePaneResponse {
@@ -182,44 +185,56 @@ impl RequestHandler {
                         }),
                         Err(error) => Response::Error(ErrorResponse { error }),
                     };
-                    (response, Vec::new())
+                    (response, Vec::new(), false)
                 }
                 _ => match state.mutate_session_and_resize_window_terminal_with_family(
                     &session_name,
                     window_index,
                     |session| {
-                        session.resize_pane_in_window(window_index, pane_index, adjustment)?;
-                        Ok(ResizePaneResponse {
-                            target: response_target,
+                        let layout_changed = super::pane_layout::resize_pane_layout_changed(
+                            session,
+                            window_index,
+                            pane_index,
                             adjustment,
-                        })
+                        )?;
+                        Ok((
+                            ResizePaneResponse {
+                                target: response_target,
+                                adjustment,
+                            },
+                            layout_changed,
+                        ))
                     },
                 ) {
-                    Ok((response, refresh_sessions)) => {
-                        (Response::ResizePane(response), refresh_sessions)
-                    }
-                    Err(error) => (Response::Error(ErrorResponse { error }), Vec::new()),
+                    Ok(((response, layout_changed), refresh_sessions)) => (
+                        Response::ResizePane(response),
+                        refresh_sessions,
+                        layout_changed,
+                    ),
+                    Err(error) => (Response::Error(ErrorResponse { error }), Vec::new(), false),
                 },
             };
-            (response, window_index, refresh_sessions)
+            (response, window_index, refresh_sessions, layout_changed)
         };
 
-        if matches!(response, Response::ResizePane(_))
-            && !matches!(adjustment, rmux_proto::ResizePaneAdjustment::NoOp)
-        {
-            self.emit(LifecycleEvent::WindowLayoutChanged {
-                target: WindowTarget::with_window(session_name.clone(), window_index),
-            })
-            .await;
-            // See handle_resize_pane in layout.rs: skip the refresh (and its
-            // Windows deferred-pane wait) when nothing is attached so a
-            // still-starting sibling cannot stall a detached resize.
-            if refresh_sessions.is_empty() {
-                if self.attached_count(&session_name).await > 0 {
-                    self.refresh_attached_session(&session_name).await;
+        if matches!(response, Response::ResizePane(_)) {
+            if layout_changed {
+                self.emit(LifecycleEvent::WindowLayoutChanged {
+                    target: WindowTarget::with_window(session_name.clone(), window_index),
+                })
+                .await;
+            }
+            if !matches!(adjustment, ResizePaneAdjustment::NoOp) {
+                // See handle_resize_pane in layout.rs: skip the refresh (and
+                // its Windows deferred-pane wait) when nothing is attached so
+                // a still-starting sibling cannot stall a detached resize.
+                if refresh_sessions.is_empty() {
+                    if self.attached_count(&session_name).await > 0 {
+                        self.refresh_attached_session(&session_name).await;
+                    }
+                } else {
+                    self.refresh_linked_window_sessions(refresh_sessions).await;
                 }
-            } else {
-                self.refresh_linked_window_sessions(refresh_sessions).await;
             }
         }
 
@@ -240,8 +255,8 @@ impl RequestHandler {
             removed_subscription_keys,
             removed_pane_ids,
             resize_targets,
-            layout_window,
             after_hook_target,
+            post_lifecycle_events,
         ) = {
             let mut state = self.state.lock().await;
             let detach_on_destroy = SessionDetachOnDestroy::capture_all(&state);
@@ -271,7 +286,10 @@ impl RequestHandler {
             let previous_subscription_keys = state
                 .pane_output_subscription_keys_for_kill(&target, request.kill_all_except)
                 .unwrap_or_default();
+            let previous_stream_sources =
+                capture_pane_stream_sources(&state, &previous_subscription_keys);
             let timer_mutation = self.plan_all_window_mutation_silence_timers_locked(&state);
+            let selection_before = SelectionTransitionSnapshot::capture(&state);
             match state.remove_pane_alias_with_options(target.clone(), request.kill_all_except) {
                 Ok(result) => {
                     state.retire_removed_lifecycle_targets();
@@ -294,16 +312,19 @@ impl RequestHandler {
                                 .map(|policy| (session_name.clone(), session_id, policy))
                         })
                         .collect::<Vec<_>>();
-                    let lifecycle_events =
-                        hook_batch.prepare_committed(&mut state, &destroyed_sessions);
                     let after_hook_target =
                         after_kill_pane_target(&state, &result.hook_context, &affected_sessions);
-                    if !result.session_destroyed && result.response.window_destroyed {
-                        let _ = state.hooks.remove_window(&WindowTarget::with_window(
-                            session_name.clone(),
-                            layout_window,
-                        ));
-                    } else if !result.session_destroyed {
+                    let layout_target =
+                        WindowTarget::with_window(session_name.clone(), layout_window);
+                    let (lifecycle_events, post_lifecycle_events) = hook_batch
+                        .prepare_explicit_committed(
+                            &mut state,
+                            &destroyed_sessions,
+                            &selection_before,
+                            layout_target,
+                            result.response.window_destroyed,
+                        );
+                    if !result.session_destroyed && !result.response.window_destroyed {
                         let _ = state.hooks.remove_pane(&target);
                     }
                     self.record_panes_closed_as_killed(&result.removed_pane_ids);
@@ -321,6 +342,10 @@ impl RequestHandler {
                             subscription_rekeys.push((previous_key, current_key));
                         }
                     }
+                    self.stage_removed_pane_stream_sources(
+                        &removed_subscription_keys,
+                        previous_stream_sources,
+                    );
                     #[cfg(test)]
                     super::super::pane_family_lifecycle_tests::pause_before_pane_kill_subscription_rekey(
                         &session_name,
@@ -359,8 +384,8 @@ impl RequestHandler {
                         removed_subscription_keys,
                         result.removed_pane_ids,
                         resize_targets,
-                        layout_window,
                         after_hook_target,
+                        post_lifecycle_events,
                     )
                 }
                 Err(error) => (
@@ -372,8 +397,8 @@ impl RequestHandler {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
-                    layout_window,
                     None,
+                    Vec::new(),
                 ),
             }
         };
@@ -422,8 +447,11 @@ impl RequestHandler {
                 }
             }
         }
+        for event in post_lifecycle_events {
+            self.emit_prepared(event).await;
+        }
         if matches!(response, Response::KillPane(_)) {
-            self.cleanup_pane_output_subscriptions(&removed_subscription_keys)
+            self.drain_removed_pane_output_subscriptions(&removed_subscription_keys)
                 .await;
             let destroyed_names = destroyed_sessions
                 .iter()
@@ -461,14 +489,6 @@ impl RequestHandler {
             }
             if !destroyed_names.is_empty() {
                 let _ = self.queue_shutdown_if_server_empty().await;
-            }
-            if let Response::KillPane(success) = &response {
-                if !success.window_destroyed {
-                    self.emit(LifecycleEvent::WindowLayoutChanged {
-                        target: WindowTarget::with_window(session_name.clone(), layout_window),
-                    })
-                    .await;
-                }
             }
         }
 

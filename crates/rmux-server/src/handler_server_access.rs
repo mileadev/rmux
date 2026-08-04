@@ -247,7 +247,7 @@ impl RequestHandler {
             (attached, controls)
         };
         for (attach_pid, attach_id) in attached {
-            if let Ok(session_name) = self
+            if let Ok(outcome) = self
                 .send_attach_control_for_client_identity(
                     attach_pid,
                     attach_id,
@@ -257,8 +257,8 @@ impl RequestHandler {
                 .await
             {
                 self.emit(LifecycleEvent::ClientDetached {
-                    session_name,
-                    client_name: Some(attach_pid.to_string()),
+                    session_name: outcome.session_name,
+                    client_name: Some(outcome.client_name),
                 })
                 .await;
             }
@@ -657,6 +657,7 @@ mod tests {
             closing: Arc::new(AtomicBool::new(false)),
             persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
             terminal_context: OuterTerminalContext::default(),
+            client_title: None,
             flags: ClientFlags::default(),
             render_stream: false,
             uid,

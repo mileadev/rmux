@@ -14,8 +14,10 @@ use std::future::Future;
 use super::attach_support::ActiveAttachIdentity;
 use super::client_support::capture_switch_client_target_identity;
 use super::control_support::{
-    control_queue_eof_action, current_control_queue_identity, with_control_queue_identity,
-    ControlClientIdentity, ControlQueueEofAction,
+    control_command_response_stream_is_active, control_queue_eof_action,
+    current_control_queue_identity, send_control_command_response_event,
+    with_control_command_response_capture, with_control_queue_identity, ControlClientIdentity,
+    ControlQueueEofAction, ManagedClient,
 };
 #[cfg(windows)]
 use super::pane_support::format_references_pane_pid;
@@ -23,9 +25,23 @@ use super::{
     active_session_target, current_expected_attach_identity, expected_attach_follows_registration,
     rebase_expected_attach_session_after_switch, validate_expected_attach_identity, RequestHandler,
 };
-use crate::control::ControlCommandResult;
+use crate::client_names::control_client_name;
+use crate::control::{
+    ControlCommandResponseEvent, ControlCommandResult, ControlQueueCommandOrigin,
+};
 use crate::hook_runtime::capture_inline_hooks;
 use crate::mouse::{AttachedMouseEvent, MouseLocation};
+
+async fn maybe_capture_control_command_response<T, F>(capture: bool, future: F) -> T
+where
+    F: Future<Output = T>,
+{
+    if capture {
+        with_control_command_response_capture(future).await
+    } else {
+        future.await
+    }
+}
 
 #[path = "handler_scripting/buffer_parse.rs"]
 mod buffer_parse;
@@ -65,16 +81,24 @@ mod prompt_parse;
 mod prompt_runtime;
 #[path = "handler_scripting/queue.rs"]
 mod queue;
+#[path = "handler_scripting/queue_current_session_transition.rs"]
+mod queue_current_session_transition;
 #[path = "handler_scripting/queue_exact_target.rs"]
 mod queue_exact_target;
 #[path = "handler_scripting/queue_lifecycle_target.rs"]
 mod queue_lifecycle_target;
 #[path = "handler_scripting/queue_parse.rs"]
 mod queue_parse;
+#[path = "handler_scripting/queue_session_rename.rs"]
+mod queue_session_rename;
 #[path = "handler_scripting/queue_special_target.rs"]
 mod queue_special_target;
+#[path = "handler_scripting/read_only_client_action.rs"]
+mod read_only_client_action;
 #[path = "handler_scripting/request_parse.rs"]
 mod request_parse;
+#[path = "handler_scripting/run_shell_dispatch.rs"]
+mod run_shell_dispatch;
 #[path = "handler_scripting/runtime.rs"]
 mod runtime;
 #[path = "handler_scripting/session_parse.rs"]
@@ -118,13 +142,19 @@ pub(in crate::handler) use self::queue::{
     rename_pane_target_session, rename_target_session, rename_window_target_session,
 };
 pub(super) use self::queue::{QueueCommandAction, QueueExecutionContext};
+pub(in crate::handler) use self::queue_current_session_transition::record_queued_new_session_transition;
+use self::queue_current_session_transition::QueuedCurrentSessionTransition;
 use self::queue_exact_target::QueueExactTargetCapture;
 #[cfg(test)]
 pub(crate) use self::queue_exact_target::{
     install_queue_exact_target_capture_pause, QueueExactTargetCapturePause,
 };
 use self::queue_lifecycle_target::{QueueLifecycleTargetCapture, QueueLifecycleTargetPlan};
+use self::queue_session_rename::QueuedSessionRename;
 use self::queue_special_target::QueueSpecialTargetPlan;
+pub(in crate::handler) use self::read_only_client_action::{
+    read_only_client_action, ReadOnlyClientAction,
+};
 use self::request_parse::parse_queue_invocation;
 #[cfg(test)]
 pub(crate) use self::request_parse::parse_request_from_parts;
@@ -153,6 +183,7 @@ tokio::task_local! {
 pub(in crate::handler) enum QueuedDisplayTargetClient {
     Missing,
     Attached(ActiveAttachIdentity),
+    Control(ControlClientIdentity),
     ResolutionError(RmuxError),
 }
 
@@ -183,16 +214,43 @@ impl RequestHandler {
         requester_pid: u32,
         invocation: &QueueInvocation,
     ) -> Option<QueuedDisplayTargetClient> {
-        let QueueInvocation::Request(Request::DisplayMessageExt(request)) = invocation else {
-            return None;
+        let target_client = match invocation {
+            QueueInvocation::Request(Request::DisplayMessage(_)) => None,
+            QueueInvocation::Request(Request::DisplayMessageExt(request)) => {
+                request.target_client.as_deref()
+            }
+            _ => return None,
         };
-        let target_client = request.target_client.as_deref()?;
+        if target_client.is_none() {
+            return current_expected_attach_identity()
+                .map(QueuedDisplayTargetClient::Attached)
+                .or_else(|| {
+                    current_control_queue_identity(requester_pid)
+                        .map(QueuedDisplayTargetClient::Control)
+                });
+        }
         Some(
             match self
-                .find_target_attach_client_identity(requester_pid, target_client, "display-message")
+                .find_display_message_client(
+                    requester_pid,
+                    target_client.expect("target client was checked above"),
+                )
                 .await
             {
-                Ok(Some(identity)) => QueuedDisplayTargetClient::Attached(identity),
+                Ok(Some(ManagedClient::Attach { pid, attach_id })) => {
+                    let active_attach = self.active_attach.lock().await;
+                    match active_attach
+                        .by_pid
+                        .get(&pid)
+                        .filter(|active| active.id == attach_id)
+                    {
+                        Some(active) => QueuedDisplayTargetClient::Attached(active.identity(pid)),
+                        None => QueuedDisplayTargetClient::Missing,
+                    }
+                }
+                Ok(Some(ManagedClient::Control(identity))) => {
+                    QueuedDisplayTargetClient::Control(identity)
+                }
                 Ok(None) => QueuedDisplayTargetClient::Missing,
                 Err(error) => QueuedDisplayTargetClient::ResolutionError(error),
             },
@@ -215,6 +273,8 @@ pub(in crate::handler) fn queued_command_context() -> Option<QueueExecutionConte
 struct QueuedCommandExecution {
     action: QueueCommandAction,
     attached_switch_target: Option<Target>,
+    current_session_transition: Option<QueuedCurrentSessionTransition>,
+    session_rename: Option<QueuedSessionRename>,
 }
 
 impl RequestHandler {
@@ -283,10 +343,16 @@ impl RequestHandler {
         &self,
         requester_pid: u32,
         commands: ParsedCommands,
-        context: QueueExecutionContext,
+        mut context: QueueExecutionContext,
     ) -> Result<CommandOutput, RmuxError> {
         let result = self
-            .execute_command_queue(requester_pid, commands, context, QueueMode::Detached, None)
+            .execute_command_queue(
+                requester_pid,
+                commands,
+                &mut context,
+                QueueMode::Detached,
+                None,
+            )
             .await;
         match result.error {
             Some(error) => Err(error),
@@ -300,10 +366,11 @@ impl RequestHandler {
         expected_control_id: u64,
         commands: ParsedCommands,
     ) -> ControlCommandResult {
+        let mut context = QueueExecutionContext::without_caller_cwd();
         self.execute_command_queue(
             requester_pid,
             commands,
-            QueueExecutionContext::without_caller_cwd(),
+            &mut context,
             QueueMode::Control,
             Some(expected_control_id),
         )
@@ -498,7 +565,7 @@ impl RequestHandler {
         &self,
         requester_pid: u32,
         commands: ParsedCommands,
-        context: QueueExecutionContext,
+        context: &mut QueueExecutionContext,
         mode: QueueMode,
         expected_control_id: Option<u64>,
     ) -> ControlCommandResult {
@@ -514,6 +581,8 @@ impl RequestHandler {
         }
         let control_identity = expected_control_id
             .map(|control_id| ControlClientIdentity::new(requester_pid, control_id));
+        let response_stream_is_active =
+            control_identity.is_some_and(control_command_response_stream_is_active);
         if control_queue_eof_action(control_identity) == ControlQueueEofAction::StopFrame {
             return ControlCommandResult {
                 stdout: Vec::new(),
@@ -538,7 +607,7 @@ impl RequestHandler {
             };
         }
         let mut queue = CommandQueue::from_parsed(commands);
-        let mut contexts = VecDeque::from(vec![context; queue.len()]);
+        let mut contexts = VecDeque::from(vec![context.clone(); queue.len()]);
         let mut stdout = Vec::new();
         let mut errors = Vec::new();
         let mut source_file_errors = Vec::new();
@@ -546,6 +615,7 @@ impl RequestHandler {
         let mut exit_status = None;
         let mut inserted_command_count = 0_usize;
         let mut server_shutdown_started = false;
+        let mut child_guard_stream_started = false;
 
         'command_queue: loop {
             if queue.is_empty() {
@@ -599,6 +669,17 @@ impl RequestHandler {
             let item_context = contexts
                 .pop_front()
                 .expect("queue item context must stay aligned");
+            if response_stream_is_active && child_guard_stream_started {
+                let origin = item_context
+                    .control_queue_origin()
+                    .unwrap_or(ControlQueueCommandOrigin::QueueContinuation);
+                if !send_control_command_response_event(
+                    control_identity.expect("response streams have a control identity"),
+                    ControlCommandResponseEvent::FrameStarted { origin },
+                ) {
+                    break 'command_queue;
+                }
+            }
             let command_execution = self.execute_queued_command(
                 requester_pid,
                 item.command().clone(),
@@ -630,8 +711,46 @@ impl RequestHandler {
                         context.rebase_current_target_after_attached_switch(target.clone());
                     }
                 }
+                if let Some(rename) = execution.session_rename {
+                    rename.apply(context);
+                    for context in &mut contexts {
+                        rename.apply(context);
+                    }
+                }
+                if let Some(transition) = execution.current_session_transition {
+                    transition.apply(context);
+                    for context in &mut contexts {
+                        transition.apply(context);
+                    }
+                }
                 execution.action
             });
+            let starts_child_guard_stream = response_stream_is_active
+                && !child_guard_stream_started
+                && command_action.as_ref().is_ok_and(|action| {
+                    let QueueCommandAction::InsertAfter { batches, .. } = action else {
+                        return false;
+                    };
+                    let inserted = batches.iter().fold(0_usize, |count, (commands, _)| {
+                        count.saturating_add(parsed_command_count(commands))
+                    });
+                    let insertion_fits = inserted_command_count.saturating_add(inserted)
+                        <= CONTROL_QUEUE_INSERTED_COMMAND_LIMIT;
+                    insertion_fits
+                        && batches
+                            .iter()
+                            .any(|(_, context)| context.control_queue_origin().is_some())
+                });
+            if child_guard_stream_started || starts_child_guard_stream {
+                let (stdout, error) = control_command_frame_outcome(&command_action);
+                if !send_control_command_response_event(
+                    control_identity.expect("response streams have a control identity"),
+                    ControlCommandResponseEvent::FrameCompleted { stdout, error },
+                ) {
+                    break 'command_queue;
+                }
+                child_guard_stream_started = true;
+            }
             match command_action {
                 Ok(QueueCommandAction::Normal {
                     output: Some(output),
@@ -771,7 +890,7 @@ impl RequestHandler {
                     {
                         *context = context
                             .clone()
-                            .with_implicit_current_target(updated_target.clone());
+                            .refresh_implicit_current_target(updated_target.clone());
                     }
                 }
             }
@@ -799,7 +918,7 @@ impl RequestHandler {
         mode: QueueMode,
         expected_control_id: Option<u64>,
     ) -> Result<QueuedCommandExecution, RmuxError> {
-        QUEUED_COMMAND_CONTEXT
+        let execution = QUEUED_COMMAND_CONTEXT
             .scope(
                 context.clone(),
                 self.execute_queued_command_scoped(
@@ -810,7 +929,15 @@ impl RequestHandler {
                     expected_control_id,
                 ),
             )
-            .await
+            .await;
+        // Same applied-window-resize backstop as `run_dispatched_hooks`, for
+        // the invocations that never dispatch a `Request` (new-window,
+        // split-window, choose-tree, display-popup, source-file, ...). Every
+        // queued command therefore leaves the geometry queue empty, whether it
+        // came from a control client, a multi-command CLI invocation, a hook or
+        // a key binding.
+        self.publish_applied_window_resizes().await;
+        execution
     }
 
     #[async_recursion::async_recursion]
@@ -924,6 +1051,7 @@ impl RequestHandler {
                     )?;
                     command.target_witness = Some(Box::new(witness));
                 }
+                let session_rename = QueuedSessionRename::capture(&invocation, &state)?;
                 let exact_target =
                     QueueExactTargetCapture::capture(&command_for_hooks, &invocation, &mut state)
                         .into_identity()?;
@@ -945,6 +1073,7 @@ impl RequestHandler {
                     retained_lifecycle_target,
                     retained_lifecycle_identity,
                     special_target_binding,
+                    session_rename,
                 ))
             })()
         };
@@ -954,6 +1083,7 @@ impl RequestHandler {
             retained_lifecycle_target,
             retained_lifecycle_identity,
             special_target_binding,
+            session_rename,
         ) = match invocation {
             Ok(invocation) => invocation,
             Err(error) => {
@@ -1003,6 +1133,8 @@ impl RequestHandler {
             .or_else(|| context.current_target.clone());
 
         let mut attached_switch_target = None;
+        let mut committed_current_session_transition = None;
+        let mut committed_session_rename = None;
         let result = match invocation {
             QueueInvocation::NoOp => Ok(QueueCommandAction::Normal {
                 output: None,
@@ -1024,28 +1156,44 @@ impl RequestHandler {
                 };
                 let request = apply_queue_context_to_request(request, context, false);
                 let request = crate::server_access::apply_access_policy(request, can_write)?;
+                let capture_control_response = mode == QueueMode::Control
+                    && (context.run_shell_command_depth() == 0
+                        || context.control_queue_origin().is_some())
+                    && matches!(
+                        &request,
+                        Request::DisplayMessage(_) | Request::DisplayMessageExt(_)
+                    );
                 let request_for_hooks = request.clone();
                 let captures_client_transition = captures_attached_client_transition(&request);
-                let dispatch = Box::pin(with_queued_display_target_client(
-                    queued_display_target_client,
-                    super::with_expected_stable_target_identities(
-                        target_identities,
-                        retained_lifecycle_target,
-                        retained_lifecycle_identity,
-                        self.dispatch_captured_with_client_name(
-                            requester_pid,
-                            u64::from(requester_pid),
-                            request,
-                            context.client_name.clone(),
+                let dispatch = Box::pin(maybe_capture_control_command_response(
+                    capture_control_response,
+                    with_queued_display_target_client(
+                        queued_display_target_client,
+                        super::with_expected_stable_target_identities(
+                            target_identities,
+                            retained_lifecycle_target,
+                            retained_lifecycle_identity,
+                            self.dispatch_captured_with_client_name(
+                                requester_pid,
+                                u64::from(requester_pid),
+                                request,
+                                context.client_name.clone(),
+                            ),
                         ),
                     ),
                 ));
-                let ((outcome, inline_hooks), switch_client_capture) = if captures_client_transition
-                {
-                    capture_switch_client_target_identity(dispatch).await
-                } else {
-                    (dispatch.await, Default::default())
-                };
+                let dispatch =
+                    QueuedCurrentSessionTransition::capture(context, &request_for_hooks, dispatch);
+                let (((outcome, inline_hooks), current_session_transition), switch_client_capture) =
+                    if captures_client_transition {
+                        capture_switch_client_target_identity(dispatch).await
+                    } else {
+                        (dispatch.await, Default::default())
+                    };
+                committed_current_session_transition = current_session_transition
+                    .and_then(|transition| transition.commit(&outcome.response));
+                committed_session_rename =
+                    session_rename.and_then(|rename| rename.commit(&outcome.response));
                 if captures_client_transition {
                     if let Response::SwitchClient(response) = &outcome.response {
                         let targeted_client =
@@ -1077,18 +1225,12 @@ impl RequestHandler {
                     } else {
                         false
                     };
-                let inline_hook_names = inline_hooks
-                    .iter()
-                    .map(|pending| pending.hook)
-                    .collect::<Vec<_>>();
-                self.run_inline_hooks(requester_pid, inline_hooks, Some(&command_for_hooks))
-                    .await;
-                self.run_request_hooks(
+                self.run_dispatched_hooks(
                     requester_pid,
                     &request_for_hooks,
                     &outcome.response,
+                    inline_hooks,
                     Some(&command_for_hooks),
-                    &inline_hook_names,
                 )
                 .await;
                 let action = match mode {
@@ -1168,18 +1310,12 @@ impl RequestHandler {
                         } else {
                             false
                         };
-                    let inline_hook_names = inline_hooks
-                        .iter()
-                        .map(|pending| pending.hook)
-                        .collect::<Vec<_>>();
-                    self.run_inline_hooks(requester_pid, inline_hooks, Some(&command_for_hooks))
-                        .await;
-                    self.run_request_hooks(
+                    self.run_dispatched_hooks(
                         requester_pid,
                         &request_for_hooks,
                         &outcome.response,
+                        inline_hooks,
                         Some(&command_for_hooks),
-                        &inline_hook_names,
                     )
                     .await;
                     let action = match mode {
@@ -1304,6 +1440,8 @@ impl RequestHandler {
             .map(|action| QueuedCommandExecution {
                 action,
                 attached_switch_target,
+                current_session_transition: committed_current_session_transition,
+                session_rename: committed_session_rename,
             })
             .map_err(|error| source_file_context_error(error, &command_for_hooks, context))
     }
@@ -1643,6 +1781,37 @@ fn append_queue_stdout(
     Ok(())
 }
 
+fn control_command_frame_outcome(
+    action: &Result<QueueCommandAction, RmuxError>,
+) -> (Vec<u8>, Option<RmuxError>) {
+    match action {
+        Ok(QueueCommandAction::Normal {
+            output,
+            error,
+            source_file_error,
+            ..
+        })
+        | Ok(QueueCommandAction::InsertAfter {
+            output,
+            error,
+            source_file_error,
+            ..
+        }) => (
+            output
+                .as_ref()
+                .map(|output| output.stdout().to_vec())
+                .unwrap_or_default(),
+            aggregate_rmux_errors(
+                [error.clone(), source_file_error.clone()]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+            ),
+        ),
+        Err(error) => (Vec::new(), Some(error.clone())),
+    }
+}
+
 fn parsed_command_count(commands: &ParsedCommands) -> usize {
     commands.commands().iter().fold(0_usize, |count, command| {
         command
@@ -1835,7 +2004,7 @@ impl RequestHandler {
                 )
                 .await?;
                 self.emit_client_attached_identity(
-                    requester_pid,
+                    control_client_name(requester_pid),
                     response.session_name.clone(),
                     session_id,
                 )

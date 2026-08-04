@@ -4,17 +4,18 @@ use rmux_core::input::mode;
 use rmux_proto::{PaneTarget, RmuxError};
 
 use super::{bracketed_paste, AttachedPaneForward};
-use crate::pane_terminals::HandlerState;
+use crate::pane_terminals::{HandlerState, PasteDelimiters};
 
 use super::super::pane_io_encoding::{
-    encode_key_for_target, pane_input_mode, prepare_pane_input_write, synchronized_input_targets,
-    write_attached_bytes_to_target_io, PaneInputLiveness, PaneInputWrite,
+    encode_key_for_target, pane_input_mode, prepare_pane_bracketed_paste_write,
+    prepare_pane_input_write, synchronized_input_targets, write_attached_bytes_to_target_io,
+    PaneInputLiveness, PaneInputWrite,
 };
 #[cfg(windows)]
 use super::super::pane_io_encoding::{
     prepare_pane_console_input_write, should_emulate_windows_cmd_select_all,
     should_route_windows_control_as_pty_bytes, windows_console_input_for_attached_key,
-    write_windows_console_input_action_to_target_io, PaneConsoleInputWrite,
+    write_attached_windows_console_input_action_to_target_io, PaneConsoleInputWrite,
     WindowsConsoleInputAction,
 };
 
@@ -91,8 +92,21 @@ pub(super) fn prepare_attached_bracketed_paste_forwards(
         if bytes.is_empty() {
             continue;
         }
-        let write =
-            prepare_pane_input_write(state, &target, &bytes, PaneInputLiveness::TolerateDead)?;
+        // Both dispositions are pasted content and must arrive byte for byte,
+        // so both take the paste write. The destination's mode decides what
+        // surrounds the body, never which sink carries it.
+        let delimiters = if bracketed {
+            PasteDelimiters::Wrapped
+        } else {
+            PasteDelimiters::Bare
+        };
+        let write = prepare_pane_bracketed_paste_write(
+            state,
+            &target,
+            &bytes,
+            PaneInputLiveness::TolerateDead,
+            delimiters,
+        )?;
         prepared.push(PreparedAttachedPaneForward::EncodedKey { write, bytes });
     }
     Ok(prepared)
@@ -108,7 +122,7 @@ pub(super) async fn write_prepared_attached_pane_forwards(
             }
             #[cfg(windows)]
             PreparedAttachedPaneForward::WindowsConsoleKey { write, action } => {
-                write_windows_console_input_action_to_target_io(write, action).await?;
+                write_attached_windows_console_input_action_to_target_io(write, action).await?;
             }
         }
     }

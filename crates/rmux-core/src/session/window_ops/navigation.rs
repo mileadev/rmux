@@ -13,6 +13,7 @@ impl Session {
         if self.active_window != window_index {
             self.last_window = Some(self.active_window);
             self.active_window = window_index;
+            self.group_initial_window_id = None;
             let _ = self.clear_all_winlink_alert_flags(window_index);
         }
 

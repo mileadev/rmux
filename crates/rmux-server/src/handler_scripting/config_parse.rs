@@ -9,7 +9,7 @@ use rmux_proto::{
 
 use super::targets::{implicit_pane_target, implicit_session_name, implicit_window_target};
 use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
-use super::values::unsupported_flag;
+use super::values::{reject_unknown_option_before_positional, unsupported_flag};
 use super::{parse_session_name, parse_target_arg};
 
 #[path = "config_parse/hooks.rs"]
@@ -113,7 +113,10 @@ pub(super) fn parse_set_option_invocation(
                     .expect("peeked set-option flag cluster must be present");
                 flags.apply_cluster(command_name, &token, force_window)?;
             }
-            _ => break,
+            _ => {
+                reject_unknown_option_before_positional(command_name, token)?;
+                break;
+            }
         }
     }
 
@@ -359,7 +362,10 @@ pub(super) fn parse_set_environment(
                 select_set_environment_mode(&mut mode, SetEnvironmentMode::Unset);
             }
             _ => {
-                let Some(cluster) = parse_compact_flag_cluster(&token, "Fghru", "t") else {
+                let Some(cluster) =
+                    parse_compact_flag_cluster("set-environment", &token, "Fghru", "t")?
+                else {
+                    reject_unknown_option_before_positional("set-environment", &token)?;
                     break;
                 };
                 let _ = args.optional();
@@ -519,7 +525,10 @@ pub(super) fn parse_show_options(
                     }
                 }
             }
-            _ => break,
+            _ => {
+                reject_unknown_option_before_positional(command_name, token)?;
+                break;
+            }
         }
     }
 

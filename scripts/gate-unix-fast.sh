@@ -13,12 +13,16 @@ Options:
   --nextest                    Use cargo-nextest for workspace tests
   --skip-doc                   Skip doc tests and cargo doc
   --skip-source-gates          Skip source boundary shell checks
+  --skip-tiny-routes           Skip the packaged tiny CLI caller-cwd routes
   --install-nextest            Install cargo-nextest if it is missing
   -h, --help                   Show this help
 
 This gate sets RUST_TEST_THREADS from --test-threads and uses the same minimum
 test-thread stack as CI. It keeps the Cargo target directory outside the repo
 by default and runs doc/source checks separately.
+
+The tiny CLI route step needs a build with debug_assertions off, so its first
+run on a host populates a second target directory; later runs are incremental.
 USAGE
 }
 
@@ -68,6 +72,7 @@ platform=""
 test_threads=""
 skip_doc=0
 skip_source_gates=0
+skip_tiny_routes=0
 install_nextest=0
 use_nextest=0
 
@@ -93,6 +98,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --skip-source-gates)
       skip_source_gates=1
+      shift
+      ;;
+    --skip-tiny-routes)
+      skip_tiny_routes=1
       shift
       ;;
     --install-nextest)
@@ -154,6 +163,10 @@ if [ "$use_nextest" -eq 1 ]; then
     cargo nextest run --workspace --all-targets --locked --no-fail-fast --test-threads "$test_threads"
 else
   run_step "cargo test workspace" cargo test --workspace --all-targets --locked --no-fail-fast
+fi
+
+if [ "$skip_tiny_routes" -eq 0 ]; then
+  run_step "tiny CLI caller-cwd routes" scripts/tiny-cli-cwd-routes.sh
 fi
 
 if [ "$skip_doc" -eq 0 ]; then

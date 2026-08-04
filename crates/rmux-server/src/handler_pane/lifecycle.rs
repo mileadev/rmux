@@ -5,8 +5,13 @@ use rmux_core::LifecycleEvent;
 use rmux_proto::{OptionName, PaneStateClosedReason, PaneTarget, RmuxError, Target, WindowTarget};
 
 use super::super::{
-    attach_support::SessionDetachOnDestroy, exited_output_support::RetainedExitedPaneIdentities,
-    prepare_lifecycle_event, scripting_support::format_context_for_target, RequestHandler,
+    attach_support::SessionDetachOnDestroy,
+    defer_lifecycle_event,
+    exited_output_support::RetainedExitedPaneIdentities,
+    pane_stream_support::{stream_source_for_target, PaneStreamSource},
+    prepare_lifecycle_event,
+    scripting_support::format_context_for_target,
+    RequestHandler, SelectionTransitionSnapshot,
 };
 use super::pane_kill_effects::KillPaneLifecycleBatch;
 use crate::format_runtime::render_runtime_template;
@@ -19,10 +24,26 @@ use tracing::warn;
 const PANE_EXIT_STATUS_RETRY_DELAY: Duration = Duration::from_millis(10);
 const PANE_EXIT_STATUS_LONG_RETRY_DELAY: Duration = Duration::from_millis(250);
 const PANE_EXIT_STATUS_FAST_RETRY_ATTEMPTS: usize = 20;
+const PANE_EXIT_TEARDOWN_RETRY_ATTEMPTS: usize = 32;
 const DEAD_PANE_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// Outcome of one attempt to plan an exited pane's teardown under the state
+/// lock.
+enum PaneExitAttempt {
+    /// The teardown committed; the plan is published outside the lock.
+    Planned(Box<PaneExitPlan>),
+    /// The child's exit is not observable yet, so nothing has been torn down.
+    ExitPending,
+    /// The pane's process is gone but the model teardown failed. The state was
+    /// rolled back, so the attempt can be repeated; the payload is the terminal
+    /// fallback to commit once the retry budget is spent.
+    TeardownFailed {
+        prepare_dead: bool,
+        output_generation: u64,
+    },
+}
+
 enum PaneExitPlan {
-    Ignore,
     KeepDead {
         prepare_dead: bool,
         output_generation: u64,
@@ -43,6 +64,7 @@ enum PaneExitPlan {
         pane_event: super::super::QueuedLifecycleEvent,
         lifecycle_events: Vec<super::super::QueuedLifecycleEvent>,
         layout_event: Option<Box<super::super::QueuedLifecycleEvent>>,
+        selection_events: Vec<super::super::QueuedLifecycleEvent>,
         output: ExitedPaneOutput,
         metadata: PaneExitMetadata,
     },
@@ -64,6 +86,7 @@ enum PaneExitPlan {
 struct ExitedPaneOutput {
     receiver: Option<PaneOutputReceiver>,
     sender: Option<PaneOutputSender>,
+    stream_source: Option<PaneStreamSource>,
 }
 
 impl ExitedPaneOutput {
@@ -74,24 +97,32 @@ impl ExitedPaneOutput {
     ) -> Self {
         let (receiver, sender) =
             state.runtime_pane_output_drain_handles(runtime_session_name, pane_id);
-        Self { receiver, sender }
+        let stream_source = state
+            .pane_target_for_runtime_pane(runtime_session_name, pane_id)
+            .and_then(|target| stream_source_for_target(state, target).ok());
+        Self {
+            receiver,
+            sender,
+            stream_source,
+        }
     }
 
-    async fn ensure_eof(&mut self, generation: Option<u64>, output_eof_published: bool) -> bool {
+    async fn ensure_eof(&mut self, output_eof_published: bool) -> bool {
         if output_eof_published {
             return true;
         }
         if wait_for_pane_output_eof(self.receiver.take()).await {
             return true;
         }
-        if let Some(sender) = self.sender.as_ref() {
-            let _ = sender.send_for_generation(generation, Vec::new());
-        }
         false
     }
 
     fn sender(&self) -> Option<PaneOutputSender> {
         self.sender.clone()
+    }
+
+    fn stream_source(&self) -> Option<PaneStreamSource> {
+        self.stream_source.clone()
     }
 }
 
@@ -135,15 +166,14 @@ impl RequestHandler {
         if !event.output_eof_published() {
             self.notify_pane_exit_output_drain_started();
         }
-        let output_eof_observed = output
-            .ensure_eof(event.generation, event.output_eof_published())
-            .await;
+        let output_eof_observed = output.ensure_eof(event.output_eof_published()).await;
         self.flush_pending_pane_alert_for_exit(event.pane_id, event.generation)
             .await;
         let mut output = Some(output);
         let mut attempts = 0;
+        let mut teardown_failures = 0;
         let plan = loop {
-            let plan = {
+            let attempt = 'attempt: {
                 let mut state = self.state.lock().await;
                 let Some(runtime_session_name) = state.resolve_pane_event_runtime_session(
                     &event.session_name,
@@ -173,12 +203,13 @@ impl RequestHandler {
                     };
 
                 if let Some(metadata) = metadata {
+                    let output_generation =
+                        state.pane_output_generation(&runtime_session_name, event.pane_id);
                     if should_keep_dead_pane(&state, &target, metadata) {
-                        Some(PaneExitPlan::KeepDead {
+                        PaneExitAttempt::Planned(Box::new(PaneExitPlan::KeepDead {
                             prepare_dead: !was_dead,
-                            output_generation: state
-                                .pane_output_generation(&runtime_session_name, event.pane_id),
-                        })
+                            output_generation,
+                        }))
                     } else {
                         let Some(session) = state.sessions.session(target.session_name()) else {
                             return;
@@ -208,10 +239,13 @@ impl RequestHandler {
                         let window_id = window.id();
                         let window_name = window.name().unwrap_or_default().to_owned();
                         let _ = (session, window);
-                        let lifecycle_batch =
+                        let mut lifecycle_batch =
                             KillPaneLifecycleBatch::capture(&state, &target, false);
-                        let pane_event = prepare_lifecycle_event(
-                            &mut state,
+                        // Deferred, not dispatched: a failed teardown is retried,
+                        // and re-preparing the event would consume one-shot hooks
+                        // for an attempt that never commits.
+                        let deferred_pane_event = defer_lifecycle_event(
+                            &state,
                             &LifecycleEvent::PaneExited {
                                 target: target.clone(),
                                 pane_id: Some(pane_id),
@@ -233,14 +267,31 @@ impl RequestHandler {
                                 match state.sessions.remove_session(target.session_name()) {
                                     Ok(removed_session) => removed_session,
                                     Err(error) => {
-                                        warn!(
-                                            session = %target.session_name(),
-                                            pane_id = event.pane_id.as_u32(),
-                                            "failed to remove exited pane session: {error}"
+                                        warn_pane_exit_teardown_failure(
+                                            teardown_failures,
+                                            target.session_name(),
+                                            event.pane_id,
+                                            &error,
                                         );
-                                        return;
+                                        break 'attempt PaneExitAttempt::TeardownFailed {
+                                            prepare_dead: !was_dead,
+                                            output_generation,
+                                        };
                                     }
                                 };
+                            let pane_event =
+                                lifecycle_batch.prepare_deferred(&mut state, deferred_pane_event);
+                            if let Some(source) =
+                                output.as_ref().and_then(ExitedPaneOutput::stream_source)
+                            {
+                                self.stage_exited_pane_stream_source(
+                                    PaneOutputSubscriptionKey::new(
+                                        runtime_session_name.clone(),
+                                        event.pane_id,
+                                    ),
+                                    source,
+                                );
+                            }
                             state.retire_removed_lifecycle_targets();
                             let destroyed_sessions = vec![(
                                 target.session_name().clone(),
@@ -279,7 +330,7 @@ impl RequestHandler {
                                 Vec::new(),
                                 &[],
                             );
-                            Some(PaneExitPlan::RemoveSession {
+                            PaneExitAttempt::Planned(Box::new(PaneExitPlan::RemoveSession {
                                 runtime_session_name,
                                 runtime_session_id,
                                 session_name: target.session_name().clone(),
@@ -296,26 +347,34 @@ impl RequestHandler {
                                     .take()
                                     .expect("pane exit output is consumed by one committed plan"),
                                 metadata,
-                            })
+                            }))
                         } else {
                             let timer_mutation =
                                 self.plan_all_window_mutation_silence_timers_locked(&state);
+                            let selection_before = SelectionTransitionSnapshot::capture(&state);
                             match state.kill_pane(target.clone()) {
                                 Ok(result) => {
+                                    let pane_event = lifecycle_batch
+                                        .prepare_deferred(&mut state, deferred_pane_event);
+                                    if let Some(source) =
+                                        output.as_ref().and_then(ExitedPaneOutput::stream_source)
+                                    {
+                                        self.stage_exited_pane_stream_source(
+                                            PaneOutputSubscriptionKey::new(
+                                                runtime_session_name.clone(),
+                                                event.pane_id,
+                                            ),
+                                            source,
+                                        );
+                                    }
                                     state.retire_removed_lifecycle_targets();
                                     self.apply_window_mutation_silence_timers_and_arm_all_locked(
                                         &state,
                                         timer_mutation,
                                         Vec::new(),
-                                        &[],
+                                        &result.reindexed_windows,
                                     );
-                                    if result.response.window_destroyed {
-                                        let _ =
-                                            state.hooks.remove_window(&WindowTarget::with_window(
-                                                target.session_name().clone(),
-                                                target.window_index(),
-                                            ));
-                                    } else {
+                                    if !result.response.window_destroyed {
                                         let _ = state.hooks.remove_pane(&target);
                                     }
                                     self.record_pane_state_change(
@@ -326,20 +385,39 @@ impl RequestHandler {
                                         },
                                     );
                                     self.prune_web_panes(&result.removed_pane_ids);
-                                    let lifecycle_events = lifecycle_batch
-                                        .prepare_committed(&mut state, &result.destroyed_sessions);
-                                    let layout_event =
-                                        (!result.response.window_destroyed).then(|| {
-                                            prepare_lifecycle_event(
-                                                &mut state,
-                                                &LifecycleEvent::WindowLayoutChanged {
-                                                    target: WindowTarget::with_window(
-                                                        target.session_name().clone(),
-                                                        target.window_index(),
-                                                    ),
-                                                },
-                                            )
-                                        });
+                                    let window_destroyed = result.response.window_destroyed;
+                                    let lifecycle_events = if window_destroyed {
+                                        lifecycle_batch.prepare_window_destroyed_committed(
+                                            &mut state,
+                                            &result.destroyed_sessions,
+                                            &selection_before,
+                                        )
+                                    } else {
+                                        lifecycle_batch.prepare_committed(
+                                            &mut state,
+                                            &result.destroyed_sessions,
+                                        )
+                                    };
+                                    let layout_target = WindowTarget::with_window(
+                                        target.session_name().clone(),
+                                        target.window_index(),
+                                    );
+                                    let layout_event = (!window_destroyed).then(|| {
+                                        prepare_lifecycle_event(
+                                            &mut state,
+                                            &LifecycleEvent::WindowLayoutChanged {
+                                                target: layout_target.clone(),
+                                            },
+                                        )
+                                    });
+                                    let selection_events = if window_destroyed {
+                                        Vec::new()
+                                    } else {
+                                        selection_before.prepare_window_pane_changes(
+                                            &mut state,
+                                            std::slice::from_ref(&layout_target),
+                                        )
+                                    };
                                     for (destroyed_session, session_id) in
                                         &result.destroyed_sessions
                                     {
@@ -363,7 +441,7 @@ impl RequestHandler {
                                             )
                                         })
                                         .collect();
-                                    Some(PaneExitPlan::RemovePane {
+                                    PaneExitAttempt::Planned(Box::new(PaneExitPlan::RemovePane {
                                         runtime_session_name,
                                         runtime_session_id,
                                         target_session_id,
@@ -375,31 +453,58 @@ impl RequestHandler {
                                         pane_event,
                                         lifecycle_events,
                                         layout_event: layout_event.map(Box::new),
+                                        selection_events,
                                         output: output.take().expect(
                                             "pane exit output is consumed by one committed plan",
                                         ),
                                         metadata,
-                                    })
+                                    }))
                                 }
                                 Err(error) => {
-                                    warn!(
-                                        session = %target.session_name(),
-                                        pane_id = event.pane_id.as_u32(),
-                                        "failed to remove exited pane: {error}"
+                                    warn_pane_exit_teardown_failure(
+                                        teardown_failures,
+                                        target.session_name(),
+                                        event.pane_id,
+                                        &error,
                                     );
-                                    Some(PaneExitPlan::Ignore)
+                                    PaneExitAttempt::TeardownFailed {
+                                        prepare_dead: !was_dead,
+                                        output_generation,
+                                    }
                                 }
                             }
                         }
                     }
                 } else {
-                    None
+                    PaneExitAttempt::ExitPending
                 }
             };
 
-            match plan {
-                Some(plan) => break plan,
-                None => {
+            match attempt {
+                PaneExitAttempt::Planned(plan) => break *plan,
+                PaneExitAttempt::TeardownFailed {
+                    prepare_dead,
+                    output_generation,
+                } => {
+                    // kill_pane rolls its own mutations back, so the pane is
+                    // still whole and the attempt can simply be repeated. The
+                    // process is already gone, so giving up would strand the
+                    // pane in the model with no terminal event for the journal,
+                    // the SDK or lifecycle subscribers. Once the budget is
+                    // spent, commit the kept-dead representation instead: the
+                    // pane stays visible, but it is honestly marked dead and
+                    // every subscriber observes it closing.
+                    let delay = pane_exit_retry_delay(teardown_failures);
+                    teardown_failures = teardown_failures.saturating_add(1);
+                    if teardown_failures >= PANE_EXIT_TEARDOWN_RETRY_ATTEMPTS {
+                        break PaneExitPlan::KeepDead {
+                            prepare_dead,
+                            output_generation,
+                        };
+                    }
+                    tokio::time::sleep(delay).await;
+                }
+                PaneExitAttempt::ExitPending => {
                     // Linux can publish PTY EOF while the session leader keeps
                     // running with all three standard descriptors redirected.
                     // The reader owns Unix's only pane-exit notification, so a
@@ -412,11 +517,7 @@ impl RequestHandler {
                     if !cfg!(unix) && attempts >= PANE_EXIT_STATUS_FAST_RETRY_ATTEMPTS {
                         return;
                     }
-                    let delay = if attempts < PANE_EXIT_STATUS_FAST_RETRY_ATTEMPTS {
-                        PANE_EXIT_STATUS_RETRY_DELAY
-                    } else {
-                        PANE_EXIT_STATUS_LONG_RETRY_DELAY
-                    };
+                    let delay = pane_exit_retry_delay(attempts);
                     attempts = attempts.saturating_add(1);
                     tokio::time::sleep(delay).await;
                 }
@@ -430,7 +531,6 @@ impl RequestHandler {
         self.pause_after_pane_exit_commit().await;
 
         match plan {
-            PaneExitPlan::Ignore => {}
             PaneExitPlan::KeepDead {
                 prepare_dead,
                 output_generation,
@@ -485,6 +585,7 @@ impl RequestHandler {
                 pane_event,
                 lifecycle_events,
                 layout_event,
+                selection_events,
                 output,
                 metadata,
             } => {
@@ -498,8 +599,12 @@ impl RequestHandler {
                 )
                 .await;
                 self.forget_pane_snapshot_coalescers(&removed_pane_ids);
-                self.cleanup_exited_pane_output_subscription(&runtime_session_name, event.pane_id)
-                    .await;
+                self.cleanup_exited_pane_output_subscription(
+                    &runtime_session_name,
+                    event.pane_id,
+                    &output,
+                )
+                .await;
                 let mut prepared_attached_switches = std::collections::HashMap::new();
                 let mut prepared_rehome_order = Vec::new();
                 for (session_name, session_id, detach_on_destroy) in &destroyed_attached_sessions {
@@ -519,6 +624,9 @@ impl RequestHandler {
                 }
                 if let Some(layout_event) = layout_event {
                     self.emit_prepared(*layout_event).await;
+                }
+                for selection_event in selection_events {
+                    self.emit_prepared(selection_event).await;
                 }
                 for session_id in prepared_rehome_order {
                     if let Some(prepared) = prepared_attached_switches.get_mut(&session_id) {
@@ -590,8 +698,12 @@ impl RequestHandler {
                     session_id,
                 )));
                 self.forget_pane_snapshot_coalescers(&removed_pane_ids);
-                self.cleanup_exited_pane_output_subscription(&runtime_session_name, event.pane_id)
-                    .await;
+                self.cleanup_exited_pane_output_subscription(
+                    &runtime_session_name,
+                    event.pane_id,
+                    &output,
+                )
+                .await;
                 let mut prepared = self
                     .prepare_destroy_session_rehome(&session_name, session_id, detach_on_destroy)
                     .await;
@@ -633,9 +745,11 @@ impl RequestHandler {
         &self,
         runtime_session_name: &rmux_proto::SessionName,
         pane_id: rmux_core::PaneId,
+        output: &ExitedPaneOutput,
     ) {
         let key = PaneOutputSubscriptionKey::new(runtime_session_name.clone(), pane_id);
-        self.drain_exited_pane_output_subscriptions(key).await;
+        self.drain_exited_pane_output_subscriptions(key, output.stream_source())
+            .await;
     }
 
     async fn commit_kept_dead_pane(
@@ -737,6 +851,32 @@ async fn wait_for_pane_output_eof(output_rx: Option<PaneOutputReceiver>) -> bool
     })
     .await
     .is_ok()
+}
+
+fn pane_exit_retry_delay(attempts: usize) -> Duration {
+    if attempts < PANE_EXIT_STATUS_FAST_RETRY_ATTEMPTS {
+        PANE_EXIT_STATUS_RETRY_DELAY
+    } else {
+        PANE_EXIT_STATUS_LONG_RETRY_DELAY
+    }
+}
+
+/// Logs the first failure of a retried teardown, then stays quiet so a pane
+/// that keeps failing cannot flood the log for the whole retry budget.
+fn warn_pane_exit_teardown_failure(
+    teardown_failures: usize,
+    session_name: &rmux_proto::SessionName,
+    pane_id: rmux_core::PaneId,
+    error: &RmuxError,
+) {
+    if teardown_failures > 0 {
+        return;
+    }
+    warn!(
+        session = %session_name,
+        pane_id = pane_id.as_u32(),
+        "failed to remove exited pane, retrying: {error}"
+    );
 }
 
 fn should_keep_dead_pane(
@@ -910,13 +1050,41 @@ mod tests {
         let mut output = ExitedPaneOutput {
             receiver: Some(receiver),
             sender: Some(sender),
+            stream_source: None,
         };
 
-        tokio::time::timeout(
-            Duration::from_millis(25),
-            output.ensure_eof(generation, true),
-        )
-        .await
-        .expect("published EOF should not wait for the drain timeout");
+        tokio::time::timeout(Duration::from_millis(25), output.ensure_eof(true))
+            .await
+            .expect("published EOF should not wait for the drain timeout");
+    }
+
+    #[tokio::test]
+    async fn ensure_eof_timeout_does_not_precede_late_reader_output() {
+        let sender = crate::pane_io::pane_output_channel();
+        let generation = None;
+        let receiver = sender.subscribe();
+        let mut stream_receiver = sender.subscribe();
+        let mut output = ExitedPaneOutput {
+            receiver: Some(receiver),
+            sender: Some(sender.clone()),
+            stream_source: None,
+        };
+
+        assert!(!output.ensure_eof(false).await);
+        sender
+            .send_for_generation(generation, b"late-conpty-tail".to_vec())
+            .expect("late output must remain publishable");
+        sender
+            .send_for_generation(generation, Vec::new())
+            .expect("reader EOF must remain publishable");
+
+        let OutputCursorItem::Event(tail) = stream_receiver.recv().await else {
+            panic!("late output must not be preceded by a synthetic EOF");
+        };
+        assert_eq!(tail.bytes(), b"late-conpty-tail");
+        let OutputCursorItem::Event(eof) = stream_receiver.recv().await else {
+            panic!("reader EOF must follow late output");
+        };
+        assert!(eof.bytes().is_empty());
     }
 }

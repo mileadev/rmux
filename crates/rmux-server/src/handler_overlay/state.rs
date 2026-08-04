@@ -4,7 +4,7 @@ use rmux_core::{BoxLines, Style};
 use rmux_proto::{Target, TerminalSize};
 
 use super::super::scripting_support::rename_target_session;
-use crate::renderer::{render_popup_overlay, OverlayRect, PopupRenderSpec};
+use crate::renderer::{render_popup_overlay, OverlayRect, PopupContent, PopupRenderSpec};
 
 use super::identity::OverlayIdentity;
 use super::menu::MenuOverlayState;
@@ -102,9 +102,16 @@ impl PopupOverlayState {
     }
 
     fn render(&self) -> Vec<u8> {
-        let content_lines = self.scrollable_text.as_ref().map_or_else(
-            || self.surface.lock().expect("popup surface").lines(),
-            |text| text.visible_lines(self.content_size().rows),
+        let content = self.scrollable_text.as_ref().map_or_else(
+            || {
+                PopupContent::Surface(
+                    self.surface
+                        .lock()
+                        .expect("popup surface")
+                        .rows(&self.style),
+                )
+            },
+            |text| PopupContent::Text(text.visible_lines(self.content_size().rows)),
         );
         let popup_frame = render_popup_overlay(&PopupRenderSpec {
             rect: self.rect,
@@ -112,7 +119,7 @@ impl PopupOverlayState {
             style: self.style.clone(),
             border_style: self.border_style.clone(),
             border_lines: self.border_lines,
-            content_lines,
+            content,
         });
         if let Some(menu) = &self.nested_menu {
             let mut frame = popup_frame;

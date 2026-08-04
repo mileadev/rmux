@@ -13,17 +13,20 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinError, JoinSet};
 use tracing::{debug, warn};
 
+use crate::client_names::attached_client_name;
 use crate::control::{self, ControlLifecycle, ControlServerEvent, ControlUpgradeInput};
 use crate::daemon::ShutdownHandle;
 use crate::handler::{
-    attach_support::AttachRegistration, with_session_lease_create_addressing,
-    ControlClientIdentity, ControlRegistration, DetachedRequestGuard, NormalRequestGuard,
-    PreparedSdkWait, RequestHandler, SessionLeaseCreateAddressing,
+    attach_support::AttachRegistration, with_authenticated_connection_peer,
+    with_session_lease_create_addressing, ControlClientIdentity, ControlRegistration,
+    DetachedRequestGuard, NormalRequestGuard, PreparedSdkWait, RequestHandler,
+    SessionLeaseCreateAddressing,
 };
 use crate::listener_options::ServeOptions;
 use crate::listener_signals::handle_server_signal;
 use crate::listener_signals::poll_server_signal;
 use crate::listener_signals::wait_server_signal;
+use crate::outer_terminal::ClientTitleState;
 use crate::pane_io;
 use crate::server_access::apply_access_policy;
 use crate::socket_cleanup::SocketCleanup;
@@ -292,10 +295,21 @@ async fn serve_connection(
                 let Some(access_admission) =
                     handler.server_access_admission_for_peer(&requester)
                 else {
-                    conn.write_response(&Response::Error(ErrorResponse {
-                        error: rmux_proto::RmuxError::Server("access not allowed".to_owned()),
-                    }))
-                    .await?;
+                    let response = match request {
+                        Request::PaneStreamCursor(request) => handler
+                            .handle_revoked_pane_stream_cursor(connection_id, request),
+                        request => handler
+                            .handle_revoked_cleanup_request(connection_id, request)
+                            .await
+                            .unwrap_or_else(|| {
+                                Response::Error(ErrorResponse {
+                                    error: rmux_proto::RmuxError::Server(
+                                        "access not allowed".to_owned(),
+                                    ),
+                                })
+                            }),
+                    };
+                    conn.write_response(&response).await?;
                     continue;
                 };
                 let can_write = access_admission.can_write();
@@ -306,6 +320,14 @@ async fn serve_connection(
                         continue;
                     }
                 };
+                let attach_client_name = matches!(
+                    &request,
+                    Request::AttachSession(_)
+                        | Request::AttachSessionExt(_)
+                        | Request::AttachSessionExt2(_)
+                        | Request::AttachSessionExt3(_)
+                )
+                .then(|| attached_client_name(requester.pid));
                 let quiesce_behavior = request_quiesce_behavior(&request);
                 let mut request_shutdown = shutdown.clone();
                 let mut normal_request_guard: Option<NormalRequestGuard> =
@@ -315,8 +337,12 @@ async fn serve_connection(
                         Some(guard) => Some(guard),
                         None => return Ok(()),
                     };
+                // The scope carries the authenticated peer as well as its
+                // admission: an attach frame is rendered before the
+                // registration below publishes this client, and both must
+                // describe the same user (issue #182).
                 let _requester_access_guard = handler
-                    .begin_detached_requester_access(requester.pid, access_admission.clone());
+                    .begin_authenticated_peer_access(&requester, access_admission.clone());
                 let mut detached_request_guard = request_counts_as_detached_activity(&request)
                     .then(|| handler.begin_detached_request());
 
@@ -482,6 +508,27 @@ async fn serve_connection(
                     None
                 };
 
+                // Tests park the loop here to make the captured admission stale
+                // between a dispatched pane-stream open and its recheck.
+                #[cfg(test)]
+                inflight_access_tests::pause_before_inflight_pane_stream_recheck(
+                    &handler,
+                    &outcome.response,
+                )
+                .await;
+
+                if matches!(
+                    outcome.response,
+                    Response::SubscribePaneStream(_) | Response::PaneStreamCursor(_)
+                ) && !handler
+                    .server_access_admission_is_current(&requester, &access_admission)
+                {
+                    outcome.response = handler.revoke_inflight_pane_stream_response(
+                        connection_id,
+                        outcome.response,
+                    );
+                }
+
                 let response_result = match (legacy_kill_server_wire, &outcome.response) {
                     (Some(wire_version), Response::KillServer(_)) => {
                         conn.write_legacy_kill_server_response(wire_version).await
@@ -491,6 +538,7 @@ async fn serve_connection(
                 if let Err(error) = response_result {
                     if let Some((_, _, _, _, control_id)) = pending_control.as_ref() {
                         handler.finish_control(requester.pid, *control_id).await;
+                        let _ = handler.request_shutdown_if_server_empty().await;
                     }
                     drop(detached_request_guard.take());
                     #[cfg(windows)]
@@ -514,9 +562,13 @@ async fn serve_connection(
                     };
                     let session_name = response.session_name.clone();
                     let terminal_context = attach.target.outer_terminal.context().clone();
+                    let client_title = attach_frame_client_title(&attach.target);
+                    let client_name = attach_client_name
+                        .expect("attach upgrade captures its client name before dispatch");
                     let attach_identity = handler
-                        .register_attach_identity_with_server_access(
+                        .register_attach_identity_with_server_access_and_client_name(
                             requester.pid,
+                            client_name.clone(),
                             session_name.clone(),
                             Some(attach.session_id),
                             AttachRegistration {
@@ -525,6 +577,7 @@ async fn serve_connection(
                                 closing: attach.closing.clone(),
                                 persistent_overlay_epoch: attach.persistent_overlay_epoch.clone(),
                                 terminal_context,
+                                client_title,
                                 flags: attach.flags,
                                 render_stream: attach.render_stream,
                                 uid: requester.uid,
@@ -542,7 +595,7 @@ async fn serve_connection(
                     drop(detached_request_guard.take());
                     handler
                         .emit_client_attached_identity(
-                            requester.pid,
+                            client_name,
                             session_name,
                             attach.session_id,
                         )
@@ -608,6 +661,7 @@ async fn serve_connection(
                     )
                     .await;
                     handler.finish_control(requester.pid, control_id).await;
+                    let _ = handler.request_shutdown_if_server_empty().await;
                     return result;
                 }
 
@@ -626,6 +680,22 @@ async fn serve_connection(
             }
         }
     }
+}
+
+/// The per-client outer-terminal identity a fresh registration inherits from
+/// the attach frame this listener is about to forward.
+///
+/// That frame reaches the client's terminal directly rather than through the
+/// control queue, so whatever it carries is already delivered. Without this
+/// seed the client's first refresh resolves the same title again and writes it
+/// a second time (issue #182).
+pub(crate) fn attach_frame_client_title(
+    target: &pane_io::AttachTarget,
+) -> Option<ClientTitleState> {
+    target
+        .client_title
+        .as_ref()
+        .map(|rendered| rendered.state().clone())
 }
 
 async fn write_prepared_sdk_wait(
@@ -681,13 +751,19 @@ async fn run_connection_with_cleanup(
     shutdown_handle: ShutdownHandle,
 ) -> io::Result<()> {
     let mut cleanup_guard = ConnectionCleanupGuard::new(Arc::clone(&handler), connection_id);
-    let result = serve_connection(
-        stream,
-        requester,
-        handler,
-        connection_id,
-        shutdown,
-        shutdown_handle,
+    // Everything this connection dispatches runs under the peer the OS
+    // authenticated for it, so a reused numeric pid cannot make one
+    // connection's own requests resolve to another's identity (issue #182).
+    let result = with_authenticated_connection_peer(
+        requester.clone(),
+        serve_connection(
+            stream,
+            requester,
+            handler,
+            connection_id,
+            shutdown,
+            shutdown_handle,
+        ),
     )
     .await;
     cleanup_guard.cleanup_now();
@@ -959,10 +1035,11 @@ mod tests {
         CancelSdkWaitResponse, ClientTerminalContext, ControlMode, ControlModeRequest,
         CreateSessionLeaseRequest, DaemonStatusRequest, ErrorResponse, HandshakeRequest,
         HasSessionRequest, ListSessionsRequest, NewSessionRequest, OptionName,
-        PaneOutputSubscriptionStart, PaneTarget, RenameSessionRequest, RmuxError, RunShellRequest,
-        ScopeSelector, SdkWaitForOutputRequest, SdkWaitForOutputResponse, SdkWaitId,
-        SdkWaitOutcome, SdkWaitOwnerId, SessionName, SetOptionMode, SetOptionRequest,
-        ShutdownIfIdleRequest, ShutdownIfIdleResponse, SourceFileRequest, TerminalSize,
+        PaneOutputSubscriptionStart, PaneStreamMode, PaneTarget, PaneTargetRef,
+        RenameSessionRequest, RmuxError, RunShellRequest, ScopeSelector, SdkWaitForOutputRequest,
+        SdkWaitForOutputResponse, SdkWaitId, SdkWaitOutcome, SdkWaitOwnerId, SessionName,
+        SetOptionMode, SetOptionRequest, ShutdownIfIdleRequest, ShutdownIfIdleResponse,
+        SourceFileRequest, SubscribePaneStreamRequest, TerminalSize, UnsubscribePaneStreamRequest,
         WaitForMode, WaitForRequest, WaitForResponse, INTERNAL_LIST_WINDOWS_ALL_EXECUTION_PATH,
         RMUX_WIRE_VERSION,
     };
@@ -1404,6 +1481,68 @@ mod tests {
             })
         );
 
+        drop(client);
+        connection_task.await.expect("connection task")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn revoked_connection_can_release_its_owned_pane_stream() -> io::Result<()> {
+        let peer_uid = rmux_os::identity::real_user_id().saturating_add(11_000);
+        let peer = PeerIdentity {
+            pid: std::process::id(),
+            uid: peer_uid,
+            user: rmux_os::identity::UserIdentity::Uid(peer_uid),
+        };
+        let handler = Arc::new(RequestHandler::new());
+        let session = SessionName::new("revoked-stream-cleanup").expect("valid session");
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: session.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+        handler
+            .set_test_access_mode_for_uid(peer_uid, AccessMode::ReadWrite)
+            .expect("test peer starts read-write");
+        let (mut client, _shutdown_tx, connection_task) =
+            spawn_test_connection_with_peer(&handler, peer)?;
+
+        write_test_request(
+            &mut client,
+            Request::SubscribePaneStream(SubscribePaneStreamRequest {
+                target: PaneTargetRef::slot(PaneTarget::new(session, 0)),
+                mode: PaneStreamMode::Raw,
+                include_snapshot: false,
+            }),
+        )
+        .await?;
+        let Response::SubscribePaneStream(subscribed) = read_test_response(&mut client).await?
+        else {
+            panic!("pane stream subscription must succeed before access revocation");
+        };
+        let subscription_id = subscribed.subscription_id;
+
+        handler
+            .remove_test_access_for_uid(peer_uid)
+            .expect("test peer access can be revoked");
+        write_test_request(
+            &mut client,
+            Request::UnsubscribePaneStream(UnsubscribePaneStreamRequest { subscription_id }),
+        )
+        .await?;
+        assert_eq!(
+            read_test_response(&mut client).await?,
+            Response::UnsubscribePaneStream(rmux_proto::UnsubscribePaneStreamResponse {
+                subscription_id,
+                removed: true,
+            })
+        );
         drop(client);
         connection_task.await.expect("connection task")?;
         Ok(())
@@ -2100,6 +2239,18 @@ mod tests {
 #[cfg(all(test, unix, feature = "web"))]
 #[path = "listener_web_share_tests.rs"]
 mod web_share_tests;
+
+#[cfg(test)]
+#[path = "listener_connection_test_support.rs"]
+mod connection_test_support;
+
+#[cfg(test)]
+#[path = "listener_inflight_access_tests.rs"]
+mod inflight_access_tests;
+
+#[cfg(test)]
+#[path = "listener_attach_identity_tests.rs"]
+mod attach_identity_tests;
 
 #[cfg(all(test, windows))]
 mod windows_tests {

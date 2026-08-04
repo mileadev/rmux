@@ -76,7 +76,7 @@ use rmux_proto::{
 
 use crate::handles::session::unexpected_response;
 use crate::transport::{DropGuard, TransportClient};
-use crate::{Result, RmuxError};
+use crate::{PaneId, Result, RmuxError};
 
 const PANE_OUTPUT_BATCH_SIZE: u16 = 256;
 const POLL_INITIAL_DELAY: Duration = Duration::from_millis(2);
@@ -212,7 +212,9 @@ pub enum PaneLineItem {
 /// type.
 pub struct PaneOutputStream {
     inner: PaneSubscription,
+    pane_id: PaneId,
     pending: VecDeque<PaneOutputChunk>,
+    next_sequence: u64,
     poll_delay: Duration,
     cursor_request: Option<tokio::task::JoinHandle<Result<Response>>>,
 }
@@ -267,8 +269,12 @@ impl PaneOutputStream {
             }
         };
 
-        let subscription_id = match response {
-            Response::SubscribePaneOutput(response) => response.subscription_id,
+        let (subscription_id, pane_id, next_sequence) = match response {
+            Response::SubscribePaneOutput(response) => (
+                response.subscription_id,
+                response.pane_id,
+                response.cursor.next_sequence,
+            ),
             response => return Err(unexpected_response("subscribe-pane-output", response)),
         };
 
@@ -286,7 +292,9 @@ impl PaneOutputStream {
                 _drop_guard: drop_guard,
                 closed: false,
             },
+            pane_id,
             pending: VecDeque::new(),
+            next_sequence,
             poll_delay: POLL_INITIAL_DELAY,
             cursor_request: None,
         })
@@ -350,6 +358,18 @@ impl PaneOutputStream {
         Ok(buffered)
     }
 
+    pub(crate) const fn next_sequence(&self) -> u64 {
+        self.next_sequence
+    }
+
+    pub(crate) const fn is_closed(&self) -> bool {
+        self.inner.closed
+    }
+
+    pub(crate) const fn pane_id(&self) -> PaneId {
+        self.pane_id
+    }
+
     async fn refill_once(&mut self) -> Result<RefillOutcome> {
         if self.cursor_request.is_none() {
             let transport = self.inner.transport.clone();
@@ -378,12 +398,16 @@ impl PaneOutputStream {
             Ok(Response::PaneOutputCursor(cursor)) => {
                 self.inner
                     .validate_response_subscription("pane-output-cursor", cursor.subscription_id)?;
+                if let Some(last) = cursor.events.last() {
+                    self.next_sequence = last.sequence.saturating_add(1);
+                }
                 ingest_cursor(&mut self.pending, cursor.events);
                 Ok(RefillOutcome::Filled)
             }
             Ok(Response::PaneOutputLag(lag)) => {
                 self.inner
                     .validate_response_subscription("pane-output-lag", lag.subscription_id)?;
+                self.next_sequence = lag.lag.resume_sequence;
                 self.pending
                     .push_back(PaneOutputChunk::Lag(PaneLagNotice::from_proto(lag.lag)));
                 Ok(RefillOutcome::Filled)

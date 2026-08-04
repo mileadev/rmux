@@ -13,6 +13,63 @@ use serde_json::Value;
 mod windows_cli_serial;
 
 #[test]
+fn windows_socket_label_is_ascii_case_insensitive_end_to_end() -> Result<(), Box<dyn Error>> {
+    let _serial_guard = windows_cli_serial::acquire("windows-socket-label-case")?;
+    let base_label = unique_label("windows-socket-label-case")?;
+    let start_label = base_label.to_ascii_uppercase();
+    let lower_label = base_label.to_ascii_lowercase();
+    let mixed_label = alternating_ascii_case(&base_label, true);
+    let kill_label = alternating_ascii_case(&base_label, false);
+    let _server = ForegroundServerGuard::start(start_label.clone())?;
+    let session = "label-case";
+
+    assert_success(
+        rmux_command(&start_label)
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "cmd.exe",
+                "/D",
+                "/Q",
+                "/K",
+            ])
+            .stdin(Stdio::null())
+            .output()?,
+        "start daemon under uppercase socket label",
+    )?;
+    assert_success(
+        rmux_command(&lower_label)
+            .args(["has-session", "-t", session])
+            .stdin(Stdio::null())
+            .output()?,
+        "find session under lowercase socket label",
+    )?;
+    let sessions = assert_success(
+        rmux_command(&mixed_label)
+            .arg("list-sessions")
+            .stdin(Stdio::null())
+            .output()?,
+        "list sessions under mixed-case socket label",
+    )?;
+    assert!(
+        String::from_utf8(sessions.stdout)?
+            .lines()
+            .any(|line| line.starts_with(&format!("{session}:"))),
+        "list-sessions did not report {session}"
+    );
+    assert_success(
+        rmux_command(&kill_label)
+            .arg("kill-server")
+            .stdin(Stdio::null())
+            .output()?,
+        "kill server under another socket-label case",
+    )?;
+    Ok(())
+}
+
+#[test]
 fn windows_automation_wait_snapshot_and_locator_work_end_to_end() -> Result<(), Box<dyn Error>> {
     let _serial_guard = windows_cli_serial::acquire("automation-cli-windows")?;
     let label = unique_label("automation-cli-windows")?;
@@ -242,6 +299,188 @@ fn windows_nonzero_pane_base_index_preserves_targeted_automation_and_percent_res
     Ok(())
 }
 
+/// Regression guard for automation targets under `base-index 1` +
+/// `pane-base-index 1`, natively on Windows.
+///
+/// The sibling above pins `pane-base-index` alone, leaves `base-index` at 0 and
+/// only ever names a `session:window.pane` slot, so the reported configuration
+/// was never exercised on this platform. This one shifts both indices and
+/// drives the same two panes through the three spellings the slot lookup has to
+/// normalise: an explicit slot, a `%id`, and a bare session target — which must
+/// land on the ACTIVE pane rather than on display index 0, which does not exist
+/// under `pane-base-index 1`.
+///
+/// Only `pane-base-index` puts internal and display pane space out of step;
+/// `base-index` renumbers windows server-side and is pinned here as combined
+/// coverage for a non-zero window index, not as a second cause.
+///
+/// The consumers asserted below — `pane-snapshot`, `wait-pane`, `locator` and
+/// `expect-pane` — each make the resolved pane observable from their own
+/// output. `stream-pane` shares the same resolver but is not driven here, so
+/// this test claims no coverage for it.
+#[test]
+fn windows_base_index_one_resolves_every_automation_target_spelling() -> Result<(), Box<dyn Error>>
+{
+    let _serial_guard = windows_cli_serial::acquire("automation-cli-windows-base-index-one")?;
+    let label = unique_label("automation-cli-windows-base-index-one")?;
+    let _server = ForegroundServerGuard::start(label.clone())?;
+
+    assert_success(
+        rmux_command(&label)
+            .args(["set-option", "-g", "base-index", "1"])
+            .stdin(Stdio::null())
+            .output()?,
+        "set base-index",
+    )?;
+    assert_success(
+        rmux_command(&label)
+            .args(["set-window-option", "-g", "pane-base-index", "1"])
+            .stdin(Stdio::null())
+            .output()?,
+        "set pane-base-index",
+    )?;
+    assert_success(
+        rmux_command(&label)
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                "alpha",
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "cmd.exe",
+                "/D",
+                "/K",
+            ])
+            .stdin(Stdio::null())
+            .output()?,
+        "create combined-index session",
+    )?;
+
+    // Both indices must actually be shifted, otherwise the matrix below would
+    // pass vacuously against the zero-based layout.
+    let listed = assert_success(
+        rmux_command(&label)
+            .args([
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name}:#{window_index}.#{pane_index}",
+            ])
+            .stdin(Stdio::null())
+            .output()?,
+        "list combined-index panes",
+    )?;
+    assert_eq!(String::from_utf8(listed.stdout)?.trim(), "alpha:1.1");
+
+    assert_success(
+        rmux_command(&label)
+            .args(["split-window", "-h", "-t", "alpha:1.1"])
+            .stdin(Stdio::null())
+            .output()?,
+        "split second visible pane",
+    )?;
+
+    for (target, marker) in [
+        ("alpha:1.1", "PANE_ONE_MARKER"),
+        ("alpha:1.2", "PANE_TWO_MARKER"),
+    ] {
+        let keys = format!("echo {marker}");
+        assert_success(
+            rmux_command(&label)
+                .args([
+                    "send-keys",
+                    "-t",
+                    target,
+                    "--wait-next-text",
+                    marker,
+                    "--timeout",
+                    "15s",
+                    "--",
+                    keys.as_str(),
+                    "Enter",
+                ])
+                .stdin(Stdio::null())
+                .output()?,
+            format!("write {marker}"),
+        )?;
+    }
+
+    let pane_one_id = pane_id(&label, "alpha:1", 1)?;
+    let pane_two_id = pane_id(&label, "alpha:1", 2)?;
+
+    for (target, expected, unexpected) in [
+        ("alpha:1.1", "PANE_ONE_MARKER", "PANE_TWO_MARKER"),
+        ("alpha:1.2", "PANE_TWO_MARKER", "PANE_ONE_MARKER"),
+        (pane_one_id.as_str(), "PANE_ONE_MARKER", "PANE_TWO_MARKER"),
+        (pane_two_id.as_str(), "PANE_TWO_MARKER", "PANE_ONE_MARKER"),
+        // `split-window -h` leaves the new pane active, so a bare session
+        // target must resolve to pane 2.
+        ("alpha", "PANE_TWO_MARKER", "PANE_ONE_MARKER"),
+    ] {
+        let snapshot = run_json(&label, &["pane-snapshot", "-t", target, "--json"])?;
+        assert_eq!(
+            snapshot["ok"], true,
+            "pane-snapshot -t {target}: {snapshot}"
+        );
+        let text = snapshot["text"]
+            .as_str()
+            .ok_or_else(|| format!("pane-snapshot -t {target} returned no text: {snapshot}"))?;
+        assert!(
+            text.contains(expected),
+            "pane-snapshot -t {target}: {text:?}"
+        );
+        assert!(
+            !text.contains(unexpected),
+            "pane-snapshot -t {target} addressed the wrong pane: {text:?}"
+        );
+
+        let waited = run_json(
+            &label,
+            &[
+                "wait-pane",
+                "-t",
+                target,
+                "--text",
+                expected,
+                "--timeout",
+                "15s",
+                "--json",
+            ],
+        )?;
+        assert_eq!(waited["ok"], true, "wait-pane -t {target}: {waited}");
+
+        let located = run_json(
+            &label,
+            &["locator", "-t", target, "--get-by-text", expected, "--json"],
+        )?;
+        assert_eq!(located["ok"], true, "locator -t {target}: {located}");
+        assert!(
+            located["count"].as_u64().unwrap_or_default() >= 1,
+            "locator -t {target}: {located}"
+        );
+
+        assert_success(
+            rmux_command(&label)
+                .args([
+                    "expect-pane",
+                    "-t",
+                    target,
+                    "--get-by-text",
+                    expected,
+                    "--visible",
+                ])
+                .stdin(Stdio::null())
+                .output()?,
+            format!("expect-pane -t {target}"),
+        )?;
+    }
+
+    Ok(())
+}
+
 #[test]
 fn windows_send_keys_wait_pane_exit_preserves_full_process_status() -> Result<(), Box<dyn Error>> {
     let _serial_guard = windows_cli_serial::acquire("automation-cli-windows-exit-status")?;
@@ -394,6 +633,24 @@ fn run_json(label: &str, args: &[&str]) -> Result<Value, Box<dyn Error>> {
     })
 }
 
+/// Looks up the stable `%id` of a pane by its *display* index in `window`.
+fn pane_id(label: &str, window: &str, pane_index: u32) -> Result<String, Box<dyn Error>> {
+    let output = assert_success(
+        rmux_command(label)
+            .args(["list-panes", "-t", window, "-F", "#{pane_index} #{pane_id}"])
+            .stdin(Stdio::null())
+            .output()?,
+        format!("list pane ids for {window}"),
+    )?;
+    let output = String::from_utf8(output.stdout)?;
+    let prefix = format!("{pane_index} ");
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .map(str::to_owned)
+        .ok_or_else(|| format!("pane {pane_index} missing from {output:?}").into())
+}
+
 fn pane_width(output: &str, pane_index: u32) -> Result<u16, Box<dyn Error>> {
     let prefix = format!("{pane_index}:");
     let width = output
@@ -416,6 +673,20 @@ fn rmux_binary() -> &'static str {
 fn unique_label(prefix: &str) -> Result<String, Box<dyn Error>> {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     Ok(format!("{prefix}-{}-{nanos}", std::process::id()))
+}
+
+fn alternating_ascii_case(value: &str, starts_uppercase: bool) -> String {
+    value
+        .chars()
+        .enumerate()
+        .map(|(index, character)| {
+            if (index % 2 == 0) == starts_uppercase {
+                character.to_ascii_uppercase()
+            } else {
+                character.to_ascii_lowercase()
+            }
+        })
+        .collect()
 }
 
 fn assert_success(output: Output, context: impl AsRef<str>) -> Result<Output, Box<dyn Error>> {

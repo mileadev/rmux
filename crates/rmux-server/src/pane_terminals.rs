@@ -25,6 +25,8 @@ use crate::status_jobs::StatusJobRuntime;
 #[cfg(windows)]
 use crate::terminal::TerminalProfile;
 
+#[path = "pane_terminals/applied_window_resize.rs"]
+mod applied_window_resize;
 #[cfg(windows)]
 #[path = "pane_terminals/deferred_initial.rs"]
 mod deferred_initial;
@@ -74,6 +76,7 @@ mod window_links;
 #[path = "pane_terminals_window.rs"]
 mod window_support;
 
+pub(crate) use applied_window_resize::{AppliedWindowResize, AppliedWindowResizeQueue};
 #[cfg(test)]
 pub(crate) use lifecycle_state::PaneLifecycleProcessState;
 use lifecycle_state::PaneLifecycleSpawn;
@@ -93,6 +96,12 @@ use pane_terminal_store::PaneTerminalStore;
 pub(crate) use pane_transcripts::PaneCaptureRequest;
 pub(crate) use window_links::WindowLinkOccurrenceId;
 use window_links::{WindowLinkGroup, WindowLinkSlot};
+
+#[derive(Clone, Copy)]
+enum WindowNameApplication {
+    Initial,
+    AutomaticUpdate,
+}
 
 #[derive(Clone)]
 pub(crate) struct WindowSpawnOptions<'a> {
@@ -192,10 +201,31 @@ pub(crate) enum DeferredInitialPaneConsoleInputAction {
     Interrupt,
 }
 
+/// Whether a pasted payload carries the bracketed-paste delimiters.
+///
+/// A pasted body must reach its destination byte for byte either way, so both
+/// dispositions take the same Windows paste sink; a legacy ConPTY parses and
+/// consumes control sequences written through the raw input pipe whether or
+/// not an envelope surrounds them. The disposition only decides what a payload
+/// the console records cannot represent means: losing an envelope leaves a
+/// paste the destination asked for delivered as live input, while a bare body
+/// has no envelope to lose and keeps the byte-oriented path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PasteDelimiters {
+    /// The destination announced `?2004h`, so the payload is wrapped.
+    Wrapped,
+    /// The destination never announced it, so the payload is the bare body.
+    Bare,
+}
+
 #[cfg(windows)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DeferredInitialPaneInput {
     Bytes(Vec<u8>),
+    Paste {
+        bytes: Vec<u8>,
+        delimiters: PasteDelimiters,
+    },
     Console {
         action: DeferredInitialPaneConsoleInputAction,
         byte_len: usize,
@@ -206,7 +236,7 @@ pub(crate) enum DeferredInitialPaneInput {
 impl DeferredInitialPaneInput {
     fn byte_len(&self) -> usize {
         match self {
-            Self::Bytes(bytes) => bytes.len(),
+            Self::Bytes(bytes) | Self::Paste { bytes, .. } => bytes.len(),
             Self::Console { byte_len, .. } => *byte_len,
         }
     }
@@ -244,6 +274,17 @@ pub(crate) struct HandlerState {
     pub(crate) retained_lifecycle_targets:
         StdMutex<crate::handler::RetainedLifecycleTargetRegistry>,
     pub(crate) message_log: VecDeque<MessageEntry>,
+    /// Windows whose stored geometry this server changed and whose
+    /// `window-layout-changed` / `window-resized` notifications have not been
+    /// published yet.
+    ///
+    /// tmux 3.7b concentrates both notifications in `resize_window()`, so every
+    /// applied resize publishes them exactly once. RMUX applies window geometry
+    /// through synchronous single-window mutation helpers and an all-window
+    /// stable-identity snapshot around join/move transfers, but has to publish
+    /// asynchronously. Those boundaries record the applied resize here and
+    /// `RequestHandler::publish_applied_window_resizes` drains it.
+    applied_window_resizes: AppliedWindowResizeQueue,
     lifecycle_commit_order: crate::lifecycle_commit_order::LifecycleCommitOrder,
     status_jobs: StatusJobRuntime,
     startup_config_files: String,
@@ -303,6 +344,7 @@ pub(crate) struct KilledPaneResult {
     pub(crate) removed_pane_ids: Vec<PaneId>,
     pub(crate) affected_sessions: Vec<SessionName>,
     pub(crate) destroyed_sessions: Vec<(SessionName, u32)>,
+    pub(crate) reindexed_windows: Vec<(SessionName, BTreeMap<u32, u32>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,6 +388,35 @@ pub(crate) struct UnlinkedWindowResult {
 }
 
 impl HandlerState {
+    /// Records that `target`'s stored geometry changed and still owes its
+    /// `window-layout-changed` / `window-resized` pair.
+    ///
+    /// Linked window aliases share one window identity, so the same window is
+    /// only ever recorded once per publication round.
+    pub(crate) fn record_applied_window_resize(&mut self, target: WindowTarget) {
+        let window_id = self.window_id_at(&target);
+        self.applied_window_resizes.record(target, window_id);
+    }
+
+    /// Gives an explicit layout event ownership of the layout half of a
+    /// pending applied resize. The resize half remains pending.
+    pub(crate) fn claim_applied_resize_layout_change(&mut self, target: &WindowTarget) {
+        let window_id = self.window_id_at(target);
+        self.applied_window_resizes
+            .claim_layout_change(target, window_id);
+    }
+
+    pub(crate) fn take_applied_window_resizes(&mut self) -> Vec<AppliedWindowResize> {
+        self.applied_window_resizes.take()
+    }
+
+    fn window_id_at(&self, target: &WindowTarget) -> Option<rmux_core::WindowId> {
+        self.sessions
+            .session(target.session_name())
+            .and_then(|session| session.window_at(target.window_index()))
+            .map(rmux_core::Window::id)
+    }
+
     pub(crate) fn reserve_lifecycle_commit_order(
         &self,
     ) -> Option<crate::lifecycle_commit_order::LifecycleCommitTicket> {
@@ -487,13 +558,14 @@ impl HandlerState {
             .unwrap_or(1000)
     }
 
-    fn apply_automatic_window_name(
+    fn apply_window_name(
         &mut self,
         session_name: &SessionName,
         window_index: u32,
-        automatic_window_name: Option<String>,
+        candidate_name: Option<String>,
+        application: WindowNameApplication,
     ) -> Result<(), RmuxError> {
-        let Some(window_name) = automatic_window_name else {
+        let Some(window_name) = candidate_name else {
             return Ok(());
         };
         let tracked = self.tracks_auto_named_window(session_name, window_index);
@@ -502,15 +574,19 @@ impl HandlerState {
             .session(session_name)
             .ok_or_else(|| session_not_found(session_name))?;
         let should_update = match session.window_at(window_index) {
-            Some(window) => {
-                crate::automatic_rename::window_allows_automatic_rename(
-                    &self.options,
-                    session_name,
-                    window_index,
-                    window,
-                    tracked,
-                ) && window.name().is_none()
-            }
+            Some(window) if window.name().is_none() => match application {
+                WindowNameApplication::Initial => true,
+                WindowNameApplication::AutomaticUpdate => {
+                    crate::automatic_rename::window_allows_automatic_rename(
+                        &self.options,
+                        session_name,
+                        window_index,
+                        window,
+                        tracked,
+                    )
+                }
+            },
+            Some(_) => false,
             None => {
                 return Err(RmuxError::invalid_target(
                     format!("{session_name}:{window_index}"),
@@ -558,23 +634,16 @@ fn pane_terminal_geometry_for_session(
     .content_geometry(geometry, alternate_on, copy_mode_active)
 }
 
-fn session_content_rows(session: &Session, options: &OptionStore, window_index: u32) -> u16 {
-    let size = session
+fn session_content_rows(session: &Session, _options: &OptionStore, window_index: u32) -> u16 {
+    let window = session
         .window_at(window_index)
-        .map(|window| window.size())
-        .unwrap_or_else(|| session.window().size());
+        .unwrap_or_else(|| session.window());
+    let size = window.size();
     if size.cols == 0 || size.rows == 0 {
         return size.rows;
     }
 
-    if session.last_attached_at().is_none() {
-        return size.rows;
-    }
-
-    crate::status_lines::content_rows_for_status(
-        options.resolve(Some(session.name()), OptionName::Status),
-        size.rows,
-    )
+    size.rows
 }
 
 pub(crate) fn session_not_found(session_name: &SessionName) -> RmuxError {
@@ -600,10 +669,13 @@ mod tests {
     }
 
     #[test]
-    fn attached_session_content_rows_use_multi_line_status() {
+    fn session_content_rows_are_not_reconverted_from_terminal_status() {
         let alpha = session_name("alpha");
         let mut session = Session::new(alpha.clone(), TerminalSize { cols: 80, rows: 24 });
-        session.touch_attached();
+        session.resize_active_window_geometry(
+            TerminalSize { cols: 80, rows: 24 },
+            TerminalSize { cols: 80, rows: 22 },
+        );
         let mut state = HandlerState::default();
 
         state
@@ -626,7 +698,7 @@ mod tests {
                 SetOptionMode::Replace,
             )
             .expect("session status set succeeds");
-        assert_eq!(session_content_rows(&session, &state.options, 0), 19);
+        assert_eq!(session_content_rows(&session, &state.options, 0), 22);
 
         state
             .options
@@ -637,6 +709,25 @@ mod tests {
                 SetOptionMode::Replace,
             )
             .expect("session status set succeeds");
+        assert_eq!(session_content_rows(&session, &state.options, 0), 22);
+    }
+
+    #[test]
+    fn content_sized_session_does_not_reserve_status_rows_after_attach() {
+        let alpha = session_name("alpha");
+        let mut session = Session::new(alpha.clone(), TerminalSize { cols: 80, rows: 24 });
+        session.touch_attached();
+        let mut state = HandlerState::default();
+        state
+            .options
+            .set(
+                ScopeSelector::Session(alpha),
+                OptionName::Status,
+                "3".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("session status set succeeds");
+
         assert_eq!(session_content_rows(&session, &state.options, 0), 24);
     }
 

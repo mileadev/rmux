@@ -217,9 +217,12 @@ impl FormatVariables for RuntimeFormatContext<'_> {
             "window_height" => self
                 .visible_window_snapshot()
                 .map(|window| window.size().rows.to_string()),
-            "window_layout" | "window_visible_layout" => self
+            "window_layout" => self
                 .layout_window_snapshot()
                 .map(|window| window.layout_dump()),
+            "window_visible_layout" => self
+                .visible_window_snapshot()
+                .map(|window| window.visible_layout_dump()),
             "window_linked" => self.window_linked(),
             "window_linked_sessions" => self.window_linked_sessions(),
             "window_linked_sessions_list" => self.window_linked_sessions_list(),

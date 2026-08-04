@@ -52,7 +52,7 @@ pub use buffers::{BufferStore, BufferView, RenameBufferOutcome, SetBufferOutcome
 pub use dec_modes::{render_dec_modes, render_dec_modes_for_snapshot};
 pub use environment::{EnvironmentStore, ShowEnvironmentEntry, ENVIRON_HIDDEN};
 pub use formats::format_skip_delimiter;
-pub use grid::GridRenderOptions;
+pub use grid::{GridRenderOptions, RenderedLineSpan};
 pub use hooks::{
     hook_explicit_scope_for_target, hook_global_root, hook_natural_scope_for_session_target,
     hook_natural_scope_for_target, validate_hook_registration, validate_hook_scope,
@@ -80,10 +80,12 @@ pub use options::{
     OptionStore, ShowOptionsMode,
 };
 pub use pane::{Pane, PaneGeometry};
-pub use screen::{Screen, ScreenCellRef, ScreenCellView, ScreenLineView};
+pub use screen::{
+    RecoveryRow, RecoveryRowRenderer, Screen, ScreenCellRef, ScreenCellView, ScreenLineView,
+};
 pub use session::{
     BreakPaneOptions, KillPaneOutcome, PaneJoinOptions, PaneSwapOptions, Session,
-    SessionPaneTarget, SessionStore,
+    SessionPaneTarget, SessionRecency, SessionStore,
 };
 pub use style::{
     colour_to_string, parse_colour, style_parse, style_tostring, ColourParseError, Style,

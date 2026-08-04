@@ -135,6 +135,17 @@ impl Session {
         self.last_attached_at
     }
 
+    /// Returns the internal total-order token behind `activity_at`.
+    ///
+    /// Targetless resolution ranks by this token so two sessions whose public
+    /// whole-second timestamps collide still have a defined order. It is not a
+    /// timestamp and never leaves the process.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn recency(&self) -> super::SessionRecency {
+        self.recency
+    }
+
     /// Returns the session working directory when one has been assigned.
     #[must_use]
     pub fn cwd(&self) -> Option<&Path> {
@@ -182,6 +193,57 @@ impl Session {
         let now = current_unix_timestamp();
         self.activity_at = now;
         self.last_attached_at = Some(now);
+        self.recency = super::SessionRecency::next();
+    }
+
+    /// Pins the public whole-second timestamps without disturbing the internal
+    /// recency order.
+    ///
+    /// Session times come from the wall clock, so no test can otherwise
+    /// guarantee that two sessions land in the same second — which is exactly
+    /// the condition targetless ranking has to survive. Regressions for it
+    /// would have to race the clock or retry; this makes them deterministic
+    /// instead.
+    ///
+    /// It is a test seam, never a runtime operation. `cfg(test)` alone cannot
+    /// reach the server crate's tests, so the `test-seams` feature carries it
+    /// there and nowhere else: it is off by default and only the dev-dependency
+    /// edge turns it on, so the published API never gains a way to rewrite a
+    /// session's public timestamps.
+    #[cfg(any(test, feature = "test-seams"))]
+    #[doc(hidden)]
+    pub fn pin_public_times_for_tests(&mut self, seconds: i64) {
+        self.created_at = seconds;
+        self.activity_at = seconds;
+        self.last_attached_at = self.last_attached_at.map(|_| seconds);
+    }
+
+    /// Records that an attached client interacted with the session, leaving
+    /// attach history untouched.
+    ///
+    /// Callers must invoke this only once per accepted interaction, at the
+    /// boundary where an attached client's input is admitted — not once per
+    /// pane write, and not for input the server rejects.
+    ///
+    /// This advances the *public* `activity_at`, not only the internal recency
+    /// token: `#{session_activity}` and the `list-sessions` payload report the
+    /// new second. tmux 3.7b does the same — it calls `session_update_activity`
+    /// while admitting a key, before deciding what the key means — so a client
+    /// typing into a session is expected to change that output.
+    pub fn touch_activity(&mut self) {
+        self.activity_at = current_unix_timestamp();
+        self.recency = super::SessionRecency::next();
+    }
+
+    /// Moves the session to its own position at the head of the recency order,
+    /// leaving every public timestamp untouched.
+    ///
+    /// `Session` is publicly cloneable, so a session handed back to a store can
+    /// carry a token a live session already holds. The order the readers rank by
+    /// has to stay total, so the store re-mints on collision rather than letting
+    /// two sessions share a position.
+    pub(super) fn renew_recency(&mut self) {
+        self.recency = super::SessionRecency::next();
     }
 
     /// Clones the session as a grouped peer with a fresh identity and timestamps.
@@ -197,9 +259,14 @@ impl Session {
         cloned.id = session_id;
         cloned.name = name;
         cloned.group_name = Some(group_name);
+        cloned.group_initial_window_id = self
+            .windows
+            .first_key_value()
+            .map(|(_, window)| window.id());
         cloned.created_at = now;
         cloned.activity_at = now;
         cloned.last_attached_at = None;
+        cloned.recency = super::SessionRecency::next();
         cloned
     }
 

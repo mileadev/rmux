@@ -156,6 +156,40 @@ async fn create_attached_session(
     control_rx
 }
 
+/// Creates the same attached session as [`create_attached_session`], with the
+/// pane shell pinned to a UTF-8 locale.
+///
+/// A fixture that types a multi-byte character into a real shell cannot inherit
+/// whatever `LC_CTYPE` the host account happens to export: a shell started in a
+/// single-byte locale discards those bytes in its own line editor, before rmux
+/// is ever observed handling them.
+#[cfg(not(windows))]
+async fn create_attached_session_in_utf8_locale(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    session: &SessionName,
+) -> mpsc::UnboundedReceiver<AttachControl> {
+    #[cfg(unix)]
+    set_unix_test_shell(handler, session).await;
+
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: session.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: utf8_locale::fixture_environment(),
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, session.clone(), control_tx)
+        .await;
+    control_rx
+}
+
 #[tokio::test]
 async fn web_render_refreshes_are_marked_pending_before_building_switches() {
     let handler = RequestHandler::new();
@@ -185,6 +219,7 @@ async fn web_render_refreshes_are_marked_pending_before_building_switches() {
                 closing: Arc::new(AtomicBool::new(false)),
                 persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
                 terminal_context: OuterTerminalContext::default(),
+                client_title: None,
                 flags: super::attach_support::ClientFlags::default(),
                 render_stream: true,
                 uid,
@@ -239,6 +274,7 @@ async fn refresh_attached_session_removes_clients_over_backlog_limit() {
                 closing: closing.clone(),
                 persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
                 terminal_context: OuterTerminalContext::default(),
+                client_title: None,
                 flags: super::attach_support::ClientFlags::default(),
                 render_stream: false,
                 uid,
@@ -806,6 +842,10 @@ async fn replace_transcript_contents(
         .set_screen_for_test(screen);
 }
 
+#[cfg(not(windows))]
+#[path = "handler_attach_tests/utf8_locale.rs"]
+mod utf8_locale;
+
 #[path = "handler_attach_tests/lifecycle.rs"]
 mod lifecycle;
 
@@ -843,6 +883,23 @@ mod attach_mutations;
 #[path = "handler_attach_tests/attach_render.rs"]
 mod attach_render;
 
+#[path = "handler_attach_tests/attaching_identity.rs"]
+mod attaching_identity;
+#[path = "handler_attach_tests/set_titles.rs"]
+mod set_titles;
+#[path = "handler_attach_tests/set_titles_client_context.rs"]
+mod set_titles_client_context;
+#[path = "handler_attach_tests/set_titles_generation.rs"]
+mod set_titles_generation;
+#[path = "handler_attach_tests/set_titles_overlay.rs"]
+mod set_titles_overlay;
+#[path = "handler_attach_tests/set_titles_path.rs"]
+mod set_titles_path;
+#[path = "handler_attach_tests/set_titles_support.rs"]
+mod set_titles_support;
+#[path = "handler_attach_tests/set_titles_switch.rs"]
+mod set_titles_switch;
+
 #[path = "handler_attach_tests/attached_prefix_lifecycle.rs"]
 mod attached_prefix_lifecycle;
 
@@ -854,10 +911,14 @@ mod key_table_identity_regressions;
 
 #[path = "handler_attach_tests/cleanup_identity.rs"]
 mod cleanup_identity;
+#[path = "handler_attach_tests/client_name_lifecycle.rs"]
+mod client_name_lifecycle;
 #[path = "handler_attach_tests/multi_client.rs"]
 mod multi_client;
 #[path = "handler_attach_tests/resize_selection_race.rs"]
 mod resize_selection_race;
+#[path = "handler_attach_tests/window_geometry.rs"]
+mod window_geometry;
 
 #[path = "handler_attach_tests/server_lifecycle.rs"]
 mod server_lifecycle;
@@ -870,3 +931,21 @@ mod client_security;
 
 #[path = "handler_attach_tests/attached_count_identity.rs"]
 mod attached_count_identity;
+
+#[path = "handler_attach_tests/session_recency.rs"]
+mod session_recency;
+
+#[path = "handler_attach_tests/session_recency_input.rs"]
+mod session_recency_input;
+#[path = "handler_attach_tests/sizeless_geometry.rs"]
+mod sizeless_geometry;
+#[path = "handler_attach_tests/switch_frame_geometry.rs"]
+mod switch_frame_geometry;
+#[path = "handler_attach_tests/switch_latest_recency.rs"]
+mod switch_latest_recency;
+
+#[path = "handler_attach_tests/combined_switch_recency.rs"]
+mod combined_switch_recency;
+
+#[path = "handler_attach_tests/combined_registration_recency.rs"]
+mod combined_registration_recency;
