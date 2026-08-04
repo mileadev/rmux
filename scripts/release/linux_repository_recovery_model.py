@@ -240,9 +240,7 @@ def load_artifact_pages(endpoint: str, label: str) -> list[dict[str, Any]]:
         if not response["artifacts"]:
             raise ValueError(f"{label} artifact pagination ended early")
         page += 1
-    return artifact_list(
-        {"total_count": expected_total, "artifacts": artifacts}, label
-    )
+    return artifact_list({"total_count": expected_total, "artifacts": artifacts}, label)
 
 
 def load_run_artifacts(run_id: int, fixture: Path | None) -> list[dict[str, Any]]:

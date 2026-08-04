@@ -78,7 +78,9 @@ def inspect_original(args: argparse.Namespace) -> None:
         payload_artifact,
         artifact_id=args.payload_artifact_id,
         name=f"rmux-downstream-apt_rpm-payload-{source_sha}-{args.release_id}",
-        digest=canonical_digest(args.payload_artifact_digest, "payload artifact digest"),
+        digest=canonical_digest(
+            args.payload_artifact_digest, "payload artifact digest"
+        ),
         run_id=args.receipt_run_id,
         source_sha=source_sha,
     )
@@ -118,17 +120,15 @@ def inspect_original(args: argparse.Namespace) -> None:
         or apt.get("execution_enabled") is not True
         or apt.get("payload_ready") is not True
     ):
-        raise ValueError("failed receipt did not authorize this Linux repository channel")
+        raise ValueError(
+            "failed receipt did not authorize this Linux repository channel"
+        )
     github_output(
         args.github_output,
         {
             "receipt_artifact_id": reference["predicate_bundle"]["artifact_id"],
-            "receipt_artifact_digest": reference["predicate_bundle"][
-                "archive_digest"
-            ],
-            "receipt_envelope_artifact_id": reference["envelope_bundle"][
-                "artifact_id"
-            ],
+            "receipt_artifact_digest": reference["predicate_bundle"]["archive_digest"],
+            "receipt_envelope_artifact_id": reference["envelope_bundle"]["artifact_id"],
             "receipt_envelope_artifact_digest": reference["envelope_bundle"][
                 "archive_digest"
             ],
@@ -312,7 +312,9 @@ def verify_bundle(args: argparse.Namespace) -> None:
         "package_repository_base": repository_base,
     }
     if manifest != expected_manifest:
-        raise ValueError("signed repository manifest differs from verified recovery proof")
+        raise ValueError(
+            "signed repository manifest differs from verified recovery proof"
+        )
     if proof.get("artifact", {}).get("artifact_id") != args.artifact_id:
         raise ValueError("downloaded recovery artifact ID differs from needs.build")
 

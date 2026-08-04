@@ -40,9 +40,7 @@ def find_direct_input_expressions(text: str) -> tuple[DirectInputExpression, ...
 def validate_no_direct_input_expressions(paths: Iterable[Path]) -> None:
     findings: list[str] = []
     for path in paths:
-        for finding in find_direct_input_expressions(
-            path.read_text(encoding="utf-8")
-        ):
+        for finding in find_direct_input_expressions(path.read_text(encoding="utf-8")):
             findings.append(f"{path}:{finding.run_line} ({finding.context})")
     if findings:
         locations = ", ".join(findings)

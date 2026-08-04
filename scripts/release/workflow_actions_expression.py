@@ -163,13 +163,9 @@ def _expression_tokens(body: str) -> tuple[_Token, ...]:
         if character.isalpha() or character == "_":
             start = index
             index += 1
-            while index < len(body) and (
-                body[index].isalnum() or body[index] == "_"
-            ):
+            while index < len(body) and (body[index].isalnum() or body[index] == "_"):
                 index += 1
-            tokens.append(
-                _Token(_TokenKind.IDENTIFIER, body[start:index])
-            )
+            tokens.append(_Token(_TokenKind.IDENTIFIER, body[start:index]))
             continue
         kind = {
             ".": _TokenKind.DOT,
@@ -181,9 +177,7 @@ def _expression_tokens(body: str) -> tuple[_Token, ...]:
     return tuple(tokens)
 
 
-def _property_name(
-    tokens: tuple[_Token, ...], start: int
-) -> tuple[str, int] | None:
+def _property_name(tokens: tuple[_Token, ...], start: int) -> tuple[str, int] | None:
     if (
         start + 1 < len(tokens)
         and tokens[start].kind is _TokenKind.DOT

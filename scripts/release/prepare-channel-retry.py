@@ -425,9 +425,7 @@ def prepare(args: argparse.Namespace) -> None:
     )
 
 
-def add_identity_args(
-    parser: argparse.ArgumentParser, *, required: bool
-) -> None:
+def add_identity_args(parser: argparse.ArgumentParser, *, required: bool) -> None:
     parser.add_argument("--channel", required=required)
     parser.add_argument("--source-sha", required=required)
     parser.add_argument("--release-id", required=required)
@@ -445,9 +443,7 @@ def add_prepare_evidence_args(
             name not in IDENTITY_INPUT_FIELDS
             and name not in PREPARE_POSITIVE_INPUT_FIELDS
         ):
-            parser.add_argument(
-                f"--{name.replace('_', '-')}", required=required
-            )
+            parser.add_argument(f"--{name.replace('_', '-')}", required=required)
 
 
 def add_environment_source(parser: argparse.ArgumentParser) -> None:
@@ -458,13 +454,9 @@ def add_environment_source(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def input_values(
-    args: argparse.Namespace, fields: tuple[str, ...]
-) -> dict[str, str]:
+def input_values(args: argparse.Namespace, fields: tuple[str, ...]) -> dict[str, str]:
     if args.from_env:
-        explicit = [
-            field for field in fields if getattr(args, field, None) is not None
-        ]
+        explicit = [field for field in fields if getattr(args, field, None) is not None]
         if explicit:
             raise ValueError(
                 "retry input environment mode cannot be mixed with value arguments"
@@ -478,9 +470,7 @@ def input_values(
     return {field: value for field, value in values.items() if value is not None}
 
 
-def apply_input_values(
-    args: argparse.Namespace, values: dict[str, str]
-) -> None:
+def apply_input_values(args: argparse.Namespace, values: dict[str, str]) -> None:
     for field, value in values.items():
         setattr(args, field, value)
 
@@ -517,9 +507,7 @@ def parse_args() -> argparse.Namespace:
     add_identity_args(action_parser, required=False)
     add_prepare_evidence_args(action_parser, required=False)
     for name in ACTION_ONLY_INPUT_FIELDS:
-        action_parser.add_argument(
-            f"--{name.replace('_', '-')}", required=False
-        )
+        action_parser.add_argument(f"--{name.replace('_', '-')}", required=False)
 
     prepare_parser = commands.add_parser("prepare")
     add_environment_source(prepare_parser)

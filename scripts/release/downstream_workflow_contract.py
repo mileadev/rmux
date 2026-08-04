@@ -90,7 +90,9 @@ def _validate_reusable_workflow(path: Path, *, require_repository_guard: bool) -
             if f"      {name}:" not in dispatch[1]:
                 raise ValueError(f"Linux repository recovery lost input {name}")
         if text.count("--allow-running-current-run") != 1:
-            raise ValueError("normal Linux repository signing lost its active-run check")
+            raise ValueError(
+                "normal Linux repository signing lost its active-run check"
+            )
         if text.count('test "$GITHUB_REF" = "refs/heads/main"') != 1:
             raise ValueError("Linux repository recovery is not bound to protected main")
         if (
@@ -322,12 +324,11 @@ def _validate_linux_repository_recovery(root: Path) -> None:
     publish = (workflows / "release-linux-repository-publish.yml").read_text(
         encoding="utf-8"
     )
-    prepare = (
-        root / ".github/actions/release-channel-prepare/action.yml"
-    ).read_text(encoding="utf-8")
+    prepare = (root / ".github/actions/release-channel-prepare/action.yml").read_text(
+        encoding="utf-8"
+    )
     authorize = (
-        root
-        / ".github/actions/release-linux-repository-recovery-authorize/action.yml"
+        root / ".github/actions/release-linux-repository-recovery-authorize/action.yml"
     ).read_text(encoding="utf-8")
     result_action = (
         root / ".github/actions/release-channel-result/action.yml"
@@ -335,9 +336,9 @@ def _validate_linux_repository_recovery(root: Path) -> None:
     helper = (root / "scripts/release/linux_repository_recovery.py").read_text(
         encoding="utf-8"
     )
-    model = (
-        root / "scripts/release/linux_repository_recovery_model.py"
-    ).read_text(encoding="utf-8")
+    model = (root / "scripts/release/linux_repository_recovery_model.py").read_text(
+        encoding="utf-8"
+    )
     dispatch = build.split("\n  workflow_dispatch:\n", 1)[1].split(
         "\npermissions: {}\n", 1
     )[0]
@@ -358,14 +359,21 @@ def _validate_linux_repository_recovery(root: Path) -> None:
     )
     if any(build.count(value) != 1 for value in build_required):
         raise ValueError("Linux repository recovery lost its same-run artifact route")
-    if "repository_artifact_id:" in dispatch or "repository_artifact_digest:" in dispatch:
-        raise ValueError("Linux repository recovery accepts an operator-supplied artifact")
+    if (
+        "repository_artifact_id:" in dispatch
+        or "repository_artifact_digest:" in dispatch
+    ):
+        raise ValueError(
+            "Linux repository recovery accepts an operator-supplied artifact"
+        )
     if "secrets: inherit" in build or "secrets: inherit" in publish:
         raise ValueError("Linux repository recovery exposes inherited secrets")
     construction_gate = build.find(
         "uses: ./.github/actions/release-linux-repository-recovery-authorize"
     )
-    construction = build.find("Authenticate retained history and generate signed repositories")
+    construction = build.find(
+        "Authenticate retained history and generate signed repositories"
+    )
     if construction_gate < 0 or construction < 0 or construction_gate >= construction:
         raise ValueError("Linux repository recovery authorizes after construction")
     publish_required = (
@@ -382,7 +390,9 @@ def _validate_linux_repository_recovery(root: Path) -> None:
         "attestation-signer-workflow-path: .github/workflows/release-linux-repository-publish.yml",
     )
     if any(publish.count(value) != 1 for value in publish_required):
-        raise ValueError("Linux repository recovery lost exact authorization or provenance")
+        raise ValueError(
+            "Linux repository recovery lost exact authorization or provenance"
+        )
     if (
         publish.count(
             "uses: ./.github/actions/release-linux-repository-recovery-authorize"
@@ -400,7 +410,9 @@ def _validate_linux_repository_recovery(root: Path) -> None:
     writer = publish.find("scripts/release/publish-linux-repository.py")
     result = publish.find("Seal exact manual Linux recovery result evidence")
     if not 0 <= bundle < remove_manifest < revalidate < writer < result:
-        raise ValueError("Linux repository recovery sequencing is no longer fail-closed")
+        raise ValueError(
+            "Linux repository recovery sequencing is no longer fail-closed"
+        )
     prepare_required = (
         "receipt-run-lifecycle: {required: false, default: active-current}",
         "mode=(--allow-completed-failed-run)",
@@ -416,9 +428,10 @@ def _validate_linux_repository_recovery(root: Path) -> None:
         "artifact-ids: ${{ inputs.plan-artifact-id }}",
         "artifact-ids: ${{ inputs.payload-artifact-id }}",
     )
-    if any(
-        authorize.count(value) != 1 for value in authorize_required
-    ) or authorize.count("--allow-completed-failed-run") != 2:
+    if (
+        any(authorize.count(value) != 1 for value in authorize_required)
+        or authorize.count("--allow-completed-failed-run") != 2
+    ):
         raise ValueError("Linux repository recovery authorization is incomplete")
     helper_required = (
         '"workflow_id": workflow_id',
@@ -437,7 +450,9 @@ def _validate_linux_repository_recovery(root: Path) -> None:
         "actions/artifacts?name=",
     )
     if any(model.count(value) < 1 for value in model_required):
-        raise ValueError("Linux repository recovery model lost global single-use checks")
+        raise ValueError(
+            "Linux repository recovery model lost global single-use checks"
+        )
     result_required = (
         "producer-head-sha:",
         "producer-source-ref:",

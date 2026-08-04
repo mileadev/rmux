@@ -72,7 +72,9 @@ def validate_producer(value: Any, channel: str) -> dict[str, Any]:
         raise ValueError("result producer workflow allowlist is missing")
     expected_workflow_id = workflows.get(value["workflow_path"])
     derived = _result_contract().get("derived_producer_workflows", {}).get(channel)
-    if not isinstance(derived, list) or not all(isinstance(item, str) for item in derived):
+    if not isinstance(derived, list) or not all(
+        isinstance(item, str) for item in derived
+    ):
         raise ValueError("derived result producer workflow allowlist is missing")
     workflow_id = positive(value["workflow_id"], "result workflow ID")
     if value["workflow_path"] not in derived and (

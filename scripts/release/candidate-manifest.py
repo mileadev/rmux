@@ -186,7 +186,9 @@ def validate_metadata(
     # keyword in Python 3.10, and release tooling must stay runnable on the
     # macOS release host's system interpreter.
     if len(expected_artifacts) != len(source_artifacts):
-        raise ValueError("canonical metadata artifacts do not pair with the expected set")
+        raise ValueError(
+            "canonical metadata artifacts do not pair with the expected set"
+        )
     ids: set[int] = set()
     for artifact, (role, platform, name) in zip(source_artifacts, expected_artifacts):
         if not isinstance(artifact, dict):

@@ -71,17 +71,11 @@ INPUT_ENVIRONMENT_NAMES = {
     "receipt_artifact_id": "RMUX_RECEIPT_ARTIFACT_ID",
     "receipt_envelope_artifact_id": "RMUX_RECEIPT_ENVELOPE_ARTIFACT_ID",
     "prior_result_run_id": "RMUX_PRIOR_RESULT_RUN_ID",
-    "prior_result_producer_workflow_id": (
-        "RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_ID"
-    ),
+    "prior_result_producer_workflow_id": ("RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_ID"),
     "prior_result_artifact_id": "RMUX_PRIOR_RESULT_ARTIFACT_ID",
-    "prior_result_envelope_artifact_id": (
-        "RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_ID"
-    ),
+    "prior_result_envelope_artifact_id": ("RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_ID"),
     "receipt_artifact_digest": "RMUX_RECEIPT_ARTIFACT_DIGEST",
-    "receipt_envelope_artifact_digest": (
-        "RMUX_RECEIPT_ENVELOPE_ARTIFACT_DIGEST"
-    ),
+    "receipt_envelope_artifact_digest": ("RMUX_RECEIPT_ENVELOPE_ARTIFACT_DIGEST"),
     "prior_result_artifact_digest": "RMUX_PRIOR_RESULT_ARTIFACT_DIGEST",
     "prior_result_envelope_artifact_digest": (
         "RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_DIGEST"
@@ -90,9 +84,7 @@ INPUT_ENVIRONMENT_NAMES = {
     "receipt_envelope_sha256": "RMUX_RECEIPT_ENVELOPE_SHA256",
     "prior_result_predicate_sha256": "RMUX_PRIOR_RESULT_PREDICATE_SHA256",
     "prior_result_envelope_sha256": "RMUX_PRIOR_RESULT_ENVELOPE_SHA256",
-    "prior_result_producer_workflow_path": (
-        "RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_PATH"
-    ),
+    "prior_result_producer_workflow_path": ("RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_PATH"),
     "receipt_run_workflow_id": "RMUX_RECEIPT_RUN_WORKFLOW_ID",
     "prior_result_run_workflow_id": "RMUX_PRIOR_RESULT_RUN_WORKFLOW_ID",
 }
@@ -118,14 +110,10 @@ def input_values_from_environment(
     for field in fields:
         environment_name = INPUT_ENVIRONMENT_NAMES[field]
         if environment_name not in environment:
-            raise ValueError(
-                f"retry input environment {environment_name} is missing"
-            )
+            raise ValueError(f"retry input environment {environment_name} is missing")
         value = environment[environment_name]
         if not isinstance(value, str):
-            raise ValueError(
-                f"retry input environment {environment_name} is not text"
-            )
+            raise ValueError(f"retry input environment {environment_name} is not text")
         values[field] = value
     return values
 
@@ -169,9 +157,7 @@ def validate_action_inputs(values: Mapping[str, Any]) -> None:
     for field in ACTION_ONLY_INPUT_FIELDS:
         canonical_positive(_required(values, field), _label(field))
 
-    if _required(values, "receipt_run_id") != _required(
-        values, "prior_result_run_id"
-    ):
+    if _required(values, "receipt_run_id") != _required(values, "prior_result_run_id"):
         raise ValueError("retry input receipt and result run IDs differ")
 
     receipt_workflow_id = _required(values, "receipt_workflow_id")

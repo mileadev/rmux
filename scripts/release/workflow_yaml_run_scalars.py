@@ -191,9 +191,7 @@ def _plain_without_comment(value: str) -> str:
     return value.rstrip()
 
 
-def _indented_end(
-    lines: tuple[_SourceLine, ...], start: int, key_column: int
-) -> int:
+def _indented_end(lines: tuple[_SourceLine, ...], start: int, key_column: int) -> int:
     index = start
     while index < len(lines):
         line = lines[index]
@@ -224,9 +222,7 @@ def _block_run_scalars(
         header_style = _block_header(entry.value)
         if header_style is not None:
             end_index = _indented_end(lines, index + 1, entry.key_column)
-            body_start = (
-                lines[index + 1].start if index + 1 < end_index else line.end
-            )
+            body_start = lines[index + 1].start if index + 1 < end_index else line.end
             body_end = lines[end_index - 1].end if index + 1 < end_index else line.end
             excluded.append((entry.value_start, body_end))
             if entry.key == "run":
@@ -246,13 +242,9 @@ def _block_run_scalars(
             quote = entry.value[0]
             end_index = _indented_end(lines, index + 1, line.indent)
             scalar_limit = (
-                lines[end_index - 1].end
-                if end_index > index + 1
-                else line.end
+                lines[end_index - 1].end if end_index > index + 1 else line.end
             )
-            scalar_span = _quoted_span(
-                text, entry.value_start, quote, scalar_limit
-            )
+            scalar_span = _quoted_span(text, entry.value_start, quote, scalar_limit)
             excluded.append((entry.value_start, scalar_span.end))
             if entry.key == "run" and scalar_span.closed:
                 style = (
@@ -280,9 +272,7 @@ def _block_run_scalars(
         pieces = [_plain_without_comment(entry.value)]
         for continuation in lines[index + 1 : end_index]:
             pieces.append(_plain_without_comment(continuation.content))
-        scalar_end = (
-            lines[end_index - 1].end if end_index > index + 1 else line.end
-        )
+        scalar_end = lines[end_index - 1].end if end_index > index + 1 else line.end
         excluded.append((entry.value_start, scalar_end))
         nodes.append(
             RunScalar(
@@ -327,11 +317,7 @@ class _FlowScanner:
         line_index = _line_index_for_offset(self.lines, offset)
         line = self.lines[line_index]
         end_index = _indented_end(self.lines, line_index + 1, line.indent)
-        return (
-            self.lines[end_index - 1].end
-            if end_index > line_index + 1
-            else line.end
-        )
+        return self.lines[end_index - 1].end if end_index > line_index + 1 else line.end
 
     def _skip_expression(self, index: int) -> int:
         scanned = scan_actions_expression(self.text, index)
@@ -403,16 +389,13 @@ class _FlowScanner:
                     self.text[value_start],
                     flow_limit,
                 )
-                if value_start < len(self.text)
-                and self.text[value_start] in "'\""
+                if value_start < len(self.text) and self.text[value_start] in "'\""
                 else None
             )
             if quoted_span is not None and not quoted_span.closed:
                 return quoted_span.end
             value_end = self._value_end(value_start, ",}")
-            if key == "run" and (
-                quoted_span is None or quoted_span.closed
-            ):
+            if key == "run" and (quoted_span is None or quoted_span.closed):
                 if value_start < len(self.text) and self.text[value_start] == "'":
                     style = ScalarStyle.FLOW_SINGLE_QUOTED
                 elif value_start < len(self.text) and self.text[value_start] == '"':
