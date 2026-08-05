@@ -705,6 +705,7 @@ async fn detached_transport_loss_becomes_a_typed_terminal_event() {
     server_task.await.expect("server task");
 }
 
+/// Pins the atomic rebase/raw-byte boundary proposed by Prabir Shrestha in #139.
 #[test]
 fn recovery_state_owns_rebase_bytes_lifecycle_and_end_ordering() {
     let mut state = PaneRecoveryState::default();
@@ -712,6 +713,7 @@ fn recovery_state_owns_rebase_bytes_lifecycle_and_end_ordering() {
         super::rebase_from_proto(rebase(1, ProtoReason::Initial)).expect("initial rebase"),
     );
     state.apply(&initial).expect("initial rebase");
+    assert_eq!(state.next_sequence(), Some(5));
     state
         .apply(&PaneRecoveryEvent::Bytes {
             epoch: 1,
