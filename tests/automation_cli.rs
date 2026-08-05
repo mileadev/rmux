@@ -188,6 +188,7 @@ fn nonzero_pane_base_index_preserves_targeted_automation_and_percent_resize(
 /// this one pins both indices at once and covers all three target spellings,
 /// including a bare session target which must land on the ACTIVE pane rather
 /// than the first one.
+/// Scenario and regression coverage contributed by Edwin Hu in #178.
 #[test]
 fn base_index_one_resolves_every_automation_target_spelling() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("automation-base-index-one")?;
@@ -236,6 +237,10 @@ fn base_index_one_resolves_every_automation_target_spelling() -> Result<(), Box<
 
     let pane_one_id = pane_id(&harness, "alpha:1", 1)?;
     let pane_two_id = pane_id(&harness, "alpha:1", 2)?;
+    assert_ne!(
+        pane_one_id, pane_two_id,
+        "fixture pane ids must be distinct"
+    );
 
     // Explicit slot targets must address the pane the user named, and a `%id`
     // must agree with the slot that reported it.
