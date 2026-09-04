@@ -460,16 +460,6 @@ impl HandlerState {
         Some(PaneScreenState::from_screen(transcript.screen()))
     }
 
-    #[cfg(feature = "web")]
-    pub(crate) fn pane_recovery_screen_state(
-        &self,
-        session_name: &SessionName,
-        pane_id: PaneId,
-    ) -> Result<Option<(PaneScreenState, bool)>, RmuxError> {
-        Ok(self
-            .pane_recovery_screen(session_name, pane_id)?
-            .map(|(screen, complete)| (PaneScreenState::from_screen(&screen), complete)))
-    }
 
     pub(crate) fn pane_copy_mode_summary(
         &self,
@@ -522,46 +512,6 @@ impl HandlerState {
             .copy_mode_render_snapshot()
     }
 
-    /// Renders a copy-mode pane under the bounded Web recovery budgets.
-    ///
-    /// Metadata that does not fit the budgets (over-long titles, an oversized
-    /// hyperlink table) is dropped from the bounded clone, exactly like the
-    /// non-copy-mode [`Self::pane_recovery_screen`], and is never a reason to
-    /// fail the render: the Web session view reports the gap through
-    /// `PaneScrollbackView::metadata_complete`. Only the geometry cap, which
-    /// no bounded frame can satisfy, is an error.
-    #[cfg(feature = "web")]
-    pub(crate) fn pane_copy_mode_recovery_snapshot(
-        &self,
-        session_name: &SessionName,
-        pane_id: PaneId,
-    ) -> Result<Option<crate::copy_mode::CopyModeRenderSnapshot>, RmuxError> {
-        let Some(window_index) = self
-            .sessions
-            .session(session_name)
-            .and_then(|session| session.window_index_for_pane_id(pane_id))
-        else {
-            return Ok(None);
-        };
-        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
-        let Some(transcript) = self
-            .transcripts
-            .get(&runtime_session_name)
-            .and_then(|panes| panes.get(&pane_id))
-        else {
-            return Ok(None);
-        };
-        let transcript = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned");
-        crate::pane_recovery::validate_recovery_geometry(transcript.screen())?;
-        Ok(transcript.copy_mode_render_snapshot_bounded(
-            crate::pane_recovery::MAX_RECOVERY_STRING_BYTES,
-            crate::pane_recovery::MAX_RECOVERY_TITLE_STACK_BYTES,
-            crate::pane_recovery::MAX_RECOVERY_HYPERLINK_ENTRY_BYTES,
-            crate::pane_recovery::MAX_RECOVERY_HYPERLINK_TOTAL_BYTES,
-        ))
-    }
 
     pub(crate) fn with_pane_screen<R>(
         &self,
@@ -601,39 +551,6 @@ impl HandlerState {
         )
     }
 
-    #[cfg(feature = "web")]
-    pub(crate) fn pane_recovery_screen(
-        &self,
-        session_name: &SessionName,
-        pane_id: PaneId,
-    ) -> Result<Option<(Screen, bool)>, RmuxError> {
-        let Some(window_index) = self
-            .sessions
-            .session(session_name)
-            .and_then(|session| session.window_index_for_pane_id(pane_id))
-        else {
-            return Ok(None);
-        };
-        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
-        let Some(transcript) = self
-            .transcripts
-            .get(&runtime_session_name)
-            .and_then(|panes| panes.get(&pane_id))
-        else {
-            return Ok(None);
-        };
-        let transcript = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned");
-        let screen = transcript.screen();
-        crate::pane_recovery::validate_recovery_geometry(screen)?;
-        Ok(Some(screen.clone_recovery_viewport_bounded(
-            crate::pane_recovery::MAX_RECOVERY_STRING_BYTES,
-            crate::pane_recovery::MAX_RECOVERY_TITLE_STACK_BYTES,
-            crate::pane_recovery::MAX_RECOVERY_HYPERLINK_ENTRY_BYTES,
-            crate::pane_recovery::MAX_RECOVERY_HYPERLINK_TOTAL_BYTES,
-        )))
-    }
 
     pub(crate) fn pane_in_mode(&self, session_name: &SessionName, pane_id: PaneId) -> bool {
         let Some(window_index) = self

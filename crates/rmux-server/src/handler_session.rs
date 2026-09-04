@@ -1641,14 +1641,6 @@ impl RequestHandler {
         #[cfg(test)]
         self.pause_before_kill_session_web_prune(&removed_sessions)
             .await;
-        #[cfg(all(any(unix, windows), feature = "web"))]
-        {
-            self.web_shares.remove_targets_for_panes(&removed_pane_ids);
-            self.web_shares
-                .remove_targets_for_sessions(&removed_sessions);
-        }
-        #[cfg(not(all(any(unix, windows), feature = "web")))]
-        let _ = &removed_sessions;
         if !removed_pane_ids.is_empty() {
             self.forget_pane_snapshot_coalescers(&removed_pane_ids);
         }

@@ -146,8 +146,6 @@ pub(crate) use attach_control::{AttachControl, AttachControlSender};
 use attach_output_batch::{
     collect_attach_output_batch, collect_attach_output_batch_metadata, AttachOutputBatch,
 };
-#[cfg(all(any(unix, windows), feature = "web"))]
-pub(crate) use attach_transport::in_process_attach_pair;
 use attach_transport::{AttachTransport, TryAttachRead};
 #[cfg(any(unix, windows))]
 use control::{

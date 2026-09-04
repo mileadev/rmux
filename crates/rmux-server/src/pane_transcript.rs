@@ -529,47 +529,7 @@ impl PaneTranscript {
         })
     }
 
-    #[cfg(feature = "web")]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn copy_mode_render_snapshot_bounded(
-        &self,
-        max_string_bytes: usize,
-        max_title_stack_bytes: usize,
-        max_hyperlink_entry_bytes: usize,
-        max_hyperlink_total_bytes: usize,
-    ) -> Option<CopyModeRenderSnapshot> {
-        self.copy_mode_state().map(|mode| {
-            let mut snapshot = mode.render_snapshot_bounded(
-                max_string_bytes,
-                max_title_stack_bytes,
-                max_hyperlink_entry_bytes,
-                max_hyperlink_total_bytes,
-            );
-            snapshot.alternate_on = self.terminal.screen().is_alternate();
-            snapshot
-        })
-    }
 
-    /// Reports whether the copy-mode backing screen's metadata fits the
-    /// bounded Web recovery budgets, or `None` when the pane is not in copy
-    /// mode.
-    #[cfg(feature = "web")]
-    pub(crate) fn copy_mode_recovery_metadata_fits(
-        &self,
-        max_string_bytes: usize,
-        max_title_stack_bytes: usize,
-        max_hyperlink_entry_bytes: usize,
-        max_hyperlink_total_bytes: usize,
-    ) -> Option<bool> {
-        self.copy_mode_state().map(|mode| {
-            mode.recovery_metadata_fits(
-                max_string_bytes,
-                max_title_stack_bytes,
-                max_hyperlink_entry_bytes,
-                max_hyperlink_total_bytes,
-            )
-        })
-    }
 
     pub(crate) fn clear_copy_mode(&mut self) -> bool {
         match self.mode {

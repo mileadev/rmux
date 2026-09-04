@@ -260,7 +260,7 @@ mod tests {
     fn local_inventory_reports_compiled_web_capability() {
         assert_eq!(
             compiled_protocol_capabilities().contains(&CAPABILITY_WEB_SHARE),
-            cfg!(all(any(unix, windows), feature = "web"))
+            false
         );
     }
 }

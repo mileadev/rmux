@@ -385,10 +385,6 @@ pub(crate) struct RequestHandler {
         Arc<StdMutex<HashMap<rmux_core::PaneId, (u64, rmux_proto::ForegroundStateDto)>>>,
     pane_mode_transaction: Arc<Mutex<()>>,
     pane_mode_post_commit: Arc<post_commit_sequencer::PostCommitSequencer>,
-    #[cfg(all(any(unix, windows), feature = "web"))]
-    web_shares: Arc<WebShareRegistry>,
-    #[cfg(all(any(unix, windows), feature = "web"))]
-    web_listener_start: Arc<Mutex<()>>,
     task_runtime: Option<tokio::runtime::Handle>,
     #[cfg(test)]
     cleanup_on_drop: bool,
@@ -487,10 +483,6 @@ impl Clone for RequestHandler {
             foreground_state_cache: self.foreground_state_cache.clone(),
             pane_mode_transaction: self.pane_mode_transaction.clone(),
             pane_mode_post_commit: self.pane_mode_post_commit.clone(),
-            #[cfg(all(any(unix, windows), feature = "web"))]
-            web_shares: self.web_shares.clone(),
-            #[cfg(all(any(unix, windows), feature = "web"))]
-            web_listener_start: self.web_listener_start.clone(),
             task_runtime: self.task_runtime.clone(),
             #[cfg(test)]
             cleanup_on_drop: false,
@@ -580,10 +572,6 @@ pub(crate) struct WeakRequestHandler {
         Weak<StdMutex<HashMap<rmux_core::PaneId, (u64, rmux_proto::ForegroundStateDto)>>>,
     pane_mode_transaction: Weak<Mutex<()>>,
     pane_mode_post_commit: Weak<post_commit_sequencer::PostCommitSequencer>,
-    #[cfg(all(any(unix, windows), feature = "web"))]
-    web_shares: Weak<WebShareRegistry>,
-    #[cfg(all(any(unix, windows), feature = "web"))]
-    web_listener_start: Weak<Mutex<()>>,
     task_runtime: Option<tokio::runtime::Handle>,
     #[cfg(test)]
     paste_buffer_delete_pause: Weak<StdMutex<Option<Arc<PasteBufferDeletePause>>>>,
@@ -641,10 +629,6 @@ impl WeakRequestHandler {
             foreground_state_cache: self.foreground_state_cache.upgrade()?,
             pane_mode_transaction: self.pane_mode_transaction.upgrade()?,
             pane_mode_post_commit: self.pane_mode_post_commit.upgrade()?,
-            #[cfg(all(any(unix, windows), feature = "web"))]
-            web_shares: self.web_shares.upgrade()?,
-            #[cfg(all(any(unix, windows), feature = "web"))]
-            web_listener_start: self.web_listener_start.upgrade()?,
             task_runtime: self.task_runtime.clone(),
             #[cfg(test)]
             cleanup_on_drop: false,
@@ -838,7 +822,6 @@ impl RequestHandler {
         )
     }
 
-    #[cfg_attr(all(any(unix, windows), feature = "web"), allow(dead_code))]
     pub(crate) fn with_owner_uid_and_subscription_limits(
         owner_uid: u32,
         subscription_limits: SubscriptionLimits,
@@ -851,21 +834,6 @@ impl RequestHandler {
         )
     }
 
-    #[cfg(all(any(unix, windows), feature = "web"))]
-    pub(crate) fn with_owner_uid_subscription_limits_and_web_settings(
-        owner_uid: u32,
-        subscription_limits: SubscriptionLimits,
-        web_settings: crate::web::WebShareSettings,
-    ) -> Self {
-        let mut handler = Self::with_owner_uid_and_environment_and_display(
-            owner_uid,
-            Some(current_process_environment_snapshot()),
-            Some(current_process_environment_display_snapshot()),
-            subscription_limits,
-        );
-        handler.web_shares = Arc::new(WebShareRegistry::new(web_settings));
-        handler
-    }
 
     #[cfg(test)]
     fn with_owner_uid_and_environment(
@@ -966,10 +934,6 @@ impl RequestHandler {
             pane_mode_post_commit: Arc::new(post_commit_sequencer::PostCommitSequencer::new(
                 PANE_MODE_POST_COMMIT_LIMIT,
             )),
-            #[cfg(all(any(unix, windows), feature = "web"))]
-            web_shares: Arc::new(WebShareRegistry::default()),
-            #[cfg(all(any(unix, windows), feature = "web"))]
-            web_listener_start: Arc::new(Mutex::new(())),
             task_runtime,
             #[cfg(test)]
             cleanup_on_drop: true,
@@ -1059,10 +1023,6 @@ impl RequestHandler {
             foreground_state_cache: Arc::downgrade(&self.foreground_state_cache),
             pane_mode_transaction: Arc::downgrade(&self.pane_mode_transaction),
             pane_mode_post_commit: Arc::downgrade(&self.pane_mode_post_commit),
-            #[cfg(all(any(unix, windows), feature = "web"))]
-            web_shares: Arc::downgrade(&self.web_shares),
-            #[cfg(all(any(unix, windows), feature = "web"))]
-            web_listener_start: Arc::downgrade(&self.web_listener_start),
             task_runtime: self.task_runtime.clone(),
             #[cfg(test)]
             paste_buffer_delete_pause: Arc::downgrade(&self.paste_buffer_delete_pause),

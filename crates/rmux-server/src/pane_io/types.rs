@@ -835,7 +835,6 @@ impl PaneOutputSender {
         )
     }
 
-    #[cfg_attr(not(all(any(unix, windows), feature = "web")), allow(dead_code))]
     pub(crate) fn capture_with_next_sequence<T>(&self, capture: impl FnOnce() -> T) -> (u64, T) {
         let state = self
             .inner

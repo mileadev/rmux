@@ -531,13 +531,6 @@ impl RequestHandler {
             for prepared in prepared_rehomes {
                 self.exit_prepared_attached_session_identity(prepared).await;
             }
-            #[cfg(all(any(unix, windows), feature = "web"))]
-            {
-                self.web_shares.remove_targets_for_panes(&removed_pane_ids);
-                self.web_shares
-                    .remove_targets_for_sessions(&destroyed_sessions);
-            }
-            self.pause_before_window_lifecycle_emit().await;
             self.forget_pane_snapshot_coalescers(&removed_pane_ids);
             let mut affected_sessions = removed_windows
                 .iter()

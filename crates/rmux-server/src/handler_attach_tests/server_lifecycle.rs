@@ -215,25 +215,6 @@ async fn shutdown_if_idle_refuses_in_flight_detached_requests() {
     assert!(!handler.request_shutdown_if_pending());
 }
 
-#[cfg(all(any(unix, windows), feature = "web"))]
-#[tokio::test]
-async fn shutdown_if_idle_refuses_an_admitted_persistent_web_listener() {
-    let handler = RequestHandler::new();
-    handler.mark_web_listener_available();
-
-    let response = handler
-        .handle(Request::ShutdownIfIdle(rmux_proto::ShutdownIfIdleRequest))
-        .await;
-    assert_eq!(
-        response,
-        Response::ShutdownIfIdle(rmux_proto::ShutdownIfIdleResponse {
-            shutdown: false,
-            session_count: 0,
-            client_count: 0,
-        })
-    );
-    assert!(!handler.request_shutdown_if_pending());
-}
 
 #[tokio::test]
 async fn server_access_protects_owner_uid() {

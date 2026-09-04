@@ -46,9 +46,6 @@ mod pane_option_rekey;
 mod pane_outputs;
 #[path = "pane_pipe.rs"]
 mod pane_pipe;
-#[cfg(feature = "web")]
-#[path = "pane_terminals/pane_scrollback.rs"]
-mod pane_scrollback;
 #[path = "pane_terminal_store.rs"]
 mod pane_terminal_store;
 #[path = "pane_terminals/pane_transcripts.rs"]

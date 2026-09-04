@@ -4,12 +4,8 @@ use rmux_proto::{
     capabilities_for_features, ControlModeResponse, ErrorResponse, HandshakeResponse, Response,
     RmuxError,
 };
-#[cfg(all(test, any(unix, windows), feature = "web"))]
-use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use tokio::sync::broadcast;
-#[cfg(all(test, any(unix, windows), feature = "web"))]
-use tokio::sync::Notify;
 #[cfg(test)]
 use tracing::warn;
 
@@ -19,43 +15,9 @@ use crate::pane_io::HandleOutcome;
 
 use super::{client_environment_snapshot, effective_client_terminal_context, RequestHandler};
 
-#[cfg(all(test, any(unix, windows), feature = "web"))]
-#[derive(Debug, Default)]
-pub(crate) struct WebShareDeliveryPause {
-    reached: Notify,
-    release: Notify,
-}
 
-#[cfg(all(test, any(unix, windows), feature = "web"))]
-impl WebShareDeliveryPause {
-    pub(crate) async fn wait_until_reached(&self) {
-        self.reached.notified().await;
-    }
 
-    pub(crate) fn release(&self) {
-        self.release.notify_one();
-    }
-}
 
-#[cfg(all(test, any(unix, windows), feature = "web"))]
-static WEB_SHARE_DELIVERY_PAUSES: Mutex<Vec<(usize, Arc<WebShareDeliveryPause>)>> =
-    Mutex::new(Vec::new());
-
-#[cfg(all(test, any(unix, windows), feature = "web"))]
-async fn pause_after_web_share_rollback_is_armed(handler: &RequestHandler) {
-    let handler_key = std::ptr::from_ref(handler).addr();
-    let pause = {
-        let mut pauses = WEB_SHARE_DELIVERY_PAUSES
-            .lock()
-            .expect("web-share delivery pause lock");
-        let position = pauses.iter().position(|(key, _)| *key == handler_key);
-        position.map(|position| pauses.swap_remove(position).1)
-    };
-    if let Some(pause) = pause {
-        pause.reached.notify_one();
-        pause.release.notified().await;
-    }
-}
 
 impl RequestHandler {
     pub(crate) async fn handle_revoked_cleanup_request(
@@ -132,35 +94,6 @@ impl RequestHandler {
         outcome
     }
 
-    #[cfg(all(any(unix, windows), feature = "web"))]
-    pub(crate) async fn dispatch_for_connection_with_web_share_guard(
-        &self,
-        requester_pid: u32,
-        connection_id: u64,
-        request: Request,
-    ) -> (HandleOutcome, Option<super::UndeliveredWebShareGuard>) {
-        let request_for_hooks = request.clone();
-        let (outcome, inline_hooks) = self
-            .dispatch_captured(requester_pid, connection_id, request)
-            .await;
-        // The connection loop may cancel this future while a hook is waiting.
-        // Arm rollback before those awaits and transfer it to the response writer.
-        let undelivered_web_share =
-            super::UndeliveredWebShareGuard::for_response(self, &outcome.response);
-        #[cfg(test)]
-        if undelivered_web_share.is_some() {
-            pause_after_web_share_rollback_is_armed(self).await;
-        }
-        self.run_dispatched_hooks(
-            requester_pid,
-            &request_for_hooks,
-            &outcome.response,
-            inline_hooks,
-            None,
-        )
-        .await;
-        (outcome, undelivered_web_share)
-    }
 
     /// Runs everything a dispatched request still owes once its handler
     /// returned: the applied-window-resize backstop, then its inline and
@@ -200,18 +133,6 @@ impl RequestHandler {
         .await;
     }
 
-    #[cfg(all(test, any(unix, windows), feature = "web"))]
-    pub(crate) fn install_web_share_delivery_pause(&self) -> Arc<WebShareDeliveryPause> {
-        let handler_key = std::ptr::from_ref(self).addr();
-        let pause = Arc::new(WebShareDeliveryPause::default());
-        let mut pauses = WEB_SHARE_DELIVERY_PAUSES
-            .lock()
-            .expect("web-share delivery pause lock");
-        let previous = pauses.iter().any(|(key, _)| *key == handler_key);
-        assert!(!previous, "web-share delivery pause already installed");
-        pauses.push((handler_key, Arc::clone(&pause)));
-        pause
-    }
 
     #[async_recursion::async_recursion]
     pub(crate) async fn dispatch_captured(

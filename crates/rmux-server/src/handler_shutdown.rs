@@ -93,10 +93,6 @@ impl RequestHandler {
         self.normal_request_admission.closing.send_replace(true);
     }
 
-    #[cfg(all(any(unix, windows), feature = "web"))]
-    pub(crate) fn normal_request_shutdown_receiver(&self) -> watch::Receiver<bool> {
-        self.normal_request_admission.closing.subscribe()
-    }
 
     pub(crate) fn normal_requests_quiesced(&self) -> bool {
         self.normal_request_admission.active.load(Ordering::SeqCst) == 0
