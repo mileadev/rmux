@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod common;
+
 #[path = "attach_session/attach_flow.rs"]
 mod attach_flow;
 #[path = "attach_session/support.rs"]

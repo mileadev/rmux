@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod common;
+
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fs;

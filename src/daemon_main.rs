@@ -11,6 +11,8 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
+mod server_runtime;
+
 use rmux_server::{ConfigFileSelection, DaemonConfig, ServerDaemon};
 
 const INTERNAL_DAEMON_FLAG: &str = "--__internal-daemon";

@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod common;
+
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::path::PathBuf;

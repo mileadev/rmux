@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod common;
+
 use std::error::Error;
 
 use common::{send_request, session_name, start_server, TestHarness};

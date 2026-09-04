@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod common;
+
 use std::collections::HashSet;
 use std::error::Error;
 use std::path::{Path, PathBuf};

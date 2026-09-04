@@ -391,6 +391,12 @@ mod source_file_conditions;
 #[path = "handler_scripting_tests/if_shell.rs"]
 mod if_shell;
 
+#[path = "handler_scripting_tests/list_windows_all.rs"]
+mod list_windows_all;
+
+#[path = "handler_scripting_tests/parsed_queue_windows_mouse.rs"]
+mod parsed_queue_windows_mouse;
+
 #[path = "handler_scripting_tests/parsed_queue_core.rs"]
 mod parsed_queue_core;
 

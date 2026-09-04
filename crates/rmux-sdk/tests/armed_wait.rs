@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod common;
+
 use std::error::Error;
 use std::fmt::{Debug, Write as _};
 use std::io;
