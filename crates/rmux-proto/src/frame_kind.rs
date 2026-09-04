@@ -111,8 +111,6 @@ pub enum FrameFeature {
     SdkWaits,
     /// Error envelopes.
     Errors,
-    /// Browser-visible pane sharing.
-    Web,
     /// Reserved for future extensions.
     Reserved,
 }
@@ -1204,11 +1202,11 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
     entry(
         c2s(114),
         FrameDirection::ClientToServer,
-        ACTIVE,
-        "WebShareRequest",
-        FrameFeature::Web,
+        RESERVED,
+        "(removed-remote-access-request)",
+        FrameFeature::Reserved,
         None,
-        "Browser-visible pane sharing command family; pinned bincode tag 114.",
+        "Former remote-access request slot. Permanently reserved and never reused.",
     ),
     entry(
         c2s(115),
@@ -2214,11 +2212,11 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
     entry(
         s2c(93),
         FrameDirection::ServerToClient,
-        ACTIVE,
-        "WebShareResponse",
-        FrameFeature::Web,
+        RESERVED,
+        "(removed-remote-access-response)",
+        FrameFeature::Reserved,
         None,
-        "Browser-visible pane sharing command response; pinned bincode tag 93.",
+        "Former remote-access response slot. Permanently reserved and never reused.",
     ),
     entry(
         s2c(94),
@@ -2462,7 +2460,7 @@ pub const fn frame_kind_for_request(request: &Request) -> FrameKind {
         Request::SdkWaitForOutputRef(_) => c2s(111),
         Request::DaemonStatus(_) => c2s(112),
         Request::ShutdownIfIdle(_) => c2s(113),
-        Request::WebShare(_) => c2s(114),
+        Request::ReservedRemoteAccessRemoved => c2s(114),
         Request::DisplayMessageExt(_) => c2s(115),
         Request::SendKeysExt2(_) => c2s(116),
         Request::AttachSessionExt3(_) => c2s(117),
@@ -2579,7 +2577,7 @@ pub const fn frame_kind_for_response(response: &Response) -> FrameKind {
         Response::ReleaseSessionLease(_) => s2c(90),
         Response::DaemonStatus(_) => s2c(91),
         Response::ShutdownIfIdle(_) => s2c(92),
-        Response::WebShare(_) => s2c(93),
+        Response::ReservedRemoteAccessRemoved => s2c(93),
         Response::PaneOptionSet(_) => s2c(94),
         Response::PaneOptionGet(_) => s2c(95),
         Response::SubscribePaneState(_) => s2c(96),

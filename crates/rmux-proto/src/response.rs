@@ -264,6 +264,8 @@ pub enum Response {
     DaemonStatus(DaemonStatusResponse),
     /// Success payload for internal idle-only daemon shutdown.
     ShutdownIfIdle(ShutdownIfIdleResponse),
+    /// Permanently reserved former remote-access wire slot. Never emitted.
+    ReservedRemoteAccessRemoved,
     /// Success payload for SDK pane option mutation.
     PaneOptionSet(Box<PaneOptionSetResponse>),
     /// Success payload for SDK pane option lookup.
@@ -398,6 +400,7 @@ impl Response {
             Self::Handshake(_) => "handshake",
             Self::DaemonStatus(_) => "daemon-status",
             Self::ShutdownIfIdle(_) => "shutdown-if-idle",
+            Self::ReservedRemoteAccessRemoved => "__reserved-remote-access-removed",
         }
     }
 
@@ -435,7 +438,6 @@ impl Response {
             Self::ListClients(response) => Some(response.command_output()),
             Self::BreakPane(response) => response.command_output(),
             Self::Handshake(_) => None,
-            Self::WebShare(response) => response.command_output(),
             Self::SubscribePaneOutput(_)
             | Self::UnsubscribePaneOutput(_)
             | Self::PaneOutputCursor(_)
@@ -458,7 +460,8 @@ impl Response {
             | Self::RenewSessionLease(_)
             | Self::ReleaseSessionLease(_)
             | Self::DaemonStatus(_)
-            | Self::ShutdownIfIdle(_) => None,
+            | Self::ShutdownIfIdle(_)
+            | Self::ReservedRemoteAccessRemoved => None,
             _ => None,
         }
     }

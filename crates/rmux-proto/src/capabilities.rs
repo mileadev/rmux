@@ -66,12 +66,6 @@ pub const CAPABILITY_CLI_CAPTURE_TARGET_ACTION: &str = "commands.cli_capture_tar
 pub const CAPABILITY_CLI_RUNTIME_COMMAND_EXPANSION: &str = "commands.cli_runtime_command_expansion";
 /// Stable feature id for daemon-owned `list-windows -a` queue execution.
 pub const CAPABILITY_CLI_LIST_WINDOWS_ALL_QUEUE: &str = "commands.cli_list_windows_all_queue";
-/// Stable feature id for browser-visible pane sharing.
-///
-/// This optional capability is advertised by daemons compiled with their web
-/// listener enabled rather than by the protocol baseline capability list.
-pub const CAPABILITY_WEB_SHARE: &str = "web.share";
-
 /// Capabilities advertised by this protocol build.
 pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     CAPABILITY_DETACHED_RPC,
@@ -106,19 +100,10 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     CAPABILITY_SDK_PANE_SURFACE_STREAM,
 ];
 
-/// Builds the capability inventory for a binary with the supplied optional
-/// features enabled.
-///
-/// The protocol baseline stays feature-independent, while binaries compiled
-/// with browser sharing must advertise that optional capability consistently
-/// from both their local inventory and daemon handshake.
+/// Returns the capability inventory for this local-only protocol build.
 #[must_use]
-pub fn capabilities_for_features(web_share: bool) -> Vec<&'static str> {
-    let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
-    if web_share {
-        capabilities.push(CAPABILITY_WEB_SHARE);
-    }
-    capabilities
+pub fn capabilities_for_features(_removed_remote_access: bool) -> Vec<&'static str> {
+    SUPPORTED_CAPABILITIES.to_vec()
 }
 
 /// Client-to-server version and capability negotiation request.

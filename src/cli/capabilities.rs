@@ -167,7 +167,7 @@ fn write_json() -> Result<i32, ExitFailure> {
 }
 
 fn compiled_protocol_capabilities() -> Vec<&'static str> {
-    capabilities_for_features(cfg!(all(any(unix, windows), feature = "web")))
+    capabilities_for_features(false)
 }
 
 fn control_mode_contract() -> serde_json::Value {

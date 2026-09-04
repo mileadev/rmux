@@ -340,6 +340,8 @@ pub enum Request {
     DaemonStatus(DaemonStatusRequest),
     /// Internal idle-only shutdown endpoint used by seamless upgrades.
     ShutdownIfIdle(ShutdownIfIdleRequest),
+    /// Permanently reserved former remote-access wire slot. No payload or behavior.
+    ReservedRemoteAccessRemoved,
     /// `display-message` extension with target-client context.
     DisplayMessageExt(Box<DisplayMessageExtRequest>),
     /// `send-keys` extension with target-client context.
@@ -504,7 +506,7 @@ impl Request {
             Self::Handshake(_) => "handshake",
             Self::DaemonStatus(_) => "daemon-status",
             Self::ShutdownIfIdle(_) => "shutdown-if-idle",
-            Self::WebShare(_) => "web-share",
+            Self::ReservedRemoteAccessRemoved => "__reserved-remote-access-removed",
         }
     }
 }
