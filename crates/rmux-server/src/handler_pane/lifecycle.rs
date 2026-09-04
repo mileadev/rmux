@@ -319,11 +319,6 @@ impl RequestHandler {
                                     reason: PaneStateClosedReason::Exited,
                                 },
                             );
-                            self.prune_web_panes(&[event.pane_id]);
-                            self.prune_web_session(Some((
-                                target.session_name().clone(),
-                                removed_session.id(),
-                            )));
                             self.apply_window_mutation_silence_timers_and_arm_all_locked(
                                 &state,
                                 timer_mutation,
@@ -384,7 +379,6 @@ impl RequestHandler {
                                             reason: PaneStateClosedReason::Exited,
                                         },
                                     );
-                                    self.prune_web_panes(&result.removed_pane_ids);
                                     let window_destroyed = result.response.window_destroyed;
                                     let lifecycle_events = if window_destroyed {
                                         lifecycle_batch.prepare_window_destroyed_committed(
@@ -421,10 +415,6 @@ impl RequestHandler {
                                     for (destroyed_session, session_id) in
                                         &result.destroyed_sessions
                                     {
-                                        self.prune_web_session(Some((
-                                            destroyed_session.clone(),
-                                            rmux_core::SessionId::new(*session_id),
-                                        )));
                                     }
                                     let mut affected_sessions = result.affected_sessions;
                                     state.expand_with_active_window_linked_session_families(

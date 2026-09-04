@@ -310,7 +310,6 @@ impl RequestHandler {
                     detach_on_destroy: _,
                     event,
                 } => {
-                    self.prune_web_session(Some((session_name, session_id)));
                     self.emit_prepared(event).await;
                 }
             }

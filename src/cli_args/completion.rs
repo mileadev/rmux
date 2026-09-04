@@ -172,7 +172,6 @@ fn completion_subcommand(entry: &'static CommandEntry) -> clap::Command {
         "source-file" => completion_typed_subcommand::<SourceFileArgs>(entry.name),
         "if-shell" => completion_typed_subcommand::<IfShellArgs>(entry.name),
         "wait-for" => completion_typed_subcommand::<WaitForArgs>(entry.name),
-        "web-share" => completion_typed_subcommand::<WebShareArgs>(entry.name),
         "command-prompt" => completion_typed_subcommand::<PromptArgs>(entry.name),
         "confirm-before" => completion_typed_subcommand::<ConfirmBeforeArgs>(entry.name),
         "find-window" => completion_typed_subcommand::<FindWindowArgs>(entry.name),

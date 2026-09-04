@@ -40,8 +40,7 @@ impl RequestHandler {
         let (session_count, client_count) = self
             .daemon_activity_counts(Some(requester_connection_id))
             .await;
-        let shutdown =
-            session_count == 0 && client_count == 0 && !self.has_persistent_web_listener();
+        let shutdown = session_count == 0 && client_count == 0;
         if shutdown {
             self.retained_exited_outputs
                 .lock()

@@ -424,7 +424,6 @@ impl RequestHandler {
                 },
             );
         }
-        self.prune_web_panes(pane_ids);
     }
 
     pub(in crate::handler) fn record_pane_option_mutation(

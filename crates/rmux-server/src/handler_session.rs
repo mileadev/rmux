@@ -1772,7 +1772,6 @@ impl RequestHandler {
                         session_id,
                     );
                     self.rename_session_lease(&session_name, &new_name, session_id);
-                    self.rekey_web_session(&session_name, &new_name, session_id);
                     let mut active_attach = self.active_attach.lock().await;
                     active_attach.rename_session(&session_name, session_id, &new_name);
                     drop(active_attach);

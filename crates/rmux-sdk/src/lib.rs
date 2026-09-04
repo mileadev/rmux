@@ -126,8 +126,6 @@ pub use pane_set::{
     PaneSetVisibleTextOutcome, PaneSetVisibleTextWait,
 };
 pub use rmux_proto::LayoutName;
-#[cfg(feature = "web")]
-pub use rmux_proto::{WebTerminalPalette, WebTerminalTheme};
 pub use snapshot::{
     PaneAttributes, PaneCell, PaneColor, PaneCursor, PaneGlyph, PaneSnapshot,
     PaneSnapshotShapeError,
@@ -143,7 +141,3 @@ pub use types::{
     WindowRef,
 };
 pub use wait::{ArmedWait, VisibleTextExpectation, VisibleTextWait, WaitTimeoutError};
-#[cfg(feature = "web")]
-pub use web_share::{
-    WebConfigInfo, WebShareBuilder, WebShareHandle, WebShareLookup, WebShareSummary,
-};

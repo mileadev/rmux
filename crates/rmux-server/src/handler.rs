@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+mod request_identity;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex as StdMutex;
@@ -195,7 +197,7 @@ pub(in crate::handler) use target_support::{
     target_for_scope_selector, target_to_scope, with_visible_pane_bases, SessionLookup,
 };
 use wait_support::SdkWaitState;
-pub(in crate::handler) use web_request_identity::{
+pub(in crate::handler) use request_identity::{
     current_expected_attach_identity, dispatch_with_expected_session_identity,
     dispatch_with_expected_window_identity, dispatch_with_expected_window_occurrence_identity,
     expected_attach_follows_registration, rebase_expected_attach_session_after_switch,

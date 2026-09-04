@@ -753,8 +753,10 @@ impl RequestHandler {
             Request::PaneSelect(request) => {
                 HandleOutcome::response(self.handle_pane_select_ref(request).await)
             }
-            Request::WebShare(request) => {
-                HandleOutcome::response(self.handle_web_share(*request).await)
+            Request::ReservedRemoteAccessRemoved => {
+                HandleOutcome::response(Response::Error(ErrorResponse {
+                    error: RmuxError::Server("reserved remote-access request is permanently unsupported".to_owned()),
+                }))
             }
             _ => HandleOutcome::response(Response::Error(ErrorResponse {
                 error: RmuxError::Server(format!(
@@ -954,7 +956,7 @@ fn request_waits_for_windows_deferred_panes(request: &Request) -> bool {
 }
 
 fn supported_capabilities() -> Vec<&'static str> {
-    capabilities_for_features(cfg!(all(any(unix, windows), feature = "web")))
+    capabilities_for_features(false)
 }
 
 #[cfg(test)]

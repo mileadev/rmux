@@ -4,7 +4,6 @@ use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use rmux_proto::DaemonStatusResponse;
-use rmux_proto::{Response, CAPABILITY_WEB_SHARE};
 
 use crate::{connect_or_absent, upgrade, ConnectResult, Connection};
 use tracing::debug;
@@ -55,7 +54,7 @@ pub(super) fn ensure_daemon_fresh_or_restart(
 
     match freshness {
         upgrade::DaemonFreshness::Current => {
-            ensure_required_web_capability_or_restart(connection, socket_path, binary_path, config)
+            Ok(ReadyServerConnection::new(connection, socket_path))
         }
         upgrade::DaemonFreshness::StaleActive(stale) => {
             upgrade::warn_stale_active_daemon(&stale, socket_path);
@@ -82,94 +81,6 @@ pub(super) fn ensure_daemon_fresh_or_restart(
             restart_hidden_daemon(binary_path, socket_path, config)
         }
     }
-}
-
-#[cfg(windows)]
-pub(super) fn ensure_daemon_fresh_or_restart_after_windows_readiness(
-    connection: Connection,
-    socket_path: &Path,
-    binary_path: &Path,
-    config: &AutoStartConfig,
-    readiness_status: Option<DaemonStatusResponse>,
-) -> Result<ReadyServerConnection, AutoStartError> {
-    if let Some(status) = readiness_status {
-        match upgrade::daemon_status_matches_current_client(&status) {
-            Ok(true) => {
-                return ensure_required_web_capability_or_restart(
-                    connection,
-                    socket_path,
-                    binary_path,
-                    config,
-                );
-            }
-            Ok(false) => {}
-            Err(incompatible) => {
-                return Err(AutoStartError::IncompatibleDaemon {
-                    socket_path: socket_path.to_path_buf(),
-                    message: upgrade::incompatible_daemon_message(&incompatible),
-                });
-            }
-        }
-    }
-
-    ensure_daemon_fresh_or_restart(connection, socket_path, binary_path, config)
-}
-
-fn ensure_required_web_capability_or_restart(
-    mut connection: Connection,
-    socket_path: &Path,
-    binary_path: &Path,
-    config: &AutoStartConfig,
-) -> Result<ReadyServerConnection, AutoStartError> {
-    if !config.web_required || connection.supports_capability(CAPABILITY_WEB_SHARE)? {
-        return Ok(ReadyServerConnection::new(connection, socket_path));
-    }
-
-    let Response::DaemonStatus(status) =
-        connection.daemon_status().map_err(AutoStartError::Client)?
-    else {
-        return Err(AutoStartError::IncompatibleDaemon {
-            socket_path: socket_path.to_path_buf(),
-            message: "running daemon did not report status for web-share upgrade".to_owned(),
-        });
-    };
-
-    if status.session_count > 0 || status.client_count > 0 {
-        return Err(AutoStartError::IncompatibleDaemon {
-            socket_path: socket_path.to_path_buf(),
-            message: "running daemon was built without web-share support and still owns sessions or clients".to_owned(),
-        });
-    }
-
-    let Response::ShutdownIfIdle(shutdown) = connection
-        .shutdown_if_idle()
-        .map_err(AutoStartError::Client)?
-    else {
-        return Err(AutoStartError::IncompatibleDaemon {
-            socket_path: socket_path.to_path_buf(),
-            message: "running daemon cannot be restarted for web-share support".to_owned(),
-        });
-    };
-
-    if !shutdown.shutdown {
-        return Err(AutoStartError::IncompatibleDaemon {
-            socket_path: socket_path.to_path_buf(),
-            message: "running daemon became active before web-share upgrade".to_owned(),
-        });
-    }
-
-    drop(connection);
-    if wait_for_server_absent(socket_path)?.is_some() {
-        return Err(AutoStartError::IncompatibleDaemon {
-            socket_path: socket_path.to_path_buf(),
-            message: format!(
-                "running daemon was built without web-share support and is still active with {} sessions and {} clients",
-                status.session_count, status.client_count
-            ),
-        });
-    }
-
-    restart_hidden_daemon(binary_path, socket_path, config)
 }
 
 fn restart_hidden_daemon(

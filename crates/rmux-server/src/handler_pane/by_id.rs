@@ -419,10 +419,6 @@ impl RequestHandler {
         }
 
         for (destroyed_session, session_id) in &destroyed_sessions {
-            self.prune_web_session(Some((
-                destroyed_session.clone(),
-                SessionId::new(*session_id),
-            )));
         }
 
         if !removed_pane_ids.is_empty() {

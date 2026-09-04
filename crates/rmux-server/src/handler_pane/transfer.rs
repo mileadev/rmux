@@ -713,7 +713,6 @@ impl RequestHandler {
             .map(|(session_name, session_id, _)| (session_name.clone(), *session_id))
             .collect::<Vec<_>>();
         for (session_name, session_id, _, _) in effects.closed_sessions {
-            self.prune_web_session(Some((session_name, session_id)));
         }
         self.remove_session_leases(&removed_identities);
         for (session_name, session_id, _detach_on_destroy) in removed_attached_identities {

@@ -832,11 +832,6 @@ fn request_quiesce_behavior(request: &Request) -> RequestQuiesceBehavior {
         Request::LoadBuffer(_) | Request::SaveBuffer(_) | Request::SourceFile(_) => {
             RequestQuiesceBehavior::CancelSafe
         }
-        Request::WebShare(web_share)
-            if matches!(web_share.as_ref(), rmux_proto::WebShareRequest::Create(_)) =>
-        {
-            RequestQuiesceBehavior::CancelSafe
-        }
         Request::SdkWaitForOutput(_)
         | Request::SdkWaitForOutputRef(_)
         | Request::PaneStateCursor(rmux_proto::PaneStateCursorRequest { wait: true, .. })
