@@ -184,7 +184,6 @@ where
     RawCli::from_arg_matches(&matches)
 }
 
-
 /// Result of parsing only the clap-owned top-level prefix and opaque command
 /// tail. Internal dispatch uses this before command-queue parsing so it shares
 /// the exact same short-option cluster and value-boundary rules as the main CLI.
