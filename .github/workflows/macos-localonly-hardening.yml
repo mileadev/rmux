@@ -23,12 +23,9 @@ jobs:
             git add -A
             git commit -m 'security: remove remote PTY, web share, tunnels and non-macOS source'
             git push origin HEAD:${GITHUB_REF_NAME}
-            echo 'Structural reduction committed; validation continues on the new push.'
-            exit 0
           fi
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt,clippy
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.1 --profile minimal --component rustfmt --component clippy --no-self-update
       - name: Format
         run: cargo fmt --all -- --check
       - name: Check macOS workspace
