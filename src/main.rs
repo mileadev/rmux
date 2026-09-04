@@ -31,10 +31,6 @@ mod server_runtime;
 #[cfg(all(feature = "tiny-cli", any(not(debug_assertions), test)))]
 mod tiny_main;
 mod tmux_error_surface;
-#[cfg(windows)]
-mod windows_shell;
-#[cfg(windows)]
-mod windows_terminal;
 
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 use std::env;

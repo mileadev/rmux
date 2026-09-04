@@ -523,6 +523,3 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-#[path = "control/windows_tests.rs"]
-mod windows_tests;
