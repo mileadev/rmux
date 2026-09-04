@@ -192,12 +192,8 @@ impl RequestHandler {
         identity: ActiveAttachIdentity,
         key: rmux_core::KeyCode,
     ) -> io::Result<bool> {
-        self.handle_attached_live_key_inner(
-            identity,
-            key,
-            AttachedPaneForward::EncodedKey,
-        )
-        .await
+        self.handle_attached_live_key_inner(identity, key, AttachedPaneForward::EncodedKey)
+            .await
     }
 
     async fn handle_attached_live_key_inner(
