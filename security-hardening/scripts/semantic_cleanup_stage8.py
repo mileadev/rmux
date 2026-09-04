@@ -4,6 +4,8 @@
 The WebShare implementation, feature definition, and dependencies are already gone. Keeping stale
 Web-only cfg blocks would leave dormant source and produce `unexpected_cfgs` warnings. This pass
 removes the positive branch as a complete Rust syntactic unit and preserves only the local branch.
+`listener.rs` is intentionally handled by Stage9 because it contains cfg branches embedded inside
+`tokio::select!`, where source-unit deletion is not structurally safe.
 """
 from __future__ import annotations
 import os,re,sys
@@ -115,7 +117,10 @@ def main() -> int:
     files=list((root/'src').rglob('*.rs'))
     for srcdir in (root/'crates').glob('*/src'):
         files.extend(srcdir.rglob('*.rs'))
+    listener=(root/'crates/rmux-server/src/listener.rs').resolve()
     for p in sorted(set(files)):
+        if p.resolve() == listener:
+            continue
         old=p.read_text(encoding='utf-8'); new,n=clean_text(old)
         if new!=old:
             tmp=p.with_name(p.name+'.rmux-strip-web-tmp'); tmp.write_text(new,encoding='utf-8'); os.replace(tmp,p)
