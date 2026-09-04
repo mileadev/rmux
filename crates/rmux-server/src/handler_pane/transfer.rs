@@ -712,7 +712,6 @@ impl RequestHandler {
             .iter()
             .map(|(session_name, session_id, _)| (session_name.clone(), *session_id))
             .collect::<Vec<_>>();
-        for (session_name, session_id, _, _) in effects.closed_sessions {}
         self.remove_session_leases(&removed_identities);
         for (session_name, session_id, _detach_on_destroy) in removed_attached_identities {
             let prepared = prepared_attached_switches

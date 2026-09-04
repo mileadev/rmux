@@ -305,8 +305,8 @@ impl RequestHandler {
                     self.emit_prepared(event).await;
                 }
                 PreparedLifecycleEffect::Closed {
-                    session_name,
-                    session_id,
+                    session_name: _,
+                    session_id: _,
                     detach_on_destroy: _,
                     event,
                 } => {

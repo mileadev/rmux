@@ -198,7 +198,7 @@ fn startup_config_from_selection(
 ) -> StartupConfig {
     let cwd = std::env::current_dir().ok();
     let _ = command;
-    let mut config = match selection {
+    let config = match selection {
         ConfigFileSelection::Default => {
             let quiet = true;
             StartupConfig {

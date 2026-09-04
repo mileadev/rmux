@@ -359,28 +359,6 @@ where
     .await
 }
 
-pub(in crate::handler) async fn with_expected_window_identity<T, F>(
-    name: SessionName,
-    session_id: SessionId,
-    window_index: u32,
-    window_id: WindowId,
-    future: F,
-) -> T
-where
-    F: Future<Output = T>,
-{
-    with_expected_window_identity_inner(
-        name,
-        session_id,
-        window_index,
-        window_id,
-        None,
-        None,
-        future,
-    )
-    .await
-}
-
 async fn with_expected_window_occurrence_identity<T, F>(
     name: SessionName,
     session_id: SessionId,
@@ -465,34 +443,6 @@ pub(in crate::handler) async fn dispatch_with_expected_session_identity(
     let (outcome, inline_hooks) = with_expected_session_identity(
         name,
         id,
-        handler.dispatch_captured(requester_pid, u64::from(requester_pid), request),
-    )
-    .await;
-    finish_identity_dispatch(
-        handler,
-        requester_pid,
-        request_for_hooks,
-        outcome,
-        inline_hooks,
-    )
-    .await
-}
-
-pub(in crate::handler) async fn dispatch_with_expected_window_identity(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    name: SessionName,
-    session_id: SessionId,
-    window_index: u32,
-    window_id: WindowId,
-    request: Request,
-) -> Response {
-    let request_for_hooks = request.clone();
-    let (outcome, inline_hooks) = with_expected_window_identity(
-        name,
-        session_id,
-        window_index,
-        window_id,
         handler.dispatch_captured(requester_pid, u64::from(requester_pid), request),
     )
     .await;

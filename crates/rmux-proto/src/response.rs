@@ -1126,7 +1126,6 @@ mod tests {
 
     #[test]
     fn pr6g_response_boxing_keeps_response_size_bounded() {
-        assert_eq!(size_of::<Box<WebShareResponse>>(), 8);
         assert_eq!(size_of::<Box<PaneOutputLagResponse>>(), 8);
         assert_eq!(size_of::<Box<PaneOptionSetResponse>>(), 8);
         assert_eq!(size_of::<Box<SubscribePaneStateResponse>>(), 8);
@@ -1135,10 +1134,6 @@ mod tests {
             size_of::<Response>(),
             72,
             "Response should stay compact after boxing the two largest payload variants"
-        );
-        assert!(
-            size_of::<WebShareResponse>() > size_of::<Response>(),
-            "WebShareResponse must remain boxed while it is larger than Response"
         );
         assert!(
             size_of::<PaneOutputLagResponse>() > size_of::<Response>(),
@@ -1195,14 +1190,5 @@ mod tests {
         };
         assert_transparent(Response::PaneOutputLag(Box::new(lag.clone())), &lag);
 
-        let web_share = WebShareResponse::Config(WebShareConfigResponse {
-            listener: WebShareListener {
-                host: "127.0.0.1".to_owned(),
-                port: 9777,
-                frontend_origin: "https://share.rmux.io".to_owned(),
-            },
-            output: CommandOutput::from_stdout("127.0.0.1:9777 https://share.rmux.io\n"),
-        });
-        assert_transparent(Response::WebShare(Box::new(web_share.clone())), &web_share);
     }
 }

@@ -719,7 +719,7 @@ mod tests {
     use super::*;
     use crate::{
         OptionScopeSelector, PaneTarget, ScopeSelector, SelectPaneDirection, SetOptionMode,
-        SplitDirection, WebShareScope,
+        SplitDirection,
     };
     use serde::Serialize;
     use std::mem::size_of;
@@ -925,7 +925,7 @@ mod tests {
         eprintln!("PR6G size baseline: Request={request_size} Box<T>={box_size}");
         eprintln!(
             "PR6G candidate sizes: NewSessionExt={} NewWindow={} SetOptionByName={} \
-             AttachSessionExt3={} SwitchClientExt3={} SendKeysExt2={} SourceFile={} WebShare={}",
+             AttachSessionExt3={} SwitchClientExt3={} SendKeysExt2={} SourceFile={}",
             size_of::<NewSessionExtRequest>(),
             size_of::<NewWindowRequest>(),
             size_of::<SetOptionByNameRequest>(),
@@ -933,7 +933,6 @@ mod tests {
             size_of::<SwitchClientExt3Request>(),
             size_of::<SendKeysExt2Request>(),
             size_of::<SourceFileRequest>(),
-            size_of::<WebShareRequest>(),
         );
         let mut remaining = [
             ("AttachSessionExt2", size_of::<AttachSessionExt2Request>()),
@@ -1107,25 +1106,6 @@ mod tests {
             },
             vec![crate::CAPABILITY_ATTACH_RENDER.to_owned()],
         ));
-        assert_box_serializes_like_value(WebShareRequest::Create(CreateWebShareRequest {
-            scope: WebShareScope::Session(alpha()),
-            public_base_url: Some("https://example.invalid".to_owned()),
-            tunnel_provider: None,
-            frontend_url: Some("https://share.example.invalid".to_owned()),
-            ttl_seconds: Some(60),
-            expires_at_unix: None,
-            max_spectators: Some(8),
-            max_operators: Some(1),
-            url_options: WebShareUrlOptions::default(),
-            require_pin: true,
-            operator_pin: Some("123456".to_owned()),
-            spectator_pin: Some("654321".to_owned()),
-            terminal_palette: None,
-            operator: true,
-            spectator: true,
-            controls: true,
-            kill_session_on_expire: false,
-        }));
     }
 
     fn assert_box_serializes_like_value<T>(value: T)

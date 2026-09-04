@@ -179,7 +179,7 @@ pub(in crate::handler) use pane_output_subscription_rekeys::{
 use pane_support::PaneSnapshotRevisionRegistry;
 pub(in crate::handler) use request_identity::{
     current_expected_attach_identity, dispatch_with_expected_session_identity,
-    dispatch_with_expected_window_identity, dispatch_with_expected_window_occurrence_identity,
+    dispatch_with_expected_window_occurrence_identity,
     expected_attach_follows_registration, rebase_expected_attach_session_after_switch,
     require_expected_pane_identity, require_expected_session_identity,
     require_expected_window_identity, resolve_expected_window_pane_target,

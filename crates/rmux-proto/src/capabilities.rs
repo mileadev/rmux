@@ -211,7 +211,7 @@ mod tests {
         CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY, CAPABILITY_SDK_PANE_RAW_RECOVERY,
         CAPABILITY_SDK_PANE_SPLIT_IDENTITY, CAPABILITY_SDK_PANE_SURFACE_STREAM,
         CAPABILITY_SDK_SESSION_LEASE_BY_ID, CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2,
-        CAPABILITY_SDK_WAITS_ARMED, CAPABILITY_WEB_SHARE,
+        CAPABILITY_SDK_WAITS_ARMED,
     };
     use crate::{RmuxError, RMUX_WIRE_VERSION};
 
@@ -301,11 +301,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn optional_web_capability_follows_the_compiled_feature() {
-        assert!(!capabilities_for_features(false).contains(&CAPABILITY_WEB_SHARE));
-        assert!(capabilities_for_features(true).contains(&CAPABILITY_WEB_SHARE));
-    }
 
     #[test]
     fn current_handshake_uses_exact_wire_window() {

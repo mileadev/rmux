@@ -1623,7 +1623,6 @@ fn attach_target_for_session_with_prompt(
         )
         .as_slice(),
     );
-    validate_attach_recovery_frame(&render_frame, options.bounded_recovery)?;
     for pane in session.window().panes() {
         let copy_snapshot = state.pane_copy_mode_render_snapshot(session_name, pane.id());
         if let Some(snapshot) = copy_snapshot.as_ref() {
@@ -1676,12 +1675,10 @@ fn attach_target_for_session_with_prompt(
                 );
             }
         }
-        validate_attach_recovery_frame(&render_frame, options.bounded_recovery)?;
     }
     render_frame.extend_from_slice(
         renderer::render_pane_border_status_lines(session, &state.options, Some(state)).as_slice(),
     );
-    validate_attach_recovery_frame(&render_frame, options.bounded_recovery)?;
     let live_pane =
         live_pane_render_for_target(state, session, &state.options, session_name, options.prompt);
     if options.prompt.is_none() {
@@ -1714,7 +1711,6 @@ fn attach_target_for_session_with_prompt(
             }
         }
     }
-    validate_attach_recovery_frame(&render_frame, options.bounded_recovery)?;
 
     let active_pane_geometry = active_pane.as_ref().map_or_else(
         || rmux_core::PaneGeometry::new(0, 0, 0, 0),
@@ -1779,13 +1775,6 @@ fn attach_target_for_session_with_prompt(
         persistent_overlay_state_id: None,
         live_pane,
     })
-}
-
-fn validate_attach_recovery_frame(
-    frame: &[u8],
-    bounded_recovery: bool,
-) -> Result<(), rmux_proto::RmuxError> {
-    Ok(())
 }
 
 pub(super) fn sized_session(
