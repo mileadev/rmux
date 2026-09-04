@@ -74,8 +74,6 @@ pub mod spec;
 pub mod trace;
 pub mod types;
 pub mod wait;
-#[cfg(feature = "web")]
-pub mod web_share;
 
 #[allow(dead_code)]
 pub(crate) mod transport;

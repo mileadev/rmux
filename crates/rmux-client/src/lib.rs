@@ -10,9 +10,6 @@
 
 #[cfg(unix)]
 pub mod attach;
-#[cfg(windows)]
-#[path = "attach_windows.rs"]
-pub mod attach;
 mod attach_lock_state;
 pub mod auto_start;
 pub(crate) mod commands;
@@ -25,8 +22,6 @@ pub(crate) mod upgrade;
 
 #[cfg(unix)]
 pub use attach::attach_terminal_with_initial_bytes_and_resize_geometry;
-#[cfg(windows)]
-pub use attach::attach_terminal_with_initial_bytes_and_windows_console_key;
 pub use attach::{
     attach_terminal, attach_terminal_with_initial_bytes, attach_with_terminal, drive_attach_stream,
     AttachError, RawTerminal,
@@ -36,8 +31,6 @@ pub use auto_start::{
     ensure_server_running_with_config_outcome, AutoStartConfig, AutoStartConfigSelection,
     AutoStartError, EnsuredServerConnection, ServerConnectionProvenance, INTERNAL_DAEMON_FLAG,
 };
-#[cfg(windows)]
-pub use commands::server::connect_for_server_shutdown;
 pub use commands::server::StartServerError;
 pub use commands::window::SplitWindowOptions;
 pub use connection::{

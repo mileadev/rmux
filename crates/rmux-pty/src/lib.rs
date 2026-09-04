@@ -14,8 +14,6 @@ mod backend;
 mod child;
 mod pty;
 mod size;
-#[cfg(windows)]
-mod windows_console_input;
 
 #[cfg(any(test, all(not(unix), not(windows))))]
 pub(crate) mod unsupported_op {
@@ -57,12 +55,6 @@ pub use child::{ChildCommand, PtyChild, SpawnedPty};
 pub use pty::PtySlave;
 pub use pty::{PtyIo, PtyMaster, PtyPair};
 pub use size::{TerminalGeometry, TerminalPixels, TerminalSize};
-#[cfg(windows)]
-pub use windows_console_input::{
-    send_windows_console_interrupt, write_windows_console_key, write_windows_console_key_batch,
-    write_windows_console_key_reporting_processed_input, write_windows_console_mouse_drag,
-    write_windows_console_utf8, WindowsConsoleKeyEvent,
-};
 
 /// A crate-local result type for PTY operations.
 pub type Result<T> = std::result::Result<T, PtyError>;

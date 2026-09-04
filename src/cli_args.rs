@@ -101,9 +101,6 @@ pub(crate) use window::{
     RenameWindowArgs, ResizeWindowArgs, RespawnWindowArgs, RotateWindowArgs, SelectWindowArgs,
     SwapWindowArgs, UnlinkWindowArgs, WindowTargetArgs,
 };
-#[path = "cli_args/web.rs"]
-mod web;
-pub(crate) use web::{WebShareArgs, WebShareTerminalThemeArg, WEB_SHARE_TUNNEL_PROVIDERS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DocumentedCliAlias {
@@ -982,7 +979,6 @@ pub(crate) enum Command {
     SourceFile(SourceFileArgs),
     IfShell(IfShellArgs),
     WaitFor(WaitForArgs),
-    WebShare(WebShareArgs),
     DisplayMenu(DisplayMenuArgs),
     DisplayPopup(DisplayPopupArgs),
     ClearPromptHistory(PromptHistoryArgs),
@@ -997,12 +993,7 @@ pub(crate) struct UnsupportedCommandArgs {
 }
 
 #[derive(Debug, Clone, Default, Args)]
-pub(crate) struct StartServerArgs {
-    #[arg(long = "web-port", value_name = "port", value_parser = clap::value_parser!(u16).range(1..))]
-    pub(crate) web_port: Option<u16>,
-    #[arg(long = "frontend-url", alias = "web-frontend", value_name = "url")]
-    pub(crate) web_frontend: Option<String>,
-}
+pub(crate) struct StartServerArgs {}
 
 trait QueuedCommand {
     fn set_queue_command(&mut self, queue_command: String);

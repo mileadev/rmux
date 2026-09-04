@@ -176,10 +176,6 @@ pub const RMUX_EXTENSION_COMMANDS: &[CommandEntry] = &[
         alias: None,
     },
     CommandEntry {
-        name: "claude",
-        alias: None,
-    },
-    CommandEntry {
         name: "doctor",
         alias: None,
     },
@@ -225,10 +221,6 @@ pub const RMUX_EXTENSION_COMMANDS: &[CommandEntry] = &[
     },
     CommandEntry {
         name: "with-session",
-        alias: None,
-    },
-    CommandEntry {
-        name: "web-share",
         alias: None,
     },
 ];

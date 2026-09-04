@@ -16,10 +16,6 @@ mod buffer_commands;
 mod capabilities;
 #[path = "cli/capture_pane.rs"]
 mod capture_pane;
-#[path = "cli/claude_launcher.rs"]
-mod claude_launcher;
-#[path = "cli/claude_skill.rs"]
-mod claude_skill;
 #[path = "cli/client_commands.rs"]
 mod client_commands;
 #[path = "cli/command_inventory.rs"]
@@ -66,10 +62,6 @@ mod terminal_theme;
 mod tmux_dropin;
 #[path = "cli/top_level.rs"]
 mod top_level;
-#[path = "cli/web_commands.rs"]
-mod web_commands;
-#[path = "cli/web_share_display.rs"]
-mod web_share_display;
 #[path = "cli/window_commands.rs"]
 mod window_commands;
 
@@ -120,9 +112,8 @@ use target_resolution::{
 };
 use terminal_size::{build_terminal_size, current_terminal_size};
 use top_level::{
-    accept_compatibility_options, infer_client_utf8_from_env, scan_claude_top_level_invocation,
-    top_level_parse_failure, top_level_version_output, top_level_version_requested,
-    validate_claude_top_level_invocation, validate_top_level_invocation,
+    accept_compatibility_options, infer_client_utf8_from_env, top_level_parse_failure,
+    top_level_version_output, top_level_version_requested, validate_top_level_invocation,
 };
 
 const TMUX_COMPAT_OVERRIDE_ENV: &str = "RMUX_INTERNAL_INVOKED_AS_TMUX";
@@ -142,24 +133,11 @@ where
             top_level_version_output(invoked_as_tmux(&args)),
         ));
     }
-    let claude_invocation = scan_claude_top_level_invocation(args.get(1..).unwrap_or(&[]));
-    validate_claude_top_level_invocation(claude_invocation.as_ref())?;
-    if let Some(invocation) = claude_launcher::parse_internal_runner(args.get(1..).unwrap_or(&[])) {
-        return claude_launcher::run_internal_runner(invocation);
-    }
     if let Some(invocation) = diagnose::parse_invocation(args.get(1..).unwrap_or(&[]))? {
         return diagnose::run(invocation);
     }
     if let Some(invocation) = tmux_dropin::parse_invocation(args.get(1..).unwrap_or(&[]))? {
         return tmux_dropin::run(invocation, args.first());
-    }
-    if let Some(claude_invocation) = claude_invocation {
-        if let Some(invocation) = claude_skill::parse_invocation(claude_invocation.arguments())? {
-            return claude_skill::run(invocation);
-        }
-        return claude_launcher::run(claude_launcher::ClaudeInvocation::new(
-            claude_invocation.into_arguments(),
-        ));
     }
     if let Some(invocation) = capabilities::parse_invocation(args.get(1..).unwrap_or(&[]))? {
         return capabilities::run(invocation);

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 #[cfg(all(unix, target_os = "macos"))]
 use std::ffi::CStr;
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 use std::ffi::OsString;
 use std::io;
 #[cfg(unix)]
@@ -12,16 +12,11 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
-#[cfg(windows)]
-#[path = "process_windows.rs"]
-mod windows_process;
 #[cfg(target_os = "linux")]
 use linux_impl::{
     command_name_impl, current_path_impl, environment_impl, executable_path_impl, fd_path_impl,
     is_live_impl, raw_environment_impl,
 };
-#[cfg(windows)]
-pub use windows_process::ProcessJob;
 
 /// Inspect process metadata for the current platform.
 #[derive(Debug, Default, Clone, Copy)]
@@ -67,16 +62,11 @@ impl ProcessInspector {
     }
 
     /// Returns a process environment snapshot without UTF-8 conversion, when available.
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     pub fn raw_environment(&self, pid: u32) -> io::Result<Option<Vec<(OsString, OsString)>>> {
         raw_environment_impl(pid)
     }
 
-    /// Returns executable names for live descendants of `pid`, when available.
-    #[cfg(windows)]
-    pub fn descendant_command_names(&self, pid: u32) -> io::Result<Vec<String>> {
-        descendant_command_names_impl(pid)
-    }
 }
 
 /// Returns the parent process id for `pid`, when available.
