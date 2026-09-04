@@ -29,6 +29,7 @@ jobs:
           python3 security-hardening/scripts/semantic_cleanup_stage6.py .
           python3 security-hardening/scripts/semantic_cleanup_stage7.py .
           python3 security-hardening/scripts/semantic_cleanup_stage8.py .
+          python3 security-hardening/scripts/semantic_cleanup_stage9.py .
           python3 security-hardening/scripts/repair_false_positive_removals.py .
           python3 security-hardening/scripts/remove_missing_path_modules.py .
           python3 security-hardening/scripts/remove_missing_modules.py .
