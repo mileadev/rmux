@@ -1134,19 +1134,6 @@ fn fast_output_candidate(
 }
 
 impl PaneOutputReceiver {
-    pub(crate) async fn recv_observed(&mut self) -> PaneObservationItem {
-        loop {
-            let inner = Arc::clone(&self.inner);
-            let notified = inner.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if let Some(item) = self.try_recv_observed() {
-                return item;
-            }
-            notified.await;
-        }
-    }
-
     pub(crate) fn try_recv_observed(&mut self) -> Option<PaneObservationItem> {
         let state = self
             .inner

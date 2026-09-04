@@ -22,10 +22,8 @@ const RESET_RENDITION: &[u8] = b"\x1b[0m\x1b]8;;\x1b\\";
 const ROW_RESET: &[u8] = b"\x1b[0m\x1b]8;;\x1b\\";
 const LINE_BREAK: &[u8] = b"\r\n";
 
-/// A pane-scoped WebShare snapshot shares the two-MiB outbound budget with
-/// its opcode and sanitizer state. The sanitizer never expands its input, so
-/// 4 KiB leaves bounded framing headroom while retaining the largest common
-/// typed viewport.
+/// Recovery keyframes reserve 4 KiB of detached-frame headroom while
+/// retaining the largest common typed viewport.
 pub(crate) const MAX_RECOVERY_KEYFRAME_BYTES: usize = 2 * DEFAULT_MAX_FRAME_LENGTH - 4 * 1024;
 const MAX_RECOVERY_VIEWPORT_CELLS: usize = 128 * 1024;
 const MAX_RECOVERY_COLS: usize = 4096;
@@ -183,34 +181,6 @@ impl RenderedRow {
     }
 }
 
-/// How much scrolled-off scrollback a recovery keyframe is allowed to replay.
-///
-/// The keyframe always carries the pane's *visible* state (main viewport, plus
-/// the saved main viewport when the pane is on the alternate screen). Scrolled-
-/// off history is extra, and only some consumers are entitled to it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RecoveryHistoryPolicy {
-    /// Replay the newest scrollback that fits the keyframe budget. Used by the
-    /// owner-authenticated SDK raw pane streams, whose contract is the pane's
-    /// byte history and which report the achieved coverage to the caller.
-    RecentHistory,
-    /// Replay the visible state only. Used by the WebShare pane surface: that
-    /// link is a read-only *view* handed to third parties, pane scope has no
-    /// scrollback protocol at all (`PaneScroll` closes the socket with
-    /// `scroll_requires_session`), so rows that left the pane before the share
-    /// existed must never reach a viewer's browser.
-    VisibleOnly,
-}
-
-impl RecoveryHistoryPolicy {
-    fn history_budget(self, keyframe_headroom: usize) -> usize {
-        match self {
-            Self::RecentHistory => keyframe_headroom,
-            Self::VisibleOnly => 0,
-        }
-    }
-}
-
 impl PaneRecoveryDraft {
     pub(crate) fn capture(transcript: &PaneTranscript) -> Result<Self, RmuxError> {
         let source = transcript.screen();
@@ -251,21 +221,6 @@ impl PaneRecoveryDraft {
     }
 
     pub(crate) fn materialize(self) -> Result<PaneRecoverySeed, RmuxError> {
-        self.materialize_with_history(RecoveryHistoryPolicy::RecentHistory)
-    }
-
-    /// Materialize a keyframe that replays the pane's visible state only.
-    ///
-    /// This is the WebShare pane-surface entry point: it must stay the only
-    /// materializer reachable from a shared link.
-    pub(crate) fn materialize_visible_only(self) -> Result<PaneRecoverySeed, RmuxError> {
-        self.materialize_with_history(RecoveryHistoryPolicy::VisibleOnly)
-    }
-
-    fn materialize_with_history(
-        self,
-        history_policy: RecoveryHistoryPolicy,
-    ) -> Result<PaneRecoverySeed, RmuxError> {
         let keyframe = {
             let renderer = self.projection.recovery_row_renderer(
                 MAX_RECOVERY_HYPERLINK_ENTRY_BYTES,
@@ -281,7 +236,6 @@ impl PaneRecoveryDraft {
                 &self.parser_state,
                 self.history_size,
                 self.metadata_complete && renderer.metadata_complete(),
-                history_policy,
             );
             match rendered {
                 Err(RmuxError::FrameTooLarge { .. }) => {
@@ -296,7 +250,6 @@ impl PaneRecoveryDraft {
                         &self.parser_state,
                         self.history_size,
                         false,
-                        history_policy,
                     )
                 }
                 result => result,
@@ -350,9 +303,6 @@ impl PaneRecoverySeed {
         self.projection.history_bytes()
     }
 
-    pub(crate) const fn alternate(&self) -> bool {
-        self.projection.alternate()
-    }
 
     pub(crate) fn keyframe(&self) -> PaneRecoveryKeyframe {
         self.keyframe.clone()
@@ -421,7 +371,6 @@ fn materialize_keyframe(
     parser_state: &[u8],
     history_rows_total: usize,
     metadata_complete: bool,
-    history_policy: RecoveryHistoryPolicy,
 ) -> Result<PaneRecoveryKeyframe, RmuxError> {
     let mut metadata_complete = metadata_complete;
     let size = source.size();
@@ -503,10 +452,8 @@ fn materialize_keyframe(
         });
     }
 
-    // Both fixes land here. The share-viewer policy bounds how much history a
-    // spectator may receive; the wrap fix needs `cols` and links the boundary
-    // row pair so a soft-wrapped row is not glued onto the next one.
-    let history_budget = history_policy.history_budget(MAX_RECOVERY_KEYFRAME_BYTES - mandatory_len);
+    // Preserve as much recent local history as fits while retaining keyframe headroom.
+    let history_budget = MAX_RECOVERY_KEYFRAME_BYTES - mandatory_len;
     let mut history = recent_history_suffix(renderer, recovery_history_rows, history_budget, cols)?;
     let first_repainted = saved_visible
         .as_mut()

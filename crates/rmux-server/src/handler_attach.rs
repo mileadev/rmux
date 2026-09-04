@@ -1262,7 +1262,6 @@ pub(super) fn attach_target_for_session(
             selection: None,
             window_size_override: None,
             master: AttachTargetMaster::Clone,
-            bounded_recovery: false,
             socket_path,
         },
     )
@@ -1334,7 +1333,6 @@ pub(super) fn attach_target_for_session_switch(
             selection,
             window_size_override,
             master,
-            bounded_recovery: render_stream,
             socket_path,
         },
     )
@@ -1361,7 +1359,6 @@ pub(super) fn attach_render_target_for_session_with_prompt(
             selection: None,
             window_size_override: None,
             master: AttachTargetMaster::Omit,
-            bounded_recovery: false,
             socket_path: request.socket_path,
         },
     )
@@ -1505,7 +1502,6 @@ struct AttachTargetRenderOptions<'a> {
     selection: Option<&'a SwitchTargetSelection>,
     window_size_override: Option<AttachWindowSizeOverride>,
     master: AttachTargetMaster,
-    bounded_recovery: bool,
     socket_path: &'a Path,
 }
 

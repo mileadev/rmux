@@ -511,24 +511,6 @@ impl HandlerState {
             .copy_mode_render_snapshot()
     }
 
-    pub(crate) fn with_pane_screen<R>(
-        &self,
-        session_name: &SessionName,
-        pane_id: PaneId,
-        render: impl FnOnce(&Screen) -> R,
-    ) -> Option<R> {
-        let window_index = self
-            .sessions
-            .session(session_name)?
-            .window_index_for_pane_id(pane_id)?;
-        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
-        let transcript = self.transcripts.get(&runtime_session_name)?.get(&pane_id)?;
-        let transcript = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned");
-        Some(render(transcript.screen()))
-    }
-
     pub(crate) fn pane_screen(
         &self,
         session_name: &SessionName,

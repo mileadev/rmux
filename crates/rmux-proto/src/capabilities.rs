@@ -16,8 +16,6 @@ pub const CAPABILITY_ATTACH_STREAM: &str = "stream.attach";
 pub const CAPABILITY_ATTACH_RESIZE_GEOMETRY: &str = "stream.attach.resize_geometry";
 /// Stable feature id for coalescible attach-stream render messages.
 pub const CAPABILITY_ATTACH_RENDER: &str = "stream.attach.render";
-/// Stable feature id for attach-stream Windows console key messages.
-pub const CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY: &str = "stream.attach.windows_console_key";
 /// Stable feature id for control-mode framed-to-raw stream upgrades.
 pub const CAPABILITY_CONTROL_STREAM: &str = "stream.control";
 /// Stable feature id for daemon shutdown over detached RPC.
@@ -74,7 +72,6 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     CAPABILITY_ATTACH_STREAM,
     CAPABILITY_ATTACH_RESIZE_GEOMETRY,
     CAPABILITY_ATTACH_RENDER,
-    CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY,
     CAPABILITY_CONTROL_STREAM,
     CAPABILITY_DAEMON_SHUTDOWN,
     CAPABILITY_DAEMON_STATUS,
@@ -205,8 +202,8 @@ impl HandshakeResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        capabilities_for_features, HandshakeRequest, HandshakeResponse, CAPABILITY_ATTACH_RENDER,
-        CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY, CAPABILITY_CLI_CAPTURE_TARGET_ACTION,
+        HandshakeRequest, HandshakeResponse, CAPABILITY_ATTACH_RENDER,
+CAPABILITY_CLI_CAPTURE_TARGET_ACTION,
         CAPABILITY_CLI_LIST_WINDOWS_ALL_QUEUE, CAPABILITY_CLI_TARGET_ACTIONS, CAPABILITY_HANDSHAKE,
         CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY, CAPABILITY_SDK_PANE_RAW_RECOVERY,
         CAPABILITY_SDK_PANE_SPLIT_IDENTITY, CAPABILITY_SDK_PANE_SURFACE_STREAM,
@@ -223,10 +220,6 @@ mod tests {
             .capabilities
             .iter()
             .any(|capability| capability == CAPABILITY_ATTACH_RENDER));
-        assert!(response
-            .capabilities
-            .iter()
-            .any(|capability| capability == CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY));
     }
 
     #[test]

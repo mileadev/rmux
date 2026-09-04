@@ -174,6 +174,7 @@ impl RequestHandler {
         .map(ActiveAttachIdentity::attach_id)
     }
 
+    #[cfg(test)]
     pub(crate) async fn register_attach_identity_with_access(
         &self,
         requester_pid: u32,

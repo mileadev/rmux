@@ -412,10 +412,6 @@ impl RequestHandler {
                                             std::slice::from_ref(&layout_target),
                                         )
                                     };
-                                    for (destroyed_session, session_id) in
-                                        &result.destroyed_sessions
-                                    {
-                                    }
                                     let mut affected_sessions = result.affected_sessions;
                                     state.expand_with_active_window_linked_session_families(
                                         &mut affected_sessions,
