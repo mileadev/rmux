@@ -3,10 +3,7 @@ use super::{
     encode_data_like_message, AttachFrameDecoder, AttachMessage, AttachShellCommand,
     AttachedKeystroke, KeyDispatched, KEYSTROKE_TAG,
 };
-use crate::{
-    RmuxError, TerminalGeometry, TerminalPixels, TerminalSize,
-    DEFAULT_MAX_FRAME_LENGTH,
-};
+use crate::{RmuxError, TerminalGeometry, TerminalPixels, TerminalSize, DEFAULT_MAX_FRAME_LENGTH};
 
 #[test]
 fn data_messages_round_trip() {
@@ -202,7 +199,6 @@ fn legacy_keystroke_payload_decodes_under_current_codec() {
         Some(AttachMessage::Keystroke(AttachedKeystroke::new(bytes)))
     );
 }
-
 
 #[test]
 fn key_dispatched_messages_round_trip() {

@@ -36,16 +36,12 @@ impl AttachedKeystroke {
         Self { bytes }
     }
 
-
     /// Returns the terminal byte sequence carried by this typed keystroke.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
-
 }
-
-
 
 /// Structured acknowledgement returned after the server receives a typed keystroke.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
