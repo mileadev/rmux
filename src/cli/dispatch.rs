@@ -847,7 +847,6 @@ pub(super) fn command_has_start_server_flag(command: &Command) -> bool {
     }
 }
 
-
 fn unsupported_argument_suffix(arguments: &[String]) -> String {
     if arguments.is_empty() {
         String::new()

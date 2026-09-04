@@ -306,7 +306,6 @@ fn run_hidden_daemon(args: InternalDaemonArgs) -> io::Result<()> {
     })
 }
 
-
 #[cfg(all(test, any(not(feature = "tiny-cli"), debug_assertions)))]
 mod tests {
     use super::{

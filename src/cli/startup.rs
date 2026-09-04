@@ -225,7 +225,6 @@ fn startup_config_from_selection(
     config
 }
 
-
 fn apply_server_startup_config(
     config: DaemonConfig,
     startup: &ServerStartupConfig,
@@ -239,7 +238,6 @@ fn apply_server_startup_config(
         }
     }
 }
-
 
 pub(super) fn run_foreground_server(
     socket_path: &Path,
