@@ -29,14 +29,6 @@ fn start_server_rejects_extra_arguments() {
     assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
 }
 
-
-
-
-
-
-
-
-
 #[test]
 fn kill_server_parses_without_arguments() {
     let cli = parse_args(&["kill-server"]).unwrap();

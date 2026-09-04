@@ -609,5 +609,4 @@ mod tests {
             Err(ListCommandsError::Unknown("wait-p".to_owned()))
         );
     }
-
 }

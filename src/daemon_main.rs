@@ -211,4 +211,3 @@ fn run_hidden_daemon(args: DaemonArgs) -> io::Result<()> {
 fn is_internal_flag_token(value: &std::ffi::OsStr) -> bool {
     value.to_str().is_some_and(|value| value.starts_with("--"))
 }
-

@@ -649,7 +649,6 @@ mod tests {
         assert!(top_level_parse_failure(&args(&["-Lhas-h", "list-sessions"])).is_none());
     }
 
-
     #[test]
     fn command_too_long_parse_errors_probe_for_absent_server_first() {
         let error = clap::Error::raw(clap::error::ErrorKind::ValueValidation, "command too long");
