@@ -2,7 +2,6 @@
 
 use std::error::Error;
 
-
 use common::{send_request, session_name, start_server, TestHarness};
 use rmux_proto::{
     NewSessionRequest, OptionName, Request, Response, RmuxError, ScopeSelector,

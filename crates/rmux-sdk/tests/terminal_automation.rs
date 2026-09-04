@@ -1,6 +1,5 @@
 #![cfg(unix)]
 
-
 use std::error::Error;
 use std::future::Future;
 use std::path::{Path, PathBuf};

@@ -1,6 +1,5 @@
 #![cfg(unix)]
 
-
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};

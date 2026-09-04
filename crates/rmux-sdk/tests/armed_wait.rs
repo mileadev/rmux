@@ -1,6 +1,5 @@
 #![cfg(unix)]
 
-
 use std::error::Error;
 use std::fmt::{Debug, Write as _};
 use std::io;

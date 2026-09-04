@@ -5,7 +5,6 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-
 use common::{session_name, start_server, ClientConnection, TestHarness, PTY_TEST_LOCK};
 use rmux_proto::{
     KillWindowRequest, LastWindowRequest, ListPanesRequest, ListWindowsRequest, MoveWindowRequest,

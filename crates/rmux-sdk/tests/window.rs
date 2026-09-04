@@ -1,6 +1,5 @@
 #![cfg(unix)]
 
-
 use std::error::Error;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};

@@ -107,7 +107,6 @@ pub use buffer::{
     ShowBufferRequest,
 };
 
-
 /// All detached public command and internal RPC requests supported by the wire
 /// protocol.
 #[non_exhaustive]

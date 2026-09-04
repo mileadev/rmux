@@ -1,6 +1,5 @@
 #![cfg(unix)]
 
-
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fs;

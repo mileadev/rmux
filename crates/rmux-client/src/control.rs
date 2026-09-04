@@ -522,4 +522,3 @@ mod tests {
         assert_eq!(String::from_utf8(output).expect("utf8"), "%exit\n");
     }
 }
-

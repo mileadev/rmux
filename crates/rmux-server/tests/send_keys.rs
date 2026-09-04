@@ -6,7 +6,6 @@ use std::io;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-
 use common::{session_name, start_server, ClientConnection, TestHarness, PTY_TEST_LOCK};
 use rmux_proto::{
     AttachMessage, AttachSessionRequest, CapturePaneRequest, DisplayMessageRequest,

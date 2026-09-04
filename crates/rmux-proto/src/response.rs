@@ -74,7 +74,6 @@ pub use options::{
     ShowEnvironmentResponse, ShowHooksResponse, ShowOptionsResponse,
 };
 
-
 /// All detached responses supported by the wire protocol.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

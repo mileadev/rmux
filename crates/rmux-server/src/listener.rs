@@ -2236,7 +2236,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 #[path = "listener_connection_test_support.rs"]
 mod connection_test_support;

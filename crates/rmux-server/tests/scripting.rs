@@ -1,6 +1,5 @@
 #![cfg(unix)]
 
-
 use std::error::Error;
 
 use common::{send_request, start_server, TestHarness};

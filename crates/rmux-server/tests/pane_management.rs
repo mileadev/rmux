@@ -4,7 +4,6 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-
 use common::{
     session_name, start_server, tty_size, wait_for_socket_removal, ClientConnection, TestHarness,
     PTY_TEST_LOCK,

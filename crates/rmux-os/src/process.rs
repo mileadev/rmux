@@ -66,7 +66,6 @@ impl ProcessInspector {
     pub fn raw_environment(&self, pid: u32) -> io::Result<Option<Vec<(OsString, OsString)>>> {
         raw_environment_impl(pid)
     }
-
 }
 
 /// Returns the parent process id for `pid`, when available.

@@ -415,7 +415,6 @@ mod parsed_queue_targets;
 #[path = "handler_scripting_tests/parsed_queue_swap_window.rs"]
 mod parsed_queue_swap_window;
 
-
 #[path = "handler_scripting_tests/parsed_queue_move_window_current.rs"]
 mod parsed_queue_move_window_current;
 
@@ -433,7 +432,6 @@ mod prompt_mouse_origin;
 
 #[path = "handler_scripting_tests/control_hooks_wait.rs"]
 mod control_hooks_wait;
-
 
 #[path = "handler_scripting_tests/command_alias.rs"]
 mod command_alias;

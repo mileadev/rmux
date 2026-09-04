@@ -580,4 +580,3 @@ fn status_job_stdout(stdout: Vec<u8>) -> String {
 #[cfg(test)]
 #[path = "status_jobs/tests.rs"]
 mod tests;
-

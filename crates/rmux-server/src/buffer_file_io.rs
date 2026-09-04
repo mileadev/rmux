@@ -1,7 +1,6 @@
 use std::io;
 use std::path::PathBuf;
 
-
 #[cfg(unix)]
 #[path = "buffer_file_io/unix.rs"]
 mod platform;
@@ -22,4 +21,3 @@ pub(crate) async fn read(path: PathBuf) -> io::Result<Vec<u8>> {
 pub(crate) async fn write(path: PathBuf, content: Vec<u8>, append: bool) -> io::Result<()> {
     platform::write(path, content, append).await
 }
-

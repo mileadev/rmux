@@ -6,7 +6,6 @@
 //! This binary owns only the internal daemon re-exec contract so long-lived
 //! server processes do not map the full CLI/help/completion surface.
 
-
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, Write};
