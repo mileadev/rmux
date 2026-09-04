@@ -114,9 +114,7 @@ impl PlainKeyDispatchSnapshot {
 }
 
 impl AttachedLiveInputWork {
-    fn new(
-        bytes: Arc<[u8]>,
-        ) -> Self {
+    fn new(bytes: Arc<[u8]>) -> Self {
         let end = bytes.len();
         Self {
             bytes,
@@ -155,7 +153,6 @@ fn take_attached_remaining_input(pending_input: &mut Vec<u8>, consumed: usize) -
 }
 
 impl RequestHandler {
-
     pub(crate) async fn handle_attached_keystroke_input_with_active_cache_for_identity(
         &self,
         identity: ActiveAttachIdentity,
@@ -289,7 +286,10 @@ impl RequestHandler {
         active_emit_cache: &mut ActiveClientEmitCache,
     ) -> io::Result<bool> {
         self.handle_attached_live_input_inner_cached_impl(
-            identity, pending_input, bytes, active_emit_cache,
+            identity,
+            pending_input,
+            bytes,
+            active_emit_cache,
         )
         .await
     }
@@ -299,19 +299,14 @@ impl RequestHandler {
         identity: ActiveAttachIdentity,
         pending_input: &mut Vec<u8>,
         bytes: &[u8],
-            active_emit_cache: &mut ActiveClientEmitCache,
+        active_emit_cache: &mut ActiveClientEmitCache,
     ) -> io::Result<bool> {
         if !bytes.is_empty() {
             self.record_attached_input_activity(identity).await?;
         }
         if bytes.len() <= ATTACHED_LIVE_REROUTE_CHUNK_BYTES {
             return match self
-                .handle_attached_live_input_chunk(
-                    identity,
-                    pending_input,
-                    bytes,
-                            active_emit_cache,
-                )
+                .handle_attached_live_input_chunk(identity, pending_input, bytes, active_emit_cache)
                 .await?
             {
                 AttachedLiveChunkResult::Complete(forwarded) => Ok(forwarded),
@@ -332,16 +327,16 @@ impl RequestHandler {
         // including submitted-line tracking. Inputs that contain a prefix or
         // terminal control fall back to bounded reroute chunks below.
         if let Some(forwarded) = self
-                .try_forward_plain_attached_bytes_fast(
-                    identity,
-                    pending_input,
-                    bytes,
-                    active_emit_cache,
-                )
-                .await?
-            {
-                return Ok(forwarded);
-            }
+            .try_forward_plain_attached_bytes_fast(
+                identity,
+                pending_input,
+                bytes,
+                active_emit_cache,
+            )
+            .await?
+        {
+            return Ok(forwarded);
+        }
 
         self.handle_attached_live_input_work_queue(
             identity,
@@ -435,7 +430,7 @@ impl RequestHandler {
                     identity,
                     pending_input,
                     work.as_bytes(),
-                            active_emit_cache,
+                    active_emit_cache,
                 )
                 .await?
             {
@@ -506,7 +501,7 @@ impl RequestHandler {
         identity: ActiveAttachIdentity,
         pending_input: &mut Vec<u8>,
         bytes: &[u8],
-            active_emit_cache: &mut ActiveClientEmitCache,
+        active_emit_cache: &mut ActiveClientEmitCache,
     ) -> io::Result<AttachedLiveInputStep> {
         let initial_transient_prefix = self
             .take_transient_terminal_prefix_for_identity(identity)
@@ -515,16 +510,16 @@ impl RequestHandler {
         pending_input.extend(initial_transient_prefix);
         let mut forwarded_to_pane = false;
         if let Some(forwarded) = self
-                .try_forward_plain_attached_bytes_fast(
-                    identity,
-                    pending_input,
-                    bytes,
-                    active_emit_cache,
-                )
-                .await?
-            {
-                return Ok(AttachedLiveInputStep::Complete(forwarded));
-            }
+            .try_forward_plain_attached_bytes_fast(
+                identity,
+                pending_input,
+                bytes,
+                active_emit_cache,
+            )
+            .await?
+        {
+            return Ok(AttachedLiveInputStep::Complete(forwarded));
+        }
         if self
             .attached_client_input_is_read_only_for_identity(identity)
             .await?
@@ -748,8 +743,6 @@ impl RequestHandler {
         let target_mode = self.target_pane_mode(&target).await.map_err(io_other)?;
         let target_focus_events = target_mode & mode::MODE_FOCUSON != 0;
         let backspace = self.attached_backspace_byte().await;
-
-
 
         if pending_input.is_empty()
             && !self.attached_key_table_active(identity).await
@@ -1972,15 +1965,10 @@ mod live_key_decode_tests {
     }
 }
 
-
-
-
-
 #[cfg(windows)]
 fn key_matches_name(key: rmux_core::KeyCode, name: &str) -> bool {
     windows_key_code_named(name).is_some_and(|expected| expected == key)
 }
-
 
 #[cfg(all(test, windows))]
 mod windows_console_binding_tests {
