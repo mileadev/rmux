@@ -31,13 +31,6 @@ signal-hook = "0.3.18"
 # every other target.
 tokio = { version = "1.48.0", features = ["net", "time"] }
 
-[target.'cfg(windows)'.dependencies]
-# Windows startup race serializes hidden-daemon launch behind a per-user named
-# mutex. The SDK keeps `forbid(unsafe_code)`; FFI lives in `rmux-ipc` and the
-# windows-sys constants imported here are pure data values.
-tokio = { version = "1.48.0", features = ["signal", "time"] }
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation"] }
-
 [dev-dependencies]
 bincode = "1.3.3"
 crossterm = { version = "0.29.0", default-features = false, features = [
@@ -47,7 +40,6 @@ crossterm = { version = "0.29.0", default-features = false, features = [
 tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
 
 [features]
-default = ["web"]
+default = []
 crossterm = ["dep:crossterm"]
 regex = ["dep:regex"]
-web = []

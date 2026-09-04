@@ -12,7 +12,6 @@ members = [
     "crates/rmux-sdk",
     "crates/rmux-render-core",
     "crates/ratatui-rmux",
-    "crates/rmux-web-crypto",
     "xtask",
 ]
 resolver = "2"
@@ -49,12 +48,6 @@ strip = "symbols"
 [profile.release.package.rmux-types]
 opt-level = "s"
 
-[profile.release.package.rmux-web-crypto]
-# `lto` is inherited from `[profile.release]`; Cargo does not allow it here.
-codegen-units = 1
-opt-level = 3
-strip = false
-
 [workspace.package]
 version = "0.10.0"
 edition = "2021"
@@ -80,8 +73,6 @@ include = [
     "/LICENSE-MIT",
     "/README.md",
     "/build.rs",
-    "/resources/windows/rmux.exe.manifest",
-    "/resources/claude/skills/rmux/SKILL.md",
     "/docs/man/rmux.1",
     "/src/**",
     "/tests/**",
@@ -92,7 +83,6 @@ include = [
 chrono = { version = "0.4.42", default-features = false, features = ["std"] }
 clap = { version = "=4.5.39", features = ["derive"] }
 libc = "0.2"
-qrcode = { version = "0.14", default-features = false }
 ratatui = { version = "=0.29.0", default-features = false }
 rmux-client = { path = "crates/rmux-client", version = "0.10.0" }
 rmux-core = { path = "crates/rmux-core", version = "0.10.0" }
@@ -105,11 +95,9 @@ serde_json = "1.0"
 tokio = { version = "1.48.0", features = ["net", "rt", "rt-multi-thread", "time"] }
 
 [features]
-default = ["web"]
+default = []
 perf-instrument = ["rmux-server/perf-instrument"]
 tiny-cli = []
-web = ["rmux-server/web"]
-
 [dev-dependencies]
 libc = "0.2"
 rmux-core = { path = "crates/rmux-core", version = "0.10.0" }
@@ -117,12 +105,6 @@ rmux-pty = { path = "crates/rmux-pty", version = "0.10.0" }
 rmux-proto = { path = "crates/rmux-proto", version = "0.10.0" }
 rmux-sdk = { path = "crates/rmux-sdk", version = "0.10.0" }
 rustix = { version = "1.1.4", features = ["event", "termios"] }
-
-[build-dependencies]
-embed-manifest = "=1.4.0"
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Pipes"] }
 
 [[bin]]
 name = "rmux"
