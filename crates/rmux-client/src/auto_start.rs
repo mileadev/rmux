@@ -1062,7 +1062,7 @@ fn hidden_daemon_binary_path_for_executable_paths(
 
 fn hidden_daemon_binary_path_for_config(
     current_exe: &Path,
-    config: &AutoStartConfig,
+    _config: &AutoStartConfig,
 ) -> Option<PathBuf> {
     let file_stem = current_exe.file_stem()?.to_str()?;
     if file_stem == "rmux-daemon" {
