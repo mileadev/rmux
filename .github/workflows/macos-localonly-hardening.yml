@@ -20,6 +20,7 @@ jobs:
             python3 security-hardening/scripts/apply_structural_reduction.py .
           fi
           python3 security-hardening/scripts/semantic_cleanup.py .
+          python3 security-hardening/scripts/semantic_cleanup_stage3.py .
           if ! git diff --quiet || ! git diff --cached --quiet; then
             git config user.name 'rmux-hardening-bot'
             git config user.email 'rmux-hardening-bot@users.noreply.github.com'
