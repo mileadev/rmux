@@ -1,10 +1,10 @@
 use super::{
     decode_attach_data_frame, encode_attach_data_into_slice, encode_attach_message,
     encode_data_like_message, AttachFrameDecoder, AttachMessage, AttachShellCommand,
-    AttachedKeystroke, KeyDispatched, KEYSTROKE_TAG, WINDOWS_CONSOLE_KEYSTROKE_TAG,
+    AttachedKeystroke, KeyDispatched, KEYSTROKE_TAG,
 };
 use crate::{
-    AttachedWindowsConsoleKey, RmuxError, TerminalGeometry, TerminalPixels, TerminalSize,
+    RmuxError, TerminalGeometry, TerminalPixels, TerminalSize,
     DEFAULT_MAX_FRAME_LENGTH,
 };
 
@@ -203,21 +203,6 @@ fn legacy_keystroke_payload_decodes_under_current_codec() {
     );
 }
 
-#[test]
-fn keystroke_messages_preserve_windows_console_key() {
-    let key = AttachedWindowsConsoleKey::new(0x44, 0x20, 0x04, 0x0008, 1);
-    let message =
-        AttachMessage::Keystroke(AttachedKeystroke::new(vec![0x04]).with_windows_console_key(key));
-    let encoded = encode_attach_message(&message).expect("encode attach keystroke");
-    let mut decoder = AttachFrameDecoder::new();
-    decoder.push_bytes(&encoded);
-
-    assert_eq!(encoded[0], WINDOWS_CONSOLE_KEYSTROKE_TAG);
-    assert_eq!(
-        decoder.next_message().expect("decode attach keystroke"),
-        Some(message)
-    );
-}
 
 #[test]
 fn key_dispatched_messages_round_trip() {
@@ -251,8 +236,8 @@ fn lock_messages_round_trip() {
 fn lock_shell_command_messages_round_trip() {
     let message = AttachMessage::LockShellCommand(AttachShellCommand::new(
         "lock-command".to_owned(),
-        "pwsh.exe".to_owned(),
-        "C:\\work".to_owned(),
+        "/bin/sh".to_owned(),
+        "/tmp".to_owned(),
     ));
     let encoded = encode_attach_message(&message).expect("encode attach lock shell command");
     let mut decoder = AttachFrameDecoder::new();
@@ -341,8 +326,8 @@ fn detach_exec_messages_round_trip() {
 fn detach_exec_shell_command_messages_round_trip() {
     let message = AttachMessage::DetachExecShellCommand(AttachShellCommand::new(
         "echo detached".to_owned(),
-        "C:\\Program Files\\PowerShell\\7\\pwsh.exe".to_owned(),
-        "C:\\repo".to_owned(),
+        "/bin/sh".to_owned(),
+        "/tmp".to_owned(),
     ));
     let encoded = encode_attach_message(&message).expect("encode attach detach-exec shell command");
     let mut decoder = AttachFrameDecoder::new();

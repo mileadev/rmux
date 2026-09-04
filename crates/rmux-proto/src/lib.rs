@@ -18,13 +18,13 @@ pub mod types;
 pub use attach::{
     decode_attach_data_frame, decode_attach_data_frame_with_limit, encode_attach_data,
     encode_attach_data_into_slice, encode_attach_message, AttachDataFrame, AttachFrameDecoder,
-    AttachMessage, AttachShellCommand, AttachedKeystroke, AttachedWindowsConsoleKey, KeyDispatched,
+    AttachMessage, AttachShellCommand, AttachedKeystroke, KeyDispatched,
     ATTACH_DATA_HEADER_LEN,
 };
 pub use capabilities::{
     capabilities_for_features, HandshakeRequest, HandshakeResponse, CAPABILITY_ATTACH_RENDER,
     CAPABILITY_ATTACH_RESIZE_GEOMETRY, CAPABILITY_ATTACH_STREAM,
-    CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY, CAPABILITY_CLI_CAPTURE_TARGET_ACTION,
+CAPABILITY_CLI_CAPTURE_TARGET_ACTION,
     CAPABILITY_CLI_LIST_WINDOWS_ALL_QUEUE, CAPABILITY_CLI_RUNTIME_COMMAND_EXPANSION,
     CAPABILITY_CLI_TARGET_ACTIONS, CAPABILITY_CONTROL_STREAM, CAPABILITY_DAEMON_SHUTDOWN,
     CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE, CAPABILITY_DAEMON_STATUS, CAPABILITY_DETACHED_RPC,
