@@ -4,11 +4,7 @@ use std::io;
 use std::sync::{atomic::Ordering, Arc};
 
 use rmux_core::{input::mode, key_code_lookup_bits, KeyCode, LifecycleEvent, KEYC_ANY};
-#[cfg(windows)]
-use rmux_core::{key_string_lookup_string, KEYC_CTRL, KEYC_IMPLIED_META, KEYC_META, KEYC_SHIFT};
 use rmux_proto::{AttachedKeystroke, PaneTarget, WindowTarget};
-#[cfg(windows)]
-use rmux_pty::WindowsConsoleKeyEvent;
 
 use super::super::super::RequestHandler;
 use super::super::decode_prompt_input_event;
@@ -73,7 +69,6 @@ struct AttachedLiveInputWork {
     bytes: Arc<[u8]>,
     start: usize,
     end: usize,
-    windows_console_key: Option<rmux_proto::AttachedWindowsConsoleKey>,
 }
 
 struct PlainKeyDispatchSnapshot {
@@ -121,14 +116,12 @@ impl PlainKeyDispatchSnapshot {
 impl AttachedLiveInputWork {
     fn new(
         bytes: Arc<[u8]>,
-        windows_console_key: Option<rmux_proto::AttachedWindowsConsoleKey>,
-    ) -> Self {
+        ) -> Self {
         let end = bytes.len();
         Self {
             bytes,
             start: 0,
             end,
-            windows_console_key,
         }
     }
 
@@ -142,7 +135,6 @@ impl AttachedLiveInputWork {
             bytes: Arc::clone(&self.bytes),
             start: split,
             end: self.end,
-            windows_console_key: None,
         };
         self.end = split;
         remaining
@@ -163,38 +155,6 @@ fn take_attached_remaining_input(pending_input: &mut Vec<u8>, consumed: usize) -
 }
 
 impl RequestHandler {
-    #[cfg(all(test, windows))]
-    pub(crate) async fn handle_attached_keystroke_input(
-        &self,
-        attach_pid: u32,
-        pending_input: &mut Vec<u8>,
-        keystroke: &AttachedKeystroke,
-    ) -> io::Result<bool> {
-        let identity = self
-            .active_attach_identity(attach_pid)
-            .await
-            .ok_or_else(|| io_other("attached client disappeared"))?;
-        self.handle_attached_keystroke_input_for_identity(identity, pending_input, keystroke)
-            .await
-    }
-
-    #[cfg(all(test, windows))]
-    pub(crate) async fn handle_attached_keystroke_input_for_identity(
-        &self,
-        identity: ActiveAttachIdentity,
-        pending_input: &mut Vec<u8>,
-        keystroke: &AttachedKeystroke,
-    ) -> io::Result<bool> {
-        let mut active_emit_cache = None;
-        self.handle_attached_live_input_inner_with_windows_console_key(
-            identity,
-            pending_input,
-            keystroke.bytes(),
-            keystroke.windows_console_key(),
-            &mut active_emit_cache,
-        )
-        .await
-    }
 
     pub(crate) async fn handle_attached_keystroke_input_with_active_cache_for_identity(
         &self,
@@ -203,11 +163,10 @@ impl RequestHandler {
         keystroke: &AttachedKeystroke,
         active_emit_cache: &mut ActiveClientEmitCache,
     ) -> io::Result<bool> {
-        self.handle_attached_live_input_inner_with_windows_console_key(
+        self.handle_attached_live_input_inner_cached(
             identity,
             pending_input,
             keystroke.bytes(),
-            keystroke.windows_console_key(),
             active_emit_cache,
         )
         .await
@@ -329,23 +288,18 @@ impl RequestHandler {
         bytes: &[u8],
         active_emit_cache: &mut ActiveClientEmitCache,
     ) -> io::Result<bool> {
-        self.handle_attached_live_input_inner_with_windows_console_key(
-            identity,
-            pending_input,
-            bytes,
-            None,
-            active_emit_cache,
+        self.handle_attached_live_input_inner_cached_impl(
+            identity, pending_input, bytes, active_emit_cache,
         )
         .await
     }
 
-    async fn handle_attached_live_input_inner_with_windows_console_key(
+    async fn handle_attached_live_input_inner_cached_impl(
         &self,
         identity: ActiveAttachIdentity,
         pending_input: &mut Vec<u8>,
         bytes: &[u8],
-        windows_console_key: Option<rmux_proto::AttachedWindowsConsoleKey>,
-        active_emit_cache: &mut ActiveClientEmitCache,
+            active_emit_cache: &mut ActiveClientEmitCache,
     ) -> io::Result<bool> {
         if !bytes.is_empty() {
             self.record_attached_input_activity(identity).await?;
@@ -356,8 +310,7 @@ impl RequestHandler {
                     identity,
                     pending_input,
                     bytes,
-                    windows_console_key,
-                    active_emit_cache,
+                            active_emit_cache,
                 )
                 .await?
             {
@@ -366,7 +319,7 @@ impl RequestHandler {
                     self.handle_attached_live_input_work_queue(
                         identity,
                         pending_input,
-                        AttachedLiveInputWork::new(Arc::from(bytes), None),
+                        AttachedLiveInputWork::new(Arc::from(bytes)),
                         forwarded,
                         active_emit_cache,
                     )
@@ -378,8 +331,7 @@ impl RequestHandler {
         // Preserve one-shot fast-path semantics for a large printable line,
         // including submitted-line tracking. Inputs that contain a prefix or
         // terminal control fall back to bounded reroute chunks below.
-        if windows_console_key.is_none() {
-            if let Some(forwarded) = self
+        if let Some(forwarded) = self
                 .try_forward_plain_attached_bytes_fast(
                     identity,
                     pending_input,
@@ -390,12 +342,11 @@ impl RequestHandler {
             {
                 return Ok(forwarded);
             }
-        }
 
         self.handle_attached_live_input_work_queue(
             identity,
             pending_input,
-            AttachedLiveInputWork::new(Arc::from(bytes), windows_console_key),
+            AttachedLiveInputWork::new(Arc::from(bytes)),
             false,
             active_emit_cache,
         )
@@ -479,14 +430,12 @@ impl RequestHandler {
                 work_queue.push_front(remaining);
             }
 
-            let windows_console_key = work.windows_console_key.take();
             match self
                 .handle_attached_live_input_chunk(
                     identity,
                     pending_input,
                     work.as_bytes(),
-                    windows_console_key,
-                    active_emit_cache,
+                            active_emit_cache,
                 )
                 .await?
             {
@@ -498,7 +447,7 @@ impl RequestHandler {
                     forwarded: step_forwarded,
                 } => {
                     forwarded |= step_forwarded;
-                    work_queue.push_front(AttachedLiveInputWork::new(Arc::from(bytes), None));
+                    work_queue.push_front(AttachedLiveInputWork::new(Arc::from(bytes)));
                 }
             }
         }
@@ -510,7 +459,6 @@ impl RequestHandler {
         identity: ActiveAttachIdentity,
         pending_input: &mut Vec<u8>,
         bytes: &[u8],
-        mut windows_console_key: Option<rmux_proto::AttachedWindowsConsoleKey>,
         active_emit_cache: &mut ActiveClientEmitCache,
     ) -> io::Result<AttachedLiveChunkResult> {
         let mut bytes = Cow::Borrowed(bytes);
@@ -558,27 +506,15 @@ impl RequestHandler {
         identity: ActiveAttachIdentity,
         pending_input: &mut Vec<u8>,
         bytes: &[u8],
-        windows_console_key: Option<rmux_proto::AttachedWindowsConsoleKey>,
-        active_emit_cache: &mut ActiveClientEmitCache,
+            active_emit_cache: &mut ActiveClientEmitCache,
     ) -> io::Result<AttachedLiveInputStep> {
-        #[cfg(not(windows))]
-        let _ = windows_console_key;
-        #[cfg(windows)]
-        let windows_console_key = windows_console_key
-            .filter(|_| pending_input.is_empty() && !bytes.is_empty())
-            .map(windows_console_key_event);
         let initial_transient_prefix = self
             .take_transient_terminal_prefix_for_identity(identity)
             .await;
         let mut has_transient_terminal_prefix = !initial_transient_prefix.is_empty();
         pending_input.extend(initial_transient_prefix);
         let mut forwarded_to_pane = false;
-        #[cfg(windows)]
-        let try_plain_fast_path = windows_console_key.is_none();
-        #[cfg(not(windows))]
-        let try_plain_fast_path = true;
-        if try_plain_fast_path {
-            if let Some(forwarded) = self
+        if let Some(forwarded) = self
                 .try_forward_plain_attached_bytes_fast(
                     identity,
                     pending_input,
@@ -589,7 +525,6 @@ impl RequestHandler {
             {
                 return Ok(AttachedLiveInputStep::Complete(forwarded));
             }
-        }
         if self
             .attached_client_input_is_read_only_for_identity(identity)
             .await?
@@ -682,8 +617,7 @@ impl RequestHandler {
                 if pending_was_empty && rerouted.as_slice() == bytes =>
             {
                 // Continue in this same step. Besides avoiding a second
-                // parse, this preserves the native Windows KEY_EVENT that
-                // belongs to these exact bytes.
+                // parse, this preserves the exact input bytes for this step.
                 debug_assert!(pending_input.is_empty());
             }
             TransientMessageInput::Dismissed(bytes) => {
@@ -815,44 +749,7 @@ impl RequestHandler {
         let target_focus_events = target_mode & mode::MODE_FOCUSON != 0;
         let backspace = self.attached_backspace_byte().await;
 
-        #[cfg(windows)]
-        if pending_input.is_empty() && bytes == b"\x04" {
-            if let Some(key) = windows_key_code_named("C-d") {
-                let handled = self
-                    .handle_attached_live_key_inner(
-                        identity,
-                        key,
-                        super::AttachedPaneForward::WindowsConsoleKey {
-                            key: WindowsConsoleKeyEvent::ctrl_d(),
-                            bytes,
-                        },
-                    )
-                    .await?;
-                return Ok(AttachedLiveInputStep::Complete(!handled));
-            }
-        }
 
-        #[cfg(windows)]
-        if let Some(key_event) = windows_console_key.filter(|_| pending_input.is_empty()) {
-            if let AttachedKeyDecode::Matched { size, key } = decode_attached_key(bytes, backspace)
-            {
-                if size == bytes.len() {
-                    if let Some(key) = windows_console_binding_override_key(key, key_event) {
-                        let handled = self
-                            .handle_attached_live_key_inner(
-                                identity,
-                                key,
-                                super::AttachedPaneForward::WindowsConsoleKey {
-                                    key: key_event,
-                                    bytes,
-                                },
-                            )
-                            .await?;
-                        return Ok(AttachedLiveInputStep::Complete(!handled));
-                    }
-                }
-            }
-        }
 
         if pending_input.is_empty()
             && !self.attached_key_table_active(identity).await
@@ -1191,30 +1088,6 @@ impl RequestHandler {
                             )
                             .await?;
                         }
-                        #[cfg(windows)]
-                        let handled = if let Some(key_event) = windows_console_key
-                            .filter(|_| {
-                                raw_start == offset
-                                    && offset == 0
-                                    && size == pending_input.len()
-                                    && size == bytes.len()
-                            })
-                            .or_else(|| windows_synthetic_console_key_for_decoded_key(key))
-                        {
-                            let key = windows_console_binding_key(key, key_event);
-                            self.handle_attached_live_key_inner(
-                                identity,
-                                key,
-                                super::AttachedPaneForward::WindowsConsoleKey {
-                                    key: key_event,
-                                    bytes: &pending_input[offset..offset + size],
-                                },
-                            )
-                            .await?
-                        } else {
-                            self.handle_attached_live_key(identity, key).await?
-                        };
-                        #[cfg(not(windows))]
                         let handled = self.handle_attached_live_key(identity, key).await?;
                         if !handled {
                             forwarded_to_pane = true;
@@ -1302,30 +1175,6 @@ impl RequestHandler {
                         .await?;
                         forwarded_to_pane = true;
                     }
-                    #[cfg(windows)]
-                    let handled = if let Some(key_event) = windows_console_key
-                        .filter(|_| {
-                            raw_start == offset
-                                && offset == 0
-                                && size == pending_input.len()
-                                && size == bytes.len()
-                        })
-                        .or_else(|| windows_synthetic_console_key_for_decoded_key(key))
-                    {
-                        let key = windows_console_binding_key(key, key_event);
-                        self.handle_attached_live_key_inner(
-                            identity,
-                            key,
-                            super::AttachedPaneForward::WindowsConsoleKey {
-                                key: key_event,
-                                bytes: &pending_input[offset..offset + size],
-                            },
-                        )
-                        .await?
-                    } else {
-                        self.handle_attached_live_key(identity, key).await?
-                    };
-                    #[cfg(not(windows))]
                     let handled = self.handle_attached_live_key(identity, key).await?;
                     if !handled {
                         forwarded_to_pane = true;
@@ -2123,73 +1972,15 @@ mod live_key_decode_tests {
     }
 }
 
-#[cfg(windows)]
-fn windows_console_key_event(key: rmux_proto::AttachedWindowsConsoleKey) -> WindowsConsoleKeyEvent {
-    WindowsConsoleKeyEvent::new(
-        key.virtual_key_code(),
-        key.virtual_scan_code(),
-        key.unicode_char(),
-        key.control_key_state(),
-        key.repeat_count(),
-    )
-}
 
-#[cfg(windows)]
-fn windows_console_binding_key(
-    decoded: rmux_core::KeyCode,
-    key: WindowsConsoleKeyEvent,
-) -> rmux_core::KeyCode {
-    windows_console_binding_override_key(decoded, key).unwrap_or(decoded)
-}
 
-#[cfg(windows)]
-fn windows_synthetic_console_key_for_decoded_key(
-    decoded: rmux_core::KeyCode,
-) -> Option<WindowsConsoleKeyEvent> {
-    key_matches_name(decoded, "C-d").then(WindowsConsoleKeyEvent::ctrl_d)
-}
 
-#[cfg(windows)]
-fn windows_console_binding_override_key(
-    decoded: rmux_core::KeyCode,
-    key: WindowsConsoleKeyEvent,
-) -> Option<rmux_core::KeyCode> {
-    const RIGHT_ALT_PRESSED: u32 = 0x0001;
-    const LEFT_ALT_PRESSED: u32 = 0x0002;
-    const LEFT_CTRL_PRESSED: u32 = 0x0008;
-    const RIGHT_CTRL_PRESSED: u32 = 0x0004;
-    const CTRL_PRESSED: u32 = LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED;
-
-    let control_key_state = key.control_key_state();
-    if decoded & KEYC_CTRL != 0 || control_key_state & CTRL_PRESSED == 0 {
-        return None;
-    }
-
-    if control_key_state & RIGHT_ALT_PRESSED != 0 {
-        return None;
-    }
-    if control_key_state & LEFT_ALT_PRESSED != 0 && control_key_state & RIGHT_CTRL_PRESSED == 0 {
-        return None;
-    }
-
-    let character = char::from_u32(u32::from(key.unicode_char()))?;
-    if !character.is_ascii() || character.is_ascii_control() {
-        return None;
-    }
-
-    let preserved_modifiers = decoded & (KEYC_META | KEYC_IMPLIED_META | KEYC_SHIFT);
-    Some(character.to_ascii_lowercase() as rmux_core::KeyCode | KEYC_CTRL | preserved_modifiers)
-}
 
 #[cfg(windows)]
 fn key_matches_name(key: rmux_core::KeyCode, name: &str) -> bool {
     windows_key_code_named(name).is_some_and(|expected| expected == key)
 }
 
-#[cfg(windows)]
-fn windows_key_code_named(name: &str) -> Option<rmux_core::KeyCode> {
-    key_string_lookup_string(name).map(key_code_lookup_bits)
-}
 
 #[cfg(all(test, windows))]
 mod windows_console_binding_tests {
