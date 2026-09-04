@@ -303,7 +303,6 @@ impl PaneRecoverySeed {
         self.projection.history_bytes()
     }
 
-
     pub(crate) fn keyframe(&self) -> PaneRecoveryKeyframe {
         self.keyframe.clone()
     }
