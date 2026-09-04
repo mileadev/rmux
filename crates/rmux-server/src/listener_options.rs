@@ -36,7 +36,6 @@ impl ServeOptions {
         }
     }
 
-
     #[cfg(unix)]
     pub(crate) fn with_socket_identity(
         mut self,

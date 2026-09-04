@@ -261,7 +261,6 @@ mod tests {
         assert!(matches!(error, super::AutoStartError::TimedOut { .. }));
     }
 
-
     fn connection_with_script(
         script: Vec<(Request, Response)>,
     ) -> (Connection, thread::JoinHandle<()>) {

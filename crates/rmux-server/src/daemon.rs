@@ -120,10 +120,6 @@ impl DaemonConfig {
         self.subscription_limits
     }
 
-
-
-
-
     /// Enables RMUX default startup config loading.
     #[must_use]
     pub fn with_default_config_load(mut self, quiet: bool, cwd: Option<PathBuf>) -> Self {
@@ -141,8 +137,6 @@ impl DaemonConfig {
         self.subscription_limits = subscription_limits;
         self
     }
-
-
 
     /// Enables explicit `-f` startup config loading.
     #[must_use]

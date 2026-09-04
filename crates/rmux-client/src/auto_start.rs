@@ -90,9 +90,6 @@ impl AutoStartConfig {
         }
     }
 
-
-
-
     /// Uses an explicit binary when this client must auto-start a hidden daemon.
     #[must_use]
     pub fn with_binary_override(mut self, binary_path: PathBuf) -> Self {
