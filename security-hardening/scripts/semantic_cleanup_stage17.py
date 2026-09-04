@@ -78,9 +78,15 @@ def remove_named_functions(text: str, names: list[str]) -> str:
 
 
 def clean_auto_start(text: str) -> str:
-    return remove_named_functions(text, [
+    text = remove_named_functions(text, [
         'with_web_port', 'with_web_frontend', 'with_web_required'
     ])
+    text = re.sub(
+        r'(?m)^    if config\.web_required \{\n        return None;\n    \}\n',
+        '',
+        text,
+    )
+    return text
 
 
 def clean_daemon(text: str) -> str:
