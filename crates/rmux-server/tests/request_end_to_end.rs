@@ -6,7 +6,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-mod common;
 
 use common::{send_request, session_name, start_server, wait_for_socket_removal, TestHarness};
 use rmux_proto::{

@@ -1,7 +1,6 @@
 #![cfg(unix)]
 
 use std::error::Error;
-mod common;
 
 use common::{send_request, session_name, start_server, TestHarness};
 use rmux_proto::{

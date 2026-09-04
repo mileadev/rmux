@@ -5,7 +5,6 @@ use std::io;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-mod common;
 
 use common::{send_request, session_name, start_server, TestHarness};
 use rmux_proto::{

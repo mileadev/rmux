@@ -6,7 +6,6 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-mod common;
 
 use common::{
     read_response_exact, send_request, session_name, start_server, ClientConnection, TestHarness,

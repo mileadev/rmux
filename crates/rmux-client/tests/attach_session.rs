@@ -1,6 +1,5 @@
 #![cfg(unix)]
 
-mod common;
 
 use std::error::Error;
 use std::fs;

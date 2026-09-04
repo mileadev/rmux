@@ -5,7 +5,6 @@ use std::io;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::Arc;
 
-mod common;
 
 use common::{
     create_stale_socket, send_request, session_name, start_server, wait_for_socket_removal,

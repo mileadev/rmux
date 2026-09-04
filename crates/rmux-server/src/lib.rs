@@ -153,12 +153,8 @@ mod unix_socket_access;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod wait_for;
-#[cfg(all(any(unix, windows), feature = "web"))]
-mod web;
 // Console-input retry policy is plain `io::Error` logic with no Win32 calls:
 // compile it in test builds on every platform so the policy stays covered.
-#[cfg(any(windows, test))]
-mod windows_console_input;
 
 /// Fuzzing entry points for protocol parsers.
 #[cfg(all(any(unix, windows), feature = "web", feature = "fuzzing"))]
