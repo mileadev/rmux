@@ -614,7 +614,7 @@ mod tests {
             top_level_parse_failure(&args(&["--help"]))
                 .expect("expected --help to fail before clap")
                 .message(),
-            "usage: rmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n\nRMUX extensions:\n  capabilities [--human|--json]\n  claude [install-skill|claude-args...]\n  diagnose [--human|--json]\n  doctor tmux-dropin\n  setup tmux-shim\n  wait-pane [flags]\n  pane-snapshot [flags]\n  stream-pane [--raw|--lines]\n  collect-pane-output --until-pane-exit --max-bytes bytes\n  locator|expect-pane [flags]\n  find-panes|find-sessions [flags]\n  broadcast-keys -t target... -- key ...\n  with-session session-name -- command ...\n  web-share [flags]\n  web-share list|lookup|stop|disconnect|off|config\n\nUse `rmux list-commands` for the tmux-compatible command surface."
+            "usage: rmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n\nRMUX extensions:\n  capabilities [--human|--json]\n  diagnose [--human|--json]\n  doctor tmux-dropin\n  setup tmux-shim\n  wait-pane [flags]\n  pane-snapshot [flags]\n  stream-pane [--raw|--lines]\n  collect-pane-output --until-pane-exit --max-bytes bytes\n  locator|expect-pane [flags]\n  find-panes|find-sessions [flags]\n  broadcast-keys -t target... -- key ...\n  with-session session-name -- command ...\n\nUse `rmux list-commands` for the tmux-compatible command surface."
         );
         assert_eq!(
             top_level_parse_failure(&args(&["--not-a-tmux-flag", "-h"]))
@@ -649,62 +649,6 @@ mod tests {
         assert!(top_level_parse_failure(&args(&["-Lhas-h", "list-sessions"])).is_none());
     }
 
-    #[test]
-    fn claude_dispatch_rejects_top_level_modes_it_cannot_honor() {
-        for flag in ["-h", "-V"] {
-            let exit = run(args(&["rmux", flag, "claude"]))
-                .expect_err("top-level display option exits before extension dispatch");
-            assert_eq!(exit.exit_code(), 0, "{flag}");
-            assert!(
-                !exit.message().contains("not supported by the managed"),
-                "{flag} keeps top-level priority"
-            );
-        }
-
-        for values in [
-            &["rmux", "-D", "claude"][..],
-            &["rmux", "-c", "echo ignored", "claude", "install-skill"][..],
-            &["rmux", "-cecho ignored", "claude"][..],
-            &["rmux", "-u", "-D", "-N", "claude"][..],
-        ] {
-            let error = run(args(values)).expect_err("managed launcher mode must be rejected");
-            assert_eq!(error.exit_code(), 1, "{values:?}");
-            assert!(
-                error.message().contains("usage: rmux"),
-                "the scanner must reject the mode before external dispatch: {values:?}"
-            );
-        }
-
-        let no_start = run(args(&["rmux", "-N", "claude"]))
-            .expect_err("-N must not silently start a private server");
-        assert!(no_start.message().contains("-N is incompatible"));
-
-        let control = run(args(&["rmux", "-C", "claude"]))
-            .expect_err("-C must not silently launch an attached client");
-        assert!(control.message().contains("-C control mode"));
-
-        for (values, option) in [
-            (&["rmux", "-2", "claude"][..], "-2"),
-            (&["rmux", "-f", "config", "claude"][..], "-f"),
-            (&["rmux", "-f", "--unknown", "claude"][..], "-f"),
-            (&["rmux", "-l", "claude"][..], "-l"),
-            (&["rmux", "-Ldemo", "claude"][..], "-L"),
-            (&["rmux", "-S/path", "claude"][..], "-S"),
-            (&["rmux", "-TRGB", "claude"][..], "-T"),
-            (&["rmux", "-u", "claude"][..], "-u"),
-            (&["rmux", "-v", "claude"][..], "-v"),
-            (&["rmux", "-v", "-fconfig", "claude"][..], "-f"),
-            (&["rmux", "-u", "-v", "-fconfig", "claude"][..], "-f"),
-            (&["rmux", "-v", "-Ldemo", "claude"][..], "-L"),
-            (&["rmux", "-L", "-f", "claude"][..], "-L"),
-        ] {
-            let error = run(args(values)).expect_err("ignored option must be rejected");
-            assert!(
-                error.message().contains(option),
-                "diagnostic must name {option}: {error:?}"
-            );
-        }
-    }
 
     #[test]
     fn command_too_long_parse_errors_probe_for_absent_server_first() {
@@ -760,25 +704,6 @@ mod tests {
                 queue_command: String::new(),
             }
         )));
-        let web_create = parse_cli(["rmux", "web-share", "-t", "alpha"])
-            .expect("web-share create parses")
-            .command
-            .expect("parsed command");
-        assert!(command_has_start_server_flag(&web_create));
-        for args in [
-            &["rmux", "web-share", "-l"][..],
-            &["rmux", "web-share", "-K", "abc12345"][..],
-            &["rmux", "web-share", "disconnect", "abc12345"][..],
-            &["rmux", "web-share", "-X"][..],
-            &["rmux", "web-share", "--lookup", "abc12345"][..],
-            &["rmux", "web-share", "--config"][..],
-        ] {
-            let command = parse_cli(args.iter().copied())
-                .expect("web-share lifecycle command parses")
-                .command
-                .expect("parsed command");
-            assert!(!command_has_start_server_flag(&command));
-        }
     }
 
     #[test]

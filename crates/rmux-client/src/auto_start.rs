@@ -53,9 +53,6 @@ pub struct AutoStartConfig {
     selection: AutoStartConfigSelection,
     quiet: bool,
     cwd: Option<PathBuf>,
-    web_frontend: Option<String>,
-    web_port: Option<u16>,
-    web_required: bool,
     binary_override: Option<PathBuf>,
 }
 
@@ -67,9 +64,6 @@ impl AutoStartConfig {
             selection: AutoStartConfigSelection::Disabled,
             quiet: true,
             cwd: None,
-            web_frontend: None,
-            web_port: None,
-            web_required: false,
             binary_override: None,
         }
     }
@@ -81,9 +75,6 @@ impl AutoStartConfig {
             selection: AutoStartConfigSelection::Default,
             quiet,
             cwd,
-            web_frontend: None,
-            web_port: None,
-            web_required: false,
             binary_override: None,
         }
     }
@@ -95,9 +86,6 @@ impl AutoStartConfig {
             selection: AutoStartConfigSelection::Files(files),
             quiet,
             cwd,
-            web_frontend: None,
-            web_port: None,
-            web_required: false,
             binary_override: None,
         }
     }
@@ -156,12 +144,6 @@ impl AutoStartConfig {
         }
         if let Some(cwd) = &self.cwd {
             command.arg("--config-cwd").arg(cwd);
-        }
-        if let Some(port) = self.web_port {
-            command.arg("--web-port").arg(port.to_string());
-        }
-        if let Some(frontend) = &self.web_frontend {
-            command.arg("--frontend-url").arg(frontend);
         }
     }
 }

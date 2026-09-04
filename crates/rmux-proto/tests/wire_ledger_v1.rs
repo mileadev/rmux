@@ -48,8 +48,7 @@ use rmux_proto::{
     SubscribePaneStateRequest, SubscribePaneStateResponse, SubscribePaneStreamRequest,
     SubscribePaneStreamResponse, TerminalSize, UnsubscribePaneOutputRequest,
     UnsubscribePaneOutputResponse, UnsubscribePaneStateRequest, UnsubscribePaneStateResponse,
-    UnsubscribePaneStreamRequest, UnsubscribePaneStreamResponse, WebShareConfigRequest,
-    WebShareListener, WebShareRequest, WebShareResponse, WindowTarget, RMUX_FRAME_MAGIC,
+    UnsubscribePaneStreamRequest, UnsubscribePaneStreamResponse, WindowTarget, RMUX_FRAME_MAGIC,
     RMUX_WIRE_VERSION, V1_FRAME_LEDGER,
 };
 
@@ -1023,7 +1022,6 @@ fn cross_section_requests() -> Vec<Request> {
             target: pane_ref,
             title: Some("agent".to_owned()),
         }),
-        Request::WebShare(Box::new(WebShareRequest::Config(WebShareConfigRequest))),
         Request::DisplayMessageExt(Box::new(DisplayMessageExtRequest {
             target: Some(rmux_proto::Target::Session(alpha.clone())),
             print: true,
@@ -1148,18 +1146,6 @@ fn cross_section_responses() -> Vec<Response> {
             wait_id: SdkWaitId::new(4),
             removed: true,
         }),
-        Response::WebShare(Box::new(WebShareResponse::Config(
-            rmux_proto::WebShareConfigResponse {
-                listener: WebShareListener {
-                    host: "127.0.0.1".to_owned(),
-                    port: 9777,
-                    frontend_origin: "https://share.rmux.io".to_owned(),
-                },
-                output: rmux_proto::CommandOutput::from_stdout(
-                    "127.0.0.1:9777 https://share.rmux.io\n",
-                ),
-            },
-        ))),
         Response::SplitWindowIdentity(SplitWindowIdentityResponse {
             pane: PaneTarget::with_window(alpha, 2, 7),
             pane_id: PaneId::new(42),

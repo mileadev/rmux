@@ -29,7 +29,7 @@ pub(super) fn prepare_attached_key_forwards(
     let mut prepared = Vec::with_capacity(targets.len());
     for target in targets {
         match forward {
-            AttachedPaneForward::EncodedKey(_) => {
+            AttachedPaneForward::EncodedKey => {
                 append_encoded_key_forward(state, &target, key, &mut prepared)?;
             }
         }

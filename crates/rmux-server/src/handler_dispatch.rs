@@ -868,7 +868,6 @@ fn request_waits_for_windows_deferred_panes(request: &Request) -> bool {
             | Request::ControlMode(_)
             | Request::PaneInput(_)
             | Request::PaneSnapshotRef(_)
-            | Request::WebShare(_)
     )
 }
 

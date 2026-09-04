@@ -43,7 +43,6 @@ use crate::unix_socket_access::UnixSocketAccessController;
 
 #[cfg(all(test, unix))]
 const FALLBACK_SOCKET_ROOT: &str = "/tmp";
-const DEFAULT_WEB_PORT: u16 = 9777;
 
 /// Computes the default RMUX daemon socket path.
 ///
@@ -79,10 +78,6 @@ pub struct DaemonConfig {
     socket_path: PathBuf,
     config_load: ConfigLoadOptions,
     subscription_limits: SubscriptionLimits,
-    web_frontend: Option<String>,
-    web_port: u16,
-    web_port_explicit: bool,
-    web_required: bool,
     startup_ready_fd: Option<i32>,
     #[cfg(windows)]
     startup_ready_event: Option<OsString>,
@@ -96,10 +91,6 @@ impl DaemonConfig {
             socket_path,
             config_load: ConfigLoadOptions::disabled(),
             subscription_limits: SubscriptionLimits::default(),
-            web_frontend: None,
-            web_port: DEFAULT_WEB_PORT,
-            web_port_explicit: false,
-            web_required: false,
             startup_ready_fd: None,
             #[cfg(windows)]
             startup_ready_event: None,
@@ -334,12 +325,6 @@ impl ServerDaemon {
                 self.config.subscription_limits(),
                 owner_uid,
             )
-            .with_web_options(
-                self.config.web_port(),
-                self.config.web_frontend().map(str::to_owned),
-                self.config.web_required(),
-                self.config.web_port_explicit(),
-            )
             .with_socket_identity(bound_listener.identity)
             .with_socket_access(socket_access)
             .with_server_signals(signal_watcher);
@@ -373,12 +358,6 @@ impl ServerDaemon {
                 self.config.config_load().clone(),
                 self.config.subscription_limits(),
                 owner_uid,
-            )
-            .with_web_options(
-                self.config.web_port(),
-                self.config.web_frontend().map(str::to_owned),
-                self.config.web_required(),
-                self.config.web_port_explicit(),
             );
 
             let task = tokio::spawn(listener::serve(

@@ -597,10 +597,6 @@ mod tests {
             "choose-tree"
         );
         assert_eq!(
-            resolve_list_commands_target("web-share").expect("extension resolves"),
-            "web-share"
-        );
-        assert_eq!(
             resolve_list_commands_target("nosuch"),
             Err(ListCommandsError::Unknown("nosuch".to_owned()))
         );
@@ -614,15 +610,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bare_listing_hides_extensions_while_explicit_lookup_keeps_them() {
-        let bare = render_list_commands(Some("#{command_list_name}"), None)
-            .expect("bare inventory renders");
-        assert!(!bare.iter().any(|name| name == "web-share"));
-        assert_eq!(
-            render_list_commands(Some("#{command_list_name}"), Some("web-share"))
-                .expect("explicit extension renders"),
-            vec!["web-share"]
-        );
-    }
 }

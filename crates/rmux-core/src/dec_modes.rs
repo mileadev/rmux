@@ -1,7 +1,7 @@
 //! Re-assert DEC private terminal modes from a tracked mode bitmap.
 //!
 //! When a viewer (re)joins a live session — a reconnecting browser, a late
-//! web-share client — it receives a snapshot that paints the visible grid but,
+//! detached client client — it receives a snapshot that paints the visible grid but,
 //! by itself, does not restore the *interactive* terminal modes the inner
 //! program had asserted (mouse reporting, bracketed paste, application cursor
 //! keys, cursor style, ...). Without them the reconstructed view looks right
@@ -14,7 +14,7 @@
 //!
 //! Adapted clean-room from the `render_dec_modes` helper in rmux PR #26
 //! (passthrough mode, by @gilescope): rewritten against this crate's `Screen`
-//! mode API and reused as a shared primitive for the web-share snapshot.
+//! mode API and reused as a shared primitive for the detached client snapshot.
 
 use crate::input::mode;
 
@@ -32,7 +32,7 @@ use crate::input::mode;
 /// immediately after a reset prefix. Layout modes that interact with painting —
 /// alternate screen (1049), scroll region (DECSTBM), origin mode (6) — are
 /// intentionally *not* emitted here; a caller that needs them must order them
-/// around the painted content itself (see the web-share snapshot).
+/// around the painted content itself (see the detached client snapshot).
 pub fn render_dec_modes(mode_bits: u32, cursor_style: u32, out: &mut Vec<u8>) {
     let on = |bit: u32| mode_bits & bit != 0;
 

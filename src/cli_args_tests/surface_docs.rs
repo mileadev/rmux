@@ -307,10 +307,6 @@ fn command_value_flags_report_missing_values_with_tmux_style_prefix() {
             &["set-option", "-t"][..],
             "command set-option: -t expects an argument",
         ),
-        (
-            &["web-share", "--frontend-url"][..],
-            "command web-share: --frontend-url expects an argument",
-        ),
     ] {
         let error = parse_args(args).unwrap_err();
         assert!(

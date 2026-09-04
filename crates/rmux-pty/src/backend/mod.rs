@@ -4,8 +4,6 @@ mod linux;
 mod macos;
 #[cfg(unix)]
 mod unix_io;
-#[cfg(windows)]
-mod windows;
 
 #[cfg(target_os = "linux")]
 pub(crate) use linux::*;

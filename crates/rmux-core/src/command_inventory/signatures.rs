@@ -261,8 +261,4 @@ pub(super) const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
         "with-session",
         "session-name [--kill-on-owner-exit] [--ttl duration] -- command ...",
     ),
-    (
-        "web-share",
-        "[-lX] [-K share-id] [disconnect share-id] [--config] [--lookup share-id] [--operator-only|--spectator-only] [--ttl seconds|--expires-at RFC3339] [--kill-session-on-expire] [--max-operators count] [--max-spectators count] [--frontend-url url] [--tunnel-url url|--tunnel-provider provider] [--no-navbar] [--no-disclaimer] [--hide-viewers] [--theme user|light|dark] [--no-pin] [-t pane|session]",
-    ),
 ];

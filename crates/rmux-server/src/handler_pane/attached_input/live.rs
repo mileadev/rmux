@@ -465,7 +465,6 @@ impl RequestHandler {
                     identity,
                     pending_input,
                     bytes.as_ref(),
-                    windows_console_key.take(),
                     active_emit_cache,
                 )
                 .await?
