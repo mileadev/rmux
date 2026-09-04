@@ -34,6 +34,7 @@ jobs:
           python3 security-hardening/scripts/repair_false_positive_removals.py .
           python3 security-hardening/scripts/remove_missing_path_modules.py .
           python3 security-hardening/scripts/remove_missing_modules.py .
+          python3 security-hardening/scripts/cleanup_missing_modules.py .
           if ! git diff --quiet || ! git diff --cached --quiet; then
             git config user.name 'rmux-hardening-bot'
             git config user.email 'rmux-hardening-bot@users.noreply.github.com'
