@@ -75,5 +75,51 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Tests
         run: cargo test --workspace --all-targets --locked
+      - name: Cargo policy audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          DENY_VERSION=0.20.2
+          DENY_SHA256=fe67d82a10d8597a3549364cb733a3f9cc1bfff9031b7ae46384a9f2a72090c3
+          ARCHIVE="/tmp/cargo-deny-${DENY_VERSION}.tar.gz"
+          EXTRACT="/tmp/cargo-deny-${DENY_VERSION}"
+          curl --fail --silent --show-error --location \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${DENY_VERSION}/cargo-deny-${DENY_VERSION}-aarch64-apple-darwin.tar.gz" \
+            --output "$ARCHIVE"
+          printf '%s  %s\n' "$DENY_SHA256" "$ARCHIVE" | shasum -a 256 -c -
+          rm -rf "$EXTRACT" && mkdir -p "$EXTRACT"
+          tar -xzf "$ARCHIVE" -C "$EXTRACT"
+          DENY_BIN="$(find "$EXTRACT" -type f -name cargo-deny -perm -111 -print -quit)"
+          test -n "$DENY_BIN"
+          "$DENY_BIN" --version
+          "$DENY_BIN" check advisories bans licenses sources
+      - name: Release build
+        run: cargo build --release --workspace --locked
+      - name: Release CLI and local-only runtime smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/release/rmux --version
+          ./target/release/rmux --help > /tmp/rmux-help.txt 2>&1 || true
+          if grep -Eqi 'web-share|share\.rmux\.io|tunnel|claude' /tmp/rmux-help.txt; then
+            cat /tmp/rmux-help.txt
+            echo 'removed remote/Claude command still present in help' >&2
+            exit 1
+          fi
+          SOCKET_NAME="security-smoke-${GITHUB_RUN_ID}"
+          cleanup() { ./target/release/rmux -L "$SOCKET_NAME" kill-server >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          ./target/release/rmux -L "$SOCKET_NAME" start-server
+          ./target/release/rmux -L "$SOCKET_NAME" new-session -d -s security-smoke
+          ./target/release/rmux -L "$SOCKET_NAME" has-session -t security-smoke
+          ./target/release/rmux -L "$SOCKET_NAME" list-sessions >/tmp/rmux-sessions.txt
+          grep -q 'security-smoke' /tmp/rmux-sessions.txt
+          if lsof -nP -iTCP -iUDP 2>/dev/null | grep -Ei '[r]mux(-daemon)?'; then
+            echo 'rmux process has an Internet socket' >&2
+            exit 1
+          fi
+          lsof -nP -U 2>/dev/null | grep -Ei '[r]mux(-daemon)?' >/tmp/rmux-unix-sockets.txt || true
+          cleanup
+          trap - EXIT
       - name: Independent local-only source gate
         run: bash security-hardening/scripts/verify_hardening.sh .
