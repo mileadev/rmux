@@ -22,13 +22,14 @@ jobs:
           python3 security-hardening/scripts/semantic_cleanup.py .
           python3 security-hardening/scripts/semantic_cleanup_stage3.py .
           python3 security-hardening/scripts/semantic_cleanup_stage4.py .
+          python3 security-hardening/scripts/repair_false_positive_removals.py .
           python3 security-hardening/scripts/remove_missing_path_modules.py .
           python3 security-hardening/scripts/remove_missing_modules.py .
           if ! git diff --quiet || ! git diff --cached --quiet; then
             git config user.name 'rmux-hardening-bot'
             git config user.email 'rmux-hardening-bot@users.noreply.github.com'
             git add -A
-            git commit -m 'security: remove stale remote/platform API references'
+            git commit -m 'security: reconcile local-only source topology'
             git push origin HEAD:${GITHUB_REF_NAME}
           fi
       - name: Install pinned Rust toolchain
@@ -46,6 +47,18 @@ jobs:
             git push origin HEAD:${GITHUB_REF_NAME}
           fi
           cargo fmt --all -- --check
+      - name: Refresh lockfile after dependency pruning
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --workspace || true
+          if ! git diff --quiet -- Cargo.lock; then
+            git config user.name 'rmux-hardening-bot'
+            git config user.email 'rmux-hardening-bot@users.noreply.github.com'
+            git add Cargo.lock
+            git commit -m 'build: refresh lockfile after attack-surface reduction'
+            git push origin HEAD:${GITHUB_REF_NAME}
+          fi
       - name: Check macOS workspace
         run: cargo check --workspace --locked
       - name: Clippy
