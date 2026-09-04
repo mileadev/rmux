@@ -8,6 +8,7 @@ use rmux_core::LifecycleEvent;
 use tokio::sync::mpsc;
 
 #[cfg(test)]
+#[cfg(test)]
 use crate::client_names::attached_client_name;
 use crate::handler::{current_client_activity_timestamp, RequestHandler};
 use crate::mouse::ClientMouseState;

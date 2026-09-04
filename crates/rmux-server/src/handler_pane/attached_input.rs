@@ -1,11 +1,8 @@
 use std::io;
-use std::marker::PhantomData;
 use std::time::Instant;
 
 use rmux_core::{key_code_lookup_bits, key_code_to_bytes, key_string_lookup_string};
 use rmux_proto::{OptionName, PaneTarget, RmuxError, Target};
-#[cfg(windows)]
-use rmux_pty::WindowsConsoleKeyEvent;
 
 use super::super::{
     mode_tree_support::ModeTreeInputError,
@@ -85,13 +82,8 @@ fn ensure_target_session_identity(
 }
 
 #[derive(Clone, Copy)]
-enum AttachedPaneForward<'a> {
-    EncodedKey(PhantomData<&'a ()>),
-    #[cfg(windows)]
-    WindowsConsoleKey {
-        key: WindowsConsoleKeyEvent,
-        bytes: &'a [u8],
-    },
+enum AttachedPaneForward {
+    EncodedKey,
 }
 
 impl RequestHandler {
@@ -203,7 +195,7 @@ impl RequestHandler {
         self.handle_attached_live_key_inner(
             identity,
             key,
-            AttachedPaneForward::EncodedKey(PhantomData),
+            AttachedPaneForward::EncodedKey,
         )
         .await
     }
@@ -212,7 +204,7 @@ impl RequestHandler {
         &self,
         identity: ActiveAttachIdentity,
         key: rmux_core::KeyCode,
-        forward: AttachedPaneForward<'_>,
+        forward: AttachedPaneForward,
     ) -> io::Result<bool> {
         let attach_pid = identity.attach_pid();
         if self
