@@ -88,8 +88,6 @@ mod shutdown_support;
 mod stable_target_identity;
 #[path = "handler_unix_socket_access.rs"]
 mod unix_socket_access_support;
-#[path = "handler/web_request_identity.rs"]
-mod web_request_identity;
 pub(crate) use shutdown_support::{DetachedRequestGuard, NormalRequestGuard};
 #[path = "handler/sdk_wait_quota.rs"]
 mod sdk_wait_quota;
@@ -109,21 +107,6 @@ mod test_support;
 #[path = "handler_waits.rs"]
 mod wait_support;
 pub(crate) use wait_support::PreparedSdkWait;
-#[cfg(all(any(unix, windows), feature = "web"))]
-#[path = "handler_web.rs"]
-mod web_support;
-#[cfg(not(all(any(unix, windows), feature = "web")))]
-#[path = "handler_web_disabled.rs"]
-mod web_support;
-#[cfg(all(test, any(unix, windows), feature = "web"))]
-pub(crate) use web_support::TestWebSessionView;
-#[cfg(all(test, any(unix, windows), feature = "web"))]
-pub(crate) use web_support::WebSessionPaneView;
-#[cfg(all(any(unix, windows), feature = "web"))]
-pub(crate) use web_support::{
-    UndeliveredWebShareGuard, WebPaneSnapshot, WebPaneStream, WebSessionAttachEvent,
-    WebSessionPaneFrame, WebSessionSnapshot, WebSessionStream, WebShareStream,
-};
 #[path = "handler_window.rs"]
 mod window_support;
 use crate::pane_state_journal::{PaneStateJournal, PANE_STATE_JOURNAL_CAPACITY};
@@ -134,8 +117,6 @@ use crate::server_access::{current_owner_uid, ServerAccessAdmission, ServerAcces
 #[cfg(unix)]
 use crate::unix_socket_access::UnixSocketAccessController;
 use crate::wait_for::WaitForStore;
-#[cfg(all(any(unix, windows), feature = "web"))]
-use crate::web::WebShareRegistry;
 use attach_support::{ActiveAttachState, ClientFlags};
 pub(in crate::handler) use client_environment_support::{
     client_spawn_environment, initial_session_spawn_environment,
