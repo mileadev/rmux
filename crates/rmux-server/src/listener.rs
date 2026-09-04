@@ -80,7 +80,7 @@ pub(crate) async fn serve(
     #[cfg(windows)]
     let mut cleanup_on_drop = SocketCleanup::new(socket_path.clone());
     let server_signals = options.server_signals;
-        let handler = Arc::new(RequestHandler::with_owner_uid_and_subscription_limits(
+    let handler = Arc::new(RequestHandler::with_owner_uid_and_subscription_limits(
         options.owner_uid,
         options.subscription_limits,
     ));
@@ -93,6 +93,7 @@ pub(crate) async fn serve(
     let lifecycle_events = handler
         .take_lifecycle_dispatch_receiver()
         .ok_or_else(|| io::Error::other("lifecycle dispatch receiver already active"))?;
+    let (connection_shutdown, connection_shutdown_rx) = watch::channel(());
     let (hook_shutdown, hook_shutdown_rx) = oneshot::channel();
     let mut connection_tasks = JoinSet::new();
     let hook_handler = Arc::clone(&handler);
@@ -373,7 +374,7 @@ async fn serve_connection(
                         continue;
                     }
                     request => {
-                                                let dispatch = handler.dispatch_for_connection(
+                        let dispatch = handler.dispatch_for_connection(
                             requester.pid,
                             connection_id,
                             request,
@@ -382,7 +383,7 @@ async fn serve_connection(
                             outcome = with_session_lease_create_addressing(
                                 session_lease_create_addressing,
                                 dispatch,
-                            ) => {
+                            ) => outcome,
                             result = wait_for_request_shutdown(
                                 &mut request_shutdown,
                                 quiesce_behavior,
@@ -506,6 +507,121 @@ async fn serve_connection(
                     return Err(error);
                 }
 
+
+                if let Some(attach) = outcome.attach {
+                    let attach_forwarder_guard = attach_forwarder_guard
+                        .expect("attach outcome must hold an attach forwarder guard");
+                    let Response::AttachSession(response) = &outcome.response else {
+                        return Err(io::Error::other(
+                            "attach upgrade requires an attach-session response",
+                        ));
+                    };
+                    let session_name = response.session_name.clone();
+                    let terminal_context = attach.target.outer_terminal.context().clone();
+                    let client_title = attach_frame_client_title(&attach.target);
+                    let client_name = attach_client_name
+                        .expect("attach upgrade captures its client name before dispatch");
+                    let attach_identity = handler
+                        .register_attach_identity_with_server_access_and_client_name(
+                            requester.pid,
+                            client_name.clone(),
+                            session_name.clone(),
+                            Some(attach.session_id),
+                            AttachRegistration {
+                                control_tx: attach.control_tx,
+                                control_backlog: attach.control_backlog.clone(),
+                                closing: attach.closing.clone(),
+                                persistent_overlay_epoch: attach.persistent_overlay_epoch.clone(),
+                                terminal_context,
+                                client_title,
+                                flags: attach.flags,
+                                render_stream: attach.render_stream,
+                                uid: requester.uid,
+                                user: requester.user.clone(),
+                                can_write,
+                                client_size: attach.client_size,
+                            },
+                            access_admission.clone(),
+                        )
+                        .await
+                        .ok_or_else(|| {
+                            io::Error::other("attach session changed before registration")
+                        })?;
+                    drop(detached_connection_guard);
+                    drop(detached_request_guard.take());
+                    handler
+                        .emit_client_attached_identity(
+                            client_name,
+                            session_name,
+                            attach.session_id,
+                        )
+                        .await;
+                    drop(normal_request_guard.take());
+                    let (stream, buffered_bytes) = conn.into_raw_parts();
+                    if !buffered_bytes.is_empty() {
+                        warn!(
+                            buffered = buffered_bytes.len(),
+                            "preserving buffered bytes at attach upgrade boundary"
+                        );
+                    }
+                    let result = pane_io::forward_attach(
+                        stream,
+                        attach.target,
+                        buffered_bytes,
+                        shutdown,
+                        attach.control_rx,
+                        attach.control_backlog,
+                        attach.closing,
+                        attach.persistent_overlay_epoch,
+                        pane_io::LiveAttachInputContext::new(
+                            Arc::clone(&handler),
+                            attach_identity,
+                        ),
+                        attach.render_stream,
+                    )
+                    .await;
+                    handler
+                        .finish_attach(requester.pid, attach_identity.attach_id())
+                        .await;
+                    drop(attach_forwarder_guard);
+                    let _ = handler.request_shutdown_if_pending();
+                    return result;
+                }
+                if let Some((
+                    initial_command_count,
+                    control_mode,
+                    server_event_rx,
+                    closing,
+                    control_id,
+                )) = pending_control
+                {
+                    drop(detached_connection_guard);
+                    drop(detached_request_guard.take());
+                    drop(normal_request_guard.take());
+                    let (stream, buffered_bytes) = conn.into_raw_parts();
+                    let result = control::forward_control(
+                        stream,
+                        Arc::clone(&handler),
+                        ControlClientIdentity::new(requester.pid, control_id),
+                        ControlUpgradeInput::with_mode(
+                            buffered_bytes,
+                            initial_command_count,
+                            control_mode,
+                        ),
+                        shutdown,
+                        server_event_rx,
+                        ControlLifecycle {
+                            closing,
+                            shutdown_handle: shutdown_handle.clone(),
+                        },
+                    )
+                    .await;
+                    handler.finish_control(requester.pid, control_id).await;
+                    let _ = handler.request_shutdown_if_server_empty().await;
+                    return result;
+                }
+
+                drop(detached_request_guard.take());
                 if handler
                     .request_shutdown_if_pending_excluding_detached_connection(Some(connection_id))
                 {
