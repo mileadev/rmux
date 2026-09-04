@@ -29,8 +29,19 @@ jobs:
           fi
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.1 --profile minimal --component rustfmt --component clippy --no-self-update
-      - name: Format
-        run: cargo fmt --all -- --check
+      - name: Format and persist deterministic rustfmt output
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all
+          if ! git diff --quiet; then
+            git config user.name 'rmux-hardening-bot'
+            git config user.email 'rmux-hardening-bot@users.noreply.github.com'
+            git add -A
+            git commit -m 'style: format hardened macOS source'
+            git push origin HEAD:${GITHUB_REF_NAME}
+          fi
+          cargo fmt --all -- --check
       - name: Check macOS workspace
         run: cargo check --workspace --locked
       - name: Clippy
