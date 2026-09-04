@@ -37,6 +37,7 @@ jobs:
           python3 security-hardening/scripts/semantic_cleanup_stage14.py .
           python3 security-hardening/scripts/semantic_cleanup_stage15.py .
           python3 security-hardening/scripts/semantic_cleanup_stage16.py .
+          python3 security-hardening/scripts/semantic_cleanup_stage17.py .
           python3 security-hardening/scripts/repair_false_positive_removals.py .
           python3 security-hardening/scripts/remove_missing_path_modules.py .
           python3 security-hardening/scripts/remove_missing_modules.py .
@@ -70,6 +71,18 @@ jobs:
             git push origin HEAD:${GITHUB_REF_NAME}
           fi
           cargo fmt --all -- --check
+      - name: Reconcile lockfile after dependency pruning
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo metadata --format-version 1 >/dev/null
+          if ! git diff --quiet -- Cargo.lock; then
+            git config user.name 'rmux-hardening-bot'
+            git config user.email 'rmux-hardening-bot@users.noreply.github.com'
+            git add Cargo.lock
+            git commit -m 'build: reconcile lockfile after platform pruning'
+            git push origin HEAD:${GITHUB_REF_NAME}
+          fi
       - name: Check macOS workspace
         run: cargo check --workspace --locked
       - name: Clippy
