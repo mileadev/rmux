@@ -48,7 +48,6 @@ use super::target_resolution::{
     resolve_pane_target_or_current, resolve_pane_target_spec, resolve_select_layout_target_spec,
     resolve_window_target_or_current,
 };
-use super::web_commands::run_web_share;
 use super::window_commands::{
     run_kill_window, run_last_window, run_link_window, run_list_windows, run_move_window,
     run_new_window, run_next_window, run_previous_window, run_rename_window, run_resize_window,
@@ -209,7 +208,6 @@ fn command_allows_detached_connection_reuse(candidate: &Command) -> bool {
         | Command::StreamPane(_)
         | Command::CollectPaneOutput(_)
         | Command::WithSession(_)
-        | Command::WebShare(_)
         | Command::Unsupported(_) => false,
         Command::HasSession(_)
         | Command::KillSession(_)
@@ -313,15 +311,7 @@ fn dispatch(
     queue_attach_detach: bool,
     queued_attach_session: &mut Option<QueuedAttachSession>,
 ) -> Result<i32, ExitFailure> {
-    let start_server_args = match &command {
-        Command::StartServer(args) => Some(args),
-        _ => None,
-    };
-    let command_startup = startup.for_command(
-        command_has_start_server_flag(&command),
-        command_requires_web_daemon(&command),
-        start_server_args,
-    );
+    let command_startup = startup.for_command(command_has_start_server_flag(&command));
 
     match command {
         Command::Noop => run_noop(socket_path),
@@ -719,7 +709,6 @@ fn dispatch(
                 connection.wait_for(args.channel, mode)
             })
         }
-        Command::WebShare(args) => run_web_share(args, socket_path, command_startup),
         Command::DisplayMenu(args) => {
             run_queued_server_command(socket_path, "display-menu", args.queue_command)
         }
@@ -854,23 +843,10 @@ pub(super) fn command_has_start_server_flag(command: &Command) -> bool {
     match command {
         Command::Noop | Command::ApplyParseTimeAssignments(_) => false,
         Command::NewSession(_) | Command::StartServer(_) | Command::AttachSession(_) => true,
-        Command::WebShare(args) => web_share_creates_share(args),
         _ => false,
     }
 }
 
-fn web_share_creates_share(args: &crate::cli_args::WebShareArgs) -> bool {
-    !args.list
-        && args.stop.is_none()
-        && args.disconnect.is_none()
-        && !args.stop_all
-        && args.lookup.is_none()
-        && !args.config
-}
-
-fn command_requires_web_daemon(command: &Command) -> bool {
-    matches!(command, Command::WebShare(args) if web_share_creates_share(args))
-}
 
 fn unsupported_argument_suffix(arguments: &[String]) -> String {
     if arguments.is_empty() {

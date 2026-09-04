@@ -56,8 +56,6 @@ mod startup;
 mod target_resolution;
 #[path = "cli/terminal_size.rs"]
 mod terminal_size;
-#[path = "cli/terminal_theme.rs"]
-mod terminal_theme;
 #[path = "cli/tmux_dropin.rs"]
 mod tmux_dropin;
 #[path = "cli/top_level.rs"]

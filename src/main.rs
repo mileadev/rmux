@@ -137,8 +137,6 @@ struct InternalDaemonArgs {
     config_selection: ServerConfigFileSelection,
     config_quiet: bool,
     config_cwd: Option<PathBuf>,
-    web_frontend: Option<String>,
-    web_port: Option<u16>,
     startup_ready_fd: Option<i32>,
     startup_ready_event: Option<OsString>,
 }
@@ -161,8 +159,6 @@ where
     let mut config_selection = ServerConfigFileSelection::Disabled;
     let mut config_quiet = false;
     let mut config_cwd = None;
-    let mut web_frontend = None;
-    let mut web_port = None;
     let mut startup_ready_fd = None;
     let mut startup_ready_event = None;
 
@@ -174,8 +170,6 @@ where
                 &mut config_selection,
                 &mut config_quiet,
                 &mut config_cwd,
-                &mut web_frontend,
-                &mut web_port,
                 &mut startup_ready_fd,
                 &mut startup_ready_event,
             )?;
@@ -194,8 +188,6 @@ where
             &mut config_selection,
             &mut config_quiet,
             &mut config_cwd,
-            &mut web_frontend,
-            &mut web_port,
             &mut startup_ready_fd,
             &mut startup_ready_event,
         )?;
@@ -206,8 +198,6 @@ where
         config_selection,
         config_quiet,
         config_cwd,
-        web_frontend,
-        web_port,
         startup_ready_fd,
         startup_ready_event,
     })
@@ -221,8 +211,6 @@ fn parse_internal_flag<I>(
     config_selection: &mut ServerConfigFileSelection,
     config_quiet: &mut bool,
     config_cwd: &mut Option<PathBuf>,
-    web_frontend: &mut Option<String>,
-    web_port: &mut Option<u16>,
     startup_ready_fd: &mut Option<i32>,
     startup_ready_event: &mut Option<OsString>,
 ) -> Result<(), String>
@@ -257,29 +245,6 @@ where
                 .ok_or_else(|| "--config-cwd requires a path".to_owned())?;
             *config_cwd = Some(PathBuf::from(cwd));
         }
-        Some("--web-port") => {
-            let port = args
-                .next()
-                .ok_or_else(|| "--web-port requires a port".to_owned())?;
-            let port = port
-                .to_str()
-                .ok_or_else(|| "invalid UTF-8 in --web-port".to_owned())?
-                .parse::<u16>()
-                .map_err(|_| "--web-port requires an integer port".to_owned())?;
-            if port == 0 {
-                return Err("--web-port must be between 1 and 65535".to_owned());
-            }
-            *web_port = Some(port);
-        }
-        Some("--frontend-url" | "--web-frontend") => {
-            let frontend = args
-                .next()
-                .ok_or_else(|| "--frontend-url requires a URL".to_owned())?;
-            let frontend = frontend
-                .to_str()
-                .ok_or_else(|| "invalid UTF-8 in --frontend-url".to_owned())?;
-            *web_frontend = Some(frontend.to_owned());
-        }
         Some("--startup-ready-fd") => {
             let fd = args
                 .next()
@@ -311,8 +276,6 @@ where
 
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 fn run_hidden_daemon(args: InternalDaemonArgs) -> io::Result<()> {
-    reject_unsupported_web_args(&args)?;
-
     let mut config = match args.socket_path {
         Some(socket_path) => DaemonConfig::new(socket_path),
         None => DaemonConfig::with_default_socket_path()?,
@@ -326,12 +289,6 @@ fn run_hidden_daemon(args: InternalDaemonArgs) -> io::Result<()> {
             config.with_config_files(files, args.config_quiet, args.config_cwd)
         }
     };
-    if let Some(port) = args.web_port {
-        config = config.with_web_port(port);
-    }
-    if let Some(frontend) = args.web_frontend {
-        config = config.with_web_frontend(frontend);
-    }
     #[cfg(target_os = "linux")]
     if let Some(ready_fd) = args.startup_ready_fd {
         config = config.with_startup_ready_fd(ready_fd);
@@ -349,23 +306,6 @@ fn run_hidden_daemon(args: InternalDaemonArgs) -> io::Result<()> {
     })
 }
 
-#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
-fn reject_unsupported_web_args(args: &InternalDaemonArgs) -> io::Result<()> {
-    #[cfg(not(feature = "web"))]
-    if args.web_port.is_some() || args.web_frontend.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "rmux was built without web-share support",
-        ));
-    }
-
-    #[cfg(feature = "web")]
-    {
-        let _ = args;
-    }
-
-    Ok(())
-}
 
 #[cfg(all(test, any(not(feature = "tiny-cli"), debug_assertions)))]
 mod tests {
