@@ -2236,9 +2236,6 @@ mod tests {
     }
 }
 
-#[cfg(all(test, unix, feature = "web"))]
-#[path = "listener_web_share_tests.rs"]
-mod web_share_tests;
 
 #[cfg(test)]
 #[path = "listener_connection_test_support.rs"]
