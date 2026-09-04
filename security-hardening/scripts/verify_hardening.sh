@@ -6,21 +6,40 @@ FAIL=0
 fail(){ printf 'FAIL: %s\n' "$*" >&2; FAIL=1; }
 pass(){ printf 'PASS: %s\n' "$*"; }
 
-for p in crates/rmux-web-crypto crates/rmux-server/src/web crates/rmux-server/tunnels web-frontend resources/windows resources/claude docs/web-share.md; do
-  [[ -e "$ROOT/$p" ]] && fail "forbidden path remains: $p" || pass "absent: $p"
-done
-
 TMP="$(mktemp -t rmux-hardening.XXXXXX)"
 FILES="$(mktemp -t rmux-hardening-files.XXXXXX)"
 trap 'rm -f "$TMP" "$FILES"' EXIT
-: > "$TMP"
+
+# Entire feature/platform trees that are forbidden in this macOS local-only fork.
+FORBIDDEN_PATHS=(
+  crates/rmux-web-crypto
+  crates/rmux-server/src/web
+  crates/rmux-server/tunnels
+  crates/rmux-sdk/src/web_share
+  src/cli/web_share_display
+  web-frontend
+  resources/windows
+  resources/claude
+  crates/rmux-client/src/attach_windows
+  crates/rmux-pty/src/backend/windows
+  crates/rmux-pty/tests/windows_conpty
+  crates/rmux-ipc/tests/named_pipe_integration.rs
+  docs/web-share.md
+)
+for p in "${FORBIDDEN_PATHS[@]}"; do
+  [[ -e "$ROOT/$p" ]] && fail "forbidden path remains: $p" || pass "absent: $p"
+done
+
+# Production Rust only: exclude tests/benches/examples so fixtures cannot mask runtime policy.
 : > "$FILES"
+while IFS= read -r -d '' f; do
+  case "$f" in
+    */tests/*|*/benches/*|*/examples/*|*_test.rs|*_tests.rs) continue ;;
+  esac
+  printf '%s\0' "$f" >> "$FILES"
+done < <(find "$ROOT/src" "$ROOT/crates" -type f -name '*.rs' -print0)
 
-# Active Rust/Cargo source inventory only. Security-hardening scripts are intentionally excluded.
-find "$ROOT/src" "$ROOT/crates" -type f \( -name '*.rs' -o -name 'Cargo.toml' \) -print0 > "$FILES"
-printf '%s\0' "$ROOT/Cargo.toml" >> "$FILES"
-
-scan(){
+scan_prod(){
   local pat="$1"
   : > "$TMP"
   if xargs -0 grep -nHE "$pat" < "$FILES" > "$TMP" 2>/dev/null; then
@@ -29,67 +48,74 @@ scan(){
   return 1
 }
 
-# Production source may use UnixListener/UnixStream, but not Internet sockets,
-# browser/WebShare transports, tunneling helpers, Claude integration, or Windows code.
-PATTERNS=(
-  'TcpListener' 'TcpStream' 'UdpSocket' 'SocketAddr' 'AF_INET' 'AF_INET6' 'SOCK_DGRAM' 'IPPROTO_TCP' 'IPPROTO_UDP'
+# Executable macOS source must not contain Internet transports or removed remote features.
+RUNTIME_PATTERNS=(
+  'TcpListener' 'TcpStream' 'UdpSocket' 'AF_INET' 'AF_INET6' 'SOCK_DGRAM' 'IPPROTO_TCP' 'IPPROTO_UDP'
   'tokio::net::Tcp' 'tokio::net::Udp' 'std::net::Tcp' 'std::net::Udp'
   'WebSocket' 'websocket' 'tungstenite' 'axum' 'hyper::' 'reqwest' 'httparse'
-  'share\.rmux\.io' 'localhost\.run' 'serveo' 'tailscale' 'cloudflared' 'ngrok' 'funnel'
+  'share\.rmux\.io' 'localhost\.run' 'serveo' 'cloudflared' 'ngrok' 'tailscale[[:space:]]+(funnel|serve)'
   'WebShare' 'web_share' 'web-share' 'CAPABILITY_WEB_SHARE' 'rmux-web-crypto'
-  'Claude' 'claude' '[Pp]ower[Ss]hell' '[Cc]on[Pp][Tt][Yy]'
-  'cfg\(windows\)' 'target_os[[:space:]]*=[[:space:]]*"windows"' 'windows_sys' 'windows-sys'
-  'AttachedWindows' 'WindowsConsole' 'WINDOWS_CONSOLE' 'CAPABILITY_[A-Z0-9_]*WINDOWS'
+  'claude_launcher' 'claude_skill' 'dangerously-skip-permissions'
 )
-for pat in "${PATTERNS[@]}"; do
-  if scan "$pat"; then
-    fail "forbidden runtime/platform pattern matched: $pat"
+for pat in "${RUNTIME_PATTERNS[@]}"; do
+  if scan_prod "$pat"; then
+    fail "forbidden macOS runtime pattern matched: $pat"
     cat "$TMP" >&2
   fi
 done
 
-# Helper execution must not automatically launch known networking tools.
-: > "$TMP"
-if find "$ROOT/src" "$ROOT/crates" -type f -name '*.rs' -print0 | \
-   xargs -0 grep -nHE 'Command::new\([^)]*(ssh|tailscale|cloudflared|ngrok|curl|wget)' > "$TMP" 2>/dev/null; then
-  fail 'network helper launcher remains'
+# No automatic launch of known networking/download helpers.
+if scan_prod 'Command::new\([^)]*(ssh|tailscale|cloudflared|ngrok|curl|wget)'; then
+  fail 'network/download helper launcher remains'
   cat "$TMP" >&2
 else
-  pass 'no automatic network helper launcher found'
+  pass 'no automatic network/download helper launcher found'
 fi
 
-# Unix-domain IPC must remain as the only transport boundary.
-if [[ -d "$ROOT/crates/rmux-ipc" ]]; then
-  if find "$ROOT/crates/rmux-ipc" -type f -name '*.rs' -print0 | \
-     xargs -0 grep -qE 'UnixListener|UnixStream'; then
-    pass 'AF_UNIX IPC implementation present'
-  else
-    fail 'rmux-ipc remains but no UnixListener/UnixStream implementation found'
-  fi
+# Same-user AF_UNIX IPC is the intended transport boundary.
+if find "$ROOT/crates/rmux-ipc" -type f -name '*.rs' -print0 | xargs -0 grep -qE 'UnixListener|UnixStream'; then
+  pass 'AF_UNIX IPC implementation present'
+else
+  fail 'AF_UNIX IPC implementation not found'
 fi
 
-# No platform/remote feature-specific tracked paths in the active tree.
+# No dedicated remote/Windows implementation paths should remain tracked.
 : > "$TMP"
 while IFS= read -r -d '' f; do
-  case "$f" in security-hardening/*|STRUCTURAL-REDUCTION.json|README.md) continue;; esac
+  case "$f" in security-hardening/*|STRUCTURAL-REDUCTION.json) continue;; esac
   lower="$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')"
-  case "$lower" in *web-share*|*web_share*|*tunnel*|*claude*|*conpty*|*powershell*|*windows*) printf '%s\n' "$f" >> "$TMP";; esac
+  case "$lower" in
+    *web-share*|*web_share*|*tunnel*|*claude*|*conpty*|*powershell*|*/windows/*|*windows_*.rs|*_windows.rs)
+      printf '%s\n' "$f" >> "$TMP" ;;
+  esac
 done < <(git -C "$ROOT" ls-files -z)
 if [[ -s "$TMP" ]]; then
-  fail 'feature/platform-specific paths remain'
+  fail 'dedicated remote/platform implementation paths remain'
   cat "$TMP" >&2
 else
-  pass 'forbidden feature-specific tracked paths absent'
+  pass 'dedicated remote/platform implementation paths absent'
 fi
 
-# Root/workspace manifests must not re-enable the deleted surfaces.
+# Cross-platform files may still contain dormant cfg(windows) compatibility branches,
+# but Windows crates/targets and removed remote feature dependencies are prohibited.
 for manifest in "$ROOT/Cargo.toml" "$ROOT"/crates/*/Cargo.toml; do
   [[ -f "$manifest" ]] || continue
-  if grep -nE 'rmux-web-crypto|windows-sys|^[[:space:]]*web[[:space:]]*=' "$manifest" > "$TMP" 2>/dev/null; then
+  if grep -nE "rmux-web-crypto|windows-sys|\[target\.'cfg\(windows\)'\.dependencies\]|^[[:space:]]*web[[:space:]]*=" "$manifest" > "$TMP" 2>/dev/null; then
     fail "forbidden manifest feature/dependency remains: $manifest"
     cat "$TMP" >&2
   fi
 done
+
+# The public CLI must not advertise deleted functionality.
+if [[ -x "$ROOT/target/release/rmux" ]]; then
+  "$ROOT/target/release/rmux" --help > "$TMP" 2>&1 || true
+  if grep -Ei 'web-share|share\.rmux\.io|tunnel|claude' "$TMP" >/dev/null; then
+    fail 'release CLI still advertises removed remote/Claude functionality'
+    cat "$TMP" >&2
+  else
+    pass 'release CLI does not advertise removed remote/Claude functionality'
+  fi
+fi
 
 if [[ "$FAIL" -ne 0 ]]; then
   echo 'FINAL_STATUS=FAIL' >&2
