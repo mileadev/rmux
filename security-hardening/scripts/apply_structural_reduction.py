@@ -21,6 +21,9 @@ def replace(path,fn,changes):
     if not path.exists(): return
     old=path.read_text(encoding='utf-8'); new=fn(old)
     if new!=old: atomic_write(path,new); changes.append(str(path))
+def is_windows_platform_file(name: str) -> bool:
+    n=name.lower()
+    return n == 'windows.rs' or n.startswith('windows_') or n.endswith('_windows.rs') or n.endswith('-windows.rs')
 
 def main():
     root=Path(sys.argv[1] if len(sys.argv)>1 else '.').resolve()
@@ -37,7 +40,7 @@ def main():
         n=p.name.lower()
         if any(tok in n for tok in ('web_share','web-share','tunnel','claude','conpty','powershell')):
             candidates.append(p)
-        elif 'windows' in n:
+        elif is_windows_platform_file(n):
             candidates.append(p)
     for p in sorted(candidates,key=lambda q:len(q.parts),reverse=True):
         if p.exists() or p.is_symlink(): rm(root,p.relative_to(root).as_posix(),removed)
