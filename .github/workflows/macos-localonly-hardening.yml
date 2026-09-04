@@ -3,13 +3,16 @@ on:
   push:
     branches: [hardening/macos-localonly-v0.10.0]
   workflow_dispatch:
+concurrency:
+  group: macos-localonly-hardening
+  cancel-in-progress: true
 permissions:
   contents: write
 jobs:
   harden-and-validate:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
       - name: Apply deterministic reduction and semantic cleanup
@@ -22,6 +25,7 @@ jobs:
           python3 security-hardening/scripts/semantic_cleanup.py .
           python3 security-hardening/scripts/semantic_cleanup_stage3.py .
           python3 security-hardening/scripts/semantic_cleanup_stage4.py .
+          python3 security-hardening/scripts/semantic_cleanup_stage5.py .
           python3 security-hardening/scripts/repair_false_positive_removals.py .
           python3 security-hardening/scripts/remove_missing_path_modules.py .
           python3 security-hardening/scripts/remove_missing_modules.py .
@@ -47,18 +51,6 @@ jobs:
             git push origin HEAD:${GITHUB_REF_NAME}
           fi
           cargo fmt --all -- --check
-      - name: Refresh lockfile after dependency pruning
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo check --workspace || true
-          if ! git diff --quiet -- Cargo.lock; then
-            git config user.name 'rmux-hardening-bot'
-            git config user.email 'rmux-hardening-bot@users.noreply.github.com'
-            git add Cargo.lock
-            git commit -m 'build: refresh lockfile after attack-surface reduction'
-            git push origin HEAD:${GITHUB_REF_NAME}
-          fi
       - name: Check macOS workspace
         run: cargo check --workspace --locked
       - name: Clippy
