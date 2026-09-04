@@ -7,5 +7,4 @@ pub(crate) mod server;
 pub(crate) mod session;
 pub(crate) mod status;
 pub(crate) mod target;
-pub(crate) mod web;
 pub(crate) mod window;

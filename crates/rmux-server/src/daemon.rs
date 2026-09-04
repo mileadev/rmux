@@ -534,6 +534,3 @@ impl Drop for ServerHandle {
 #[path = "daemon_tests/unix.rs"]
 mod tests;
 
-#[cfg(all(test, windows))]
-#[path = "daemon_tests/windows.rs"]
-mod tests;

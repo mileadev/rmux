@@ -107,13 +107,6 @@ pub use buffer::{
     ShowBufferRequest,
 };
 
-#[path = "request/web.rs"]
-mod web;
-pub use web::{
-    CreateWebShareRequest, ListWebSharesRequest, LookupWebShareRequest, StopAllWebSharesRequest,
-    StopWebShareRequest, WebShareConfigRequest, WebShareRequest, WebShareScope, WebShareUrlOptions,
-    WebTerminalPalette, WebTerminalTheme,
-};
 
 /// All detached public command and internal RPC requests supported by the wire
 /// protocol.
@@ -348,8 +341,6 @@ pub enum Request {
     DaemonStatus(DaemonStatusRequest),
     /// Internal idle-only shutdown endpoint used by seamless upgrades.
     ShutdownIfIdle(ShutdownIfIdleRequest),
-    /// Browser-visible pane sharing command family.
-    WebShare(Box<WebShareRequest>),
     /// `display-message` extension with target-client context.
     DisplayMessageExt(Box<DisplayMessageExtRequest>),
     /// `send-keys` extension with target-client context.

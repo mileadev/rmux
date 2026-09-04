@@ -8,10 +8,6 @@ use rmux_proto::Response;
 
 use super::ExitFailure;
 
-#[cfg(windows)]
-#[path = "diagnose_windows.rs"]
-mod diagnose_windows;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiagnoseFormat {
     Human,
