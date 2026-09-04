@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Remove ordinary Rust `mod name;` declarations whose source module no longer exists."""
+"""Remove ordinary Rust `mod name;` declarations whose source module no longer exists.
+
+Only production `src/` trees are scanned. Integration-test files are crate roots and resolve
+`mod common;` relative to their containing `tests/` directory, so they are deliberately excluded.
+"""
 from __future__ import annotations
 import os,re,sys
 from pathlib import Path
@@ -10,7 +14,9 @@ BLOCK=re.compile(
 )
 
 def module_base(src: Path) -> Path:
-    if src.name in ('lib.rs','main.rs','mod.rs'):
+    # Cargo crate roots resolve submodules beside the root file, even when the root
+    # has a nonstandard name such as daemon_main.rs.
+    if src.name in ('lib.rs','main.rs','mod.rs','daemon_main.rs') or src.parent.name == 'bin':
         return src.parent
     return src.parent/src.stem
 
@@ -20,12 +26,13 @@ def exists_for(src: Path,name: str) -> bool:
 
 def main() -> int:
     root=Path(sys.argv[1] if len(sys.argv)>1 else '.').resolve(); changed=0
-    sources=sorted(list((root/'src').rglob('*.rs'))+list((root/'crates').rglob('*.rs')))
-    for src in sources:
+    sources=list((root/'src').rglob('*.rs'))
+    for crate_src in (root/'crates').glob('*/src'):
+        if crate_src.is_dir(): sources.extend(crate_src.rglob('*.rs'))
+    for src in sorted(sources):
         text=src.read_text(encoding='utf-8'); old=text
         def repl(m: re.Match[str]) -> str:
             block=m.group('block')
-            # #[path] declarations are handled by the dedicated pass.
             if '#[path' in block:
                 return block
             name=m.group('name')
