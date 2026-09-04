@@ -17,7 +17,7 @@ const DAEMON_BLOCKING_THREAD_KEEP_ALIVE: Duration = Duration::from_secs(2);
 
 /// Builds the runtime used by daemon entrypoints.
 ///
-/// Pane readers, IPC handlers, attach forwarding, and web-share tasks all run on
+/// Pane readers, IPC handlers, attach forwarding, and background tasks all run on
 /// this runtime. Keep the scheduler small: pane readers are mostly readiness
 /// driven, while render and status work is already coalesced. More workers
 /// increase cross-thread wakeups and idle RSS on the common local daemon path.

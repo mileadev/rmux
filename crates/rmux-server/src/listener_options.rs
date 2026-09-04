@@ -36,19 +36,6 @@ impl ServeOptions {
         }
     }
 
-    pub(crate) fn with_web_options(
-        mut self,
-        port: u16,
-        frontend: Option<String>,
-        required: bool,
-        port_explicit: bool,
-    ) -> Self {
-        self.web_port = port;
-        self.web_frontend = frontend;
-        self.web_required = required;
-        self.web_port_explicit = port_explicit;
-        self
-    }
 
     #[cfg(unix)]
     pub(crate) fn with_socket_identity(

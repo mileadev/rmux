@@ -261,44 +261,6 @@ mod tests {
         assert!(matches!(error, super::AutoStartError::TimedOut { .. }));
     }
 
-    #[test]
-    fn web_required_does_not_replace_active_no_web_daemon() {
-        let (connection, server_thread) = connection_with_script(vec![
-            (
-                Request::Handshake(HandshakeRequest::current()),
-                Response::Handshake(HandshakeResponse {
-                    wire_version: RMUX_WIRE_VERSION,
-                    capabilities: vec![
-                        CAPABILITY_DAEMON_STATUS.to_owned(),
-                        CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE.to_owned(),
-                    ],
-                }),
-            ),
-            (
-                Request::DaemonStatus(DaemonStatusRequest),
-                Response::DaemonStatus(DaemonStatusResponse {
-                    rmux_version: env!("CARGO_PKG_VERSION").to_owned(),
-                    wire_version: RMUX_WIRE_VERSION,
-                    session_count: 1,
-                    client_count: 0,
-                    config_loading: false,
-                }),
-            ),
-        ]);
-        let config = AutoStartConfig::disabled().with_web_required();
-
-        let error = ensure_required_web_capability_or_restart(
-            connection,
-            Path::new("/tmp/rmux-web-active.sock"),
-            Path::new("/bin/rmux"),
-            &config,
-        )
-        .expect_err("active no-web daemon must not be replaced");
-
-        assert!(matches!(error, AutoStartError::IncompatibleDaemon { .. }));
-        assert!(error.to_string().contains("without web-share support"));
-        server_thread.join().expect("scripted server should finish");
-    }
 
     fn connection_with_script(
         script: Vec<(Request, Response)>,

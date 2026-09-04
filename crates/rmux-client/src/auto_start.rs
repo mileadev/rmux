@@ -90,28 +90,8 @@ impl AutoStartConfig {
         }
     }
 
-    /// Overrides the web-share listener port for a newly auto-started daemon.
-    #[must_use]
-    pub const fn with_web_port(mut self, port: u16) -> Self {
-        self.web_port = Some(port);
-        self.web_required = true;
-        self
-    }
 
-    /// Overrides the frontend origin used by newly auto-started web shares.
-    #[must_use]
-    pub fn with_web_frontend(mut self, frontend: String) -> Self {
-        self.web_frontend = Some(frontend);
-        self.web_required = true;
-        self
-    }
 
-    /// Requires a daemon compiled with web-share support for this autostart.
-    #[must_use]
-    pub const fn with_web_required(mut self) -> Self {
-        self.web_required = true;
-        self
-    }
 
     /// Uses an explicit binary when this client must auto-start a hidden daemon.
     #[must_use]

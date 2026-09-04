@@ -158,7 +158,6 @@ const COMMAND_SURFACE: [&str; COMMAND_SURFACE_COUNT] = [
     "rename-session",
     "list-sessions",
     "list-panes",
-    "web-share",
 ];
 
 #[test]

@@ -120,29 +120,9 @@ impl DaemonConfig {
         self.subscription_limits
     }
 
-    /// Returns the configured web-share listener port.
-    #[must_use]
-    pub const fn web_port(&self) -> u16 {
-        self.web_port
-    }
 
-    /// Returns whether the web-share listener port was explicitly configured.
-    #[must_use]
-    pub const fn web_port_explicit(&self) -> bool {
-        self.web_port_explicit
-    }
 
-    /// Returns whether this daemon startup requires the web listener to bind.
-    #[must_use]
-    pub const fn web_required(&self) -> bool {
-        self.web_required
-    }
 
-    /// Returns the optional external web-share frontend origin.
-    #[must_use]
-    pub fn web_frontend(&self) -> Option<&str> {
-        self.web_frontend.as_deref()
-    }
 
     /// Enables RMUX default startup config loading.
     #[must_use]
@@ -162,22 +142,7 @@ impl DaemonConfig {
         self
     }
 
-    /// Overrides the web-share listener port.
-    #[must_use]
-    pub const fn with_web_port(mut self, port: u16) -> Self {
-        self.web_port = port;
-        self.web_port_explicit = true;
-        self.web_required = true;
-        self
-    }
 
-    /// Overrides the frontend origin used in generated web-share URLs.
-    #[must_use]
-    pub fn with_web_frontend(mut self, frontend: String) -> Self {
-        self.web_frontend = Some(frontend);
-        self.web_required = true;
-        self
-    }
 
     /// Enables explicit `-f` startup config loading.
     #[must_use]
