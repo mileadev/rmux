@@ -32,6 +32,7 @@ jobs:
           python3 security-hardening/scripts/semantic_cleanup_stage9.py .
           python3 security-hardening/scripts/semantic_cleanup_stage10.py .
           python3 security-hardening/scripts/semantic_cleanup_stage11.py .
+          python3 security-hardening/scripts/semantic_cleanup_stage12.py .
           python3 security-hardening/scripts/repair_false_positive_removals.py .
           python3 security-hardening/scripts/remove_missing_path_modules.py .
           python3 security-hardening/scripts/remove_missing_modules.py .
@@ -43,6 +44,14 @@ jobs:
             git commit -m 'security: reconcile local-only source topology'
             git push origin HEAD:${GITHUB_REF_NAME}
           fi
+      - name: Residual platform and remote token inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          rg -n --hidden --glob '!target/**' --glob '!.git/**' --glob '!security-hardening/**' \
+            --glob '*.rs' --glob 'Cargo.toml' \
+            -e 'AttachedWindows|WINDOWS_CONSOLE|CAPABILITY_[A-Z0-9_]*WINDOWS|cfg\(windows\)|target_os\s*=\s*"windows"|windows_sys|ConPTY|PowerShell|WebShare|web_share|web-share|share\.rmux\.io|TcpListener|TcpStream|UdpSocket' \
+            src crates Cargo.toml || true
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.1 --profile minimal --component rustfmt --component clippy --no-self-update
       - name: Format and persist deterministic rustfmt output
