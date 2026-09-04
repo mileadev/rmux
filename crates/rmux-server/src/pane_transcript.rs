@@ -529,8 +529,6 @@ impl PaneTranscript {
         })
     }
 
-
-
     pub(crate) fn clear_copy_mode(&mut self) -> bool {
         match self.mode {
             Some(PaneModeState::Copy(_)) => {

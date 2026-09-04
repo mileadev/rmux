@@ -214,7 +214,7 @@ fn is_internal_flag_token(value: &std::ffi::OsStr) -> bool {
 
 #[cfg(test)]
 mod tests {
-        use super::reject_unsupported_web_args;
+    use super::reject_unsupported_web_args;
     use super::{parse_daemon_args, ConfigFileSelection, INTERNAL_DAEMON_FLAG};
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -257,7 +257,7 @@ mod tests {
         assert_eq!(args.web_frontend.as_deref(), Some("http://127.0.0.1:4325"));
     }
 
-        #[test]
+    #[test]
     fn daemon_without_web_rejects_web_listener_flags() {
         let args = parse_daemon_args(
             [

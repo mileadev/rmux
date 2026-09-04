@@ -460,7 +460,6 @@ impl HandlerState {
         Some(PaneScreenState::from_screen(transcript.screen()))
     }
 
-
     pub(crate) fn pane_copy_mode_summary(
         &self,
         session_name: &SessionName,
@@ -512,7 +511,6 @@ impl HandlerState {
             .copy_mode_render_snapshot()
     }
 
-
     pub(crate) fn with_pane_screen<R>(
         &self,
         session_name: &SessionName,
@@ -550,7 +548,6 @@ impl HandlerState {
                 .clone(),
         )
     }
-
 
     pub(crate) fn pane_in_mode(&self, session_name: &SessionName, pane_id: PaneId) -> bool {
         let Some(window_index) = self

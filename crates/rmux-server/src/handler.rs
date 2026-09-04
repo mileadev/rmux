@@ -834,7 +834,6 @@ impl RequestHandler {
         )
     }
 
-
     #[cfg(test)]
     fn with_owner_uid_and_environment(
         owner_uid: u32,

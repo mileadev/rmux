@@ -1268,7 +1268,6 @@ pub(super) fn attach_target_for_session(
     )
 }
 
-
 pub(super) struct AttachSessionSwitchRenderOptions<'a> {
     pub(super) attached_count: usize,
     pub(super) previous_title: Option<&'a ClientTitleState>,
@@ -1316,7 +1315,7 @@ pub(super) fn attach_target_for_session_switch(
         selection,
         window_size_override,
     } = options;
-        let master = {
+    let master = {
         let _ = render_stream;
         AttachTargetMaster::Clone
     };
@@ -1340,7 +1339,6 @@ pub(super) fn attach_target_for_session_switch(
         },
     )
 }
-
 
 pub(super) fn attach_render_target_for_session_with_prompt(
     state: &HandlerState,
@@ -1540,7 +1538,7 @@ fn attach_target_for_session_with_prompt(
     // replayable without retaining live-only passthroughs for detached panes.
     let (pane_output_start_sequence, pane_output) = pane_output_sender.subscribe_live_from_now();
     let active_pane = session.window().active_pane().cloned();
-        let pane_state = session
+    let pane_state = session
         .active_pane_id()
         .and_then(|pane_id| state.pane_screen_state(session_name, pane_id));
     // A kept-dead pane retains its transcript for capture and rendering, but
@@ -1627,7 +1625,7 @@ fn attach_target_for_session_with_prompt(
     );
     validate_attach_recovery_frame(&render_frame, options.bounded_recovery)?;
     for pane in session.window().panes() {
-                let copy_snapshot = state.pane_copy_mode_render_snapshot(session_name, pane.id());
+        let copy_snapshot = state.pane_copy_mode_render_snapshot(session_name, pane.id());
         if let Some(snapshot) = copy_snapshot.as_ref() {
             let pane_frame = if options.prompt.is_some() {
                 renderer::render_copy_mode_pane_screen_preserving_prompt_cursor(
@@ -1641,7 +1639,7 @@ fn attach_target_for_session_with_prompt(
             };
             render_frame.extend_from_slice(pane_frame.as_slice());
         } else {
-                        let screen = state.pane_screen(session_name, pane.id());
+            let screen = state.pane_screen(session_name, pane.id());
             let Some(screen) = screen else {
                 continue;
             };
@@ -1688,7 +1686,7 @@ fn attach_target_for_session_with_prompt(
         live_pane_render_for_target(state, session, &state.options, session_name, options.prompt);
     if options.prompt.is_none() {
         if let Some(active_pane) = active_pane.clone() {
-                        let copy_snapshot =
+            let copy_snapshot =
                 state.pane_copy_mode_render_snapshot(session_name, active_pane.id());
             if let Some(snapshot) = copy_snapshot {
                 render_frame.extend_from_slice(
@@ -1701,7 +1699,7 @@ fn attach_target_for_session_with_prompt(
                     .as_slice(),
                 );
             } else {
-                                let screen = state.pane_screen(session_name, active_pane.id());
+                let screen = state.pane_screen(session_name, active_pane.id());
                 if let Some(screen) = screen {
                     render_frame.extend_from_slice(
                         renderer::render_pane_cursor(

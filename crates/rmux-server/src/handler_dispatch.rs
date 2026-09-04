@@ -15,10 +15,6 @@ use crate::pane_io::HandleOutcome;
 
 use super::{client_environment_snapshot, effective_client_terminal_context, RequestHandler};
 
-
-
-
-
 impl RequestHandler {
     pub(crate) async fn handle_revoked_cleanup_request(
         &self,
@@ -94,7 +90,6 @@ impl RequestHandler {
         outcome
     }
 
-
     /// Runs everything a dispatched request still owes once its handler
     /// returned: the applied-window-resize backstop, then its inline and
     /// request hooks.
@@ -132,7 +127,6 @@ impl RequestHandler {
         )
         .await;
     }
-
 
     #[async_recursion::async_recursion]
     pub(crate) async fn dispatch_captured(

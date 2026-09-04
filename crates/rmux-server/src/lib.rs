@@ -156,7 +156,6 @@ mod wait_for;
 // Console-input retry policy is plain `io::Error` logic with no Win32 calls:
 // compile it in test builds on every platform so the policy stays covered.
 
-
 pub use daemon::{
     default_socket_path, ConfigFileSelection, ConfigLoadOptions, DaemonConfig, ServerDaemon,
     ServerHandle,

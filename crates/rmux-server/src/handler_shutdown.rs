@@ -93,7 +93,6 @@ impl RequestHandler {
         self.normal_request_admission.closing.send_replace(true);
     }
 
-
     pub(crate) fn normal_requests_quiesced(&self) -> bool {
         self.normal_request_admission.active.load(Ordering::SeqCst) == 0
     }

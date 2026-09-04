@@ -215,7 +215,6 @@ async fn shutdown_if_idle_refuses_in_flight_detached_requests() {
     assert!(!handler.request_shutdown_if_pending());
 }
 
-
 #[tokio::test]
 async fn server_access_protects_owner_uid() {
     let handler = RequestHandler::with_owner_uid(current_owner_uid());

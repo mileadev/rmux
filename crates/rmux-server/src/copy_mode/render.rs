@@ -25,8 +25,6 @@ impl CopyModeState {
         }
     }
 
-
-
     fn render_overlays(&self) -> CopyModeRenderOverlays {
         let mark = (self.show_mark && self.cols() > 0)
             .then_some(self.mark)
