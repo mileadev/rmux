@@ -403,8 +403,7 @@ impl RequestHandler {
             }
         }
 
-        for (destroyed_session, session_id) in &destroyed_sessions {
-        }
+        for (destroyed_session, session_id) in &destroyed_sessions {}
 
         if !removed_pane_ids.is_empty() {
             self.forget_pane_snapshot_coalescers(&removed_pane_ids);

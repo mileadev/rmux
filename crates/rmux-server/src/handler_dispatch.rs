@@ -755,7 +755,9 @@ impl RequestHandler {
             }
             Request::ReservedRemoteAccessRemoved => {
                 HandleOutcome::response(Response::Error(ErrorResponse {
-                    error: RmuxError::Server("reserved remote-access request is permanently unsupported".to_owned()),
+                    error: RmuxError::Server(
+                        "reserved remote-access request is permanently unsupported".to_owned(),
+                    ),
                 }))
             }
             _ => HandleOutcome::response(Response::Error(ErrorResponse {

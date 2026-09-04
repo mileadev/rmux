@@ -177,6 +177,16 @@ pub(in crate::handler) use pane_output_subscription_rekeys::{
     PaneOutputSubscriptionKeySnapshot, PaneOutputSubscriptionReconciliation,
 };
 use pane_support::PaneSnapshotRevisionRegistry;
+pub(in crate::handler) use request_identity::{
+    current_expected_attach_identity, dispatch_with_expected_session_identity,
+    dispatch_with_expected_window_identity, dispatch_with_expected_window_occurrence_identity,
+    expected_attach_follows_registration, rebase_expected_attach_session_after_switch,
+    require_expected_pane_identity, require_expected_session_identity,
+    require_expected_window_identity, resolve_expected_window_pane_target,
+    validate_expected_attach_identity, with_expected_attach_and_session_identity,
+    with_expected_attach_registration, with_expected_session_identity,
+    ExpectedWindowOccurrenceIdentity,
+};
 pub(in crate::handler) use selection_transitions::{
     SelectionTargetTransitionSnapshot, SelectionTransitionSnapshot,
 };
@@ -197,16 +207,6 @@ pub(in crate::handler) use target_support::{
     target_for_scope_selector, target_to_scope, with_visible_pane_bases, SessionLookup,
 };
 use wait_support::SdkWaitState;
-pub(in crate::handler) use request_identity::{
-    current_expected_attach_identity, dispatch_with_expected_session_identity,
-    dispatch_with_expected_window_identity, dispatch_with_expected_window_occurrence_identity,
-    expected_attach_follows_registration, rebase_expected_attach_session_after_switch,
-    require_expected_pane_identity, require_expected_session_identity,
-    require_expected_window_identity, resolve_expected_window_pane_target,
-    validate_expected_attach_identity, with_expected_attach_and_session_identity,
-    with_expected_attach_registration, with_expected_session_identity,
-    ExpectedWindowOccurrenceIdentity,
-};
 
 /// Default detached session size used when `new-session` omits `-x` and `-y`.
 ///
