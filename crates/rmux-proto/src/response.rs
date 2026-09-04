@@ -1189,6 +1189,5 @@ mod tests {
             },
         };
         assert_transparent(Response::PaneOutputLag(Box::new(lag.clone())), &lag);
-
     }
 }

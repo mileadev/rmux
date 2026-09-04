@@ -301,7 +301,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn current_handshake_uses_exact_wire_window() {
         let request = HandshakeRequest::current();
